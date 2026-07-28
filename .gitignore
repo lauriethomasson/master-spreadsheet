@@ -1,0 +1,8 @@
+.env
+*.xlsx
+__pycache__/
+venv/
+.venv/
+.streamlit/secrets.toml
+data/
+staging/
