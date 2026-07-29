@@ -26,7 +26,7 @@ with page_setup.setup_page("review"):
         st.caption(f"{len(pending)} pending upload(s) combined into {len(combined_df)} rows.")
 
         visible = display_utils.visible_columns(combined_df)
-        edited_visible = st.data_editor(combined_df[visible], num_rows="dynamic", width="stretch", height=600)
+        edited_visible = st.data_editor(combined_df[visible], num_rows="fixed", width="stretch", height=600)
         edited_df = display_utils.restore_hidden_columns(edited_visible, combined_df)
 
         if st.button("Approve → Master", type="primary"):

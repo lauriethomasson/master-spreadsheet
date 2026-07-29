@@ -117,5 +117,7 @@ def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
     rows = []
     for record in df.to_dict(orient="records"):
         cleaned = {key: _clean_value(value) for key, value in record.items()}
+        if all(value is None for value in cleaned.values()):
+            continue
         rows.append(ListingRow(**cleaned))
     return rows
