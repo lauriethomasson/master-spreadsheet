@@ -109,6 +109,11 @@ def render_pages(pdf_path: Path) -> list[types.Part]:
         pix = page.get_pixmap(dpi=RENDER_DPI)
         parts.append(types.Part.from_bytes(data=pix.tobytes("png"), mime_type="image/png"))
     doc.close()
+    # MuPDF's internal object store (decoded pixmaps/glyphs/images) is process-wide,
+    # not tied to this Document - closing it above doesn't touch that cache. Every
+    # upload here is a one-off brochure that's never re-rendered, so the cache is
+    # pure dead weight that otherwise accumulates ~20MB per call, forever.
+    fitz.TOOLS.store_shrink(100)
     return parts
 
 
