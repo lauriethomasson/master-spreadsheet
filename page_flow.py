@@ -34,12 +34,14 @@ def render_nav_buttons(current_path: str) -> None:
     st.divider()
     back_col, _, next_col = st.columns([1, 4, 1])
 
-    with back_col:
-        back_label = "← Back" if is_first else f"← {PAGES[index - 1]['label']}"
-        if st.button(back_label, width="stretch", disabled=is_first, key="page_flow_back"):
-            st.switch_page(PAGES[index - 1]["path"])
+    if not is_first:
+        with back_col:
+            back_label = f"← {PAGES[index - 1]['label']}"
+            if st.button(back_label, width="stretch", key="page_flow_back"):
+                st.switch_page(PAGES[index - 1]["path"])
 
-    with next_col:
-        next_label = "Next →" if is_last else f"{PAGES[index + 1]['label']} →"
-        if st.button(next_label, width="stretch", type="primary", disabled=is_last, key="page_flow_next"):
-            st.switch_page(PAGES[index + 1]["path"])
+    if not is_last:
+        with next_col:
+            next_label = f"{PAGES[index + 1]['label']} →"
+            if st.button(next_label, width="stretch", type="primary", key="page_flow_next"):
+                st.switch_page(PAGES[index + 1]["path"])
