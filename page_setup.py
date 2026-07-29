@@ -24,12 +24,15 @@ PAGE_CONFIG = dict(
 # Streamlit's classic multipage mode auto-injects a page list into the
 # sidebar from the pages/ directory - there's no Python-level toggle for
 # just that (initial_sidebar_state only controls collapsed/expanded, and a
-# collapsed sidebar can still be re-expanded to reveal it). Targeting this
-# testid is the standard way to actually remove it; page order/navigation
-# is handled explicitly instead via page_flow.py's Back/Next buttons.
-_HIDE_SIDEBAR_NAV_CSS = """
+# collapsed sidebar can still be re-expanded to reveal it). Page order/
+# navigation is handled explicitly instead via page_flow.py's Back/Next
+# buttons, so nothing in this app ever puts real content in st.sidebar -
+# hiding the whole sidebar (not just its nav list) removes the now-purposeless
+# collapse/expand toggle too, rather than leaving an empty panel behind it.
+_HIDE_SIDEBAR_CSS = """
 <style>
-[data-testid="stSidebarNav"] { display: none; }
+[data-testid="stSidebar"] { display: none; }
+[data-testid="stExpandSidebarButton"] { display: none; }
 </style>
 """
 
@@ -44,7 +47,7 @@ def setup_page(page_key: str, loading_message: str = "Loading..."):
             st.title(...)
             ...
 
-    Sets page config, hides Streamlit's default sidebar page nav (replaced
+    Sets page config, hides Streamlit's default sidebar entirely (replaced
     by page_flow.py's explicit Back/Next buttons), then shows
     loading_message only the first time this page runs in the current
     browser session — not on every rerun. Streamlit reruns the whole script
@@ -54,7 +57,7 @@ def setup_page(page_key: str, loading_message: str = "Loading..."):
     initial page load.
     """
     st.set_page_config(**PAGE_CONFIG)
-    st.markdown(_HIDE_SIDEBAR_NAV_CSS, unsafe_allow_html=True)
+    st.markdown(_HIDE_SIDEBAR_CSS, unsafe_allow_html=True)
 
     loaded_key = f"_page_loaded_{page_key}"
     first_load = not st.session_state.get(loaded_key)
