@@ -2,25 +2,25 @@ import streamlit as st
 
 import display_utils
 import master_writer
+import page_setup
 
-st.set_page_config(page_title="Master Spreadsheet Pipeline", page_icon="📋", layout="wide")
+with page_setup.setup_page("master"):
+    st.title("Master Spreadsheet")
 
-st.title("Master Spreadsheet")
+    if master_writer.master_exists():
+        df = master_writer.load_master_as_dataframe()
+        st.dataframe(df[display_utils.visible_columns(df)])
 
-if master_writer.master_exists():
-    df = master_writer.load_master_as_dataframe()
-    st.dataframe(df[display_utils.visible_columns(df)])
+        with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
+            st.download_button(
+                "Download master.xlsx",
+                f,
+                file_name="master.xlsx",
+            )
 
-    with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
-        st.download_button(
-            "Download master.xlsx",
-            f,
-            file_name="master.xlsx",
-        )
-
-    log = master_writer.get_master_write_log()
-    if log:
-        last = log[-1]
-        st.caption(f"Last updated: {last['timestamp']} — {last['row_count']} rows")
-else:
-    st.info("No master spreadsheet yet — approve an upload to create one.")
+        log = master_writer.get_master_write_log()
+        if log:
+            last = log[-1]
+            st.caption(f"Last updated: {last['timestamp']} — {last['row_count']} rows")
+    else:
+        st.info("No master spreadsheet yet — approve an upload to create one.")
