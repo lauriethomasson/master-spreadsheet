@@ -6,6 +6,7 @@ import streamlit as st
 
 import extract
 import extract_email
+import page_flow
 import page_setup
 from gemini_client import QuotaExceededError
 from geocode import geocode_rows
@@ -92,3 +93,5 @@ with page_setup.setup_page("upload"):
                 f"✅ **{entry['batch_name']}** — {entry['n_rows']} row(s) from "
                 f"{entry['n_files']} file(s), {entry['timestamp']}"
             )
+
+    page_flow.render_nav_buttons("app.py")

@@ -3,6 +3,7 @@ import streamlit as st
 
 import display_utils
 import master_writer
+import page_flow
 import page_setup
 from storage.file_store import (
     dataframe_to_listing_rows,
@@ -78,3 +79,5 @@ with page_setup.setup_page("review"):
                 st.caption(f"Last updated: {last['timestamp']} — {last['row_count']} rows")
         else:
             st.info("No master spreadsheet yet — approve an upload to create one.")
+
+    page_flow.render_nav_buttons("pages/2_Review_and_Master.py")
