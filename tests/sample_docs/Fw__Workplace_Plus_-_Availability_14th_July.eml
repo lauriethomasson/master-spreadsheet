@@ -1,0 +1,1359 @@
+Delivered-To: juliemibui@gmail.com
+Received: by 2002:a02:c4d6:0:b0:5e9:1917:79d5 with SMTP id h22csp343885jaj;
+        Tue, 14 Jul 2026 08:00:33 -0700 (PDT)
+X-Received: by 2002:a05:690c:f09:b0:7ba:f0d0:5e9b with SMTP id 00721157ae682-81e8fff34fdmr92671447b3.2.1784041233412;
+        Tue, 14 Jul 2026 08:00:33 -0700 (PDT)
+ARC-Seal: i=2; a=rsa-sha256; t=1784041233; cv=pass;
+        d=google.com; s=arc-20260327;
+        b=MzDC+ufmsl26jZennT5fnJbOE+n1gUni779EZnn2nZTD8YBD607kpQe49hBQ6ii23e
+         XDGUUy8VY9UQcNN7dcFjfF/y1iKGUlfu2dr/LKpEAsOVv+txHljdAAaatJR4s/hsXTvY
+         TbPQ6pOT+my0epF91xQAWC6bo7CTS562Y3CQ5rl+pHJRPdbj0mKm++I6s9pUmvOQ7xGp
+         gshg0+g+aExwvrNwPE7KRZI/FbnVSPf28y9EREfOFaNHplx1BI+jex0dqC4rBesAfztL
+         V5TbUsLVJLWPJG6Dw2jJrQToquV1yd2MOLwSFw1e4cerpIStVsBY/iJpdPPQsnQGJ6HN
+         xDRw==
+ARC-Message-Signature: i=2; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20260327;
+        h=mime-version:msip_labels:content-language:accept-language
+         :in-reply-to:references:message-id:date:thread-index:thread-topic
+         :subject:to:from:dkim-signature;
+        bh=5CxcJMenepg6qWWUg+BKoh0G9CkWhUq3IsMt3iY2E6U=;
+        fh=dLA7344mpy6pSvPTVqL8AbgtfPClPtjTQLRGSOlqBMY=;
+        b=ep6tl1wTqAg2Fu46dpMMUft2AdRRUtN/lUp+xTHwgydL7tdH+TFKN9dwc5ZPtpYBM1
+         4Os0/wIyas+W+2nthRAw4uDGmPLflv+4y+nPwWM7EZsBxJNedMvakRxYYTZs5iQ76fo0
+         WwjNvSCJBCnrspdFiMcljktuZtXt8IvoNdmypBmoxdOTEiYGdovekCO6aUY4OpEI23TI
+         fs5XCLVqaT8QZDFpc5i4B2Tuoy6B20VxHRnT1+L8pLzzdEOG57AfTifSryZxtmofDq5/
+         wk84wTAWWHrU4WTlu+I3Ap3yYpV2Q+YwEulPT3hHuMzyrxPnGQLPMaNWpqnEN4EtVYnZ
+         CScg==;
+        dara=google.com
+ARC-Authentication-Results: i=2; mx.google.com;
+       dkim=pass header.i=@spacepoint.co.uk header.s=selector2 header.b=Tc0K9rZ2;
+       arc=pass (i=1 spf=pass spfdomain=spacepoint.co.uk dkim=pass dkdomain=spacepoint.co.uk dmarc=pass fromdomain=spacepoint.co.uk);
+       spf=pass (google.com: domain of lthomasson@spacepoint.co.uk designates 2a01:111:f403:c206::3 as permitted sender) smtp.mailfrom=lthomasson@spacepoint.co.uk;
+       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=spacepoint.co.uk
+Return-Path: <lthomasson@spacepoint.co.uk>
+Received: from CWXP265CU009.outbound.protection.outlook.com (mail-ukwestazlp170110003.outbound.protection.outlook.com. [2a01:111:f403:c206::3])
+        by mx.google.com with ESMTPS id 00721157ae682-81e6c2299c3si156939227b3.89.2026.07.14.08.00.32
+        for <juliemibui@gmail.com>
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Tue, 14 Jul 2026 08:00:33 -0700 (PDT)
+Received-SPF: pass (google.com: domain of lthomasson@spacepoint.co.uk designates 2a01:111:f403:c206::3 as permitted sender) client-ip=2a01:111:f403:c206::3;
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@spacepoint.co.uk header.s=selector2 header.b=Tc0K9rZ2;
+       arc=pass (i=1 spf=pass spfdomain=spacepoint.co.uk dkim=pass dkdomain=spacepoint.co.uk dmarc=pass fromdomain=spacepoint.co.uk);
+       spf=pass (google.com: domain of lthomasson@spacepoint.co.uk designates 2a01:111:f403:c206::3 as permitted sender) smtp.mailfrom=lthomasson@spacepoint.co.uk;
+       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=spacepoint.co.uk
+ARC-Seal: i=1; a=rsa-sha256; s=arcselector10001; d=microsoft.com; cv=none;
+ b=Q25IaLLOEfohwVnPdVrEGXF5tP4tONTCsjTHFww136yeuvcTdr1U1QiY+ih7xcokLC/0G3It7ZqZxyIghdc3qCjm2Ujv+B7l2aswe9AMT7Q6vB76qa9QPBmwpf2/gUNfMvPKkQeVc+p2hmfzLP0pUMAHCnYVhlWTTKiwW2ueQg5PmaKcQ0XHu3Xq5vrBtUHL+O9zp9QXOYQUq9G+goEsC5ZWptnhOSGWYMFcOVU8uJAyVhRj9rbAYoSr/bLDpGLcHk0pdugEQuvjFCk6G4iW3FrBJF3UXijN8no0TsggIR5vfvmgVoxZ02bBLfKAGODdb+fqabmpzxhhFKgM+ToXBA==
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=microsoft.com;
+ s=arcselector10001; h=From:Date:Subject:Message-ID:MIME-Version;
+ bh=5CxcJMenepg6qWWUg+BKoh0G9CkWhUq3IsMt3iY2E6U=;
+ b=JV5HY3PROX7VGuRyi55ReLjKDlaWr2PMLy+YfPrwHYY/Fz7VXGMGSlD2EhULjFjgru1k3cNTBkL0kOO61X9c0+tzFHMLgmXoKrFvI8CE00TeB96BHxO0xC25Hd8v6LRf7ISwv3kr1d8eKNsChrlJGzvAQpX1No5Xeo/QvdlryEXGkyB0dGZh2ohksyJSGhop98I5rGUc0qVeAx8leSRlCumDDQZB+e6JBs4s5wyCfYbiJ53mqWYwvVPRZMii0GAujyVgFFIbTV7x/uHvSGAivwcBetCZXaQVK8JLb9v8XISYQIrn8xm3k8oq2VGQehARaIk6vgwqSWNNFTgSpbZmkg==
+ARC-Authentication-Results: i=1; mx.microsoft.com 1; spf=pass
+ smtp.mailfrom=spacepoint.co.uk; dmarc=pass action=none
+ header.from=spacepoint.co.uk; dkim=pass header.d=spacepoint.co.uk; arc=none
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=spacepoint.co.uk;
+ s=selector2;
+ h=From:Date:Subject:Message-ID:Content-Type:MIME-Version:X-MS-Exchange-SenderADCheck;
+ bh=5CxcJMenepg6qWWUg+BKoh0G9CkWhUq3IsMt3iY2E6U=;
+ b=Tc0K9rZ2Q+7lfN701kB9BpCJ4zrSUD+cFf0NBJSvaeljSoaFad742/1BIC+gPs5HH3jVbowBDlvkdZaAbxJrPl2DOBt/MOuDSizZG+DbWoi0GFLRoLd/pfFNM9vL6lmoIGhUdXnVI82naihxJMIOAtLKdAlLZ/UKlfc32tAVk6MvmgiennM2o6f+X3oD6SBsBRQntvIQozcqxqrfSz95FV36Kc08Y/gee8+ljnARs9ILRWr6mN4y3rmWFZS1Yx4mBR6/8+5NNwU3DM9EBjdzom46EI9k5B4S4ybxY5fAvM7PNWu5z/GXSvjc9x3g25HNiA6ZjMMLN/4+ewb0eweS1Q==
+Received: from LO2P123MB3965.GBRP123.PROD.OUTLOOK.COM (2603:10a6:600:145::12)
+ by LO4P123MB6966.GBRP123.PROD.OUTLOOK.COM (2603:10a6:600:2e0::9) with
+ Microsoft SMTP Server (version=TLS1_2,
+ cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.21.202.20; Tue, 14 Jul
+ 2026 15:00:30 +0000
+Received: from LO2P123MB3965.GBRP123.PROD.OUTLOOK.COM
+ ([fe80::23be:6e6f:ae29:1cbd]) by LO2P123MB3965.GBRP123.PROD.OUTLOOK.COM
+ ([fe80::23be:6e6f:ae29:1cbd%3]) with mapi id 15.21.0202.018; Tue, 14 Jul 2026
+ 15:00:29 +0000
+From: Laurie Thomasson <lthomasson@spacepoint.co.uk>
+To: Julie Bui <juliemibui@gmail.com>
+Subject: Fw: Workplace Plus - Availability 14th July
+Thread-Topic: Workplace Plus - Availability 14th July
+Thread-Index: AQHdE49LhljShLpbeEOm+GDTk0ED3LZtG+FW
+Date: Tue, 14 Jul 2026 15:00:29 +0000
+Message-ID:
+ <LO2P123MB3965F48C3089EECCD30C36CDF2F92@LO2P123MB3965.GBRP123.PROD.OUTLOOK.COM>
+References: <c41329f7bb18dcb299534ccb13e6c1b6@workplaceplus.co.uk>
+In-Reply-To: <c41329f7bb18dcb299534ccb13e6c1b6@workplaceplus.co.uk>
+Accept-Language: en-GB, en-US
+Content-Language: en-GB
+X-MS-Has-Attach:
+X-MS-TNEF-Correlator:
+msip_labels:
+x-wisestamphostedsignatures-messageprocessed: true
+authentication-results: dkim=none (message not signed)
+ header.d=none;dmarc=none action=none header.from=spacepoint.co.uk;
+x-ms-publictraffictype: Email
+x-ms-traffictypediagnostic: LO2P123MB3965:EE_|LO4P123MB6966:EE_
+x-ms-office365-filtering-correlation-id: 65c586fa-eae5-4627-2bdd-08dee1b8a571
+x-ms-exchange-senderadcheck: 1
+x-ms-exchange-antispam-relay: 0
+x-microsoft-antispam:
+ BCL:0;ARA:13230040|1800799024|4022899009|376014|69100299015|366016|7049299003|3109299003|23010399003|18002099003|56012099006|22082099003|8096899003|13003099007|38070700021;
+x-microsoft-antispam-message-info:
+ LU5HM/fUSq1BBQ7SeJzJf10CEXmG7yJdcSRMv+vxkVgxXFdfq+uCXCM0EzV3O6WoFnxKcwo/8grfTZko4LZvcN3xFMN2Zg6ggBgPbGd3Wy/3hHOwjhh7Jovo1QJukUEUhNXa2hC+UmJrv3j7wwVqWQFxqxyCPBEgz6BDsmoSFNPPElBvYfJMUqzMHx8bTeb3up6FuAKaf6eGxkcMyQVugl3LpjtCNZTQjTp8njQfbkaZ/thb4jXKx53QkN4GMsbV+77GmOfi5gbVUoWewYTQ6W7rmE/gWxdTJZiJIA+BTMJmWJt3lMEcZekZ2vJv6QEmZSj/79ix2bNJZsCQgeRMwUOu78ot2x4+1Nlf1ta4CKJlnmq9PZ/EM12K0dqCnjbMb9DMFDU2Wd4syr4mURtzL5f46CRzPm8BUOBfq4p7RydbQ7rme8heA0SEkEX2gxlivciaNMDoVmoc8u+jXrxFtDlpz3M8iCyWS3UmQMX52kU95HOVli6g/hlc4DhdM6A4ZtXjq8vAYH5OsLayLODbtVenZl9PTJkrRpNMpR0a9njspTvObBllr9hMZeMjQu1om7o9DYvUHvF5qkzAm6xpBwumwXkhJAFBLMuIai0c9q1Hx1+5pyUNSxmZVVh758q4rN2/mettztCZKtjlw1y1lrhRnMuEQo3Us6pX0+H3t7g=
+x-forefront-antispam-report:
+ CIP:255.255.255.255;CTRY:;LANG:en;SCL:1;SRV:;IPV:NLI;SFV:NSPM;H:LO2P123MB3965.GBRP123.PROD.OUTLOOK.COM;PTR:;CAT:NONE;SFS:(13230040)(1800799024)(4022899009)(376014)(69100299015)(366016)(7049299003)(3109299003)(23010399003)(18002099003)(56012099006)(22082099003)(8096899003)(13003099007)(38070700021);DIR:OUT;SFP:1102;
+x-ms-exchange-antispam-messagedata-chunkcount: 1
+x-ms-exchange-antispam-messagedata-0:
+ =?iso-8859-1?Q?HN7QAKyzHvOSgKDcTPiwVFtnR4FmfItOTR+4TZywTg8qg7ufjm1oDnlu4v?=
+ =?iso-8859-1?Q?WMHs9srav566oWMcwU1t620AQOpNUTSjAPB/Qt6AQG+9gsYwKOt+LOz+1e?=
+ =?iso-8859-1?Q?cx9NuOxCI/dGJYatK3H4C/nvVafYerEsDV0EtwIFnkVUKqMVbZjkzsLG5S?=
+ =?iso-8859-1?Q?9ZZD7eW/RZn274AZil4jF0O8AYb2oeeXAbo8l9RCoUezG6KQB/8vk4d//e?=
+ =?iso-8859-1?Q?I1qkJs+VGiC+ppBrydPCPwx7Wgdzx+iHdeuueMFJXIZnPV5353FvgJNMOu?=
+ =?iso-8859-1?Q?3ImhuNvodAupGITjxTlKEe5UfItOJMhynJMtaKRsDCEf+SblvnLDmBBHUg?=
+ =?iso-8859-1?Q?ytLgNLfHgMtF5g6x7F9IxN2ZtVvNnuqHxivut1owJhJBFc2/O/HlWJF31+?=
+ =?iso-8859-1?Q?flRqIzo+FVmE/0yafg4PxEt1GUc1UCX/D71o42abWYz4sZRgzeo0CWp+vS?=
+ =?iso-8859-1?Q?v9vMiwEWjQLmyBNTafDcyPc7+YHVlorxfZiYbAcRV6Bx8Q6OL5cfO9j0cr?=
+ =?iso-8859-1?Q?56Bm+kqFbtpMo5F9Wntmrfgeg7L2kcgCQSuSFYEwEjAGjE+GLAL8G04eGa?=
+ =?iso-8859-1?Q?Ibak4aQdgVTG/vgMthyC0d/H2CcccPo6+GtrIma0Nsp2r9Yf4Ry0GmXsHY?=
+ =?iso-8859-1?Q?4+ZkOnxgFBOF8dXOiBeToRcyGOYAF0e1VvGpsRG0GaYXKsjy2COJ0DvTrY?=
+ =?iso-8859-1?Q?9g04xYARpFslPUxj+facucZYnaG3ZxHPyeC3QcfB0tl1wsTzv49oKgMzlN?=
+ =?iso-8859-1?Q?XyMAZIm9hsESRz66mYZ6UlSDy4YhHG7im9UQkblRwJdzU/IG5m7D8khjL9?=
+ =?iso-8859-1?Q?rKj1YRkx6GJU+D/Yu9L875SeHQ47VS/i3iI5wn13keBkhP5aOJjIlcd38G?=
+ =?iso-8859-1?Q?H8R6MzhQkdz6uVtyTJl4I4Aw/qk6zP+O4HuGjKD0f1B3FosmeRQaMyM4J4?=
+ =?iso-8859-1?Q?wy2kNpMr4XEvU9EHOH1VNgkXANmYxBFDUaweysLDyr810q3uTS1LFxn6WL?=
+ =?iso-8859-1?Q?h+bdlPKowBqpecXEzIxhtOg1c0NnAsk73sh6/wwLOfi8l8Ay5smy+WLLWL?=
+ =?iso-8859-1?Q?WL9TSycsfZD7VBAHjp9TXBqrWj3aW6DTG/Q/yW1j4c6WPvOfpW1SpPc22r?=
+ =?iso-8859-1?Q?UEwAIycVk1OwmW4RY0YfhbWo20a2MkVDB1EUPDPgo8mW9+G+esIDZlrLkY?=
+ =?iso-8859-1?Q?qOzdc2BEKTwj86IpTDxN8txAM1gC/IMLBWEiEfRZ+Psyl+AD1QoEf8Zwmy?=
+ =?iso-8859-1?Q?p6cCsTEPlp3rR6ASI6wzTwb45wYgYMX5PYwzrFsaTodVfM9waYt2mjm547?=
+ =?iso-8859-1?Q?k9rzyuqblXE1fal+U9uZJw8WGE4xxpj8RXU6SaiCuri1fv48EwE6dDJ76q?=
+ =?iso-8859-1?Q?5iOlJmmi6GvHbJde5dhAuj1iUXIB/04vZybMHCr4v+cKB2MFMOkg04uaaf?=
+ =?iso-8859-1?Q?baIWqBwIJcjupZxzxRcujN2KomcvBgtmz00nHlIXdwh4du2q1KbRIjvtnN?=
+ =?iso-8859-1?Q?od2w2cotgncNVHfAEWDWgfe6yoYCWvXAdWk9kah5tu53LVzp73i3y8vtFJ?=
+ =?iso-8859-1?Q?2IvQCRSiMG/Ayw/6oio+Q7Mg0g2kfqxMbaddYTzd/z+W/gQpIPadlbUYs8?=
+ =?iso-8859-1?Q?ND6ihzmO9y+FTU3f7cZHkiGBzbdwrD1obGfIE0Ua5QlsEotlV9pEy0ZB/o?=
+ =?iso-8859-1?Q?juQdjjvMI6cYQ1TVn5IIV02GwGaGwck9t1TwOFCDakwfSnvJ+mqe1nk6zh?=
+ =?iso-8859-1?Q?OyHjFV/wsBJA6Ts5tDjYzQbtPnR4KR7AqYTFmCDoVxTQAtWwB4wlSeMkTV?=
+ =?iso-8859-1?Q?asR61eATOw=3D=3D?=
+Content-Type: multipart/alternative;
+	boundary="_000_LO2P123MB3965F48C3089EECCD30C36CDF2F92LO2P123MB3965GBRP_"
+MIME-Version: 1.0
+X-OriginatorOrg: spacepoint.co.uk
+X-MS-Exchange-CrossTenant-AuthAs: Internal
+X-MS-Exchange-CrossTenant-AuthSource: LO2P123MB3965.GBRP123.PROD.OUTLOOK.COM
+X-MS-Exchange-CrossTenant-Network-Message-Id: 65c586fa-eae5-4627-2bdd-08dee1b8a571
+X-MS-Exchange-CrossTenant-originalarrivaltime: 14 Jul 2026 15:00:29.8827
+ (UTC)
+X-MS-Exchange-CrossTenant-fromentityheader: Hosted
+X-MS-Exchange-CrossTenant-id: 43ab53b0-30b3-41c3-a577-61264e19c4d6
+X-MS-Exchange-CrossTenant-mailboxtype: HOSTED
+X-MS-Exchange-CrossTenant-userprincipalname: X7uOFoSgo2hAdbT1gbUYdpxcfefgBctVJpWYb+3ds5vPZHqXnB4Xgqi1v5rFyBcTO6XipLXPTW0P0srjHpIUP8P9u4UOK9E3Mtf0ERYPLAc=
+X-MS-Exchange-Transport-CrossTenantHeadersStamped: LO4P123MB6966
+
+--_000_LO2P123MB3965F48C3089EECCD30C36CDF2F92LO2P123MB3965GBRP_
+Content-Type: text/plain; charset="iso-8859-1"
+Content-Transfer-Encoding: quoted-printable
+
+
+
+[Company logo]<https://spacepoint.co.uk/>
+
+[Employee photo]
+
+Laurie Thomasson
+
+Director
+
+[Icon]<https://www.rics.org/>
+
+
+
+[Icon]<https://www.linkedin.com/company/spacepointre>
+
+[Icon]
+
+0203 369 9800<tel:>
+
+[Icon]
+
+07723 086 502<tel:>
+
+[Icon]
+
+spacepoint.co.uk
+
+[Icon]
+
+Silver House, 31-35 Beak Street, Soho, London, W1F 9SX
+
+IMPORTANT: This e-mail is intended for the named recipient only. It may con=
+tain privileged and confidential information. If you are not the intended r=
+ecipient, please notify the sender immediately and destroy this e-mail. You=
+ must not copy, distribute or take action in reliance upon it. Whilst all e=
+fforts are made to safe-guard e-mails, Spacepoint Real Estate does not acce=
+pt liability for any loss or damage caused by software viruses. Any offer o=
+r acceptance contained within or implied by this e-mail is made subject to =
+contract. Where this e-mail message is sent in connection with a contentiou=
+s issue, the contents are Without Prejudice.
+
+
+[__tpx__]
+________________________________
+From: Alina Sheikh <hello@workplaceplus.co.uk>
+Sent: 14 July 2026 13:50
+To: Laurie Thomasson <lthomasson@spacepoint.co.uk>
+Subject: Workplace Plus - Availability 14th July
+
+
+[Workplace Plus logo] <https://eot.workplaceplus.co.uk/f/a/FfcuuyUPykjqyIBF=
+xkuutA~~/AAAHURA~/QyNIRMLa37UosROObmjQN5enx7SYGGPrYnf8Bw6IKZEFaUXnXGhnp9Iym=
+8zxyT5WG78Z12LI8sE5qQDMInr0DbhYTysvTqVU-5Oucn8s417RPLpOqqO1LcLpxOzXbDy6MH5w=
+vqBP9lxaISWl2uPOPUVpksIXdp02pLg-LI3y5lg~>
+[Availability]<https://eot.workplaceplus.co.uk/f/a/2qSm5NwLjza8DKTdSvUrOg~~=
+/AAAHURA~/65A5x_tvrBwa6EC_ryjlv0JVQYZvc--aDlJwAQ17IUHantY3Up4ffyqiPuLf7AXw5=
+DQbZuGuYrAN9G5xgwMlwLGb-jfF8ZWXlDpk_WRT73W6BFW5e7-jZnCnsXKX_KbB6nStXMnZ6UW4=
+LmKq21bCoClVM48ehERfBI6zPVo7uMDkEkPGvXqQKbAxKYQdjfePer3ALN6aKfhSK6vIePjJVJQ=
+1w29M66-SNfqC5K445PuVc-0TqaDH8aHWFAQ2nQ7NTAra2cdtJy06bnv_iFqNew~~>
+Please see our latest Workplace Plus availability
+Availability<https://eot.workplaceplus.co.uk/f/a/2qSm5NwLjza8DKTdSvUrOg~~/A=
+AAHURA~/65A5x_tvrBwa6EC_ryjlv0JVQYZvc--aDlJwAQ17IUHantY3Up4ffyqiPuLf7AXw5DQ=
+bZuGuYrAN9G5xgwMlwLGb-jfF8ZWXlDpk_WRT73W6BFW5e7-jZnCnsXKX_KbB6nStXMnZ6UW4Lm=
+Kq21bCoClVM48ehERfBI6zPVo7uMDkEkPGvXqQKbAxKYQdjfePer3ALN6aKfhSK6vIePjJVJQ1w=
+29M66-SNfqC5K445PuVc-0TqaDH8aHWFAQ2nQ7NTAra2cdtJy06bnv_iFqNew~~>
+We also have a number of newly added spaces!
+[https://gallery.eocampaign1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2F019=
+f5f9e-994e-7620-91ae-d02e77351615.jpg]<https://eot.workplaceplus.co.uk/f/a/=
+jeACq79vkuubiYnOXBZcNg~~/AAAHURA~/dImOlh3zggAULTCU17DEcDKAq7HYESoIGsX7-Q-P3=
+SFjvyUhfAqbztZlhdUxIaBBuW4nyYUXr3XM5IotEA_gmzReraV65G0v0ppG2rkELWYftZoNHbQ4=
+o_p6p6n_BC9I7lluKm5BLezzHtcliosjqLYBkoephVuzYdzZduCkE5DIt64dIZbtMI9CTxZ7HHP=
+Y_5xwglw0-LpYbEqx_ivSs1pIncZTLuWhG7sH_CE6EGvFTU79dvdPvemNQOLtxDev>
+77 Gracechurch Street, EC3V 0AS
+6th Floor
+54 Desks + 3 Meeting Rooms
+=A355,100 Per Month
+Brochure<https://eot.workplaceplus.co.uk/f/a/jeACq79vkuubiYnOXBZcNg~~/AAAHU=
+RA~/dImOlh3zggAULTCU17DEcDKAq7HYESoIGsX7-Q-P3SFjvyUhfAqbztZlhdUxIaBBuW4nyYU=
+Xr3XM5IotEA_gmzReraV65G0v0ppG2rkELWYftZoNHbQ4o_p6p6n_BC9I7lluKm5BLezzHtclio=
+sjqLYBkoephVuzYdzZduCkE5DIt64dIZbtMI9CTxZ7HHPY_5xwglw0-LpYbEqx_ivSs1pIncZTL=
+uWhG7sH_CE6EGvFTU79dvdPvemNQOLtxDev>
+[https://gallery.eocampaign1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2F019=
+f5bd5-dbf2-7125-96ce-6043c82f678c.jpg]<https://eot.workplaceplus.co.uk/f/a/=
+tC9ookNmaWCubhYRhEcy0A~~/AAAHURA~/MQpLKzsSlNE12Mwu0U255ZUCYF6Y89YOyfQ1Jns85=
+pF4y5fqf0QUwd35hZUrvrnL5xl0VQSYLFOrK1Pw0TmopxH3Eq54yGSDRq_azjhszNDBw_NFA7Q4=
+ikURzoyDGpwtqX7Fjx9kz6jZBLy6rrJUZ9AyIAxiW2O9tK0GndHEVqPuqjg9IfOcZEnjtcAC95e=
+wpZCpIBg7I8nzSCRESOi4sqG4un9GlXb5bAb4rA6rPSAXDSfJGnQBc0i74RVw-Ipf>
+150 Waterloo Road, SE1 8SB
+2nd Floor
+24 Desks
+=A316,000 Per Month
+
+4th Floor
+18 Desks + Meeting Room
+=A314,600 Per Month
+Brochure<https://eot.workplaceplus.co.uk/f/a/tC9ookNmaWCubhYRhEcy0A~~/AAAHU=
+RA~/MQpLKzsSlNE12Mwu0U255ZUCYF6Y89YOyfQ1Jns85pF4y5fqf0QUwd35hZUrvrnL5xl0VQS=
+YLFOrK1Pw0TmopxH3Eq54yGSDRq_azjhszNDBw_NFA7Q4ikURzoyDGpwtqX7Fjx9kz6jZBLy6rr=
+JUZ9AyIAxiW2O9tK0GndHEVqPuqjg9IfOcZEnjtcAC95ewpZCpIBg7I8nzSCRESOi4sqG4un9Gl=
+Xb5bAb4rA6rPSAXDSfJGnQBc0i74RVw-Ipf>
+[https://gallery.eocampaign1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2F019=
+f5bd2-f8b9-78db-a0aa-1418eedf8d8d.jpg]<https://eot.workplaceplus.co.uk/f/a/=
+OZchnwvXuLMFHG1H5lIUTA~~/AAAHURA~/MmTDcruEtbhc47XtdfNoBuoxXCk0PDZ8b-SODASOg=
+wbnLVTrd0DNVBBZZ99zTq34zqVpooUAaju7QdyW7fpQcovWWZI-Bxfmd3kT1ETNEsRWG4cqZzHk=
+gG3bcAbIhSkRSCpqdJU5Ml1TJvNAgX-jwxenE_YZwAvxD04XmczoiOUArI7qTU2xY2CIUhiw4Rf=
+VBpmGWqpcjeWFxtTIZvKEX4oYSmwbzFnNqtVdS8VeAm2gZqNlStuGzV5aT4ePGxUv>
+8 Durweston Street, W1H 1EW
+Ground & First Floor
+24 Desks + Meeting Room
+=A314,600Per Month
+Brochure<https://eot.workplaceplus.co.uk/f/a/OZchnwvXuLMFHG1H5lIUTA~~/AAAHU=
+RA~/MmTDcruEtbhc47XtdfNoBuoxXCk0PDZ8b-SODASOgwbnLVTrd0DNVBBZZ99zTq34zqVpooU=
+Aaju7QdyW7fpQcovWWZI-Bxfmd3kT1ETNEsRWG4cqZzHkgG3bcAbIhSkRSCpqdJU5Ml1TJvNAgX=
+-jwxenE_YZwAvxD04XmczoiOUArI7qTU2xY2CIUhiw4RfVBpmGWqpcjeWFxtTIZvKEX4oYSmwbz=
+FnNqtVdS8VeAm2gZqNlStuGzV5aT4ePGxUv>
+[linkedin social link] <https://eot.workplaceplus.co.uk/f/a/aILlMe5K63d6mLh=
+1j7HQMg~~/AAAHURA~/O_bPpYT6wNvWKUUdkAoim64GDM03IjoiJbRe1U-yDtD13kTLwCLunLRr=
+2DyLr7JrE9O2NIexlX34ZUppx7tiS2kb28kEZMRRXMONlV17udgNBna6-6jTz6qLBLoOYHbStPm=
+e5vfB-tpXPXw7Y3sNdvw-cxwkv9ESrKLWRW6CPFRwSMxsEfbtTX2gfcUPRvKk>         [web=
+site social link]  <https://eot.workplaceplus.co.uk/f/a/FfcuuyUPykjqyIBFxku=
+utA~~/AAAHURA~/QyNIRMLa37UosROObmjQN5enx7SYGGPrYnf8Bw6IKZEFaUXnXGhnp9Iym8zx=
+yT5WG78Z12LI8sE5qQDMInr0DbhYTysvTqVU-5Oucn8s417RPLpOqqO1LcLpxOzXbDy6MH5wvqB=
+P9lxaISWl2uPOPUVpksIXdp02pLg-LI3y5lg~>
+75-77 St John Street, London, EC1M 4NN
+United Kingdom
+You received this email because you subscribed to our list. You can unsubsc=
+ribe<https://eot.workplaceplus.co.uk/f/a/6-NZZm-YpXY4XsqbaYSqwg~~/AAAHURA~/=
+iJZ3ft8Cke3LgsCG9aGBy8d06gTZ2WWut3J4n7VUlrRJYfbQawYwq0_swFQVanaUtGMOwcHcVfL=
+Y989-D4iuCNuOungC2V3sJMQI9xYQ92_NIpIimy7q3Qfvm15A5GInJWol32x__Qud_9w9FdG_fQ=
+tZFK-vEiHgzVvvRGVp0zi9XL9eFGkpIKMHAU9uYqpdVogTn_V-MYFqw8wpKcKiOsYmNkL1NMagr=
+Sd2zl8Khi4zFyOSz1YEQWUmEMXoPlmn-nbvEOkId2OYRBs5tC2Fc5b2GYGDR0iA0sXXrOfV8Mnv=
+HR7Soy11dcstS6zy9hl_SoayAuyOg97L_j3m9lmtMpSSUjXegO3SaG7V4zTb4lHbxdUk_CsaeBS=
+S68R-NgfVo-tj-BMtk0_udN1uBLTf0PJliDXl1-4r4hfvnKaZdybwdTvJAQyrtJg8Ux5tWTXKXU=
+kAUuMz5FUwwolrmt1_-A~~> at any time.
+
+
+
+--_000_LO2P123MB3965F48C3089EECCD30C36CDF2F92LO2P123MB3965GBRP_
+Content-Type: text/html; charset="iso-8859-1"
+Content-Transfer-Encoding: quoted-printable
+
+<html>
+<head>
+<meta http-equiv=3D"Content-Type" content=3D"text/html; charset=3Diso-8859-=
+1">
+<style type=3D"text/css" style=3D"display:none;"> P {margin-top:0;margin-bo=
+ttom:0;} </style>
+</head>
+<body dir=3D"ltr">
+<div class=3D"elementToProof" style=3D"font-family: Calibri, Helvetica, san=
+s-serif; font-size: 12pt; color: rgb(0, 0, 0);">
+<br>
+</div>
+<div style=3D"font-family: Calibri, Helvetica, sans-serif; font-size: 12pt;=
+ color: rgb(0, 0, 0);">
+<br>
+</div>
+<div id=3D"Signature">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; min-wid=
+th: 100%; border-collapse: collapse; border-spacing: 0px; box-sizing: borde=
+r-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; width: =
+500px; max-width: 500px; border-collapse: collapse; border-spacing: 0px; bo=
+x-sizing: border-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; margin:=
+ 12px 0px 0px; height: 1px; border-collapse: collapse; border-spacing: 0px;=
+ box-sizing: border-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; padding: 0.1px; vertical-align: top;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; height:=
+ 1px; border-collapse: collapse; border-spacing: 0px; box-sizing: border-bo=
+x;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; padding-right: 14px; vertical-align: top; widt=
+h: 24px;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; width: =
+24px; height: 1px; border-collapse: collapse; border-spacing: 0px; box-sizi=
+ng: border-box;">
+<tbody>
+<tr>
+<td align=3D"center" style=3D"direction: ltr; padding-top: 6px; padding-rig=
+ht: 5px; padding-left: 5px; vertical-align: bottom;">
+<p style=3D"direction: ltr; margin: 1px; padding: 0.01px;"><a href=3D"https=
+://spacepoint.co.uk/" target=3D"_blank" rel=3D"nofollow noreferrer" style=
+=3D"margin-top: 0px; margin-bottom: 0px;"><img alt=3D"Company logo" width=
+=3D"135" style=3D"width: 135px; margin-top: 0px; margin-bottom: 0px; displa=
+y: block;" src=3D"https://d36urhup7zbd7q.cloudfront.net/a/4bc2a91e-7e0e-441=
+b-b69d-2a04c118e8bb.png"></a></p>
+</td>
+</tr>
+<tr>
+<td align=3D"center" style=3D"direction: ltr; padding: 0.1px; vertical-alig=
+n: top;">
+<p style=3D"direction: ltr; margin: 1px; padding-top: 14px;"><img alt=3D"Em=
+ployee photo" width=3D"135" style=3D"width: 135px; margin-top: 0px; margin-=
+bottom: 0px; display: block;" src=3D"https://gifo.srv.wisestamp.com/img/aHR=
+0cHM6Ly9kMzZ1cmh1cDd6YmQ3cS5jbG91ZGZyb250Lm5ldC91L3A2bjlaa0pLMXZFL2I1NDdmZG=
+E4LTNhZDctNDY5Ni04MDIxLWNjMzMyZjk0ODc3Zl9fNDAweDQwMF9fLnBuZw/rounded.png"><=
+/p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+<td style=3D"direction: ltr; padding: 0.1px; vertical-align: top;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; width: =
+100%; height: 1px; border-collapse: collapse; border-spacing: 0px; box-sizi=
+ng: border-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; padding: 2px 5px 4px; vertical-align: top;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; height:=
+ 1px; border-collapse: collapse; border-spacing: 0px; box-sizing: border-bo=
+x;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; padding: 0.01px; vertical-align: top;">
+<p style=3D"direction: ltr; line-height: 18.2px; margin: 0.1px;"><span styl=
+e=3D"font-family: Arial; font-size: 13px; color: rgb(82, 38, 210);"><b>Laur=
+ie Thomasson</b></span></p>
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; padding: 0.01px; vertical-align: bottom;">
+<p style=3D"direction: ltr; line-height: 18.2px; margin: 0.1px;"><span styl=
+e=3D"font-family: Arial; font-size: 13px; color: rgb(67, 67, 67);">Director=
+</span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+<td align=3D"right" style=3D"direction: ltr; padding-left: 50px; vertical-a=
+lign: middle;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; line-he=
+ight: 2.5px; border-collapse: collapse; border-spacing: 0px; box-sizing: bo=
+rder-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 2.5px;">
+<p style=3D"direction: ltr; line-height: 2.5px; margin: 1px;"><span style=
+=3D"font-size: 1px; color: rgb(0, 0, 0);"><a href=3D"https://www.rics.org/"=
+ target=3D"_blank" rel=3D"nofollow noreferrer" style=3D"margin-top: 0px; ma=
+rgin-bottom: 0px;"><img alt=3D"Icon" width=3D"29" height=3D"29" style=3D"wi=
+dth: 29px; height: 29px; margin-top: 0px; margin-bottom: 0px; display: bloc=
+k;" src=3D"https://gifo.srv.wisestamp.com/s/custom/https%3A%2F%2Fd36urhup7z=
+bd7q.cloudfront.net%2Fu%2Fp6n9ZkJK1vE%2F4302134f-afa1-402f-867e-65cd83b2b42=
+b__45x45__.png/36/8.png"></a></span></p>
+</td>
+<td style=3D"direction: ltr; line-height: 2.5px; width: 6px;">
+<div style=3D"direction: ltr; line-height: 2.5px; font-size: 1px;">&nbsp;</=
+div>
+</td>
+<td style=3D"direction: ltr; line-height: 2.5px;">
+<p style=3D"direction: ltr; line-height: 2.5px; margin: 1px;"><span style=
+=3D"font-size: 1px; color: rgb(0, 0, 0);"><a href=3D"https://www.linkedin.c=
+om/company/spacepointre" target=3D"_blank" rel=3D"nofollow noreferrer" styl=
+e=3D"margin-top: 0px; margin-bottom: 0px;"><img alt=3D"Icon" width=3D"29" h=
+eight=3D"29" style=3D"width: 29px; height: 29px; margin-top: 0px; margin-bo=
+ttom: 0px; display: block;" src=3D"https://gifo.srv.wisestamp.com/s/custom/=
+https%3A%2F%2Fd36urhup7zbd7q.cloudfront.net%2Fu%2Fp6n9ZkJK1vE%2F2bfe24a3-5d=
+c1-42ab-87b2-dfd0359b3863__45x45__.png/36/8.png"></a></span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td colspan=3D"2" style=3D"direction: ltr; padding-top: 2px; vertical-align=
+: top;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; width: =
+100%; min-width: 100%;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 0; padding-top: 5px;"></td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 0; border-bottom: 1px solid rgb(6=
+7, 67, 67);">
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 0; padding-bottom: 5px;"></td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td colspan=3D"2" style=3D"direction: ltr; padding-top: 4px; vertical-align=
+: top;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; line-he=
+ight: 14px;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; padding-bottom: 0.1px; vert=
+ical-align: middle; height: 24.3958px;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; line-he=
+ight: 14px; border-collapse: collapse; border-spacing: 0px; box-sizing: bor=
+der-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; vertical-align: middle;">
+<p style=3D"direction: ltr; line-height: 14px; margin: 1px;"><span style=3D=
+"font-family: Arial; font-size: 12px; color: rgb(82, 38, 210);"><img alt=3D=
+"Icon" width=3D"12" height=3D"12" style=3D"width: 12px; height: 12px; margi=
+n-top: 0px; margin-bottom: 0px; display: block;" src=3D"https://gifo.srv.wi=
+sestamp.com/i/v2/rfp3/F4F6F8/5226d2/48/12/0/0/bg.png"></span></p>
+</td>
+<td style=3D"direction: ltr; line-height: 14px; width: 1px;"></td>
+<td style=3D"direction: ltr; line-height: 14px; padding: 0.1px; vertical-al=
+ign: middle;">
+<p style=3D"direction: ltr; line-height: 12px; margin: 0.1px; font-family: =
+Arial; font-size: 12px;">
+<span style=3D"color: rgb(67, 67, 67);"><a href=3D"tel:" target=3D"_blank" =
+rel=3D"nofollow noreferrer" style=3D"color: rgb(67, 67, 67); margin-top: 0p=
+x; margin-bottom: 0px;">0203 369 9800</a></span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; padding-bottom: 0.1px; vert=
+ical-align: middle; height: 24.3958px;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; line-he=
+ight: 14px; border-collapse: collapse; border-spacing: 0px; box-sizing: bor=
+der-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; vertical-align: middle;">
+<p style=3D"direction: ltr; line-height: 14px; margin: 1px;"><span style=3D=
+"font-family: Arial; font-size: 12px; color: rgb(82, 38, 210);"><img alt=3D=
+"Icon" width=3D"12" height=3D"12" style=3D"width: 12px; height: 12px; margi=
+n-top: 0px; margin-bottom: 0px; display: block;" src=3D"https://gifo.srv.wi=
+sestamp.com/i/v2/rfm1/F4F6F8/5226d2/48/12/0/0/bg.png"></span></p>
+</td>
+<td style=3D"direction: ltr; line-height: 14px; width: 1px;"></td>
+<td style=3D"direction: ltr; line-height: 14px; padding: 0.1px; vertical-al=
+ign: middle;">
+<p style=3D"direction: ltr; line-height: 12px; margin: 0.1px; font-family: =
+Arial; font-size: 12px;">
+<span style=3D"color: rgb(67, 67, 67);"><a href=3D"tel:" target=3D"_blank" =
+rel=3D"nofollow noreferrer" style=3D"color: rgb(67, 67, 67); margin-top: 0p=
+x; margin-bottom: 0px;">07723 086 502</a></span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; padding-bottom: 0.1px; vert=
+ical-align: middle; height: 24.3958px;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; line-he=
+ight: 14px; border-collapse: collapse; border-spacing: 0px; box-sizing: bor=
+der-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; vertical-align: middle;">
+<p style=3D"direction: ltr; line-height: 14px; margin: 1px;"><span style=3D=
+"font-family: Arial; font-size: 12px; color: rgb(82, 38, 210);"><img alt=3D=
+"Icon" width=3D"12" height=3D"12" style=3D"width: 12px; height: 12px; margi=
+n-top: 0px; margin-bottom: 0px; display: block;" src=3D"https://gifo.srv.wi=
+sestamp.com/i/v2/rfw1/F4F6F8/5226d2/48/12/0/0/bg.png"></span></p>
+</td>
+<td style=3D"direction: ltr; line-height: 14px; width: 1px;"></td>
+<td style=3D"direction: ltr; line-height: 14px; padding: 0.1px; vertical-al=
+ign: middle;">
+<p style=3D"direction: ltr; line-height: 12px; margin: 0.1px; font-family: =
+Arial; font-size: 12px;">
+<span style=3D"color: rgb(67, 67, 67);">spacepoint.co.uk</span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; padding-bottom: 0.1px; vert=
+ical-align: middle; height: 24.3958px;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; line-he=
+ight: 14px; border-collapse: collapse; border-spacing: 0px; box-sizing: bor=
+der-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 14px; vertical-align: middle;">
+<p style=3D"direction: ltr; line-height: 14px; margin: 1px;"><span style=3D=
+"font-family: Arial; font-size: 12px; color: rgb(82, 38, 210);"><img alt=3D=
+"Icon" width=3D"12" height=3D"12" style=3D"width: 12px; height: 12px; margi=
+n-top: 0px; margin-bottom: 0px; display: block;" src=3D"https://gifo.srv.wi=
+sestamp.com/i/v2/rfa2/F4F6F8/5226d2/48/12/0/0/bg.png"></span></p>
+</td>
+<td style=3D"direction: ltr; line-height: 14px; width: 1px;"></td>
+<td style=3D"direction: ltr; line-height: 14px; padding: 0.1px; vertical-al=
+ign: middle;">
+<p style=3D"direction: ltr; line-height: 12px; margin: 0.1px; font-family: =
+Arial; font-size: 12px;">
+<span style=3D"color: rgb(67, 67, 67);">Silver House, 31&#8209;35 Beak Stre=
+et, Soho, London, W1F 9SX</span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td colspan=3D"2" style=3D"direction: ltr; padding-top: 4px; vertical-align=
+: top;">
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; width: =
+100%; min-width: 100%;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 0; padding-top: 5px;"></td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 0; border-bottom: 1px solid rgb(6=
+7, 67, 67);">
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; line-height: 0; padding-bottom: 5px;"></td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td style=3D"direction: ltr; padding: 13px 5px 5px; vertical-align: bottom;=
+ color: rgb(128, 128, 128);">
+<table style=3D"direction: ltr;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr;">
+<p style=3D"direction: ltr; margin: 0px 0px 3px;"><span style=3D"font-famil=
+y: Arial; font-size: 9px; color: rgb(155, 155, 155);">IMPORTANT:<i>
+</i>This e-mail is intended for the named recipient only. It may contain pr=
+ivileged and confidential information. If you are not the intended recipien=
+t, please notify the sender immediately and destroy this e-mail. You must n=
+ot copy, distribute or take action
+ in reliance upon it. Whilst all efforts are made to safe-guard e-mails, Sp=
+acepoint Real Estate does not accept liability for any loss or damage cause=
+d by software viruses. Any offer or acceptance contained within or implied =
+by this e-mail is made subject to
+ contract. Where this e-mail message is sent in connection with a contentio=
+us issue, the contents are Without Prejudice.</span></p>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table cellspacing=3D"0" cellpadding=3D"0" style=3D"direction: ltr; width: =
+1px; max-width: 1px; border-collapse: collapse; border-spacing: 0px; box-si=
+zing: border-box;">
+<tbody>
+<tr>
+<td style=3D"direction: ltr; line-height: 0px;">
+<div style=3D"direction: ltr; line-height: 0px; font-family: &quot;ws-id 1&=
+quot;; font-size: 0.01px;">
+&nbsp;</div>
+</td>
+</tr>
+</tbody>
+</table>
+<div style=3D"direction: ltr;"><img alt=3D"__tpx__" src=3D"https://tracy.sr=
+v.wisestamp.com/px/wsid/qQbgNora9R2.png"></div>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id=3D"appendonsend"></div>
+<hr style=3D"display:inline-block;width:98%" tabindex=3D"-1">
+<div id=3D"divRplyFwdMsg" dir=3D"ltr"><font face=3D"Calibri, sans-serif" st=
+yle=3D"font-size:11pt" color=3D"#000000"><b>From:</b> Alina Sheikh &lt;hell=
+o@workplaceplus.co.uk&gt;<br>
+<b>Sent:</b> 14 July 2026 13:50<br>
+<b>To:</b> Laurie Thomasson &lt;lthomasson@spacepoint.co.uk&gt;<br>
+<b>Subject:</b> Workplace Plus - Availability 14th July</font>
+<div>&nbsp;</div>
+</div>
+<style>
+<!--
+*, *:after, *:before
+	{box-sizing:border-box}
+*
+	{}
+html, div, .x_document
+	{width:100%!important;
+	height:100%!important;
+	margin:0;
+	padding:0}
+div
+	{}
+table, td
+	{padding:0}
+table
+	{border-spacing:0;
+	border-collapse:collapse;
+	table-layout:fixed;
+	margin:0 auto}
+img
+	{max-width:100%;
+	border:0}
+*[x-apple-data-detectors]
+	{color:inherit!important;
+	text-decoration:none!important}
+.x_x-gmail-data-detectors, .x_x-gmail-data-detectors *, .x_aBn
+	{border-bottom:0!important}
+div, html, td
+	{font-family:Montserrat,"DejaVu Sans",Verdana,sans-serif;
+	color:rgb(0,0,0)}
+a, .x_container a
+	{color:#0A2D29;
+	text-decoration:underline}
+span > a
+	{color:inherit!important}
+-->
+</style><style id=3D"x_v3-editor-styles">
+<!--
+.x_emoji
+	{font-family:EmojiMart,'Segoe UI Emoji','Segoe UI Symbol','Segoe UI','Appl=
+e Color Emoji','Twemoji Mozilla','Noto Color Emoji','Android Emoji'}
+.x_text-block li
+	{padding-bottom:0!important}
+.x_text-block ul[data-position=3D'inside'] li > div, .x_text-block ol[data-=
+position=3D'inside'] li > div
+	{display:inline}
+.x_text-block ul[data-position=3D'inside'] li > div ~ div, .x_text-block ol=
+[data-position=3D'inside'] li > div ~ div
+	{display:block}
+.x_text-block
+	{word-wrap:break-word}
+-->
+</style>
+<div class=3D"" style=3D"background-color:#ffffff; color:rgb(0,0,0); font-f=
+amily:Montserrat,&quot;DejaVu Sans&quot;,Verdana,sans-serif; font-size:14px=
+; background-color:#ffffff">
+<div style=3D"color:transparent; visibility:hidden; opacity:0; font-size:0p=
+x; border:0; max-height:1px; width:1px; margin:0px; padding:0px; border-wid=
+th:0px!important; display:none!important; line-height:0px!important">
+<img border=3D"0" width=3D"1" height=3D"1" alt=3D"" src=3D"https://eot.work=
+placeplus.co.uk/q/djt7EVTY6fKCDD05txSk6Q~~/AAAHURA~/1cPAJxhFpvXBH4CF8jV6Lho=
+VOiXbzKoLblpP7L46CGku4lPWvg-yKeL6_-oj9Ap4knqr4OBFPETPJIfW1oQXrw~~"></div>
+<div style=3D"display:none; max-height:0px; overflow:hidden"></div>
+<div style=3D"display:none; max-height:0px; overflow:hidden"></div>
+<table role=3D"presentation" class=3D"x_document" align=3D"center">
+<tbody>
+<tr>
+<td valign=3D"top">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"600" class=3D"x_container" style=3D"margin:0px=
+ auto">
+<tbody>
+<tr class=3D"x_inner-body">
+<td>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%">
+<tbody>
+<tr class=3D"x_header">
+<td class=3D"x_container" bgcolor=3D"" style=3D"background-position:initial=
+; background-size:initial; background-repeat:initial; background-attachment=
+:initial; background-origin:initial; background-clip:initial">
+<table role=3D"presentation" width=3D"100%">
+<tbody>
+<tr>
+<td class=3D"x_container">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static">
+<tbody>
+<tr>
+<td style=3D"padding:0 15px 0 15px">
+<table role=3D"presentation" border=3D"0" class=3D"x_container" align=3D"ce=
+nter" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" bgcolor=3D"" style=
+=3D"margin-bottom:10px; margin-top:10px; position:static">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_hero" valign=3D"top" style=3D"border-collap=
+se:collapse; border-spacing:0; margin:0; padding:0">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/FfcuuyUPykjqyIBFxkuutA~~/AAA=
+HURA~/QyNIRMLa37UosROObmjQN5enx7SYGGPrYnf8Bw6IKZEFaUXnXGhnp9Iym8zxyT5WG78Z1=
+2LI8sE5qQDMInr0DbhYTysvTqVU-5Oucn8s417RPLpOqqO1LcLpxOzXbDy6MH5wvqBP9lxaISWl=
+2uPOPUVpksIXdp02pLg-LI3y5lg~"><img width=3D"342" alt=3D"Workplace Plus logo=
+" style=3D"width:60%; max-width:100%; object-fit:cover; padding:0px; outlin=
+e:none; border-width:medium; border-style:none; border-color:currentcolor; =
+display:block" src=3D"https://gallery.eocampaign1.com/3cfb2852-c496-11f0-bc=
+56-0b4df89ec22e%2F1772625589240-w%2Bgreenpink.png">
+</a></td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr bgcolor=3D"#ffffff" style=3D"background-color:#ffffff">
+<td class=3D"x_container">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static; m=
+argin-bottom:0px">
+<tbody>
+<tr>
+<td style=3D"padding:10px 15px 20px">
+<table role=3D"presentation" border=3D"0" class=3D"x_container" align=3D"ce=
+nter" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" bgcolor=3D"" style=
+=3D"margin-bottom:5px; margin-top:5px; position:static">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_hero" valign=3D"top" style=3D"border-collap=
+se:collapse; border-spacing:0; margin:0; padding:0">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/2qSm5NwLjza8DKTdSvUrOg~~/AAA=
+HURA~/65A5x_tvrBwa6EC_ryjlv0JVQYZvc--aDlJwAQ17IUHantY3Up4ffyqiPuLf7AXw5DQbZ=
+uGuYrAN9G5xgwMlwLGb-jfF8ZWXlDpk_WRT73W6BFW5e7-jZnCnsXKX_KbB6nStXMnZ6UW4LmKq=
+21bCoClVM48ehERfBI6zPVo7uMDkEkPGvXqQKbAxKYQdjfePer3ALN6aKfhSK6vIePjJVJQ1w29=
+M66-SNfqC5K445PuVc-0TqaDH8aHWFAQ2nQ7NTAra2cdtJy06bnv_iFqNew~~" target=3D"_b=
+lank"><img alt=3D"Availability" width=3D"228" style=3D"width:40%; max-width=
+:100%; object-fit:cover; padding:0px; outline:none; border-width:medium; bo=
+rder-style:none; border-color:currentcolor; display:block" src=3D"https://g=
+allery.eocampaign1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2Fmedia-manager=
+%2F1773078324097-availability%20logo.png"></a>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" aria-hidden=3D"true" width=3D"100%" bgcolor=3D=
+"" style=3D"table-layout:fixed; width:100%; position:static">
+<tbody>
+<tr>
+<td style=3D"min-width:100%; padding-top:5px; padding-bottom:5px">
+<table role=3D"presentation" border=3D"0" cellpadding=3D"0" cellspacing=3D"=
+0" width=3D"40" align=3D"center" style=3D"min-width:40px; border-top:1px so=
+lid rgb(220,214,209); border-collapse:collapse; width:5%">
+<tbody>
+<tr>
+<td><span></span></td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" class=3D"" style=3D"positio=
+n:static">
+<tbody>
+<tr>
+<td class=3D"x_container" style=3D"padding-top:10px; padding-bottom:15px">
+<div class=3D"x_text-block x_fr-inner" style=3D"line-height:1.25">
+<div style=3D"text-align:center">Please see our latest Workplace Plus avail=
+ability</div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" clas=
+s=3D"x_container" role=3D"presentation" bgcolor=3D"">
+<tbody>
+<tr>
+<td valign=3D"top" align=3D"center" style=3D"padding-bottom:10px">
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" align=3D"center" ro=
+le=3D"presentation" class=3D"x_eo-button" width=3D"199" bgcolor=3D"rgb(10, =
+45, 41)" style=3D"border-radius:3px; background-color:rgb(10,45,41); width:=
+35%; border-collapse:separate!important">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"middle" style=3D""><a href=3D"https://eot.wo=
+rkplaceplus.co.uk/f/a/2qSm5NwLjza8DKTdSvUrOg~~/AAAHURA~/65A5x_tvrBwa6EC_ryj=
+lv0JVQYZvc--aDlJwAQ17IUHantY3Up4ffyqiPuLf7AXw5DQbZuGuYrAN9G5xgwMlwLGb-jfF8Z=
+WXlDpk_WRT73W6BFW5e7-jZnCnsXKX_KbB6nStXMnZ6UW4LmKq21bCoClVM48ehERfBI6zPVo7u=
+MDkEkPGvXqQKbAxKYQdjfePer3ALN6aKfhSK6vIePjJVJQ1w29M66-SNfqC5K445PuVc-0TqaDH=
+8aHWFAQ2nQ7NTAra2cdtJy06bnv_iFqNew~~" target=3D"_blank" title=3D"Availabili=
+ty" style=3D"font-weight:bold; font-size:18px; padding:18px; letter-spacing=
+:-0.5px; line-height:100%; text-align:center; text-decoration:none; color:#=
+FFFFFF; display:block">Availability</a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" class=3D"" style=3D"positio=
+n:static">
+<tbody>
+<tr>
+<td class=3D"x_container" style=3D"padding:10px 0px 15px">
+<div class=3D"x_text-block x_fr-inner" style=3D"line-height:1.25">
+<div style=3D"text-align:center">We also have a number of newly added space=
+s!</div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" width=3D"100%" class=3D"x_container" align=3D"center" c=
+ellpadding=3D"0" cellspacing=3D"0" bgcolor=3D"" role=3D"presentation" style=
+=3D"margin-bottom:0; position:static; border-collapse:collapse">
+<tbody>
+<tr>
+<td style=3D"padding:10px">
+<table border=3D"0" width=3D"100%" align=3D"center" role=3D"presentation">
+<tbody>
+<tr>
+<td width=3D"50%" class=3D"x_stack" valign=3D"top">
+<table class=3D"x_container" border=3D"0" width=3D"100%" align=3D"left" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"top" class=3D"x_container" width=3D"100%" st=
+yle=3D"border-collapse:collapse; border-spacing:0; margin:0">
+<table role=3D"presentation" border=3D"0" class=3D"x_container" align=3D"ce=
+nter" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" bgcolor=3D"" style=
+=3D"position:static">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_hero" valign=3D"top" style=3D"border-collap=
+se:collapse; border-spacing:0; margin:0; padding:10px">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/jeACq79vkuubiYnOXBZcNg~~/AAA=
+HURA~/dImOlh3zggAULTCU17DEcDKAq7HYESoIGsX7-Q-P3SFjvyUhfAqbztZlhdUxIaBBuW4ny=
+YUXr3XM5IotEA_gmzReraV65G0v0ppG2rkELWYftZoNHbQ4o_p6p6n_BC9I7lluKm5BLezzHtcl=
+iosjqLYBkoephVuzYdzZduCkE5DIt64dIZbtMI9CTxZ7HHPY_5xwglw0-LpYbEqx_ivSs1pIncZ=
+TLuWhG7sH_CE6EGvFTU79dvdPvemNQOLtxDev" target=3D"_blank"><img alt=3D"" widt=
+h=3D"290" style=3D"width:100%; max-width:100%; object-fit:cover; padding:0;=
+ outline:none; border:none; display:block" src=3D"https://gallery.eocampaig=
+n1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2F019f5f9e-994e-7620-91ae-d02e7=
+7351615.jpg"></a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+<td width=3D"50%" class=3D"x_stack" valign=3D"top">
+<table class=3D"x_container" border=3D"0" width=3D"100%" align=3D"left" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_container" width=3D"100%" valign=3D"top" st=
+yle=3D"border-collapse:collapse; border-spacing:0; margin:0">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static">
+<tbody>
+<tr>
+<td width=3D"100%" class=3D"x_container x_text-block x_fr-inner" style=3D"t=
+ext-decoration:none; padding:5px 10px; line-height:1.25; font-size:10px; fo=
+nt-family:Roboto,&quot;Franklin Gothic Medium&quot;,Tahoma,sans-serif; font=
+-weight:normal; font-style:normal">
+<h1 style=3D"margin-top:0px; margin-bottom:0px; font-size:18px"><span style=
+=3D"font-size:18px">77 Gracechurch Street, EC3V 0AS</span></h1>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static">
+<tbody>
+<tr>
+<td class=3D"x_container" style=3D"padding:5px 10px">
+<div class=3D"x_text-block x_fr-inner" style=3D"line-height:1.25">
+<div><u>6th Floor</u></div>
+<div>54 Desks + 3 Meeting Rooms</div>
+<div>=A355,100 Per Month</div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" clas=
+s=3D"x_container" role=3D"presentation" bgcolor=3D"" style=3D"margin-top:10=
+px">
+<tbody>
+<tr>
+<td valign=3D"top" align=3D"center" style=3D"padding:0px 0px 10px 10px">
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" align=3D"left" bgco=
+lor=3D"rgb(10, 45, 41)" role=3D"presentation" class=3D"x_eo-button" width=
+=3D"130" style=3D"border-radius:3px; background-color:rgb(10,45,41); width:=
+45%; border-collapse:separate!important">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"middle" style=3D""><a href=3D"https://eot.wo=
+rkplaceplus.co.uk/f/a/jeACq79vkuubiYnOXBZcNg~~/AAAHURA~/dImOlh3zggAULTCU17D=
+EcDKAq7HYESoIGsX7-Q-P3SFjvyUhfAqbztZlhdUxIaBBuW4nyYUXr3XM5IotEA_gmzReraV65G=
+0v0ppG2rkELWYftZoNHbQ4o_p6p6n_BC9I7lluKm5BLezzHtcliosjqLYBkoephVuzYdzZduCkE=
+5DIt64dIZbtMI9CTxZ7HHPY_5xwglw0-LpYbEqx_ivSs1pIncZTLuWhG7sH_CE6EGvFTU79dvdP=
+vemNQOLtxDev" target=3D"_blank" title=3D"Brochure" style=3D"font-weight:bol=
+d; font-size:15px; padding:9px; letter-spacing:-0.5px; line-height:100%; te=
+xt-align:center; text-decoration:none; color:#FFFFFF; display:block">Brochu=
+re</a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" width=3D"100%" class=3D"x_container" align=3D"center" c=
+ellpadding=3D"0" cellspacing=3D"0" bgcolor=3D"" role=3D"presentation" style=
+=3D"margin-bottom:0; position:static; border-collapse:collapse">
+<tbody>
+<tr>
+<td style=3D"padding:10px">
+<table border=3D"0" width=3D"100%" align=3D"center" role=3D"presentation">
+<tbody>
+<tr>
+<td width=3D"50%" class=3D"x_stack" valign=3D"top">
+<table class=3D"x_container" border=3D"0" width=3D"100%" align=3D"left" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"top" class=3D"x_container" width=3D"100%" st=
+yle=3D"border-collapse:collapse; border-spacing:0; margin:0">
+<table role=3D"presentation" border=3D"0" class=3D"x_container" align=3D"ce=
+nter" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" bgcolor=3D"" style=
+=3D"position:static">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_hero" valign=3D"top" style=3D"border-collap=
+se:collapse; border-spacing:0; margin:0; padding:10px">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/tC9ookNmaWCubhYRhEcy0A~~/AAA=
+HURA~/MQpLKzsSlNE12Mwu0U255ZUCYF6Y89YOyfQ1Jns85pF4y5fqf0QUwd35hZUrvrnL5xl0V=
+QSYLFOrK1Pw0TmopxH3Eq54yGSDRq_azjhszNDBw_NFA7Q4ikURzoyDGpwtqX7Fjx9kz6jZBLy6=
+rrJUZ9AyIAxiW2O9tK0GndHEVqPuqjg9IfOcZEnjtcAC95ewpZCpIBg7I8nzSCRESOi4sqG4un9=
+GlXb5bAb4rA6rPSAXDSfJGnQBc0i74RVw-Ipf" target=3D"_blank"><img alt=3D"" widt=
+h=3D"290" style=3D"width:100%; max-width:100%; object-fit:cover; padding:0;=
+ outline:none; border:none; display:block" src=3D"https://gallery.eocampaig=
+n1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2F019f5bd5-dbf2-7125-96ce-6043c=
+82f678c.jpg"></a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+<td width=3D"50%" class=3D"x_stack" valign=3D"top">
+<table class=3D"x_container" border=3D"0" width=3D"100%" align=3D"left" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_container" width=3D"100%" valign=3D"top" st=
+yle=3D"border-collapse:collapse; border-spacing:0; margin:0">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static">
+<tbody>
+<tr>
+<td width=3D"100%" class=3D"x_container x_text-block x_fr-inner" style=3D"t=
+ext-decoration:none; padding:5px 10px; line-height:1.25; font-size:10px; fo=
+nt-family:Roboto,&quot;Franklin Gothic Medium&quot;,Tahoma,sans-serif; font=
+-weight:normal; font-style:normal">
+<h1 style=3D"margin-top:0px; margin-bottom:0px; font-size:18px"><span style=
+=3D"font-size:18px">150 Waterloo Road, SE1 8SB</span></h1>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static">
+<tbody>
+<tr>
+<td class=3D"x_container" style=3D"padding:5px 10px">
+<div class=3D"x_text-block x_fr-inner" style=3D"line-height:1.25">
+<div><u>2nd Floor</u></div>
+<div>24 Desks</div>
+<div>=A316,000 Per Month</div>
+<div><br>
+</div>
+<div><u>4th Floor</u></div>
+<div>18 Desks + Meeting Room</div>
+<div>=A314,600 Per Month</div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" clas=
+s=3D"x_container" role=3D"presentation" bgcolor=3D"" style=3D"margin-top:10=
+px">
+<tbody>
+<tr>
+<td valign=3D"top" align=3D"center" style=3D"padding:0px 0px 10px 10px">
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" align=3D"left" bgco=
+lor=3D"rgb(10, 45, 41)" role=3D"presentation" class=3D"x_eo-button" width=
+=3D"130" style=3D"border-radius:3px; background-color:rgb(10,45,41); width:=
+45%; border-collapse:separate!important">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"middle" style=3D""><a href=3D"https://eot.wo=
+rkplaceplus.co.uk/f/a/tC9ookNmaWCubhYRhEcy0A~~/AAAHURA~/MQpLKzsSlNE12Mwu0U2=
+55ZUCYF6Y89YOyfQ1Jns85pF4y5fqf0QUwd35hZUrvrnL5xl0VQSYLFOrK1Pw0TmopxH3Eq54yG=
+SDRq_azjhszNDBw_NFA7Q4ikURzoyDGpwtqX7Fjx9kz6jZBLy6rrJUZ9AyIAxiW2O9tK0GndHEV=
+qPuqjg9IfOcZEnjtcAC95ewpZCpIBg7I8nzSCRESOi4sqG4un9GlXb5bAb4rA6rPSAXDSfJGnQB=
+c0i74RVw-Ipf" target=3D"_blank" title=3D"Brochure" style=3D"font-weight:bol=
+d; font-size:15px; padding:9px; letter-spacing:-0.5px; line-height:100%; te=
+xt-align:center; text-decoration:none; color:#FFFFFF; display:block">Brochu=
+re</a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" width=3D"100%" class=3D"x_container" align=3D"center" c=
+ellpadding=3D"0" cellspacing=3D"0" bgcolor=3D"" role=3D"presentation" style=
+=3D"margin-bottom:0; position:static; border-collapse:collapse">
+<tbody>
+<tr>
+<td style=3D"padding:10px">
+<table border=3D"0" width=3D"100%" align=3D"center" role=3D"presentation">
+<tbody>
+<tr>
+<td width=3D"50%" class=3D"x_stack" valign=3D"top">
+<table class=3D"x_container" border=3D"0" width=3D"100%" align=3D"left" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"top" class=3D"x_container" width=3D"100%" st=
+yle=3D"border-collapse:collapse; border-spacing:0; margin:0">
+<table role=3D"presentation" border=3D"0" class=3D"x_container" align=3D"ce=
+nter" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" bgcolor=3D"" style=
+=3D"position:static">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_hero" valign=3D"top" style=3D"border-collap=
+se:collapse; border-spacing:0; margin:0; padding:10px">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/OZchnwvXuLMFHG1H5lIUTA~~/AAA=
+HURA~/MmTDcruEtbhc47XtdfNoBuoxXCk0PDZ8b-SODASOgwbnLVTrd0DNVBBZZ99zTq34zqVpo=
+oUAaju7QdyW7fpQcovWWZI-Bxfmd3kT1ETNEsRWG4cqZzHkgG3bcAbIhSkRSCpqdJU5Ml1TJvNA=
+gX-jwxenE_YZwAvxD04XmczoiOUArI7qTU2xY2CIUhiw4RfVBpmGWqpcjeWFxtTIZvKEX4oYSmw=
+bzFnNqtVdS8VeAm2gZqNlStuGzV5aT4ePGxUv" target=3D"_blank"><img alt=3D"" widt=
+h=3D"290" style=3D"width:100%; max-width:100%; object-fit:cover; padding:0;=
+ outline:none; border:none; display:block" src=3D"https://gallery.eocampaig=
+n1.com/3cfb2852-c496-11f0-bc56-0b4df89ec22e%2F019f5bd2-f8b9-78db-a0aa-1418e=
+edf8d8d.jpg"></a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+<td width=3D"50%" class=3D"x_stack" valign=3D"top">
+<table class=3D"x_container" border=3D"0" width=3D"100%" align=3D"left" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr>
+<td align=3D"center" class=3D"x_container" width=3D"100%" valign=3D"top" st=
+yle=3D"border-collapse:collapse; border-spacing:0; margin:0">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static; m=
+argin-top:0px">
+<tbody>
+<tr>
+<td width=3D"100%" class=3D"x_container x_text-block x_fr-inner" style=3D"t=
+ext-decoration:none; padding:5px 10px; line-height:1.25; font-size:10px; fo=
+nt-family:Roboto,&quot;Franklin Gothic Medium&quot;,Tahoma,sans-serif; font=
+-weight:normal; font-style:normal">
+<h1 style=3D"margin-top:0px; margin-bottom:0px; font-size:18px"><span style=
+=3D"font-size:18px">8 Durweston Street, W1H 1EW</span></h1>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"#ffffff" style=3D"position:st=
+atic; background-color:#ffffff">
+<tbody>
+<tr>
+<td class=3D"x_container" style=3D"padding:7px">
+<div class=3D"x_text-block x_fr-inner" style=3D"line-height:1.25">
+<div><u>Ground &amp; First Floor</u></div>
+<div>24 Desks + Meeting Room</div>
+<div>=A314,600Per Month</div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" clas=
+s=3D"x_container" role=3D"presentation" bgcolor=3D"" style=3D"margin-top:10=
+px">
+<tbody>
+<tr>
+<td valign=3D"top" align=3D"center" style=3D"padding:0px 0px 10px 10px">
+<table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" align=3D"left" bgco=
+lor=3D"rgb(10, 45, 41)" role=3D"presentation" class=3D"x_eo-button" width=
+=3D"159" style=3D"border-radius:3px; background-color:rgb(10,45,41); width:=
+55%; border-collapse:separate!important">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"middle" style=3D""><a href=3D"https://eot.wo=
+rkplaceplus.co.uk/f/a/OZchnwvXuLMFHG1H5lIUTA~~/AAAHURA~/MmTDcruEtbhc47XtdfN=
+oBuoxXCk0PDZ8b-SODASOgwbnLVTrd0DNVBBZZ99zTq34zqVpooUAaju7QdyW7fpQcovWWZI-Bx=
+fmd3kT1ETNEsRWG4cqZzHkgG3bcAbIhSkRSCpqdJU5Ml1TJvNAgX-jwxenE_YZwAvxD04Xmczoi=
+OUArI7qTU2xY2CIUhiw4RfVBpmGWqpcjeWFxtTIZvKEX4oYSmwbzFnNqtVdS8VeAm2gZqNlStuG=
+zV5aT4ePGxUv" target=3D"_blank" title=3D"Brochure" style=3D"font-weight:bol=
+d; font-size:15px; padding:9px; letter-spacing:-0.5px; line-height:100%; te=
+xt-align:center; text-decoration:none; color:#FFFFFF; display:block">Brochu=
+re</a>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+<tr>
+<td bgcolor=3D"#f3f3f4" style=3D"background-color:#f3f3f4">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"600" class=3D"x_container" style=3D"margin:0px=
+ auto">
+<tbody>
+<tr>
+<td class=3D"x_container">
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" style=3D"position:static">
+<tbody>
+<tr>
+<td>
+<table role=3D"presentation" aria-hidden=3D"true" cellspacing=3D"0" cellpad=
+ding=3D"0" border=3D"0" align=3D"center" width=3D"100%" bgcolor=3D"">
+<tbody>
+<tr>
+<td align=3D"center" valign=3D"top" style=3D"padding-top:5px; padding-botto=
+m:5px">
+<table class=3D"x_social-links-container" align=3D"center" border=3D"0" cel=
+lpadding=3D"0" cellspacing=3D"0" role=3D"presentation" style=3D"border-coll=
+apse:collapse">
+<tbody>
+<tr class=3D"x_social-links-row">
+<td class=3D"x_social-link-container" align=3D"center" valign=3D"middle" wi=
+dth=3D"48" style=3D"padding:0 5px">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/aILlMe5K63d6mLh1j7HQMg~~/AAA=
+HURA~/O_bPpYT6wNvWKUUdkAoim64GDM03IjoiJbRe1U-yDtD13kTLwCLunLRr2DyLr7JrE9O2N=
+IexlX34ZUppx7tiS2kb28kEZMRRXMONlV17udgNBna6-6jTz6qLBLoOYHbStPme5vfB-tpXPXw7=
+Y3sNdvw-cxwkv9ESrKLWRW6CPFRwSMxsEfbtTX2gfcUPRvKk" target=3D"_blank"><img he=
+ight=3D"48" width=3D"48" alt=3D"linkedin social link" style=3D"display:bloc=
+k; border:0; height:auto; outline:none; text-decoration:none" src=3D"https:=
+//gallery.eocampaign1.com/tentacles/icons/v1/social-block/square/color/link=
+edin.png">
+</a></td>
+<td class=3D"x_social-link-container" align=3D"center" valign=3D"middle" wi=
+dth=3D"48" style=3D"padding:0 5px">
+<a href=3D"https://eot.workplaceplus.co.uk/f/a/FfcuuyUPykjqyIBFxkuutA~~/AAA=
+HURA~/QyNIRMLa37UosROObmjQN5enx7SYGGPrYnf8Bw6IKZEFaUXnXGhnp9Iym8zxyT5WG78Z1=
+2LI8sE5qQDMInr0DbhYTysvTqVU-5Oucn8s417RPLpOqqO1LcLpxOzXbDy6MH5wvqBP9lxaISWl=
+2uPOPUVpksIXdp02pLg-LI3y5lg~" target=3D"_blank"><img height=3D"48" width=3D=
+"48" alt=3D"website social link" style=3D"display:block; border:0; height:a=
+uto; outline:none; text-decoration:none" src=3D"https://gallery.eocampaign1=
+.com/tentacles/icons/v1/social-block/square/color/website.png">
+</a></td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<table role=3D"presentation" cellspacing=3D"0" cellpadding=3D"0" border=3D"=
+0" align=3D"center" width=3D"100%" bgcolor=3D"" style=3D"position:static">
+<tbody>
+<tr>
+<td class=3D"x_container" style=3D"padding-top:20px; padding-bottom:10px">
+<div class=3D"x_text-block x_fr-inner" style=3D"font-size:11px; line-height=
+:1.25">
+<div style=3D"text-align:center">75-77 St John Street, London, EC1M 4NN<br>
+United Kingdom</div>
+<div style=3D"text-align:center">You received this email because you subscr=
+ibed to our list. You can
+<a target=3D"_blank" rel=3D"noopener noreferrer nofollow" href=3D"https://e=
+ot.workplaceplus.co.uk/f/a/6-NZZm-YpXY4XsqbaYSqwg~~/AAAHURA~/iJZ3ft8Cke3Lgs=
+CG9aGBy8d06gTZ2WWut3J4n7VUlrRJYfbQawYwq0_swFQVanaUtGMOwcHcVfLY989-D4iuCNuOu=
+ngC2V3sJMQI9xYQ92_NIpIimy7q3Qfvm15A5GInJWol32x__Qud_9w9FdG_fQtZFK-vEiHgzVvv=
+RGVp0zi9XL9eFGkpIKMHAU9uYqpdVogTn_V-MYFqw8wpKcKiOsYmNkL1NMagrSd2zl8Khi4zFyO=
+Sz1YEQWUmEMXoPlmn-nbvEOkId2OYRBs5tC2Fc5b2GYGDR0iA0sXXrOfV8MnvHR7Soy11dcstS6=
+zy9hl_SoayAuyOg97L_j3m9lmtMpSSUjXegO3SaG7V4zTb4lHbxdUk_CsaeBSS68R-NgfVo-tj-=
+BMtk0_udN1uBLTf0PJliDXl1-4r4hfvnKaZdybwdTvJAQyrtJg8Ux5tWTXKXUkAUuMz5FUwwolr=
+mt1_-A~~" style=3D"color:rgb(49,54,56)">
+unsubscribe</a> at any time.</div>
+<div style=3D"text-align:center"><br>
+</div>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+</td>
+</tr>
+</tbody>
+</table>
+<img border=3D"0" width=3D"1" height=3D"1" alt=3D"" src=3D"https://eot.work=
+placeplus.co.uk/q/tVEvA8G_xjwcTScdIjTcDA~~/AAAHURA~/GaFRjoIXPNG8V9JLD4Ru1cR=
+sXGnC918t8O4MVgOIQ-w5e-Vw1qV8pGdGtXh9pLmSGw3p66bxaEq48uR_yQYOcg~~">
+</div>
+</body>
+</html>
+
+--_000_LO2P123MB3965F48C3089EECCD30C36CDF2F92LO2P123MB3965GBRP_--
