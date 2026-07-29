@@ -20,7 +20,7 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files and st.button("Extract"):
-    with st.spinner("Extracting data..."):
+    with st.spinner("Extracting data from your file..."):
         tmp_path = None
         try:
             all_rows = []

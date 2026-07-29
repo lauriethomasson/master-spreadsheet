@@ -33,10 +33,11 @@ else:
             st.success("Edits saved.")
     with col2:
         if st.button("Approve → Master", type="primary"):
-            try:
-                rows = dataframe_to_listing_rows(edited_df)
-                master_writer.write_master(rows)
-                mark_as_approved(selected)
-                st.success("Master spreadsheet updated.")
-            except Exception as e:
-                st.error(f"Approval failed, master was not changed: {e}")
+            with st.spinner("Updating master spreadsheet..."):
+                try:
+                    rows = dataframe_to_listing_rows(edited_df)
+                    master_writer.write_master(rows)
+                    mark_as_approved(selected)
+                    st.success("Master spreadsheet updated.")
+                except Exception as e:
+                    st.error(f"Approval failed, master was not changed: {e}")
