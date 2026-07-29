@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from brochure_link_resolver import finalize_brochure_link
+from brochure_link_resolver import finalize_brochure_link, resolve_email_tracking_links
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
@@ -98,16 +98,24 @@ Also extract for each unit:
   "Av: Now" / "Available: Now", "Av: Sept" → "Available: September").
 - state_of_space: the fit-out condition if stated (e.g. "Fitted", "Fully Managed"). If ambiguous
   or unstated for this particular unit, leave this null rather than guessing.
-- brochure_link: only a clean, directly-readable URL if one is plainly present in the text for THIS
-  SPECIFIC unit/listing — do NOT attempt to decode or reconstruct a URL from redirect/tracking
-  parameters. If every link near this unit is an obfuscated tracking redirect, leave this null. Never
-  take a link that belongs to one specific listing and reuse it for a different, unrelated unit — if
-  the document has one shared portfolio-level link that clearly applies to the whole email (not to
-  any one specific listing), use that for every unit instead. This must be a link to an actual
-  brochure, floorplan, or listing-specific page — NEVER a generic company homepage, "contact us" page,
-  or top-level marketing domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific
-  property page under that domain). If the only link present is a generic company URL with no
-  listing-specific path, leave this null rather than populating it with a non-brochure link.
+- brochure_link: any link-tracking redirects in the email body have already been resolved to their
+  real destination before you see this text, so a URL you see here can be used directly — but only
+  treat it as THIS unit's brochure_link candidate if it sits close to that specific building/listing
+  name (e.g. directly on the building name's own line, or on a "Brochure"/"Floorplan"/"View listing"
+  line immediately next to that unit's block). A link floating elsewhere in the email — a header logo,
+  a social media icon, a "view in browser" link, a sender's signature/website link — does NOT qualify,
+  even if it's the only link in the email, and should NOT be reused as a fallback. Never take a link
+  that belongs to one specific listing and reuse it for a different, unrelated unit — if the document
+  has one shared portfolio-level link that clearly applies to the whole email (not to any one specific
+  listing), use that for every unit instead. This must be a link to an actual brochure, floorplan, or
+  listing-specific page — NEVER a generic company homepage, "contact us" page, or top-level marketing
+  domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific property page under that
+  domain). If the only link present is a generic company URL with no listing-specific path, leave this
+  null rather than populating it with a non-brochure link.
+  HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out",
+  "manage preferences", "manage your subscription", or "email preferences" — anywhere in the email,
+  regardless of how close it also is to a building name — it must NEVER be used as a brochure_link,
+  even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -166,7 +174,7 @@ def load_eml_body(eml_path: Path) -> str:
 
 
 def clean_email_text(text: str) -> str:
-    text = re.sub(r"<https?://\S+?>", "", text)
+    text = resolve_email_tracking_links(text)
     lines = [
         line for line in text.splitlines()
         if not re.fullmatch(r"\[https?://\S+\]", line.strip())

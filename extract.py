@@ -67,6 +67,9 @@ Also extract for each unit:
   top-level marketing domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific property page
   under that domain). If the only link present is a generic company URL with no listing-specific path, leave
   this null rather than populating it with a non-brochure link.
+  HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out", "manage
+  preferences", "manage your subscription", or "email preferences", it must NEVER be used as a brochure_link,
+  even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
 - special_features: a semicolon-separated list of notable amenities, inclusions, or notes
   (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth")
 - state_of_space: the fit-out condition if stated or clearly implied (e.g. "Fitted", "Fully Managed",
