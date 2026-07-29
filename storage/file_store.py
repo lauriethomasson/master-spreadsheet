@@ -61,6 +61,9 @@ def _staging_signature() -> tuple:
     added, removed, or edited in place (e.g. mark_as_approved rewriting an
     existing meta.json), so it's a reliable cache key for the directory's
     current state without needing an explicit .clear() on every write path.
+    Every upload/approval produces a brand new signature that's never looked
+    up again, so the cached functions below bound entries/ttl to keep that
+    unreachable history from growing without limit over a long-running process.
     """
     return tuple(sorted((p.name, p.stat().st_mtime) for p in STAGING_DIR.glob("*.meta.json")))
 
@@ -71,7 +74,7 @@ def list_pending_staging_files() -> list[str]:
     return _list_pending_staging_files_cached(_staging_signature())
 
 
-@st.cache_data
+@st.cache_data(max_entries=4, ttl=3600)
 def _list_pending_staging_files_cached(signature: tuple) -> list[str]:
     pending = []
     for xlsx_path in STAGING_DIR.glob("*.xlsx"):
@@ -90,7 +93,7 @@ def load_staging_as_dataframe(path: str) -> pd.DataFrame:
     return _load_staging_as_dataframe_cached(path, Path(path).stat().st_mtime)
 
 
-@st.cache_data
+@st.cache_data(max_entries=8, ttl=3600)
 def _load_staging_as_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
     return pd.read_excel(path)
 

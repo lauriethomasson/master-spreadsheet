@@ -37,10 +37,12 @@ def load_master_as_dataframe(master_path: str = DEFAULT_MASTER_PATH) -> pd.DataF
     # mtime is part of the cache key (not an underscore-prefixed arg), so a
     # fresh write_master() — which always changes the file's mtime — is
     # enough to invalidate this on its own, with no explicit .clear() needed.
+    # A superseded (path, mtime) entry is never looked up again, so max_entries/ttl
+    # bound how much of that unreachable history st.cache_data keeps around.
     return _load_master_as_dataframe_cached(master_path, os.path.getmtime(master_path))
 
 
-@st.cache_data
+@st.cache_data(max_entries=4, ttl=3600)
 def _load_master_as_dataframe_cached(master_path: str, mtime: float) -> pd.DataFrame:
     return pd.read_excel(master_path)
 
@@ -52,7 +54,7 @@ def get_master_write_log(log_path: str = LOG_PATH) -> list:
     return _get_master_write_log_cached(log_path, path.stat().st_mtime)
 
 
-@st.cache_data
+@st.cache_data(max_entries=4, ttl=3600)
 def _get_master_write_log_cached(log_path: str, mtime: float) -> list:
     with open(log_path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
