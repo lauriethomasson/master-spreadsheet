@@ -7,7 +7,15 @@ gets written to the staging/master .xlsx files — only what's rendered.
 
 import pandas as pd
 
-RANGE_COLUMNS = ["size_sqft_min", "size_sqft_max", "desks_min"]
+RANGE_COLUMNS = [
+    "size_sqft_min",
+    "size_sqft_max",
+    "desks_min",
+    "rent_psf_min",
+    "rent_psf_max",
+    "rent_pcm_min",
+    "rent_pcm_max",
+]
 
 
 def visible_columns(df: pd.DataFrame) -> list:
