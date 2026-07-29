@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from brochure_link_resolver import resolve_brochure_link
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
@@ -102,7 +103,11 @@ Also extract for each unit:
   parameters. If every link near this unit is an obfuscated tracking redirect, leave this null. Never
   take a link that belongs to one specific listing and reuse it for a different, unrelated unit — if
   the document has one shared portfolio-level link that clearly applies to the whole email (not to
-  any one specific listing), use that for every unit instead.
+  any one specific listing), use that for every unit instead. This must be a link to an actual
+  brochure, floorplan, or listing-specific page — NEVER a generic company homepage, "contact us" page,
+  or top-level marketing domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific
+  property page under that domain). If the only link present is a generic company URL with no
+  listing-specific path, leave this null rather than populating it with a non-brochure link.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -194,6 +199,9 @@ def extract(eml_path: Path) -> list[ListingRow]:
                 continue
             unit["building"] = last_building
         last_building = unit["building"]
+
+        if unit.get("brochure_link"):
+            unit["brochure_link"] = resolve_brochure_link(unit["brochure_link"])
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

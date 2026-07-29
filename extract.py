@@ -7,6 +7,7 @@ import fitz  # PyMuPDF
 from google.genai import types
 from pydantic import ValidationError
 
+from brochure_link_resolver import resolve_brochure_link
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
@@ -61,7 +62,11 @@ Also extract for each unit:
   clearly given for it. If the document instead has one shared portfolio-level link that applies to the
   whole document (not to any one specific listing), use that for every unit. Never take a link that belongs
   to one specific listing and reuse it for a different, unrelated unit — leave it null for units that don't
-  have their own link when the only link found belongs to another listing.
+  have their own link when the only link found belongs to another listing. This must be a link to an actual
+  brochure, floorplan, or listing-specific page — NEVER a generic company homepage, "contact us" page, or
+  top-level marketing domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific property page
+  under that domain). If the only link present is a generic company URL with no listing-specific path, leave
+  this null rather than populating it with a non-brochure link.
 - special_features: a semicolon-separated list of notable amenities, inclusions, or notes
   (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth")
 - state_of_space: the fit-out condition if stated or clearly implied (e.g. "Fitted", "Fully Managed",
@@ -130,6 +135,9 @@ def extract(pdf_path: Path) -> list[ListingRow]:
                 continue
             unit["building"] = last_building
         last_building = unit["building"]
+
+        if unit.get("brochure_link"):
+            unit["brochure_link"] = resolve_brochure_link(unit["brochure_link"])
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

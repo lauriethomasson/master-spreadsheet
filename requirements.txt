@@ -4,3 +4,5 @@ pydantic
 openpyxl
 streamlit
 pandas
+httpx
+beautifulsoup4
