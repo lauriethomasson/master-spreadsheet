@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 
@@ -55,10 +56,23 @@ def save_staging_file(rows: list[ListingRow], original_filename: str) -> str:
     return str(staging_path)
 
 
+def _staging_signature() -> tuple:
+    """One (name, mtime) pair per sidecar file — changes whenever a file is
+    added, removed, or edited in place (e.g. mark_as_approved rewriting an
+    existing meta.json), so it's a reliable cache key for the directory's
+    current state without needing an explicit .clear() on every write path.
+    """
+    return tuple(sorted((p.name, p.stat().st_mtime) for p in STAGING_DIR.glob("*.meta.json")))
+
+
 def list_pending_staging_files() -> list[str]:
     if not STAGING_DIR.exists():
         return []
+    return _list_pending_staging_files_cached(_staging_signature())
 
+
+@st.cache_data
+def _list_pending_staging_files_cached(signature: tuple) -> list[str]:
     pending = []
     for xlsx_path in STAGING_DIR.glob("*.xlsx"):
         try:
@@ -73,6 +87,11 @@ def list_pending_staging_files() -> list[str]:
 
 
 def load_staging_as_dataframe(path: str) -> pd.DataFrame:
+    return _load_staging_as_dataframe_cached(path, Path(path).stat().st_mtime)
+
+
+@st.cache_data
+def _load_staging_as_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
     return pd.read_excel(path)
 
 

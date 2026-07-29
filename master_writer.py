@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
 
 from schema import ListingRow
@@ -33,12 +34,26 @@ def master_exists(master_path: str = DEFAULT_MASTER_PATH) -> bool:
 
 
 def load_master_as_dataframe(master_path: str = DEFAULT_MASTER_PATH) -> pd.DataFrame:
+    # mtime is part of the cache key (not an underscore-prefixed arg), so a
+    # fresh write_master() — which always changes the file's mtime — is
+    # enough to invalidate this on its own, with no explicit .clear() needed.
+    return _load_master_as_dataframe_cached(master_path, os.path.getmtime(master_path))
+
+
+@st.cache_data
+def _load_master_as_dataframe_cached(master_path: str, mtime: float) -> pd.DataFrame:
     return pd.read_excel(master_path)
 
 
 def get_master_write_log(log_path: str = LOG_PATH) -> list:
-    if not Path(log_path).exists():
+    path = Path(log_path)
+    if not path.exists():
         return []
+    return _get_master_write_log_cached(log_path, path.stat().st_mtime)
+
+
+@st.cache_data
+def _get_master_write_log_cached(log_path: str, mtime: float) -> list:
     with open(log_path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
