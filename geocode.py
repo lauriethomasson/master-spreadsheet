@@ -8,7 +8,12 @@ Resolves lat/lng for a ListingRow using a two-tier strategy:
 
 Also attempts to backfill address_1/postcode from the Places result when the
 fallback path succeeds, since Places often returns a formatted address even
-when the source document didn't state one.
+when the source document didn't state one. When Places resolves coordinates
+but its own record has no street_number/route/postal_code component at all
+(seen for some buildings, e.g. "Kent House" — a valid, correctly-disambiguated
+match with no structured address on file), falls back to reverse-geocoding
+those coordinates through the legacy Geocoding API, which often has address
+data for a location that Places' own record lacks.
 """
 
 import json
@@ -74,6 +79,31 @@ def call_geocoding_api(address: str) -> dict:
     return {"status": "OK", "lat": location["lat"], "lng": location["lng"]}
 
 
+def call_reverse_geocoding_api(lat: float, lng: float) -> dict:
+    """
+    Looks up address data for a known coordinate (the reverse of
+    call_geocoding_api) via the same legacy Geocoding API endpoint, just with
+    a latlng param instead of an address. A reverse lookup typically returns
+    several results at different specificity levels (street address, postal
+    code area, neighborhood, ...) rather than one - address_components from
+    all of them are pooled together, since the most specific result isn't
+    always the one that happens to carry the postal_code component.
+    """
+    resp = httpx.get(GEOCODE_URL, params={"latlng": f"{lat},{lng}", "key": _api_key()}, timeout=10)
+    data = resp.json()
+    status = data.get("status", "UNKNOWN")
+    _check_not_enabled(status, data.get("error_message", ""), "Geocoding API")
+
+    if status != "OK" or not data.get("results"):
+        return {"status": status}
+
+    address_components = []
+    for result in data["results"]:
+        address_components.extend(result.get("address_components", []))
+
+    return {"status": "OK", "address_components": address_components}
+
+
 def call_places_text_search(query: str) -> dict:
     resp = httpx.post(
         PLACES_NEW_SEARCHTEXT_URL,
@@ -115,18 +145,25 @@ def call_places_text_search(query: str) -> dict:
     }
 
 
-def _address_line1_and_postcode(address_components: list) -> tuple:
+def _address_line1_and_postcode(address_components: list, name_key: str = "longText") -> tuple:
+    """
+    name_key is "longText" for Places API (New) components (the shape
+    call_places_text_search returns) or "long_name" for legacy Geocoding API
+    components (call_reverse_geocoding_api). Guards against overwriting an
+    already-found value, since call_reverse_geocoding_api pools components
+    from several results and an earlier, more specific result should win.
+    """
     street_number = None
     route = None
     postcode = None
     for comp in address_components:
         types = comp.get("types", [])
-        if "street_number" in types:
-            street_number = comp["longText"]
-        elif "route" in types:
-            route = comp["longText"]
-        elif "postal_code" in types:
-            postcode = comp["longText"]
+        if "street_number" in types and not street_number:
+            street_number = comp[name_key]
+        elif "route" in types and not route:
+            route = comp[name_key]
+        elif "postal_code" in types and not postcode:
+            postcode = comp[name_key]
 
     address_1 = None
     if street_number and route:
@@ -184,6 +221,28 @@ def geocode_row(row: ListingRow) -> ListingRow:
                     row.address_1 = address_1
                 if not row.postcode and postcode:
                     row.postcode = postcode
+
+            if not row.address_1 or not row.postcode:
+                # Places matched real coordinates but its own record has no street
+                # address on file (e.g. Kent House — a correct, well-disambiguated
+                # match with a "premise"-only record) - reverse-geocode the
+                # coordinates we already trust as a second attempt to fill this in.
+                reverse = call_reverse_geocoding_api(row.lat, row.lng)
+                if reverse["status"] == "OK":
+                    address_1, postcode = _address_line1_and_postcode(
+                        reverse.get("address_components", []), name_key="long_name"
+                    )
+                    if not row.address_1 and address_1:
+                        row.address_1 = address_1
+                    if not row.postcode and postcode:
+                        row.postcode = postcode
+
+                if not row.address_1 or not row.postcode:
+                    log_geocode_failure(
+                        row,
+                        f"Places matched (lat={row.lat}, lng={row.lng}) but no street "
+                        "address/postcode found there, even after a reverse-geocode fallback",
+                    )
 
             return row
 
