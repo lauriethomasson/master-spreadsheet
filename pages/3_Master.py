@@ -1,12 +1,15 @@
 import streamlit as st
 
+import display_utils
 import master_writer
+
+st.set_page_config(page_title="Master Spreadsheet Pipeline", page_icon="📋", layout="wide")
 
 st.title("Master Spreadsheet")
 
 if master_writer.master_exists():
     df = master_writer.load_master_as_dataframe()
-    st.dataframe(df)
+    st.dataframe(df[display_utils.visible_columns(df)])
 
     with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
         st.download_button(

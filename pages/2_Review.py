@@ -1,5 +1,6 @@
 import streamlit as st
 
+import display_utils
 import master_writer
 from storage.file_store import (
     dataframe_to_listing_rows,
@@ -8,6 +9,8 @@ from storage.file_store import (
     mark_as_approved,
     save_staging_dataframe,
 )
+
+st.set_page_config(page_title="Master Spreadsheet Pipeline", page_icon="📋", layout="wide")
 
 st.title("Review Staged Uploads")
 
@@ -19,7 +22,9 @@ else:
     selected = st.selectbox("Choose an upload to review", pending)
 
     df = load_staging_as_dataframe(selected)
-    edited_df = st.data_editor(df, num_rows="dynamic")
+    visible = display_utils.visible_columns(df)
+    edited_visible = st.data_editor(df[visible], num_rows="dynamic", width="stretch", height=600)
+    edited_df = display_utils.restore_hidden_columns(edited_visible, df)
 
     col1, col2 = st.columns(2)
     with col1:
