@@ -1,2 +1,4 @@
 -r requirements.txt
 psutil
+playwright
+# after installing, also run: playwright install chromium
