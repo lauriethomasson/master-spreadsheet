@@ -11,6 +11,19 @@ from schema import ListingRow
 MIN_COLUMN_WIDTH = 10
 MAX_COLUMN_WIDTH = 40
 
+# Columns holding a URL - given a real openpyxl hyperlink (not just plain text)
+# so the cell is directly clickable when the .xlsx is opened in Excel/Google
+# Sheets, not just styled to look like a link.
+HYPERLINK_COLUMNS = ["brochure_link"]
+HYPERLINK_FONT = Font(color="0563C1", underline="single")
+
+# Present in every row for traceability (geocode failure logs, the
+# brochure_link PDF-fallback default) but not something Mark/Laurie need to
+# see day-to-day - hidden as an Excel column rather than dropped from the
+# file, so it's still there to unhide/read directly (e.g. via pandas) if a
+# listing ever needs tracing back to its source upload.
+HIDDEN_COLUMNS = ["source_file"]
+
 
 def write_rows_to_xlsx(rows: list[ListingRow], output_path: Path) -> None:
     fields = list(ListingRow.model_fields.keys())
@@ -36,7 +49,17 @@ def write_rows_to_xlsx(rows: list[ListingRow], output_path: Path) -> None:
             if value is not None:
                 max_len = max(max_len, len(str(value)))
         width = min(max(max_len + 2, MIN_COLUMN_WIDTH), MAX_COLUMN_WIDTH)
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+        column_letter = get_column_letter(col_idx)
+        ws.column_dimensions[column_letter].width = width
+        if field in HIDDEN_COLUMNS:
+            ws.column_dimensions[column_letter].hidden = True
+
+        if field in HYPERLINK_COLUMNS:
+            for row_idx in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if cell.value:
+                    cell.hyperlink = cell.value
+                    cell.font = HYPERLINK_FONT
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
