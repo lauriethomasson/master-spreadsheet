@@ -83,11 +83,6 @@ with page_setup.setup_page("upload"):
 
     if st.session_state["recent_uploads"]:
         st.divider()
-        st.subheader("Uploaded this session")
-        st.caption(
-            "Stays visible across page navigation even though the file picker above "
-            "resets — each of these has already been extracted and staged."
-        )
         for entry in st.session_state["recent_uploads"]:
             st.write(
                 f"✅ **{entry['batch_name']}** — {entry['n_rows']} row(s) from "
