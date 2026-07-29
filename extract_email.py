@@ -52,7 +52,8 @@ Then identify EVERY SEPARATE AVAILABLE UNIT (each row/building-block of availabi
 For each unit, extract its own location fields — do not assume they're shared with other units,
 since this email may list several unrelated buildings:
 - building: the property name this unit belongs to (e.g. "16 Dufour's Place", "141 Fenchurch
-  Street (Monument)")
+  Street (Monument)"). ALWAYS populate this for every unit, even when several consecutive units
+  are in the same building and it feels redundant to repeat it — never leave building null.
 - submarket: the ALL-CAPS section header this building falls under, normalized to title case
   (e.g. "Soho", "West End", "Mid Town")
 - address_1: leave this null unless a street address is stated for THIS SPECIFIC property
@@ -178,7 +179,19 @@ def extract(eml_path: Path) -> list[ListingRow]:
     }
 
     rows = []
-    for unit in raw.get("units", []):
+    last_building = None
+    for i, unit in enumerate(raw.get("units", [])):
+        if not unit.get("building"):
+            if not last_building:
+                print(
+                    f"Warning: {eml_path.name} unit {i} has no building and no prior "
+                    "unit to inherit one from — skipping this unit.",
+                    file=sys.stderr,
+                )
+                continue
+            unit["building"] = last_building
+        last_building = unit["building"]
+
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)
         rows.append(

@@ -1,3 +1,4 @@
+import gc
 import json
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ from pydantic import ValidationError
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
-RENDER_DPI = 150
+RENDER_DPI = 72
 
 PROMPT = """You are extracting structured data from a commercial office property brochure.
 You will be shown the pages of the brochure as images. Read all pages carefully,
@@ -30,7 +31,9 @@ many units across entirely unrelated properties (different streets, different bu
 distinct floor, suite, or unit as a separate entry.
 
 For each unit, extract its own location fields — do not assume they're shared with other units:
-- building: the name of the building this specific unit is in (e.g. "John Stow House", "City Tower")
+- building: the name of the building this specific unit is in (e.g. "John Stow House", "City Tower").
+  ALWAYS populate this for every unit, even when several consecutive units are in the same building and
+  it feels redundant to repeat it — never leave building null.
 - address_1: the street address of this specific unit's building (e.g. "18 Bevis Marks")
 - postcode: the UK postcode of this specific unit's building (e.g. "EC3A 7JB")
 - submarket: the general area/district for this specific unit, if stated or clearly inferable
@@ -99,6 +102,8 @@ def extract(pdf_path: Path) -> list[ListingRow]:
     client = get_client()
     images = render_pages(pdf_path)
     raw = call_gemini(client, PROMPT, images)
+    del images
+    gc.collect()
 
     brochure = {
         "internal_ref": raw.get("provider"),
@@ -108,7 +113,19 @@ def extract(pdf_path: Path) -> list[ListingRow]:
     }
 
     rows = []
-    for unit in raw.get("units", []):
+    last_building = None
+    for i, unit in enumerate(raw.get("units", [])):
+        if not unit.get("building"):
+            if not last_building:
+                print(
+                    f"Warning: {pdf_path.name} unit {i} has no building and no prior "
+                    "unit to inherit one from — skipping this unit.",
+                    file=sys.stderr,
+                )
+                continue
+            unit["building"] = last_building
+        last_building = unit["building"]
+
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)
         rows.append(
