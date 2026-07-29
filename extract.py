@@ -7,7 +7,7 @@ import fitz  # PyMuPDF
 from google.genai import types
 from pydantic import ValidationError
 
-from brochure_link_resolver import resolve_brochure_link
+from brochure_link_resolver import finalize_brochure_link
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
@@ -136,8 +136,9 @@ def extract(pdf_path: Path) -> list[ListingRow]:
             unit["building"] = last_building
         last_building = unit["building"]
 
-        if unit.get("brochure_link"):
-            unit["brochure_link"] = resolve_brochure_link(unit["brochure_link"])
+        unit["brochure_link"] = finalize_brochure_link(
+            unit.get("brochure_link"), is_pdf=True, own_filename=pdf_path.name
+        )
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

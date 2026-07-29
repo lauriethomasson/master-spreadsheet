@@ -1,15 +1,17 @@
 """
 brochure_link_resolver.py
 
-Some documents (confirmed: GPE) give a landing-page URL per listing rather
-than a direct link to the brochure/floorplan document itself — the landing
-page contains a "Download brochure" link pointing to the actual document.
-This resolves that one level deep: fetch the URL Gemini extracted, look for
-an actual document link on that page, and use it instead if found.
+finalize_brochure_link is the entry point extract.py/extract_email.py call
+per unit, applying the full brochure_link priority order (see its
+docstring): a genuine per-unit link, resolved through one landing-page hop
+if needed (confirmed: GPE, whose per-property link is a landing page
+containing the real brochure PDF's link, not the PDF itself) > discard
+anything generic (a bare company homepage with no listing-specific path) >
+default to the uploaded PDF's own filename > null for emails.
 
-Never discards a working link — on any failure (network error, timeout, no
-document link found), the original URL is kept as-is, since a working
-landing page is still better than nothing.
+resolve_brochure_link never discards a working link on its own - on any
+failure (network error, timeout, no document link found), the original URL
+is kept as-is, since a working landing page is still better than nothing.
 """
 
 import functools
@@ -43,6 +45,26 @@ def _normalize_url(url: str) -> str:
     if not urlparse(url).scheme:
         return f"https://{url}"
     return url
+
+
+def is_generic_link(url: str) -> bool:
+    """
+    True for a bare company homepage or top-level marketing domain with no
+    listing-specific path at all (e.g. 'workplaceplus.co.uk',
+    'https://www.workspace.co.uk/') - the exact shape of link the extraction
+    prompt is supposed to suppress on its own. This is a deterministic
+    code-level backstop for that judgment call, not a replacement for it:
+    the prompt is better placed to judge fuzzier cases (a "contact us" page,
+    a generic multi-property portfolio index) since those still have SOME
+    path. This only catches the unambiguous case - empty or "/" path, no
+    query string - so it never second-guesses a link that has any specific
+    path segment, however it eventually resolves (see resolve_brochure_link:
+    a genuine per-unit landing page that fails to resolve to a document is
+    still kept, not treated as generic).
+    """
+    parsed = urlparse(_normalize_url(url))
+    path = parsed.path.rstrip("/")
+    return not path and not parsed.query
 
 
 def _score_candidate(href: str, text: str) -> int:
@@ -118,3 +140,32 @@ def resolve_brochure_link(url: str) -> str:
         file=sys.stderr,
     )
     return resolved
+
+
+def finalize_brochure_link(raw_link, *, is_pdf: bool, own_filename: str):
+    """
+    Applies the full brochure_link priority order to whatever Gemini
+    returned for one unit:
+
+    1. A genuine, specific, per-unit link (e.g. a distinct floor-plan/
+       brochure asset tied to that unit) - used as-is, resolved through one
+       landing-page hop first if resolve_brochure_link finds a direct
+       document. Resolving (or failing to resolve) doesn't change which
+       rule applies - a genuine link stays genuine either way.
+    2. A generic link (bare company homepage/top-level domain, no
+       listing-specific path) - discarded entirely, treated as though
+       nothing was found.
+    3. Nothing genuine found (1 empty, 2 discarded) and the source is a
+       PDF - defaults to the uploaded PDF's own filename, since it
+       genuinely is the brochure for the majority of PDF uploads. This is
+       the expected default, not a last-resort fallback.
+    4. Nothing genuine found and the source is an email - stays null; an
+       email is not itself a brochure.
+    """
+    if raw_link and not is_generic_link(raw_link):
+        return resolve_brochure_link(raw_link)
+
+    if is_pdf:
+        return own_filename
+
+    return None
