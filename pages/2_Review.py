@@ -19,9 +19,10 @@ with page_setup.setup_page("review"):
     if not pending:
         st.info("No pending uploads to review.")
     else:
-        combined_df = pd.concat(
-            [load_staging_as_dataframe(path) for path in pending], ignore_index=True
-        )
+        with st.spinner("Loading..."):
+            combined_df = pd.concat(
+                [load_staging_as_dataframe(path) for path in pending], ignore_index=True
+            )
         st.caption(f"{len(pending)} pending upload(s) combined into {len(combined_df)} rows.")
 
         visible = display_utils.visible_columns(combined_df)

@@ -8,7 +8,8 @@ with page_setup.setup_page("master"):
     st.title("Master Spreadsheet")
 
     if master_writer.master_exists():
-        df = master_writer.load_master_as_dataframe()
+        with st.spinner("Loading..."):
+            df = master_writer.load_master_as_dataframe()
         st.dataframe(df[display_utils.visible_columns(df)])
 
         with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
