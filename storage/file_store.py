@@ -1,10 +1,13 @@
 """
 storage/file_store.py
 
-Manages staging .xlsx files created by the Upload page and consumed/edited
-by the Review page. Each staging upload gets its own file plus a sidecar
-.meta.json tracking {filename, timestamp, status, n_rows}, so multiple
-pending uploads can coexist before any of them is approved.
+Manages staging .xlsx files created by the Upload page and consumed by the
+Review page, which combines every currently-pending file into one table.
+Each staging upload gets its own file plus a sidecar .meta.json tracking
+{filename, timestamp, status, n_rows}, so multiple pending uploads can
+coexist before any of them is approved. Approving marks every pending file's
+status as approved; the underlying .xlsx files are never deleted or edited
+in place after that.
 """
 
 import json
@@ -13,8 +16,6 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook
-from openpyxl.styles import Font
 
 from schema import ListingRow
 from staging_writer import write_rows_to_xlsx
@@ -96,16 +97,6 @@ def load_staging_as_dataframe(path: str) -> pd.DataFrame:
 @st.cache_data(max_entries=8, ttl=3600)
 def _load_staging_as_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
     return pd.read_excel(path)
-
-
-def save_staging_dataframe(path: str, df: pd.DataFrame) -> None:
-    df.to_excel(path, index=False)
-    wb = load_workbook(path)
-    ws = wb.active
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    ws.freeze_panes = "A2"
-    wb.save(path)
 
 
 def mark_as_approved(path: str) -> None:
