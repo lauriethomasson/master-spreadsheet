@@ -183,7 +183,16 @@ def clean_email_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned)
 
 
-def extract(eml_path: Path) -> list[ListingRow]:
+def extract(eml_path: Path, original_filename: str = None) -> list[ListingRow]:
+    """
+    original_filename is the name the user actually uploaded — eml_path itself
+    is often a temp file (pages/1_Upload.py copies the upload there before
+    calling this), so eml_path.name is a randomly-generated temp name, not
+    something a person should ever see in the source_file column. Defaults
+    to eml_path.name for CLI usage, where eml_path already is the real file.
+    """
+    filename = original_filename or eml_path.name
+
     client = get_client()
     body = load_eml_body(eml_path)
     raw = call_gemini(client, PROMPT, [body])
@@ -200,7 +209,7 @@ def extract(eml_path: Path) -> list[ListingRow]:
         if not unit.get("building"):
             if not last_building:
                 print(
-                    f"Warning: {eml_path.name} unit {i} has no building and no prior "
+                    f"Warning: {filename} unit {i} has no building and no prior "
                     "unit to inherit one from — skipping this unit.",
                     file=sys.stderr,
                 )
@@ -209,7 +218,7 @@ def extract(eml_path: Path) -> list[ListingRow]:
         last_building = unit["building"]
 
         unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=False, own_filename=eml_path.name
+            unit.get("brochure_link"), is_pdf=False, own_filename=filename
         )
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
@@ -219,7 +228,7 @@ def extract(eml_path: Path) -> list[ListingRow]:
                 **fields,
                 lat=None,
                 lng=None,
-                source_file=eml_path.name,
+                source_file=filename,
             )
         )
     return rows

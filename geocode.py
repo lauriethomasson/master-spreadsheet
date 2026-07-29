@@ -189,7 +189,8 @@ def geocode_row(row: ListingRow) -> ListingRow:
 
         if result["status"] == "OK":
             log_geocode_failure(
-                row, f"Places match outside London bounding box (lat={result['lat']}, lng={result['lng']})"
+                row,
+                f"Places match outside London bounding box (lat={result['lat']}, lng={result['lng']})",
             )
             return row
 

@@ -34,10 +34,16 @@ class ExtractedFields(BaseModel):
 
 
 class ListingRow(BaseModel):
+    """
+    Same fields as ExtractedFields, plus lat/lng/source_file which are set
+    programmatically rather than by Gemini (see ExtractedFields' docstring).
+    """
+
     internal_ref: Optional[str] = None
     provider: Optional[str] = None
     address_1: Optional[str] = None
     postcode: Optional[str] = None
+    source_file: Optional[str] = None  # the real uploaded filename; never required — a phantom/blank row must still validate
     lat: Optional[float] = None
     lng: Optional[float] = None
     submarket: Optional[str] = None
@@ -58,4 +64,3 @@ class ListingRow(BaseModel):
     special_features: Optional[str] = None
     state_of_space: Optional[str] = None
     contacts: Optional[str] = None  # all contacts combined, one per line/semicolon, each as "Name, email, phone"
-    source_file: str

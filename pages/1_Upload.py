@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -12,6 +13,8 @@ from storage.file_store import save_staging_file
 
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
+
+    st.session_state.setdefault("recent_uploads", [])
 
     uploaded_files = st.file_uploader(
         "Upload one or more PDF brochures or .eml emails",
@@ -33,9 +36,9 @@ with page_setup.setup_page("upload"):
 
                     try:
                         if suffix == ".pdf":
-                            rows = extract.extract(tmp_path)
+                            rows = extract.extract(tmp_path, original_filename=uploaded_file.name)
                         elif suffix == ".eml":
-                            rows = extract_email.extract(tmp_path)
+                            rows = extract_email.extract(tmp_path, original_filename=uploaded_file.name)
                         else:
                             raise ValueError(f"Unsupported file type: {suffix}")
                     finally:
@@ -52,7 +55,18 @@ with page_setup.setup_page("upload"):
                     stems = "_".join(Path(f.name).stem for f in uploaded_files)
                     batch_name = stems if len(stems) < 60 else f"batch_of_{len(uploaded_files)}_files"
 
-                save_staging_file(all_rows, batch_name)
+                staging_path = save_staging_file(all_rows, batch_name)
+
+                st.session_state["recent_uploads"].insert(
+                    0,
+                    {
+                        "batch_name": batch_name,
+                        "n_files": len(uploaded_files),
+                        "n_rows": len(all_rows),
+                        "staging_path": staging_path,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    },
+                )
 
                 st.success(
                     f"Extracted {len(all_rows)} rows from {len(uploaded_files)} file(s). "
@@ -65,3 +79,16 @@ with page_setup.setup_page("upload"):
             finally:
                 if tmp_path is not None:
                     tmp_path.unlink(missing_ok=True)
+
+    if st.session_state["recent_uploads"]:
+        st.divider()
+        st.subheader("Uploaded this session")
+        st.caption(
+            "Stays visible across page navigation even though the file picker above "
+            "resets — each of these has already been extracted and staged."
+        )
+        for entry in st.session_state["recent_uploads"]:
+            st.write(
+                f"✅ **{entry['batch_name']}** — {entry['n_rows']} row(s) from "
+                f"{entry['n_files']} file(s), {entry['timestamp']}"
+            )

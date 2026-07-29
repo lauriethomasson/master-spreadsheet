@@ -17,13 +17,24 @@ RANGE_COLUMNS = [
     "rent_pcm_max",
 ]
 
+# Unlike RANGE_COLUMNS (hidden only when every row is empty), these are
+# internal/traceability-only columns that never belong in front of Mark/Laurie
+# regardless of whether they have a value - still written to the underlying
+# .xlsx (see write_rows_to_xlsx), just never rendered here.
+ALWAYS_HIDDEN_COLUMNS = [
+    "source_file",
+]
+
 
 def visible_columns(df: pd.DataFrame) -> list:
-    """All of df's columns, minus RANGE_COLUMNS when no row has a value in any of them."""
+    """All of df's columns, minus RANGE_COLUMNS when no row has a value in any
+    of them, minus ALWAYS_HIDDEN_COLUMNS unconditionally."""
     present = [c for c in RANGE_COLUMNS if c in df.columns]
     if present and df[present].notna().any().any():
-        return list(df.columns)
-    return [c for c in df.columns if c not in RANGE_COLUMNS]
+        columns = list(df.columns)
+    else:
+        columns = [c for c in df.columns if c not in RANGE_COLUMNS]
+    return [c for c in columns if c not in ALWAYS_HIDDEN_COLUMNS]
 
 
 def restore_hidden_columns(edited_df: pd.DataFrame, original_df: pd.DataFrame) -> pd.DataFrame:

@@ -112,7 +112,17 @@ def render_pages(pdf_path: Path) -> list[types.Part]:
     return parts
 
 
-def extract(pdf_path: Path) -> list[ListingRow]:
+def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
+    """
+    original_filename is the name the user actually uploaded — pdf_path itself
+    is often a temp file (pages/1_Upload.py copies the upload there before
+    calling this), so pdf_path.name is a randomly-generated temp name, not
+    something a person should ever see in a brochure_link fallback or in the
+    source_file column. Defaults to pdf_path.name for CLI usage, where pdf_path
+    already is the real file.
+    """
+    filename = original_filename or pdf_path.name
+
     client = get_client()
     images = render_pages(pdf_path)
     raw = call_gemini(client, PROMPT, images)
@@ -131,7 +141,7 @@ def extract(pdf_path: Path) -> list[ListingRow]:
         if not unit.get("building"):
             if not last_building:
                 print(
-                    f"Warning: {pdf_path.name} unit {i} has no building and no prior "
+                    f"Warning: {filename} unit {i} has no building and no prior "
                     "unit to inherit one from — skipping this unit.",
                     file=sys.stderr,
                 )
@@ -140,7 +150,7 @@ def extract(pdf_path: Path) -> list[ListingRow]:
         last_building = unit["building"]
 
         unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=True, own_filename=pdf_path.name
+            unit.get("brochure_link"), is_pdf=True, own_filename=filename
         )
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
@@ -150,7 +160,7 @@ def extract(pdf_path: Path) -> list[ListingRow]:
                 **fields,
                 lat=None,
                 lng=None,
-                source_file=pdf_path.name,
+                source_file=filename,
             )
         )
     return rows
