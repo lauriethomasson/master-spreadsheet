@@ -6,6 +6,13 @@ gets written to the staging/master .xlsx files — only what's rendered.
 """
 
 import pandas as pd
+import streamlit as st
+
+# Columns holding a URL - rendered as a clickable link with a fixed label
+# instead of the raw URL (which would otherwise make the table unreadable).
+LINK_COLUMNS = [
+    "brochure_link",
+]
 
 RANGE_COLUMNS = [
     "size_sqft_min",
@@ -35,6 +42,19 @@ def visible_columns(df: pd.DataFrame) -> list:
     else:
         columns = [c for c in df.columns if c not in RANGE_COLUMNS]
     return [c for c in columns if c not in ALWAYS_HIDDEN_COLUMNS]
+
+
+def link_column_config(df: pd.DataFrame) -> dict:
+    """column_config for st.dataframe/st.data_editor: renders every column in
+    LINK_COLUMNS that's actually present in df as a clickable link showing a
+    short fixed label rather than the raw URL. Editing still works exactly as
+    before (LinkColumn behaves like a text input when edited) - this only
+    changes how a cell is displayed, not what's stored."""
+    return {
+        col: st.column_config.LinkColumn(display_text="Open brochure")
+        for col in LINK_COLUMNS
+        if col in df.columns
+    }
 
 
 def restore_hidden_columns(edited_df: pd.DataFrame, original_df: pd.DataFrame) -> pd.DataFrame:

@@ -32,7 +32,13 @@ with page_setup.setup_page("review"):
         st.caption(f"{len(pending)} pending upload(s) combined into {len(combined_df)} rows.")
 
         visible = display_utils.visible_columns(combined_df)
-        edited_visible = st.data_editor(combined_df[visible], num_rows="fixed", width="stretch", height=600)
+        edited_visible = st.data_editor(
+            combined_df[visible],
+            num_rows="fixed",
+            width="stretch",
+            height=600,
+            column_config=display_utils.link_column_config(combined_df[visible]),
+        )
         edited_df = display_utils.restore_hidden_columns(edited_visible, combined_df)
 
         if st.button("Approve → Master", type="primary"):
@@ -63,7 +69,8 @@ with page_setup.setup_page("review"):
         if master_writer.master_exists():
             with st.spinner("Loading..."):
                 df = master_writer.load_master_as_dataframe()
-            st.dataframe(df[display_utils.visible_columns(df)])
+            visible_master = df[display_utils.visible_columns(df)]
+            st.dataframe(visible_master, column_config=display_utils.link_column_config(visible_master))
 
             with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
                 st.download_button(
