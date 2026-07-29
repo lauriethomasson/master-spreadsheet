@@ -9,6 +9,8 @@ from gemini_client import QuotaExceededError
 from geocode import geocode_rows
 from storage.file_store import save_staging_file
 
+st.set_page_config(page_title="Master Spreadsheet Pipeline", page_icon="📋", layout="wide")
+
 st.title("Upload Brochure")
 
 uploaded_files = st.file_uploader(
