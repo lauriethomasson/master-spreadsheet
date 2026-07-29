@@ -40,10 +40,8 @@ The email body has this general shape:
 Extract the following email-level information (who sent this, not which property it's about):
 - provider: the company/agent whose availability this is (e.g. "GPE", "MetSpace"). This is
   usually clear from the branding/sender context, not necessarily the literal email address
-  domain or legal entity name (e.g. use "MetSpace" not "Metspace London LTD").
-- brochure_link: only a clean, directly-readable URL if one is plainly present in the text —
-  do NOT attempt to decode or reconstruct a URL from redirect/tracking parameters. If every link
-  in the document is an obfuscated tracking redirect, leave this null.
+  domain or legal entity name (e.g. use "MetSpace" not "Metspace London LTD"). If genuinely
+  no sender/branding is identifiable, leave this null rather than guessing.
 - contacts: every named contact person listed (typically in a "Get in touch"/"Contact" section),
   each as "Name, email, phone" — omit whichever of email/phone isn't given for that person. Join
   multiple contacts with "; ".
@@ -99,12 +97,17 @@ Also extract for each unit:
   "Av: Now" / "Available: Now", "Av: Sept" → "Available: September").
 - state_of_space: the fit-out condition if stated (e.g. "Fitted", "Fully Managed"). If ambiguous
   or unstated for this particular unit, leave this null rather than guessing.
+- brochure_link: only a clean, directly-readable URL if one is plainly present in the text for THIS
+  SPECIFIC unit/listing — do NOT attempt to decode or reconstruct a URL from redirect/tracking
+  parameters. If every link near this unit is an obfuscated tracking redirect, leave this null. Never
+  take a link that belongs to one specific listing and reuse it for a different, unrelated unit — if
+  the document has one shared portfolio-level link that clearly applies to the whole email (not to
+  any one specific listing), use that for every unit instead.
 
 Return your answer as a single JSON object with this exact structure:
 
 {
-  "provider": "...",
-  "brochure_link": "..." or null,
+  "provider": "..." or null,
   "contacts": "..." or null,
   "units": [
     {
@@ -122,6 +125,7 @@ Return your answer as a single JSON object with this exact structure:
       "rent_psf": number or null,
       "rent_psf_min": number or null,
       "rent_psf_max": number or null,
+      "brochure_link": "..." or null,
       "special_features": "..." or null,
       "state_of_space": "..." or null
     }
@@ -174,7 +178,6 @@ def extract(eml_path: Path) -> list[ListingRow]:
     brochure = {
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),
-        "brochure_link": raw.get("brochure_link"),
         "contacts": raw.get("contacts"),
     }
 

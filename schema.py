@@ -9,8 +9,8 @@ class ExtractedFields(BaseModel):
     (set from upload metadata) — those never go in the extraction prompt.
     """
 
-    internal_ref: str
-    provider: str
+    internal_ref: Optional[str] = None  # mirrors provider — null for landlord-direct brochures with no named agent
+    provider: Optional[str] = None      # some brochures are produced directly by a landlord with no presenting agent
     address_1: Optional[str] = None  # not every source (e.g. email listings) states a street address
     postcode: Optional[str] = None   # same — never fabricate, leave null if not stated
     submarket: Optional[str] = None
@@ -34,8 +34,8 @@ class ExtractedFields(BaseModel):
 
 
 class ListingRow(BaseModel):
-    internal_ref: str
-    provider: str
+    internal_ref: Optional[str] = None
+    provider: Optional[str] = None
     address_1: Optional[str] = None
     postcode: Optional[str] = None
     lat: Optional[float] = None

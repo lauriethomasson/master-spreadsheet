@@ -19,8 +19,9 @@ including tables, floor plans, and photo captions.
 Extract the following brochure-level information (these describe who is presenting this
 brochure, not which property it's about — they apply to the whole document regardless of
 how many properties or units it covers):
-- provider: the company/agent presenting this brochure (e.g. "Breezblok", "GPE", "The Crown Estate Workplaces")
-- brochure_link: any URL present in the document (e.g. a portfolio page link), otherwise null
+- provider: the company/agent presenting this brochure (e.g. "Breezblok", "GPE", "The Crown Estate Workplaces").
+  Some brochures are produced directly by a landlord/developer with no presenting agent named anywhere —
+  in that case leave this null rather than guessing or using the building/property name as a stand-in.
 - contacts: every contact person or generic contact listed in the document (e.g. "Sales" if no named
   person is given). Format each contact as "Name, email, phone" — omit any of the three pieces that
   aren't given. If there are multiple contacts, join them with "; ".
@@ -56,6 +57,11 @@ Also extract for each unit:
   the document. Do not calculate this yourself — leave null if not directly given.
 - rent_psf: rent per square foot as a plain number, ONLY if explicitly stated in the document. Do not
   calculate this yourself — leave null if not directly given.
+- brochure_link: a URL for this specific unit/listing (e.g. a "view listing" or floorplan link), if one is
+  clearly given for it. If the document instead has one shared portfolio-level link that applies to the
+  whole document (not to any one specific listing), use that for every unit. Never take a link that belongs
+  to one specific listing and reuse it for a different, unrelated unit — leave it null for units that don't
+  have their own link when the only link found belongs to another listing.
 - special_features: a semicolon-separated list of notable amenities, inclusions, or notes
   (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth")
 - state_of_space: the fit-out condition if stated or clearly implied (e.g. "Fitted", "Fully Managed",
@@ -64,8 +70,7 @@ Also extract for each unit:
 Return your answer as a single JSON object with this exact structure:
 
 {
-  "provider": "...",
-  "brochure_link": "..." or null,
+  "provider": "..." or null,
   "contacts": "..." or null,
   "units": [
     {
@@ -78,6 +83,7 @@ Return your answer as a single JSON object with this exact structure:
       "desks_max": integer or null,
       "rent_pcm": number or null,
       "rent_psf": number or null,
+      "brochure_link": "..." or null,
       "special_features": "..." or null,
       "state_of_space": "..." or null
     }
@@ -108,7 +114,6 @@ def extract(pdf_path: Path) -> list[ListingRow]:
     brochure = {
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),
-        "brochure_link": raw.get("brochure_link"),
         "contacts": raw.get("contacts"),
     }
 
