@@ -70,13 +70,22 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool) -> d
 
 
 def _render_master_table(df: pd.DataFrame, key: str):
-    """Full master, browsable and row-selectable (for the export step) - every
+    """
+    Full master, browsable and row-selectable (for the export step) - every
     column but Select is disabled so this stays a read/select view, never a
-    silent side door for editing master data outside the diff-and-merge flow."""
+    silent side door for editing master data outside the diff-and-merge flow.
+
+    The current selection (full rows, all columns including the ones hidden
+    from this display) is written to session_state on every render, not just
+    on a button click - Streamlit reruns this whole script on each checkbox
+    toggle, so by the time the user clicks the shared "Export →" nav button
+    at the bottom of the page, session_state already reflects whatever is
+    currently checked.
+    """
     visible = display_utils.visible_columns(df)
     display_df = df[visible].copy()
     display_df.insert(0, "Select", False)
-    st.data_editor(
+    edited = st.data_editor(
         display_df,
         column_config={
             "Select": st.column_config.CheckboxColumn(required=True),
@@ -87,6 +96,10 @@ def _render_master_table(df: pd.DataFrame, key: str):
         height=600,
         key=key,
     )
+
+    selected_positions = edited.index[edited["Select"]].tolist()
+    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
+    st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
 
 
 def _render_full_master_view():
