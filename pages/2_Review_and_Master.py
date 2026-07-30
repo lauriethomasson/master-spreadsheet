@@ -22,15 +22,6 @@ def _empty_master_df() -> pd.DataFrame:
     return pd.DataFrame(columns=list(ListingRow.model_fields.keys()))
 
 
-def _row_label(row_dict: dict) -> str:
-    parts = [row_dict.get("building") or "(no building)"]
-    if row_dict.get("provider"):
-        parts.append(row_dict["provider"])
-    if row_dict.get("floor_unit"):
-        parts.append(row_dict["floor_unit"])
-    return " — ".join(parts)
-
-
 def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool) -> dict:
     """
     Renders one line per changed field: name, old value, editable new value,
@@ -90,6 +81,7 @@ def _render_master_table(df: pd.DataFrame, key: str):
         column_config={
             "Select": st.column_config.CheckboxColumn(required=True),
             **display_utils.link_column_config(display_df),
+            **display_utils.wide_text_column_config(display_df),
         },
         disabled=[c for c in display_df.columns if c != "Select"],
         width="stretch",
@@ -101,6 +93,8 @@ def _render_master_table(df: pd.DataFrame, key: str):
     st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
     st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
 
+    display_utils.render_row_detail(df, key=f"{key}_detail")
+
 
 def _render_full_master_view():
     if st.session_state.pop("just_approved", False):
@@ -111,7 +105,7 @@ def _render_full_master_view():
         return
 
     with st.spinner("Loading..."):
-        df = master_writer.load_master_as_dataframe()
+        df = display_utils.sort_by_provider(master_writer.load_master_as_dataframe())
 
     _render_master_table(df, key="master_table_default_view")
 
@@ -125,14 +119,16 @@ def _render_full_master_view():
     log = master_writer.get_master_write_log()
     if log:
         last = log[-1]
-        st.caption(f"Last updated: {last['timestamp']} — {last['row_count']} rows")
+        st.caption(
+            f"Last updated: {display_utils.to_london_display(last['timestamp'])} — {last['row_count']} rows"
+        )
 
 
 def _render_pending_review(pending: list):
     with st.spinner("Loading..."):
-        combined_df = pd.concat(
+        combined_df = display_utils.sort_by_provider(pd.concat(
             [load_staging_as_dataframe(path) for path in pending], ignore_index=True
-        )
+        ))
         new_rows = dataframe_to_listing_rows(combined_df)
         master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
         plan = master_merge.build_merge_plan(new_rows, master_df)
@@ -189,7 +185,7 @@ def _render_pending_review(pending: list):
                 continue
 
             prefix = "⚠️ " if is_collision else ""
-            label = f"{prefix}{_row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
+            label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
             with st.expander(label):
                 key_prefix = f"matched_{i}_{m.property_id}"
                 approved_fields = _render_field_rows(m.diffs, key_prefix, default_checked=not is_collision)
@@ -204,7 +200,7 @@ def _render_pending_review(pending: list):
             st.subheader("No match found — will be added as new")
         master_options = {"— add as new —": None}
         for rec in plan.master_records:
-            master_options[f"{_row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
+            master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
 
         for i, u in enumerate(plan.unmatched):
             is_collision = id(u) in colliding_unmatched_ids
@@ -215,7 +211,7 @@ def _render_pending_review(pending: list):
             row_dict = u.new_row.model_dump()
             key_prefix = f"unmatched_{i}"
             prefix = "⚠️ " if is_collision else ""
-            with st.expander(f"{prefix}{_row_label(row_dict)}"):
+            with st.expander(f"{prefix}{display_utils.row_label(row_dict)}"):
                 summary = {
                     k: v for k, v in row_dict.items()
                     if k not in ("property_id", "source_file") and v not in (None, "")
@@ -225,7 +221,7 @@ def _render_pending_review(pending: list):
                 if u.suggestions:
                     st.caption(
                         "Possible near-misses already in the master: "
-                        + ", ".join(_row_label(s) for s in u.suggestions)
+                        + ", ".join(display_utils.row_label(s) for s in u.suggestions)
                     )
 
                 choice_label = st.selectbox(
@@ -299,7 +295,7 @@ with page_setup.setup_page("review"):
         else:
             for v in versions:
                 cols = st.columns([3, 4, 2])
-                cols[0].write(v["timestamp"] or "—")
+                cols[0].write(display_utils.to_london_display(v["timestamp"]) if v["timestamp"] else "—")
                 cols[1].write(v["label"])
                 restore_key = f"restore_{v['path']}"
                 pending_key = f"{restore_key}_pending"
@@ -310,8 +306,8 @@ with page_setup.setup_page("review"):
                 if st.session_state.get(pending_key):
                     st.warning(
                         f"This replaces the current master.xlsx with the version from "
-                        f"{v['timestamp']}. This itself creates a new version, so it can "
-                        f"be undone."
+                        f"{display_utils.to_london_display(v['timestamp'])}. This itself creates a "
+                        f"new version, so it can be undone."
                     )
                     confirm_cols = st.columns(2)
                     if confirm_cols[0].button("Confirm restore", key=f"{restore_key}_confirm", type="primary"):

@@ -23,15 +23,22 @@ with page_setup.setup_page("export"):
             "want, then come back here."
         )
     else:
+        selected_df = display_utils.sort_by_provider(selected_df)
         visible = display_utils.visible_columns(selected_df)
         edited_visible = st.data_editor(
             selected_df[visible],
             num_rows="fixed",
             width="stretch",
-            column_config=display_utils.link_column_config(selected_df[visible]),
+            column_config={
+                **display_utils.link_column_config(selected_df[visible]),
+                **display_utils.wide_text_column_config(selected_df[visible]),
+            },
             key="export_editor",
         )
         edited_full = display_utils.restore_hidden_columns(edited_visible, selected_df)
+
+        display_utils.render_row_detail(edited_full, key="export_detail_view")
+
         rows = dataframe_to_listing_rows(edited_full)
 
         buffer = BytesIO()

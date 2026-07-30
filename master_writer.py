@@ -167,6 +167,15 @@ def write_master(
     new_count: int = None,
     updated_count: int = None,
 ):
+    # Grouped by provider regardless of what order the merge upstream
+    # produced (matched rows keep their prior on-disk position, new rows
+    # are appended at the end) - sorting here, at the single write choke
+    # point, guarantees the invariant holds after every write rather than
+    # depending on every call site remembering to sort. Stable and
+    # case-insensitive; rows with no provider sort last.
+    approved_rows = sorted(
+        approved_rows, key=lambda r: (r.provider is None, (r.provider or "").lower())
+    )
     try:
         buffer = BytesIO()
         write_rows_to_xlsx(approved_rows, buffer)

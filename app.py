@@ -8,6 +8,7 @@ import extract
 import extract_email
 import page_flow
 import page_setup
+from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 from geocode import geocode_rows
 from storage.file_store import save_staging_file
@@ -65,7 +66,7 @@ with page_setup.setup_page("upload"):
                             "filename": uploaded_file.name,
                             "n_rows": len(rows),
                             "staging_path": staging_path,
-                            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                            "timestamp": datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M %Z"),
                         },
                     )
 

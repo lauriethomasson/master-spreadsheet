@@ -71,9 +71,16 @@ Also extract for each unit:
   preferences", "manage your subscription", or "email preferences", it must NEVER be used as a brochure_link,
   even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
 - special_features: a semicolon-separated list of notable amenities, inclusions, or notes
-  (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth")
-- state_of_space: the fit-out condition if stated or clearly implied (e.g. "Fitted", "Fully Managed",
-  "Shell and Core", "Ready to Fit", "Cat A"). Leave null if genuinely unclear.
+  (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth"). Fit-out timing/
+  completion details belong here too, as descriptive text (e.g. "Fit out to be completed in
+  July 2026") — never in state_of_space, which only ever holds the fit-out category itself.
+- state_of_space: the physical fit-out condition/readiness of the space — NOT when it becomes
+  available, which is a timing detail and belongs in special_features instead (see above), not
+  here. Capture this whenever the document states or clearly implies it, using the source's own
+  wording where possible (e.g. "Fully Fitted", "Partially Fitted", "Fitout Underway",
+  "Fully Managed", "Cat A", "Shell & Core", "Ready to Fit"). A space still being fitted out is
+  still a real value here (e.g. "Fitout Underway") — that's not a reason to leave this null.
+  Leave null only if the document truly gives no indication of fit-out condition at all.
 
 Return your answer as a single JSON object with this exact structure:
 

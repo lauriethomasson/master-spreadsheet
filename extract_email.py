@@ -94,10 +94,17 @@ Also extract for each unit:
     metric — pick whichever the source actually shows.
 - special_features: the bullet-point features listed for that building (if any), semicolon-joined
   with the desk "+" qualifiers described above, any inline caveat near that specific unit (e.g.
-  "Reduced pricing for a limited time only*"), and an availability note if one is given (e.g.
-  "Av: Now" / "Available: Now", "Av: Sept" → "Available: September").
-- state_of_space: the fit-out condition if stated (e.g. "Fitted", "Fully Managed"). If ambiguous
-  or unstated for this particular unit, leave this null rather than guessing.
+  "Reduced pricing for a limited time only*"), an availability note if one is given (e.g.
+  "Av: Now" / "Available: Now", "Av: Sept" → "Available: September"), and any fit-out completion/
+  timing detail (e.g. "Fit out to be completed September 2026") — these stay here as descriptive
+  text, never in state_of_space.
+- state_of_space: the physical fit-out condition/readiness of the space — NOT when it becomes
+  available, which is a timing detail and belongs in special_features instead (see above), not
+  here. Capture this whenever the document states or clearly implies it, using the source's own
+  wording where possible (e.g. "Fully Fitted", "Partially Fitted", "Fitout Underway",
+  "Fully Managed", "Cat A", "Shell & Core", "Ready to Fit"). A space still being fitted out is
+  still a real value here (e.g. "Fitout Underway") — that's not a reason to leave this null.
+  Leave null only if the document truly gives no indication of fit-out condition at all.
 - brochure_link: any link-tracking redirects in the email body have already been resolved to their
   real destination before you see this text, so a URL you see here can be used directly — but only
   treat it as THIS unit's brochure_link candidate if it sits close to that specific building/listing
@@ -132,8 +139,8 @@ Return your answer as a single JSON object with this exact structure:
       "size_sqft": number or null,
       "size_sqft_min": number or null,
       "size_sqft_max": number or null,
-      "desks_max": integer or null,
       "desks_min": integer or null,
+      "desks_max": integer or null,
       "rent_pcm": number or null,
       "rent_psf": number or null,
       "rent_psf_min": number or null,

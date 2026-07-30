@@ -17,8 +17,8 @@ class ExtractedFields(BaseModel):
     building: str
     floor_unit: Optional[str] = None
     size_sqft: Optional[float] = None        # single unit's size — normal case, unchanged
-    desks_max: Optional[int] = None          # single unit's desk count, OR the upper bound of a range if desks_min is also set
     desks_min: Optional[int] = None          # only populated for a genuine range-group row (e.g. "24-58 desks")
+    desks_max: Optional[int] = None          # single unit's desk count, OR the upper bound of a range if desks_min is also set
     size_sqft_min: Optional[float] = None    # only populated for a genuine range-group row
     size_sqft_max: Optional[float] = None    # only populated for a genuine range-group row
     rent_pcm: Optional[float] = None
@@ -51,8 +51,8 @@ class ListingRow(BaseModel):
     building: str
     floor_unit: Optional[str] = None
     size_sqft: Optional[float] = None
-    desks_max: Optional[int] = None
     desks_min: Optional[int] = None
+    desks_max: Optional[int] = None
     size_sqft_min: Optional[float] = None
     size_sqft_max: Optional[float] = None
     rent_pcm: Optional[float] = None
