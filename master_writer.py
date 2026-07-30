@@ -32,7 +32,7 @@ import streamlit as st
 from openpyxl import load_workbook
 
 from schema import ListingRow
-from staging_writer import write_rows_to_xlsx
+from staging_writer import read_xlsx_with_hyperlinks, write_rows_to_xlsx
 from storage import blob_store
 
 DEFAULT_MASTER_PATH = "data/master.xlsx"
@@ -56,7 +56,7 @@ def load_master_as_dataframe(master_path: str = DEFAULT_MASTER_PATH) -> pd.DataF
 
 @st.cache_data(max_entries=4, ttl=3600)
 def _load_master_as_dataframe_cached(master_path: str, mtime: float) -> pd.DataFrame:
-    return pd.read_excel(BytesIO(blob_store.read_bytes(master_path)))
+    return read_xlsx_with_hyperlinks(blob_store.read_bytes(master_path))
 
 
 def get_master_write_log(log_path: str = LOG_PATH) -> list:

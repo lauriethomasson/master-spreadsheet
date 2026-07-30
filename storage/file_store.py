@@ -23,7 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from schema import ListingRow
-from staging_writer import write_rows_to_xlsx
+from staging_writer import read_xlsx_with_hyperlinks, write_rows_to_xlsx
 from storage import blob_store
 
 STAGING_PREFIX = "staging"
@@ -101,7 +101,7 @@ def load_staging_as_dataframe(path: str) -> pd.DataFrame:
 
 @st.cache_data(max_entries=8, ttl=3600)
 def _load_staging_as_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
-    return pd.read_excel(BytesIO(blob_store.read_bytes(path)))
+    return read_xlsx_with_hyperlinks(blob_store.read_bytes(path))
 
 
 def mark_as_approved(path: str) -> None:

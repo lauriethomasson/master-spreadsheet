@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from master_merge import row_label  # noqa: F401 - re-exported for display_utils.row_label(...) call sites
+from staging_writer import HYPERLINK_DISPLAY_TEXT
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
@@ -69,7 +70,7 @@ def link_column_config(df: pd.DataFrame) -> dict:
     before (LinkColumn behaves like a text input when edited) - this only
     changes how a cell is displayed, not what's stored."""
     return {
-        col: st.column_config.LinkColumn(display_text="Open Brochure")
+        col: st.column_config.LinkColumn(display_text=HYPERLINK_DISPLAY_TEXT)
         for col in LINK_COLUMNS
         if col in df.columns
     }

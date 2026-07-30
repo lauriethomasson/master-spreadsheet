@@ -1,8 +1,10 @@
 import json
 import sys
+from io import BytesIO
 from pathlib import Path
 
-from openpyxl import Workbook
+import pandas as pd
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
@@ -13,9 +15,14 @@ MAX_COLUMN_WIDTH = 40
 
 # Columns holding a URL - given a real openpyxl hyperlink (not just plain text)
 # so the cell is directly clickable when the .xlsx is opened in Excel/Google
-# Sheets, not just styled to look like a link.
+# Sheets, not just styled to look like a link. The cell's displayed text is
+# HYPERLINK_DISPLAY_TEXT, not the (often long, unreadable) raw URL - the real
+# URL only ever lives in the hyperlink target from that point on, which is
+# exactly why every read-back of a written file (read_xlsx_with_hyperlinks
+# below) has to recover it from there instead of the cell's plain value.
 HYPERLINK_COLUMNS = ["brochure_link"]
 HYPERLINK_FONT = Font(color="0563C1", underline="single")
+HYPERLINK_DISPLAY_TEXT = "Open Brochure"
 
 # Columns that regularly hold long text (a multi-sentence description, several
 # contacts, or a long URL) - wrapped so the full value is visible on several
@@ -93,12 +100,42 @@ def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
             for row_idx in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
                 if cell.value:
-                    cell.hyperlink = cell.value
+                    url = cell.value
+                    cell.hyperlink = url
+                    cell.value = HYPERLINK_DISPLAY_TEXT
                     cell.font = HYPERLINK_FONT
 
     if isinstance(output, (str, Path)):
         Path(output).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
+
+
+def read_xlsx_with_hyperlinks(data: bytes) -> pd.DataFrame:
+    """
+    Reads a workbook written by write_rows_to_xlsx() back into a DataFrame -
+    like pd.read_excel(), except for HYPERLINK_COLUMNS, where the cell's
+    displayed text is HYPERLINK_DISPLAY_TEXT rather than the real URL (see
+    write_rows_to_xlsx). pd.read_excel only ever sees that displayed text,
+    which would silently replace every brochure_link with the literal string
+    "Open Brochure" on every read-back after a write - reads the cell's
+    actual hyperlink target instead for those columns; every other column
+    is read exactly as pd.read_excel would.
+    """
+    wb = load_workbook(BytesIO(data))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+    hyperlink_col_indices = {i for i, h in enumerate(headers) if h in HYPERLINK_COLUMNS}
+
+    records = []
+    for row in ws.iter_rows(min_row=2):
+        record = {}
+        for col_idx, cell in enumerate(row):
+            if col_idx in hyperlink_col_indices and cell.hyperlink is not None:
+                record[headers[col_idx]] = cell.hyperlink.target
+            else:
+                record[headers[col_idx]] = cell.value
+        records.append(record)
+    return pd.DataFrame(records, columns=headers)
 
 
 def main():
