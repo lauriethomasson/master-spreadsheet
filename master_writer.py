@@ -1,15 +1,25 @@
 """
 master_writer.py
 
-Replaces the entire master spreadsheet with an approved batch of rows.
+Owns every write to the cumulative master spreadsheet, and the versioned-
+backup/restore mechanism that rides along with every such write.
 
-Safe against partial failure: the new workbook is built and validated in
-memory first, and only written to its final location (via blob_store -
-local disk or a GCS bucket, depending on configuration) once that
-validation passes. blob_store.write_bytes() itself is atomic on both
-backends (temp-file-then-rename locally; a single upload is inherently
-atomic on GCS), so a reader never sees a partially-written file and a
-failure before that write leaves the existing master.xlsx untouched.
+The write itself stays a full atomic rewrite (build the complete desired
+xlsx in memory, one blob_store.write_bytes() call), never a cell-level
+patch of the existing file - master_merge.py computes the complete new
+content (existing master rows, minus the fields a user approved changing,
+plus brand-new rows) before this module ever touches storage. That keeps
+the exact same crash-safety guarantees the original wipe-and-replace
+design had, just fed a cumulative row list instead of one batch's rows.
+
+Every successful write to master.xlsx - whether from a normal approval or
+a restore - also writes a timestamped snapshot to versions/, then prunes
+versions/ down to the most recent MAX_VERSIONS. Versioning is best-effort
+bookkeeping riding on top of an already-successful live write, not part of
+the same all-or-nothing operation: if the live master.xlsx write succeeds,
+that's success as far as the caller/log/UI are concerned, even if the
+version snapshot or pruning step then has a problem - the live data never
+gets held hostage by that secondary bookkeeping. See _snapshot_version.
 """
 
 import json
@@ -27,6 +37,8 @@ from storage import blob_store
 
 DEFAULT_MASTER_PATH = "data/master.xlsx"
 LOG_PATH = "data/master_write_log.jsonl"
+VERSIONS_PREFIX = "versions"
+MAX_VERSIONS = 30
 
 
 def master_exists(master_path: str = DEFAULT_MASTER_PATH) -> bool:
@@ -59,18 +71,102 @@ def _get_master_write_log_cached(log_path: str, mtime: float) -> list:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-def log_master_write(success: bool, row_count: int = None, error: str = None):
+def log_master_write(
+    success: bool,
+    row_count: int = None,
+    error: str = None,
+    source: str = "approve",
+    new_count: int = None,
+    updated_count: int = None,
+    version_path: str = None,
+    timestamp: str = None,
+):
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
         "success": success,
         "row_count": row_count,
         "error": error,
+        "source": source,
+        "new_count": new_count,
+        "updated_count": updated_count,
+        "version_path": version_path,
     }
     blob_store.append_text(LOG_PATH, json.dumps(entry) + "\n")
     print(f"[master_writer] {entry}", file=sys.stderr)
 
 
-def write_master(approved_rows: list[ListingRow], master_path: str = DEFAULT_MASTER_PATH):
+def _version_path(stamp: str) -> str:
+    return f"{VERSIONS_PREFIX}/master_{stamp}.xlsx"
+
+
+def _snapshot_version(data: bytes, stamp: str):
+    """
+    Best-effort: writes a timestamped copy of `data` to versions/ and prunes
+    old ones beyond MAX_VERSIONS. Never raises - a hiccup here must not turn
+    an already-successful live master.xlsx write into a reported failure.
+    Returns the version's path on success, None if the snapshot itself
+    failed (a pruning failure is swallowed too, but doesn't change the
+    return value - the snapshot existing is what matters for restore).
+    """
+    path = _version_path(stamp)
+    try:
+        blob_store.write_bytes(path, data)
+    except Exception as e:
+        print(f"[master_writer] WARNING: version snapshot failed: {e}", file=sys.stderr)
+        return None
+
+    try:
+        versions = sorted(blob_store.list_with_mtimes(VERSIONS_PREFIX, ".xlsx"), key=lambda pair: pair[0])
+        excess = len(versions) - MAX_VERSIONS
+        if excess > 0:
+            for old_path, _mtime in versions[:excess]:
+                blob_store.delete(old_path)
+    except Exception as e:
+        print(f"[master_writer] WARNING: version pruning failed: {e}", file=sys.stderr)
+
+    return path
+
+
+def list_versions(limit: int = None) -> list:
+    """
+    Most-recent-first list of {path, timestamp, label} for the version
+    history UI, joined against master_write_log.jsonl (matched by the
+    version_path shared between a write's log entry and its version
+    snapshot) for a human-readable change summary when available.
+    """
+    versions = sorted(blob_store.list_with_mtimes(VERSIONS_PREFIX, ".xlsx"), key=lambda pair: pair[0], reverse=True)
+    if limit:
+        versions = versions[:limit]
+
+    log_by_version_path = {}
+    for entry in get_master_write_log():
+        vp = entry.get("version_path")
+        if vp:
+            log_by_version_path[vp] = entry
+
+    result = []
+    for path, _mtime in versions:
+        entry = log_by_version_path.get(path)
+        if entry is None:
+            result.append({"path": path, "timestamp": None, "label": "—"})
+            continue
+
+        source = entry.get("source", "approve")
+        if source.startswith("restore:"):
+            label = f"Restored from {source.split(':', 1)[1]}"
+        else:
+            new_c, upd_c = entry.get("new_count"), entry.get("updated_count")
+            label = f"{upd_c or 0} updated, {new_c or 0} new" if (new_c is not None or upd_c is not None) else "Approved upload"
+        result.append({"path": path, "timestamp": entry["timestamp"], "label": label})
+    return result
+
+
+def write_master(
+    approved_rows: list[ListingRow],
+    master_path: str = DEFAULT_MASTER_PATH,
+    new_count: int = None,
+    updated_count: int = None,
+):
     try:
         buffer = BytesIO()
         write_rows_to_xlsx(approved_rows, buffer)
@@ -85,12 +181,60 @@ def write_master(approved_rows: list[ListingRow], master_path: str = DEFAULT_MAS
                 f"got {actual_row_count} in written file"
             )
 
-        blob_store.write_bytes(master_path, buffer.getvalue())
-        log_master_write(success=True, row_count=len(approved_rows))
-
+        data = buffer.getvalue()
+        blob_store.write_bytes(master_path, data)
     except Exception as e:
-        log_master_write(success=False, error=str(e))
+        log_master_write(success=False, error=str(e), source="approve")
         raise
+
+    # Milliseconds, not just seconds - two writes landing in the same second
+    # (a fast successive approve+restore, or just an unlucky click) would
+    # otherwise produce the same version filename and silently overwrite
+    # each other's snapshot instead of keeping both.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
+    version_path = _snapshot_version(data, stamp)
+    log_master_write(
+        success=True,
+        row_count=len(approved_rows),
+        source="approve",
+        new_count=new_count,
+        updated_count=updated_count,
+        version_path=version_path,
+        timestamp=stamp,
+    )
+
+
+def restore_version(version_path: str, master_path: str = DEFAULT_MASTER_PATH):
+    """
+    Restoring is just another write, not a separate code path: it replaces
+    the live master.xlsx with a historical version's exact bytes (no
+    re-serialization through ListingRow/write_rows_to_xlsx, which would risk
+    subtly altering a file that was already valid) and goes through the same
+    versioning/pruning tail as write_master(), so restoring itself produces
+    a brand new version - nothing is ever a one-way trip.
+    """
+    try:
+        data = blob_store.read_bytes(version_path)
+        wb = load_workbook(BytesIO(data))  # sanity check it's a readable workbook before promoting it to live
+        row_count = wb.active.max_row - 1
+        blob_store.write_bytes(master_path, data)
+    except Exception as e:
+        log_master_write(success=False, error=str(e), source=f"restore:{version_path}")
+        raise
+
+    # Milliseconds, not just seconds - two writes landing in the same second
+    # (a fast successive approve+restore, or just an unlucky click) would
+    # otherwise produce the same version filename and silently overwrite
+    # each other's snapshot instead of keeping both.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
+    new_version_path = _snapshot_version(data, stamp)
+    log_master_write(
+        success=True,
+        row_count=row_count,
+        source=f"restore:{version_path}",
+        version_path=new_version_path,
+        timestamp=stamp,
+    )
 
 
 def main():

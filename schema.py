@@ -44,6 +44,7 @@ class ListingRow(BaseModel):
     address_1: Optional[str] = None
     postcode: Optional[str] = None
     source_file: Optional[str] = None  # the real uploaded filename; never required — a phantom/blank row must still validate
+    property_id: Optional[str] = None  # assigned once a row lands in the master as a distinct property (master_merge.py); never set by extraction
     lat: Optional[float] = None
     lng: Optional[float] = None
     submarket: Optional[str] = None

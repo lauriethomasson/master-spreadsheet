@@ -132,6 +132,18 @@ def append_text(path: str, text: str) -> None:
         f.write(text)
 
 
+def delete(path: str) -> None:
+    if using_gcs():
+        from google.api_core.exceptions import NotFound
+
+        try:
+            _get_bucket().blob(path).delete()
+        except NotFound:
+            pass
+        return
+    Path(path).unlink(missing_ok=True)
+
+
 def list_with_mtimes(prefix: str, suffix: str) -> list[tuple[str, float]]:
     """Every path under `prefix` ending in `suffix`, paired with its mtime -
     one list_blobs() call in GCS mode (Blob.updated comes back for free, no

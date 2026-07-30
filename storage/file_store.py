@@ -110,7 +110,7 @@ def mark_as_approved(path: str) -> None:
     _write_meta(path, meta)
 
 
-def _clean_value(value):
+def clean_value(value):
     if pd.isna(value):
         return None
     if hasattr(value, "item"):
@@ -121,7 +121,7 @@ def _clean_value(value):
 def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
     rows = []
     for record in df.to_dict(orient="records"):
-        cleaned = {key: _clean_value(value) for key, value in record.items()}
+        cleaned = {key: clean_value(value) for key, value in record.items()}
         if all(value is None for value in cleaned.values()):
             continue
         rows.append(ListingRow(**cleaned))

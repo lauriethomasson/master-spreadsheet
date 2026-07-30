@@ -12,6 +12,7 @@ import streamlit as st
 PAGES = [
     {"path": "app.py", "label": "Upload"},
     {"path": "pages/2_Review_and_Master.py", "label": "Review & Master"},
+    {"path": "pages/3_Export.py", "label": "Export"},
 ]
 
 

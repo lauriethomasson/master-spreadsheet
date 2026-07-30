@@ -21,8 +21,11 @@ HYPERLINK_FONT = Font(color="0563C1", underline="single")
 # brochure_link PDF-fallback default) but not something Mark/Laurie need to
 # see day-to-day - hidden as an Excel column rather than dropped from the
 # file, so it's still there to unhide/read directly (e.g. via pandas) if a
-# listing ever needs tracing back to its source upload.
-HIDDEN_COLUMNS = ["source_file"]
+# listing ever needs tracing back to its source upload. property_id is
+# master_merge.py's internal identity for a property across uploads - never
+# meaningful to a person, but needed in the file so re-loading the master
+# preserves it.
+HIDDEN_COLUMNS = ["source_file", "property_id"]
 
 
 def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:

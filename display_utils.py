@@ -30,6 +30,7 @@ RANGE_COLUMNS = [
 # .xlsx (see write_rows_to_xlsx), just never rendered here.
 ALWAYS_HIDDEN_COLUMNS = [
     "source_file",
+    "property_id",
 ]
 
 
