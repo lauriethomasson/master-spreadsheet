@@ -3,20 +3,19 @@ master_writer.py
 
 Replaces the entire master spreadsheet with an approved batch of rows.
 
-Safe against partial failure: writes to a temp file first (in the SAME
-directory as the target, so the final replace is an atomic rename rather
-than a slow cross-device copy), validates it, then atomically replaces the
-real master.xlsx. If anything fails before that final replace, the existing
-master.xlsx is untouched.
+Safe against partial failure: the new workbook is built and validated in
+memory first, and only written to its final location (via blob_store -
+local disk or a GCS bucket, depending on configuration) once that
+validation passes. blob_store.write_bytes() itself is atomic on both
+backends (temp-file-then-rename locally; a single upload is inherently
+atomic on GCS), so a reader never sees a partially-written file and a
+failure before that write leaves the existing master.xlsx untouched.
 """
 
 import json
-import os
-import shutil
 import sys
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
@@ -24,13 +23,14 @@ from openpyxl import load_workbook
 
 from schema import ListingRow
 from staging_writer import write_rows_to_xlsx
+from storage import blob_store
 
 DEFAULT_MASTER_PATH = "data/master.xlsx"
 LOG_PATH = "data/master_write_log.jsonl"
 
 
 def master_exists(master_path: str = DEFAULT_MASTER_PATH) -> bool:
-    return Path(master_path).exists()
+    return blob_store.exists(master_path)
 
 
 def load_master_as_dataframe(master_path: str = DEFAULT_MASTER_PATH) -> pd.DataFrame:
@@ -39,25 +39,24 @@ def load_master_as_dataframe(master_path: str = DEFAULT_MASTER_PATH) -> pd.DataF
     # enough to invalidate this on its own, with no explicit .clear() needed.
     # A superseded (path, mtime) entry is never looked up again, so max_entries/ttl
     # bound how much of that unreachable history st.cache_data keeps around.
-    return _load_master_as_dataframe_cached(master_path, os.path.getmtime(master_path))
+    return _load_master_as_dataframe_cached(master_path, blob_store.get_mtime(master_path))
 
 
 @st.cache_data(max_entries=4, ttl=3600)
 def _load_master_as_dataframe_cached(master_path: str, mtime: float) -> pd.DataFrame:
-    return pd.read_excel(master_path)
+    return pd.read_excel(BytesIO(blob_store.read_bytes(master_path)))
 
 
 def get_master_write_log(log_path: str = LOG_PATH) -> list:
-    path = Path(log_path)
-    if not path.exists():
+    if not blob_store.exists(log_path):
         return []
-    return _get_master_write_log_cached(log_path, path.stat().st_mtime)
+    return _get_master_write_log_cached(log_path, blob_store.get_mtime(log_path))
 
 
 @st.cache_data(max_entries=4, ttl=3600)
 def _get_master_write_log_cached(log_path: str, mtime: float) -> list:
-    with open(log_path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+    text = blob_store.read_bytes(log_path).decode("utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def log_master_write(success: bool, row_count: int = None, error: str = None):
@@ -67,27 +66,17 @@ def log_master_write(success: bool, row_count: int = None, error: str = None):
         "row_count": row_count,
         "error": error,
     }
-    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    blob_store.append_text(LOG_PATH, json.dumps(entry) + "\n")
     print(f"[master_writer] {entry}", file=sys.stderr)
 
 
 def write_master(approved_rows: list[ListingRow], master_path: str = DEFAULT_MASTER_PATH):
-    master_dir = os.path.dirname(master_path) or "."
-    os.makedirs(master_dir, exist_ok=True)
-
-    # Temp file MUST live in the same directory as master_path — that's what
-    # makes the final shutil.move a same-filesystem atomic rename instead of
-    # a copy-then-delete, which would reintroduce the exact corruption risk
-    # this function exists to avoid.
-    temp_fd, temp_path = tempfile.mkstemp(suffix=".xlsx", dir=master_dir)
-    os.close(temp_fd)
-
     try:
-        write_rows_to_xlsx(approved_rows, temp_path)
+        buffer = BytesIO()
+        write_rows_to_xlsx(approved_rows, buffer)
 
-        wb = load_workbook(temp_path)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
         ws = wb.active
         actual_row_count = ws.max_row - 1
         if actual_row_count != len(approved_rows):
@@ -96,12 +85,10 @@ def write_master(approved_rows: list[ListingRow], master_path: str = DEFAULT_MAS
                 f"got {actual_row_count} in written file"
             )
 
-        shutil.move(temp_path, master_path)
+        blob_store.write_bytes(master_path, buffer.getvalue())
         log_master_write(success=True, row_count=len(approved_rows))
 
     except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
         log_master_write(success=False, error=str(e))
         raise
 

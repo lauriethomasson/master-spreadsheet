@@ -1,5 +1,6 @@
 pymupdf
 google-genai
+google-cloud-storage
 pydantic
 openpyxl
 streamlit

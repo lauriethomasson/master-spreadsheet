@@ -8,10 +8,15 @@ Each staging upload gets its own file plus a sidecar .meta.json tracking
 coexist before any of them is approved. Approving marks every pending file's
 status as approved; the underlying .xlsx files are never deleted or edited
 in place after that.
+
+Storage itself (local disk vs. a GCS bucket) is delegated entirely to
+storage/blob_store - this module only deals in the same plain path/key
+strings either way, e.g. "staging/20260101_120000_brochure.xlsx".
 """
 
 import json
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -19,32 +24,34 @@ import streamlit as st
 
 from schema import ListingRow
 from staging_writer import write_rows_to_xlsx
+from storage import blob_store
 
-STAGING_DIR = Path("staging")
-
-
-def _meta_path(xlsx_path: Path) -> Path:
-    return xlsx_path.with_suffix(".meta.json")
+STAGING_PREFIX = "staging"
 
 
-def _read_meta(xlsx_path: Path) -> dict:
-    with open(_meta_path(xlsx_path), encoding="utf-8") as f:
-        return json.load(f)
+def _meta_path(xlsx_path: str) -> str:
+    # as_posix(), not str() - this is a key/path string compared and stored
+    # elsewhere as forward-slash-separated (matching GCS blob-name
+    # conventions), which str() would break on Windows (backslash).
+    return Path(xlsx_path).with_suffix(".meta.json").as_posix()
 
 
-def _write_meta(xlsx_path: Path, meta: dict) -> None:
-    with open(_meta_path(xlsx_path), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+def _read_meta(xlsx_path: str) -> dict:
+    return json.loads(blob_store.read_bytes(_meta_path(xlsx_path)))
+
+
+def _write_meta(xlsx_path: str, meta: dict) -> None:
+    blob_store.write_bytes(_meta_path(xlsx_path), json.dumps(meta, indent=2).encode("utf-8"))
 
 
 def save_staging_file(rows: list[ListingRow], original_filename: str) -> str:
-    STAGING_DIR.mkdir(parents=True, exist_ok=True)
-
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     stem = Path(original_filename).stem
-    staging_path = STAGING_DIR / f"{timestamp}_{stem}.xlsx"
+    staging_path = f"{STAGING_PREFIX}/{timestamp}_{stem}.xlsx"
 
-    write_rows_to_xlsx(rows, staging_path)
+    buffer = BytesIO()
+    write_rows_to_xlsx(rows, buffer)
+    blob_store.write_bytes(staging_path, buffer.getvalue())
     _write_meta(
         staging_path,
         {
@@ -54,7 +61,7 @@ def save_staging_file(rows: list[ListingRow], original_filename: str) -> str:
             "n_rows": len(rows),
         },
     )
-    return str(staging_path)
+    return staging_path
 
 
 def _staging_signature() -> tuple:
@@ -66,43 +73,41 @@ def _staging_signature() -> tuple:
     up again, so the cached functions below bound entries/ttl to keep that
     unreachable history from growing without limit over a long-running process.
     """
-    return tuple(sorted((p.name, p.stat().st_mtime) for p in STAGING_DIR.glob("*.meta.json")))
+    return tuple(sorted(blob_store.list_with_mtimes(STAGING_PREFIX, ".meta.json")))
 
 
 def list_pending_staging_files() -> list[str]:
-    if not STAGING_DIR.exists():
-        return []
     return _list_pending_staging_files_cached(_staging_signature())
 
 
 @st.cache_data(max_entries=4, ttl=3600)
 def _list_pending_staging_files_cached(signature: tuple) -> list[str]:
     pending = []
-    for xlsx_path in STAGING_DIR.glob("*.xlsx"):
+    for xlsx_path, _ in blob_store.list_with_mtimes(STAGING_PREFIX, ".xlsx"):
         try:
             meta = _read_meta(xlsx_path)
         except FileNotFoundError:
             continue
         if meta.get("status") == "pending_review":
-            pending.append((meta.get("timestamp", ""), str(xlsx_path)))
+            pending.append((meta.get("timestamp", ""), xlsx_path))
 
     pending.sort(reverse=True)
     return [path for _, path in pending]
 
 
 def load_staging_as_dataframe(path: str) -> pd.DataFrame:
-    return _load_staging_as_dataframe_cached(path, Path(path).stat().st_mtime)
+    return _load_staging_as_dataframe_cached(path, blob_store.get_mtime(path))
 
 
 @st.cache_data(max_entries=8, ttl=3600)
 def _load_staging_as_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
-    return pd.read_excel(path)
+    return pd.read_excel(BytesIO(blob_store.read_bytes(path)))
 
 
 def mark_as_approved(path: str) -> None:
-    meta = _read_meta(Path(path))
+    meta = _read_meta(path)
     meta["status"] = "approved"
-    _write_meta(Path(path), meta)
+    _write_meta(path, meta)
 
 
 def _clean_value(value):

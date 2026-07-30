@@ -25,7 +25,14 @@ HYPERLINK_FONT = Font(color="0563C1", underline="single")
 HIDDEN_COLUMNS = ["source_file"]
 
 
-def write_rows_to_xlsx(rows: list[ListingRow], output_path: Path) -> None:
+def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
+    """
+    output is a filesystem path (str/Path) OR a writable binary stream (e.g.
+    io.BytesIO) - openpyxl's Workbook.save() accepts either natively. A
+    stream is what master_writer.py/storage/file_store.py pass so the result
+    can go straight to blob_store (local disk or a GCS upload) without ever
+    touching a local temp file.
+    """
     fields = list(ListingRow.model_fields.keys())
 
     wb = Workbook()
@@ -61,8 +68,9 @@ def write_rows_to_xlsx(rows: list[ListingRow], output_path: Path) -> None:
                     cell.hyperlink = cell.value
                     cell.font = HYPERLINK_FONT
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    wb.save(output_path)
+    if isinstance(output, (str, Path)):
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output)
 
 
 def main():
