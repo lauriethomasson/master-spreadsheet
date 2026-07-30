@@ -37,8 +37,6 @@ with page_setup.setup_page("export"):
         )
         edited_full = display_utils.restore_hidden_columns(edited_visible, selected_df)
 
-        display_utils.render_row_detail(edited_full, key="export_detail_view")
-
         rows = dataframe_to_listing_rows(edited_full)
 
         buffer = BytesIO()

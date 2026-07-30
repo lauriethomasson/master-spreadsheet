@@ -79,43 +79,15 @@ def link_column_config(df: pd.DataFrame) -> dict:
 def wide_text_column_config(df: pd.DataFrame) -> dict:
     """column_config widening every column in WIDE_TEXT_COLUMNS that's
     present in df, so long descriptive text is genuinely more readable
-    without scrolling - see WIDE_TEXT_COLUMNS. Pair with render_row_detail
-    for the full untruncated text, since column width alone still can't
-    word-wrap a multi-sentence value onto several lines."""
+    without scrolling - see WIDE_TEXT_COLUMNS. Very long values may still be
+    visually truncated within the grid itself; the full text is always
+    available by downloading the .xlsx (which has its own wrap-text/row-
+    height formatting - see staging_writer.write_rows_to_xlsx)."""
     return {
         col: st.column_config.TextColumn(width="large")
         for col in WIDE_TEXT_COLUMNS
         if col in df.columns
     }
-
-
-def _blank(value) -> bool:
-    """True for None and NaN - a bare `value or default` check gets this
-    wrong for NaN, which is truthy in Python, so a dict built straight from
-    a DataFrame row (e.g. via to_dict) needs this instead of `or`."""
-    return value is None or (isinstance(value, float) and pd.isna(value))
-
-
-def render_row_detail(df: pd.DataFrame, key: str) -> None:
-    """
-    Supplements a data_editor grid that truncates WIDE_TEXT_COLUMNS to one
-    line with no word-wrap: lets a reviewer pick one row from a selectbox
-    and see its complete special_features/contacts text, which the grid
-    itself has no way to show without truncating.
-    """
-    if df.empty:
-        return
-    records = df.to_dict(orient="records")
-    labels = [f"{i}: {row_label(record)}" for i, record in enumerate(records)]
-    choice = st.selectbox("View full details for a row", labels, key=key)
-    record = records[labels.index(choice)]
-    with st.expander("Full text", expanded=True):
-        for col in WIDE_TEXT_COLUMNS:
-            if col not in df.columns:
-                continue
-            value = record.get(col)
-            st.markdown(f"**{col}**")
-            st.write("—" if _blank(value) else value)
 
 
 def sort_by_provider(df: pd.DataFrame) -> pd.DataFrame:

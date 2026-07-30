@@ -93,8 +93,6 @@ def _render_master_table(df: pd.DataFrame, key: str):
     st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
     st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
 
-    display_utils.render_row_detail(df, key=f"{key}_detail")
-
 
 def _render_approval_confirmation(approval: dict):
     updated_count = approval["updated_count"]
