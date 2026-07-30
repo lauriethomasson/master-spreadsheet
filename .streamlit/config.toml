@@ -1,3 +1,11 @@
 [server]
 enableCORS = false
 enableXsrfProtection = false
+
+[client]
+# Primary mechanism for hiding the classic pages/-directory nav list - a
+# real server-side toggle, not dependent on frontend DOM/testid structure
+# that can (and has) changed across Streamlit releases. The CSS in
+# page_setup.py stays as a backup in case this ever isn't honored for any
+# reason (e.g. an older cached Streamlit build on a deploy platform).
+showSidebarNavigation = false

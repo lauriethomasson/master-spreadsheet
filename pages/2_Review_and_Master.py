@@ -5,6 +5,7 @@ import display_utils
 import master_writer
 import page_flow
 import page_setup
+from storage import blob_store
 from storage.file_store import (
     dataframe_to_listing_rows,
     list_pending_staging_files,
@@ -56,13 +57,12 @@ with page_setup.setup_page("review"):
     if st.session_state.get("just_approved"):
         st.success("Approved — master spreadsheet updated.")
         if master_writer.master_exists():
-            with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
-                st.download_button(
-                    "Download master.xlsx",
-                    f,
-                    file_name="master.xlsx",
-                    key="download_after_approve",
-                )
+            st.download_button(
+                "Download master.xlsx",
+                blob_store.read_bytes(master_writer.DEFAULT_MASTER_PATH),
+                file_name="master.xlsx",
+                key="download_after_approve",
+            )
 
     st.divider()
     with st.expander("View / download current master.xlsx"):
@@ -72,13 +72,12 @@ with page_setup.setup_page("review"):
             visible_master = df[display_utils.visible_columns(df)]
             st.dataframe(visible_master, column_config=display_utils.link_column_config(visible_master))
 
-            with open(master_writer.DEFAULT_MASTER_PATH, "rb") as f:
-                st.download_button(
-                    "Download master.xlsx",
-                    f,
-                    file_name="master.xlsx",
-                    key="download_master_section",
-                )
+            st.download_button(
+                "Download master.xlsx",
+                blob_store.read_bytes(master_writer.DEFAULT_MASTER_PATH),
+                file_name="master.xlsx",
+                key="download_master_section",
+            )
 
             log = master_writer.get_master_write_log()
             if log:

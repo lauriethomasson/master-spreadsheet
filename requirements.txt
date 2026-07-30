@@ -3,7 +3,7 @@ google-genai
 google-cloud-storage
 pydantic
 openpyxl
-streamlit
+streamlit==1.60.0
 pandas
 httpx
 beautifulsoup4
