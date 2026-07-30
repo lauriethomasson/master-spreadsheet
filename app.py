@@ -24,11 +24,12 @@ with page_setup.setup_page("upload"):
     )
 
     if uploaded_files and st.button("Extract"):
-        with st.spinner("Extracting data from your file..."):
-            tmp_path = None
-            try:
-                all_rows = []
-                for uploaded_file in uploaded_files:
+        total = len(uploaded_files)
+        succeeded = 0
+        tmp_path = None
+        try:
+            for i, uploaded_file in enumerate(uploaded_files, start=1):
+                with st.spinner(f"Processing {i} of {total}: {uploaded_file.name}..."):
                     suffix = Path(uploaded_file.name).suffix.lower()
 
                     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -46,47 +47,52 @@ with page_setup.setup_page("upload"):
                         tmp_path.unlink(missing_ok=True)
                         tmp_path = None
 
-                    all_rows.extend(rows)
+                    # Geocoded and staged immediately, per file - so a failure
+                    # partway through a multi-file batch (a timeout, a dropped
+                    # connection, a mid-request deploy) never loses a file that
+                    # already finished. Previously all files were extracted
+                    # first, geocode_rows() ran once over the combined batch,
+                    # and save_staging_file() was called once at the very end
+                    # - meaning an interruption at any point lost everything,
+                    # even files that had already been fully processed.
+                    geocode_rows(rows)
+                    staging_path = save_staging_file(rows, uploaded_file.name)
+                    succeeded += 1
 
-                geocode_rows(all_rows)
+                    st.session_state["recent_uploads"].insert(
+                        0,
+                        {
+                            "filename": uploaded_file.name,
+                            "n_rows": len(rows),
+                            "staging_path": staging_path,
+                            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        },
+                    )
 
-                if len(uploaded_files) == 1:
-                    batch_name = uploaded_files[0].name
-                else:
-                    stems = "_".join(Path(f.name).stem for f in uploaded_files)
-                    batch_name = stems if len(stems) < 60 else f"batch_of_{len(uploaded_files)}_files"
-
-                staging_path = save_staging_file(all_rows, batch_name)
-
-                st.session_state["recent_uploads"].insert(
-                    0,
-                    {
-                        "batch_name": batch_name,
-                        "n_files": len(uploaded_files),
-                        "n_rows": len(all_rows),
-                        "staging_path": staging_path,
-                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                    },
-                )
-
-                st.success(
-                    f"Extracted {len(all_rows)} rows from {len(uploaded_files)} file(s). "
-                    "Go to Review & Master to check them."
-                )
-            except QuotaExceededError:
-                st.error("Daily extraction limit reached. Try again tomorrow.")
-            except Exception as e:
-                st.error(f"Extraction failed: {e}")
-            finally:
-                if tmp_path is not None:
-                    tmp_path.unlink(missing_ok=True)
+            st.success(
+                f"Extracted and staged {succeeded} of {total} file(s). "
+                "Go to Review & Master to check them."
+            )
+        except QuotaExceededError:
+            st.error(
+                f"Daily extraction limit reached after {succeeded} of {total} file(s)."
+                + (f" The first {succeeded} file(s) are already staged and ready to review." if succeeded else "")
+                + " Try the rest again tomorrow."
+            )
+        except Exception as e:
+            st.error(
+                f"Extraction failed on file {succeeded + 1} of {total}: {e}"
+                + (f" The first {succeeded} file(s) were already staged successfully." if succeeded else "")
+            )
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     if st.session_state["recent_uploads"]:
         st.divider()
         for entry in st.session_state["recent_uploads"]:
             st.write(
-                f"✅ **{entry['batch_name']}** — {entry['n_rows']} row(s) from "
-                f"{entry['n_files']} file(s), {entry['timestamp']}"
+                f"✅ **{entry['filename']}** — {entry['n_rows']} row(s), {entry['timestamp']}"
             )
 
     page_flow.render_nav_buttons("app.py")
