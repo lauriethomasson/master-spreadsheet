@@ -118,6 +118,15 @@ def _primary_key(row: dict):
     return _fallback_key(row) + (normalize_key(row.get("postcode")),)
 
 
+def row_label(row_dict: dict) -> str:
+    parts = [row_dict.get("building") if not _is_blank(row_dict.get("building")) else "(no building)"]
+    if not _is_blank(row_dict.get("provider")):
+        parts.append(row_dict["provider"])
+    if not _is_blank(row_dict.get("floor_unit")):
+        parts.append(row_dict["floor_unit"])
+    return " — ".join(parts)
+
+
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
     """Cheap, stdlib-only fuzzy hint for the "no match" review section - not
     part of matching itself, just reduces manual searching when a near-miss
@@ -233,3 +242,49 @@ def apply_merge(master_records: list, updates: dict, new_rows: list) -> list:
         result.append(ListingRow(**{k: v for k, v in merged.items() if k in ListingRow.model_fields}))
     result.extend(new_rows)
     return result
+
+
+def pending_status_line(n_uploads: int, plan: MergePlan) -> str:
+    """
+    Plain, sentence-case summary of what a pending batch actually contains -
+    zero-count clauses are dropped entirely rather than spelled out (e.g.
+    never "0 matched with changes"), so this reads naturally whether the
+    batch is all-new, all-changes, a mix, or (rare) entirely unchanged.
+    """
+    parts = []
+    if plan.unmatched:
+        n = len(plan.unmatched)
+        parts.append(f"{n} new propert{'y' if n == 1 else 'ies'}")
+    if plan.matched_changed:
+        n = len(plan.matched_changed)
+        parts.append(f"{n} propert{'y' if n == 1 else 'ies'} with changes")
+
+    headline = f"{n_uploads} upload{'s' if n_uploads != 1 else ''} pending"
+    if parts:
+        headline += " — " + ", ".join(parts)
+    elif plan.matched_unchanged:
+        headline += " — no changes"
+    return headline
+
+
+def build_approval_summary(plan: MergePlan, updates: dict, new_rows_final: list) -> tuple:
+    """
+    Compact, read-only diff data for a post-approve confirmation UI - plan/
+    updates/new_rows_final are all local to whatever render pass computed
+    them and typically gone by the time the confirmation is shown (e.g.
+    after a Streamlit rerun), so this is what a caller persists instead.
+    Returns (diff_rows, new_labels): diff_rows is a list of
+    {"property", "field", "old", "new"} dicts (one per approved field
+    change), new_labels is a list of row_label() strings for genuinely new
+    properties.
+    """
+    diff_rows = []
+    for master_index, fields in updates.items():
+        old_rec = plan.master_records[master_index]
+        label = row_label(old_rec)
+        for field_name, new_val in fields.items():
+            if field_name == "source_file":
+                continue  # internal bookkeeping, not a meaningful change to show
+            diff_rows.append({"property": label, "field": field_name, "old": old_rec.get(field_name), "new": new_val})
+    new_labels = [row_label(r.model_dump()) for r in new_rows_final]
+    return diff_rows, new_labels

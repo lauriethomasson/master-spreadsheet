@@ -96,9 +96,51 @@ def _render_master_table(df: pd.DataFrame, key: str):
     display_utils.render_row_detail(df, key=f"{key}_detail")
 
 
+def _render_approval_confirmation(approval: dict):
+    updated_count = approval["updated_count"]
+    new_count = approval["new_count"]
+    parts = []
+    if updated_count:
+        parts.append(f"updated {updated_count} propert{'y' if updated_count == 1 else 'ies'}")
+    if new_count:
+        parts.append(f"added {new_count} new propert{'y' if new_count == 1 else 'ies'}")
+    summary = ("Approved — " + " and ".join(parts) + ".") if parts else "Approved — no changes were applied."
+    st.success(summary)
+
+    show_details = st.session_state.get("show_approval_details", False)
+    action_cols = st.columns([1, 1, 3])
+    if action_cols[0].button("Hide details" if show_details else "View what changed", key="toggle_approval_details"):
+        st.session_state["show_approval_details"] = not show_details
+        st.rerun()
+
+    if approval.get("version_path"):
+        if action_cols[1].button("Undo this update", key="undo_last_approval"):
+            with st.spinner("Undoing..."):
+                master_writer.restore_version(approval["version_path"])
+            st.session_state.pop("last_approval", None)
+            st.session_state["just_restored"] = approval["version_path"]
+            st.rerun()
+
+    if show_details:
+        rows = [
+            {
+                "Property": d["property"],
+                "Field": d["field"],
+                "Change": f"{'—' if d['old'] in (None, '') else d['old']} → {d['new']}",
+            }
+            for d in approval["diff_rows"]
+        ]
+        rows += [{"Property": label, "Field": "(new property)", "Change": "—"} for label in approval["new_labels"]]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        else:
+            st.caption("No field-level changes to show.")
+
+
 def _render_full_master_view():
-    if st.session_state.pop("just_approved", False):
-        st.success("Approved — master spreadsheet updated.")
+    last_approval = st.session_state.get("last_approval")
+    if last_approval:
+        _render_approval_confirmation(last_approval)
 
     if not master_writer.master_exists():
         st.info("No master spreadsheet yet — approve an upload to create one.")
@@ -133,42 +175,40 @@ def _render_pending_review(pending: list):
         master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
         plan = master_merge.build_merge_plan(new_rows, master_df)
 
-    st.caption(
-        f"{len(pending)} pending upload(s), {len(new_rows)} row(s) total — "
-        f"{len(plan.matched_changed)} matched with changes, "
-        f"{len(plan.unmatched)} with no match, "
-        f"{len(plan.matched_unchanged)} matched with no changes."
-    )
+    st.caption(master_merge.pending_status_line(len(pending), plan))
 
     colliding_changed_ids = {id(m) for group in plan.collisions for m in group}
     colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}
+    any_collisions = bool(colliding_changed_ids or colliding_unmatched_ids)
 
-    if plan.collisions or plan.unmatched_collisions:
+    if any_collisions:
         st.warning(
             "Some rows in this batch appear to target the same property (marked "
-            "⚠️ below). These always need a manual pick, regardless of the mode "
-            "chosen below, rather than write order silently deciding a winner."
+            "⚠️ below) — these always need a manual pick before the rest can be "
+            "applied, rather than write order silently deciding a winner."
         )
 
-    mode = st.radio(
-        "How should this batch be handled?",
-        ["Review each field", "Auto-accept all changes"],
-        key="review_mode",
-        horizontal=True,
+    manual_review = st.toggle(
+        "Review each field manually instead of applying automatically",
+        key="manual_review_toggle",
     )
-    auto_accept = mode == "Auto-accept all changes"
+    auto_accept = not manual_review
 
     if auto_accept:
         auto_changed = [m for m in plan.matched_changed if id(m) not in colliding_changed_ids]
         auto_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
-        total_fields = sum(len(m.diffs) for m in auto_changed)
-        st.info(
-            f"Auto-accept: {total_fields} field(s) will be updated across "
-            f"{len(auto_changed)} propert{'y' if len(auto_changed) == 1 else 'ies'}, "
-            f"{len(auto_new)} new propert{'y' if len(auto_new) == 1 else 'ies'} will be added. "
-            + ("Rows involved in a collision above are excluded and still need manual review below."
-               if (colliding_changed_ids or colliding_unmatched_ids) else "")
-        )
+        summary_parts = []
+        if auto_changed:
+            summary_parts.append(f"update {len(auto_changed)} propert{'y' if len(auto_changed) == 1 else 'ies'}")
+        if auto_new:
+            summary_parts.append(f"add {len(auto_new)} new propert{'y' if len(auto_new) == 1 else 'ies'}")
+        if summary_parts:
+            st.info(
+                "This will " + " and ".join(summary_parts) + "."
+                + (" Rows involved in a collision above need manual review first." if any_collisions else "")
+            )
+        elif not any_collisions:
+            st.info("Nothing to apply automatically — every row already matches the master with no changes.")
 
     updates = {}         # master_index -> {field: approved_value}
     new_rows_final = []  # ListingRow objects confirmed as genuinely new
@@ -186,8 +226,12 @@ def _render_pending_review(pending: list):
 
             prefix = "⚠️ " if is_collision else ""
             label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
-            with st.expander(label):
-                key_prefix = f"matched_{i}_{m.property_id}"
+            key_prefix = f"matched_{i}_{m.property_id}"
+            # Two colliding rows both targeting the same master property share
+            # the exact same label text (that's what makes them a collision) -
+            # an explicit, per-iteration key is required here, or Streamlit
+            # can't tell the two expanders apart and silently renders only one.
+            with st.expander(label, key=f"{key_prefix}_expander"):
                 approved_fields = _render_field_rows(m.diffs, key_prefix, default_checked=not is_collision)
             if approved_fields:
                 entry = updates.setdefault(m.master_index, {})
@@ -211,7 +255,7 @@ def _render_pending_review(pending: list):
             row_dict = u.new_row.model_dump()
             key_prefix = f"unmatched_{i}"
             prefix = "⚠️ " if is_collision else ""
-            with st.expander(f"{prefix}{display_utils.row_label(row_dict)}"):
+            with st.expander(f"{prefix}{display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
                 summary = {
                     k: v for k, v in row_dict.items()
                     if k not in ("property_id", "source_file") and v not in (None, "")
@@ -260,6 +304,15 @@ def _render_pending_review(pending: list):
     if st.button("Approve → Master", type="primary"):
         with st.spinner("Updating master spreadsheet..."):
             try:
+                diff_rows, new_labels = master_merge.build_approval_summary(plan, updates, new_rows_final)
+
+                # The version to offer for "Undo this update" is whatever was
+                # newest BEFORE this write - the one write_master() is about
+                # to create is the new current state, not something to
+                # restore back to (restoring that would be a no-op).
+                previous_versions = master_writer.list_versions(limit=1)
+                previous_version_path = previous_versions[0]["path"] if previous_versions else None
+
                 merged_rows = master_merge.apply_merge(plan.master_records, updates, new_rows_final)
                 master_writer.write_master(
                     merged_rows,
@@ -268,7 +321,14 @@ def _render_pending_review(pending: list):
                 )
                 for path in pending:
                     mark_as_approved(path)
-                st.session_state["just_approved"] = True
+                st.session_state["last_approval"] = {
+                    "updated_count": len(updates),
+                    "new_count": len(new_rows_final),
+                    "diff_rows": diff_rows,
+                    "new_labels": new_labels,
+                    "version_path": previous_version_path,
+                }
+                st.session_state["show_approval_details"] = False
                 st.rerun()
             except Exception as e:
                 st.error(f"Approval failed, master was not changed: {e}")

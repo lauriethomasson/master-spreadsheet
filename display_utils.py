@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+from master_merge import row_label  # noqa: F401 - re-exported for display_utils.row_label(...) call sites
+
 LONDON_TZ = ZoneInfo("Europe/London")
 
 # Columns holding a URL - rendered as a clickable link with a fixed label
@@ -91,15 +93,6 @@ def _blank(value) -> bool:
     wrong for NaN, which is truthy in Python, so a dict built straight from
     a DataFrame row (e.g. via to_dict) needs this instead of `or`."""
     return value is None or (isinstance(value, float) and pd.isna(value))
-
-
-def row_label(row_dict: dict) -> str:
-    parts = [row_dict.get("building") if not _blank(row_dict.get("building")) else "(no building)"]
-    if not _blank(row_dict.get("provider")):
-        parts.append(row_dict["provider"])
-    if not _blank(row_dict.get("floor_unit")):
-        parts.append(row_dict["floor_unit"])
-    return " — ".join(parts)
 
 
 def render_row_detail(df: pd.DataFrame, key: str) -> None:
