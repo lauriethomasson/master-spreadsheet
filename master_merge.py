@@ -27,6 +27,7 @@ import difflib
 import re
 import typing
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -79,19 +80,34 @@ def _is_blank(value) -> bool:
     return False
 
 
+def _normalize_text(value) -> str:
+    """Case- and whitespace-insensitive form of a text value, for tolerant
+    comparison only (never used for what's actually stored) - lowercases
+    and discards ALL whitespace, not just repeated runs, so a formatting-
+    only difference like "+44(0)7837 270455" vs "+44(0)7837270455", or a
+    stray capitalization difference like "METSPACE" vs "Metspace", doesn't
+    register as a real change. Punctuation is left alone: a dash swapped
+    for a space (or missing entirely) still compares different, since that
+    can indicate an actual typo or a different source worth a human's
+    attention, unlike whitespace/case."""
+    return re.sub(r"\s+", "", str(value).strip().lower())
+
+
 def _values_equal(old, new) -> bool:
     if isinstance(old, (int, float)) and isinstance(new, (int, float)):
         return abs(float(old) - float(new)) < 1e-6
-    return str(old).strip() == str(new).strip()
+    return _normalize_text(old) == _normalize_text(new)
 
 
 def diff_fields(old: dict, new: dict) -> dict:
     """
-    Only fields present in `new` (non-blank) and different from `old` are
-    included - a blank/missing value in a fresh extraction is treated as "no
-    data this time", never as a change that would blank out an existing
-    value. A field filled in for the first time (old blank, new has a value)
-    is treated as a change like any other. Returns {field: (old, new)}.
+    Only fields present in `new` (non-blank), different from `old`, and NOT
+    merely a tolerant-equal formatting difference (see _values_equal /
+    silent_field_updates) are included - a blank/missing value in a fresh
+    extraction is treated as "no data this time", never as a change that
+    would blank out an existing value. A field filled in for the first time
+    (old blank, new has a value) is treated as a change like any other.
+    Returns {field: (old, new)}.
     """
     diffs = {}
     for f in DIFF_FIELDS:
@@ -102,6 +118,36 @@ def diff_fields(old: dict, new: dict) -> dict:
         if _is_blank(old_val) or not _values_equal(old_val, new_val):
             diffs[f] = (old_val, new_val)
     return diffs
+
+
+def silent_field_updates(old: dict, new: dict) -> dict:
+    """
+    Text fields where `new` is tolerant-equal to `old` (see _values_equal)
+    but not byte-identical - e.g. a phone number gaining a missing space, or
+    "METSPACE" replacing "Metspace". diff_fields() correctly excludes these
+    from the review-worthy diff (see its docstring), but the improved
+    formatting should still replace the old value in master rather than
+    being silently discarded on every future upload - it's just applied
+    without ever surfacing as a "change" a human needs to review. Restricted
+    to str-kind fields: numeric near-equality (already tolerated by
+    _values_equal) is a different, pre-existing concern and isn't affected
+    here. Returns {field: new_value}.
+    """
+    updates = {}
+    for f in DIFF_FIELDS:
+        if field_kind(f) != "str":
+            continue
+        new_val = new.get(f)
+        if _is_blank(new_val):
+            continue
+        old_val = old.get(f)
+        if _is_blank(old_val):
+            continue
+        if str(old_val) == str(new_val):
+            continue
+        if _values_equal(old_val, new_val):
+            updates[f] = new_val
+    return updates
 
 
 def _fallback_key(row: dict) -> tuple:
@@ -125,6 +171,36 @@ def row_label(row_dict: dict) -> str:
     if not _is_blank(row_dict.get("floor_unit")):
         parts.append(row_dict["floor_unit"])
     return " — ".join(parts)
+
+
+def new_property_labels(rows: list) -> list:
+    """
+    One plain "{address_1} — {provider} — {floor_unit}" label per row, for
+    the purely-informational "will be added as new" list on the Review page
+    - floor_unit is appended only when needed to tell two rows in this same
+    batch apart (i.e. more than one shares the same address_1, like 111
+    Wardour Street's three separate floors); a single new property at a
+    unique address is just "{address_1} — {provider}". Grouping uses
+    normalize_key so two rows that share an address but differ only in
+    case/punctuation/whitespace still count as the same address. A floor
+    range or multiple non-contiguous floors extracted together (e.g. "4th &
+    5th Floors") is untouched here - floor_unit is a single field, so
+    whatever formatting the extraction produced for it is preserved as-is,
+    never split into separate rows/labels.
+    """
+    dicts = [r.model_dump() for r in rows]
+    address_counts = Counter(normalize_key(d.get("address_1")) for d in dicts)
+
+    labels = []
+    for d in dicts:
+        parts = [d.get("address_1") if not _is_blank(d.get("address_1")) else "(no address)"]
+        if not _is_blank(d.get("provider")):
+            parts.append(d["provider"])
+        shares_address = address_counts[normalize_key(d.get("address_1"))] > 1
+        if shares_address and not _is_blank(d.get("floor_unit")):
+            parts.append(d["floor_unit"])
+        labels.append(" — ".join(parts))
+    return labels
 
 
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
@@ -152,6 +228,7 @@ class MatchedRow:
     new_row: ListingRow
     diffs: dict
     match_tier: str  # "postcode" or "fallback"
+    silent_updates: dict = field(default_factory=dict)  # see silent_field_updates - never shown in the diff-review UI
 
 
 @dataclass
@@ -207,7 +284,8 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
         if master_idx is not None:
             old_rec = master_records[master_idx]
             diffs = diff_fields(old_rec, new_dict)
-            matched = MatchedRow(master_idx, old_rec["property_id"], new_row, diffs, tier)
+            silent = silent_field_updates(old_rec, new_dict)
+            matched = MatchedRow(master_idx, old_rec["property_id"], new_row, diffs, tier, silent)
             (matched_changed if diffs else matched_unchanged).append(matched)
         else:
             unmatched.append(UnmatchedRow(new_row, _suggest_similar(new_dict, master_records)))

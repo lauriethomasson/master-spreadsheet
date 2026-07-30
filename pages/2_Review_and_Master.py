@@ -210,14 +210,26 @@ def _render_pending_review(pending: list):
         elif not any_collisions:
             st.info("Nothing to apply automatically — every row already matches the master with no changes.")
 
-    updates = {}         # master_index -> {field: approved_value}
-    new_rows_final = []  # ListingRow objects confirmed as genuinely new
+    updates = {}          # master_index -> {field: approved_value} - real, review-worthy changes only
+    silent_by_index = {}  # master_index -> {field: value} - tolerant-formatting fixes, never shown in the diff UI
+    new_rows_final = []   # ListingRow objects confirmed as genuinely new
+
+    def _apply_silent(m):
+        # Applies regardless of auto/manual mode and regardless of whether
+        # the row's real diff (if any) was approved - a tolerant-formatting
+        # fix (case/whitespace only, see master_merge.silent_field_updates)
+        # is independent of that decision and never itself needs review.
+        if m.silent_updates:
+            entry = silent_by_index.setdefault(m.master_index, {})
+            entry.update(m.silent_updates)
+            entry["source_file"] = m.new_row.source_file
 
     if plan.matched_changed:
         if not auto_accept or colliding_changed_ids:
             st.subheader("Matched — changes detected")
         for i, m in enumerate(plan.matched_changed):
             is_collision = id(m) in colliding_changed_ids
+            _apply_silent(m)
             if auto_accept and not is_collision:
                 entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
                 entry["source_file"] = m.new_row.source_file
@@ -238,65 +250,73 @@ def _render_pending_review(pending: list):
                 entry.update(approved_fields)
                 entry["source_file"] = m.new_row.source_file
 
+    for m in plan.matched_unchanged:
+        _apply_silent(m)
+
     if plan.unmatched:
-        show_unmatched_detail = not auto_accept or colliding_unmatched_ids
-        if show_unmatched_detail:
+        non_collision_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
+        collision_new = [u for u in plan.unmatched if id(u) in colliding_unmatched_ids]
+
+        if non_collision_new or collision_new:
             st.subheader("No match found — will be added as new")
-        master_options = {"— add as new —": None}
-        for rec in plan.master_records:
-            master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
 
-        for i, u in enumerate(plan.unmatched):
-            is_collision = id(u) in colliding_unmatched_ids
-            if auto_accept and not is_collision:
-                new_rows_final.append(u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}))
-                continue
+        if non_collision_new:
+            for label in master_merge.new_property_labels([u.new_row for u in non_collision_new]):
+                st.write(label)
+            new_rows_final.extend(
+                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in non_collision_new
+            )
 
-            row_dict = u.new_row.model_dump()
-            key_prefix = f"unmatched_{i}"
-            prefix = "⚠️ " if is_collision else ""
-            with st.expander(f"{prefix}{display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
-                summary = {
-                    k: v for k, v in row_dict.items()
-                    if k not in ("property_id", "source_file") and v not in (None, "")
-                }
-                st.write(summary)
+        if collision_new:
+            master_options = {"— add as new —": None}
+            for rec in plan.master_records:
+                master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
 
-                if u.suggestions:
-                    st.caption(
-                        "Possible near-misses already in the master: "
-                        + ", ".join(display_utils.row_label(s) for s in u.suggestions)
-                    )
+            for i, u in enumerate(collision_new):
+                row_dict = u.new_row.model_dump()
+                key_prefix = f"unmatched_collision_{i}"
+                with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
+                    summary = {
+                        k: v for k, v in row_dict.items()
+                        if k not in ("property_id", "source_file") and v not in (None, "")
+                    }
+                    st.write(summary)
 
-                choice_label = st.selectbox(
-                    "What should happen with this row?",
-                    list(master_options.keys()),
-                    key=f"{key_prefix}_choice",
-                )
-                linked_property_id = master_options[choice_label]
-
-                if linked_property_id is None:
-                    confirm_new = st.checkbox(
-                        "Confirm — add as a new property", value=True, key=f"{key_prefix}_confirm_new"
-                    )
-                    if confirm_new:
-                        new_rows_final.append(
-                            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                    if u.suggestions:
+                        st.caption(
+                            "Possible near-misses already in the master: "
+                            + ", ".join(display_utils.row_label(s) for s in u.suggestions)
                         )
-                else:
-                    target_index = next(
-                        idx for idx, rec in enumerate(plan.master_records)
-                        if rec["property_id"] == linked_property_id
+
+                    choice_label = st.selectbox(
+                        "What should happen with this row?",
+                        list(master_options.keys()),
+                        key=f"{key_prefix}_choice",
                     )
-                    old_rec = plan.master_records[target_index]
-                    diffs = master_merge.diff_fields(old_rec, row_dict)
-                    st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
-                    if diffs:
-                        approved_fields = _render_field_rows(diffs, f"{key_prefix}_link", default_checked=True)
-                        if approved_fields:
-                            entry = updates.setdefault(target_index, {})
-                            entry.update(approved_fields)
-                            entry["source_file"] = u.new_row.source_file
+                    linked_property_id = master_options[choice_label]
+
+                    if linked_property_id is None:
+                        confirm_new = st.checkbox(
+                            "Confirm — add as a new property", value=True, key=f"{key_prefix}_confirm_new"
+                        )
+                        if confirm_new:
+                            new_rows_final.append(
+                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                            )
+                    else:
+                        target_index = next(
+                            idx for idx, rec in enumerate(plan.master_records)
+                            if rec["property_id"] == linked_property_id
+                        )
+                        old_rec = plan.master_records[target_index]
+                        diffs = master_merge.diff_fields(old_rec, row_dict)
+                        st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
+                        if diffs:
+                            approved_fields = _render_field_rows(diffs, f"{key_prefix}_link", default_checked=True)
+                            if approved_fields:
+                                entry = updates.setdefault(target_index, {})
+                                entry.update(approved_fields)
+                                entry["source_file"] = u.new_row.source_file
 
     if plan.matched_unchanged:
         st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")
@@ -313,7 +333,14 @@ def _render_pending_review(pending: list):
                 previous_versions = master_writer.list_versions(limit=1)
                 previous_version_path = previous_versions[0]["path"] if previous_versions else None
 
-                merged_rows = master_merge.apply_merge(plan.master_records, updates, new_rows_final)
+                # Silent (tolerant-formatting-only) updates are folded in only
+                # here, right before writing - build_approval_summary above
+                # deliberately never sees silent_by_index, so they never
+                # appear in the "View what changed" confirmation.
+                combined_updates = {idx: dict(fields) for idx, fields in silent_by_index.items()}
+                for idx, fields in updates.items():
+                    combined_updates.setdefault(idx, {}).update(fields)
+                merged_rows = master_merge.apply_merge(plan.master_records, combined_updates, new_rows_final)
                 master_writer.write_master(
                     merged_rows,
                     new_count=len(new_rows_final),
