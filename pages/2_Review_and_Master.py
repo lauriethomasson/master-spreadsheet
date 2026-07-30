@@ -31,35 +31,238 @@ def _row_label(row_dict: dict) -> str:
     return " — ".join(parts)
 
 
-def _render_diff_fields(diffs: dict, key_prefix: str) -> dict:
+def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool) -> dict:
     """
-    Renders an old value / editable new value row per changed field and
-    returns the field: value mapping currently entered (defaulting to the
-    new extracted value) - this is what gets applied if the row is approved,
-    letting a reviewer correct a value rather than only accept or reject it
-    wholesale. Numeric fields get a number_input (typed correctly, per
-    master_merge.field_kind) rather than a free-text box.
+    Renders one line per changed field: name, old value, editable new value,
+    and its OWN apply/skip checkbox - field-level, not row-level, so a
+    reviewer can accept some of a row's changes and reject others rather
+    than an all-or-nothing choice for the whole row. Returns only the
+    fields whose checkbox is checked, using whatever value is currently
+    entered (letting a reviewer correct a value, not just accept/reject it).
     """
-    result = {}
+    approved = {}
     for f, (old_val, new_val) in diffs.items():
-        cols = st.columns([2, 3, 3])
+        cols = st.columns([2, 3, 3, 1])
         cols[0].markdown(f"**{f}**")
         cols[1].write("—" if old_val in (None, "") else old_val)
         kind = master_merge.field_kind(f)
-        if kind in ("int", "float"):
-            default = float(new_val) if new_val is not None else 0.0
-            edited = cols[2].number_input(
-                "New value", value=default, step=(1.0 if kind == "int" else 0.01),
-                key=f"{key_prefix}_{f}", label_visibility="collapsed",
+        with cols[2]:
+            if kind in ("int", "float"):
+                default = float(new_val) if new_val is not None else 0.0
+                edited = st.number_input(
+                    "New value", value=default, step=(1.0 if kind == "int" else 0.01),
+                    key=f"{key_prefix}_{f}_value", label_visibility="collapsed",
+                )
+                value = int(edited) if kind == "int" else edited
+            else:
+                edited = st.text_input(
+                    "New value", value="" if new_val is None else str(new_val),
+                    key=f"{key_prefix}_{f}_value", label_visibility="collapsed",
+                )
+                value = edited if edited != "" else None
+        with cols[3]:
+            apply_field = st.checkbox(
+                "Apply", value=default_checked, key=f"{key_prefix}_{f}_apply", label_visibility="collapsed"
             )
-            result[f] = int(edited) if kind == "int" else edited
-        else:
-            edited = cols[2].text_input(
-                "New value", value="" if new_val is None else str(new_val),
-                key=f"{key_prefix}_{f}", label_visibility="collapsed",
-            )
-            result[f] = edited if edited != "" else None
-    return result
+        if apply_field:
+            approved[f] = value
+    return approved
+
+
+def _render_master_table(df: pd.DataFrame, key: str):
+    """Full master, browsable and row-selectable (for the export step) - every
+    column but Select is disabled so this stays a read/select view, never a
+    silent side door for editing master data outside the diff-and-merge flow."""
+    visible = display_utils.visible_columns(df)
+    display_df = df[visible].copy()
+    display_df.insert(0, "Select", False)
+    st.data_editor(
+        display_df,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(required=True),
+            **display_utils.link_column_config(display_df),
+        },
+        disabled=[c for c in display_df.columns if c != "Select"],
+        width="stretch",
+        height=600,
+        key=key,
+    )
+
+
+def _render_full_master_view():
+    if st.session_state.pop("just_approved", False):
+        st.success("Approved — master spreadsheet updated.")
+
+    if not master_writer.master_exists():
+        st.info("No master spreadsheet yet — approve an upload to create one.")
+        return
+
+    with st.spinner("Loading..."):
+        df = master_writer.load_master_as_dataframe()
+
+    _render_master_table(df, key="master_table_default_view")
+
+    st.download_button(
+        "Download master.xlsx",
+        blob_store.read_bytes(master_writer.DEFAULT_MASTER_PATH),
+        file_name="master.xlsx",
+        key="download_master_default_view",
+    )
+
+    log = master_writer.get_master_write_log()
+    if log:
+        last = log[-1]
+        st.caption(f"Last updated: {last['timestamp']} — {last['row_count']} rows")
+
+
+def _render_pending_review(pending: list):
+    with st.spinner("Loading..."):
+        combined_df = pd.concat(
+            [load_staging_as_dataframe(path) for path in pending], ignore_index=True
+        )
+        new_rows = dataframe_to_listing_rows(combined_df)
+        master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
+        plan = master_merge.build_merge_plan(new_rows, master_df)
+
+    st.caption(
+        f"{len(pending)} pending upload(s), {len(new_rows)} row(s) total — "
+        f"{len(plan.matched_changed)} matched with changes, "
+        f"{len(plan.unmatched)} with no match, "
+        f"{len(plan.matched_unchanged)} matched with no changes."
+    )
+
+    colliding_changed_ids = {id(m) for group in plan.collisions for m in group}
+    colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}
+
+    if plan.collisions or plan.unmatched_collisions:
+        st.warning(
+            "Some rows in this batch appear to target the same property (marked "
+            "⚠️ below). These always need a manual pick, regardless of the mode "
+            "chosen below, rather than write order silently deciding a winner."
+        )
+
+    mode = st.radio(
+        "How should this batch be handled?",
+        ["Review each field", "Auto-accept all changes"],
+        key="review_mode",
+        horizontal=True,
+    )
+    auto_accept = mode == "Auto-accept all changes"
+
+    if auto_accept:
+        auto_changed = [m for m in plan.matched_changed if id(m) not in colliding_changed_ids]
+        auto_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
+        total_fields = sum(len(m.diffs) for m in auto_changed)
+        st.info(
+            f"Auto-accept: {total_fields} field(s) will be updated across "
+            f"{len(auto_changed)} propert{'y' if len(auto_changed) == 1 else 'ies'}, "
+            f"{len(auto_new)} new propert{'y' if len(auto_new) == 1 else 'ies'} will be added. "
+            + ("Rows involved in a collision above are excluded and still need manual review below."
+               if (colliding_changed_ids or colliding_unmatched_ids) else "")
+        )
+
+    updates = {}         # master_index -> {field: approved_value}
+    new_rows_final = []  # ListingRow objects confirmed as genuinely new
+
+    if plan.matched_changed:
+        if not auto_accept or colliding_changed_ids:
+            st.subheader("Matched — changes detected")
+        for i, m in enumerate(plan.matched_changed):
+            is_collision = id(m) in colliding_changed_ids
+            if auto_accept and not is_collision:
+                entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
+                entry["source_file"] = m.new_row.source_file
+                updates[m.master_index] = entry
+                continue
+
+            prefix = "⚠️ " if is_collision else ""
+            label = f"{prefix}{_row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
+            with st.expander(label):
+                key_prefix = f"matched_{i}_{m.property_id}"
+                approved_fields = _render_field_rows(m.diffs, key_prefix, default_checked=not is_collision)
+            if approved_fields:
+                entry = updates.setdefault(m.master_index, {})
+                entry.update(approved_fields)
+                entry["source_file"] = m.new_row.source_file
+
+    if plan.unmatched:
+        show_unmatched_detail = not auto_accept or colliding_unmatched_ids
+        if show_unmatched_detail:
+            st.subheader("No match found — will be added as new")
+        master_options = {"— add as new —": None}
+        for rec in plan.master_records:
+            master_options[f"{_row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
+
+        for i, u in enumerate(plan.unmatched):
+            is_collision = id(u) in colliding_unmatched_ids
+            if auto_accept and not is_collision:
+                new_rows_final.append(u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}))
+                continue
+
+            row_dict = u.new_row.model_dump()
+            key_prefix = f"unmatched_{i}"
+            prefix = "⚠️ " if is_collision else ""
+            with st.expander(f"{prefix}{_row_label(row_dict)}"):
+                summary = {
+                    k: v for k, v in row_dict.items()
+                    if k not in ("property_id", "source_file") and v not in (None, "")
+                }
+                st.write(summary)
+
+                if u.suggestions:
+                    st.caption(
+                        "Possible near-misses already in the master: "
+                        + ", ".join(_row_label(s) for s in u.suggestions)
+                    )
+
+                choice_label = st.selectbox(
+                    "What should happen with this row?",
+                    list(master_options.keys()),
+                    key=f"{key_prefix}_choice",
+                )
+                linked_property_id = master_options[choice_label]
+
+                if linked_property_id is None:
+                    confirm_new = st.checkbox(
+                        "Confirm — add as a new property", value=True, key=f"{key_prefix}_confirm_new"
+                    )
+                    if confirm_new:
+                        new_rows_final.append(
+                            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                        )
+                else:
+                    target_index = next(
+                        idx for idx, rec in enumerate(plan.master_records)
+                        if rec["property_id"] == linked_property_id
+                    )
+                    old_rec = plan.master_records[target_index]
+                    diffs = master_merge.diff_fields(old_rec, row_dict)
+                    st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
+                    if diffs:
+                        approved_fields = _render_field_rows(diffs, f"{key_prefix}_link", default_checked=True)
+                        if approved_fields:
+                            entry = updates.setdefault(target_index, {})
+                            entry.update(approved_fields)
+                            entry["source_file"] = u.new_row.source_file
+
+    if plan.matched_unchanged:
+        st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")
+
+    if st.button("Approve → Master", type="primary"):
+        with st.spinner("Updating master spreadsheet..."):
+            try:
+                merged_rows = master_merge.apply_merge(plan.master_records, updates, new_rows_final)
+                master_writer.write_master(
+                    merged_rows,
+                    new_count=len(new_rows_final),
+                    updated_count=len(updates),
+                )
+                for path in pending:
+                    mark_as_approved(path)
+                st.session_state["just_approved"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"Approval failed, master was not changed: {e}")
 
 
 with page_setup.setup_page("review"):
@@ -68,161 +271,9 @@ with page_setup.setup_page("review"):
     pending = list_pending_staging_files()
 
     if pending:
-        # New pending work supersedes any confirmation from a previous approval.
-        st.session_state["just_approved"] = False
-
-    updates = {}         # master_index -> {field: approved_value}
-    new_rows_final = []  # ListingRow objects confirmed as genuinely new
-
-    if not pending:
-        st.info("No pending uploads to review.")
+        _render_pending_review(pending)
     else:
-        with st.spinner("Loading..."):
-            combined_df = pd.concat(
-                [load_staging_as_dataframe(path) for path in pending], ignore_index=True
-            )
-            new_rows = dataframe_to_listing_rows(combined_df)
-            master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
-            plan = master_merge.build_merge_plan(new_rows, master_df)
-
-        st.caption(
-            f"{len(pending)} pending upload(s), {len(new_rows)} row(s) total — "
-            f"{len(plan.matched_changed)} matched with changes, "
-            f"{len(plan.unmatched)} with no match, "
-            f"{len(plan.matched_unchanged)} matched with no changes."
-        )
-
-        if plan.collisions or plan.unmatched_collisions:
-            st.warning(
-                "Some rows in this batch appear to target the same property. "
-                "They're marked with ⚠️ below and default to unchecked — review "
-                "them carefully, since approving more than one for the same "
-                "property applies them in the order shown, each on top of the last."
-            )
-
-        colliding_ids = {id(m) for group in plan.collisions for m in group}
-
-        if plan.matched_changed:
-            st.subheader("Matched — changes detected")
-            for i, m in enumerate(plan.matched_changed):
-                is_collision = id(m) in colliding_ids
-                prefix = "⚠️ " if is_collision else ""
-                label = f"{prefix}{_row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
-                with st.expander(label):
-                    key_prefix = f"matched_{i}_{m.property_id}"
-                    field_values = _render_diff_fields(m.diffs, key_prefix)
-                    apply_it = st.checkbox(
-                        "Apply this update", value=not is_collision, key=f"{key_prefix}_apply"
-                    )
-                if apply_it:
-                    entry = updates.setdefault(m.master_index, {})
-                    entry.update(field_values)
-                    entry["source_file"] = m.new_row.source_file
-
-        if plan.unmatched:
-            st.subheader("No match found — will be added as new")
-            master_options = {"— add as new —": None}
-            for rec in plan.master_records:
-                master_options[f"{_row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
-
-            for i, u in enumerate(plan.unmatched):
-                row_dict = u.new_row.model_dump()
-                key_prefix = f"unmatched_{i}"
-                with st.expander(_row_label(row_dict)):
-                    summary = {
-                        k: v for k, v in row_dict.items()
-                        if k not in ("property_id", "source_file") and v not in (None, "")
-                    }
-                    st.write(summary)
-
-                    if u.suggestions:
-                        st.caption(
-                            "Possible near-misses already in the master: "
-                            + ", ".join(_row_label(s) for s in u.suggestions)
-                        )
-
-                    choice_label = st.selectbox(
-                        "What should happen with this row?",
-                        list(master_options.keys()),
-                        key=f"{key_prefix}_choice",
-                    )
-                    linked_property_id = master_options[choice_label]
-
-                    if linked_property_id is None:
-                        confirm_new = st.checkbox(
-                            "Confirm — add as a new property", value=True, key=f"{key_prefix}_confirm_new"
-                        )
-                        if confirm_new:
-                            new_rows_final.append(
-                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
-                            )
-                    else:
-                        target_index = next(
-                            idx for idx, rec in enumerate(plan.master_records)
-                            if rec["property_id"] == linked_property_id
-                        )
-                        old_rec = plan.master_records[target_index]
-                        diffs = master_merge.diff_fields(old_rec, row_dict)
-                        st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
-                        field_values = _render_diff_fields(diffs, f"{key_prefix}_link") if diffs else {}
-                        apply_link = st.checkbox(
-                            "Apply this update to the linked property", value=True, key=f"{key_prefix}_apply_link"
-                        )
-                        if apply_link:
-                            entry = updates.setdefault(target_index, {})
-                            entry.update(field_values)
-                            entry["source_file"] = u.new_row.source_file
-
-        if plan.matched_unchanged:
-            st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")
-
-        if st.button("Approve → Master", type="primary"):
-            with st.spinner("Updating master spreadsheet..."):
-                try:
-                    merged_rows = master_merge.apply_merge(plan.master_records, updates, new_rows_final)
-                    master_writer.write_master(
-                        merged_rows,
-                        new_count=len(new_rows_final),
-                        updated_count=len(updates),
-                    )
-                    for path in pending:
-                        mark_as_approved(path)
-                    st.session_state["just_approved"] = True
-                except Exception as e:
-                    st.session_state["just_approved"] = False
-                    st.error(f"Approval failed, master was not changed: {e}")
-
-    if st.session_state.get("just_approved"):
-        st.success("Approved — master spreadsheet updated.")
-        if master_writer.master_exists():
-            st.download_button(
-                "Download master.xlsx",
-                blob_store.read_bytes(master_writer.DEFAULT_MASTER_PATH),
-                file_name="master.xlsx",
-                key="download_after_approve",
-            )
-
-    st.divider()
-    with st.expander("View / download current master.xlsx"):
-        if master_writer.master_exists():
-            with st.spinner("Loading..."):
-                df = master_writer.load_master_as_dataframe()
-            visible_master = df[display_utils.visible_columns(df)]
-            st.dataframe(visible_master, column_config=display_utils.link_column_config(visible_master))
-
-            st.download_button(
-                "Download master.xlsx",
-                blob_store.read_bytes(master_writer.DEFAULT_MASTER_PATH),
-                file_name="master.xlsx",
-                key="download_master_section",
-            )
-
-            log = master_writer.get_master_write_log()
-            if log:
-                last = log[-1]
-                st.caption(f"Last updated: {last['timestamp']} — {last['row_count']} rows")
-        else:
-            st.info("No master spreadsheet yet — approve an upload to create one.")
+        _render_full_master_view()
 
     st.divider()
     with st.expander("Version history", expanded=bool(st.session_state.get("just_restored"))):
