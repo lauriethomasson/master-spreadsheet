@@ -17,9 +17,12 @@ Run with:
 
 import sys
 import unittest
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pandas as pd
+from openpyxl import Workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -101,6 +104,22 @@ class SuggestMappingTests(unittest.TestCase):
         self.assertEqual(guess["Brochure PDF"], "brochure_link")
         self.assertIsNone(guess["Link to File"])
 
+    def test_maps_the_real_kitts_brochure_link_header_and_close_variants(self):
+        # "Link to Brochure" is the real header used by the actual Kitt's
+        # Availability (External).xlsx export - previously unmapped,
+        # defaulting to "(ignore)" in the confirm-mapping UI on first
+        # upload of that format.
+        guess = extract_spreadsheet.suggest_mapping(["Link to Brochure", "Brochure Link", "Link to Brochure PDF"])
+        self.assertEqual(guess["Link to Brochure"], "brochure_link")
+        self.assertEqual(guess["Brochure Link"], None)  # already used by "Link to Brochure" above
+        self.assertEqual(guess["Link to Brochure PDF"], None)  # same
+
+    def test_brochure_link_close_variant_maps_alone(self):
+        for header in ("Link to Brochure", "Brochure Link", "Link to Brochure PDF"):
+            with self.subTest(header=header):
+                guess = extract_spreadsheet.suggest_mapping([header])
+                self.assertEqual(guess[header], "brochure_link")
+
     def test_never_suggests_an_unmappable_field(self):
         guess = extract_spreadsheet.suggest_mapping(["Property Id", "Source File"])
         self.assertIsNone(guess["Property Id"])
@@ -172,6 +191,110 @@ class BuildRowsTests(unittest.TestCase):
         rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
 
         self.assertEqual(rows[0].building, "City Tower")
+
+
+class ParseXludfFallbackTests(unittest.TestCase):
+    """
+    Formula strings here are taken verbatim from a real Google Sheets/
+    IMPORTRANGE .xlsx export (Kitt's Availability (External).xlsx, not
+    committed into this repo) - checked directly, not guessed.
+    """
+
+    def test_quoted_string_fallback_with_nested_importrange_call(self):
+        formula = (
+            '=IFERROR(__xludf.DUMMYFUNCTION("IMPORTRANGE(""https://docs.google.com/spreadsheets/d/abc/edit#gid=1"",'
+            '""\'Availability\'!A:ab"")"),"Area")'
+        )
+        self.assertEqual(extract_spreadsheet._parse_xludf_fallback(formula), "Area")
+
+    def test_quoted_string_fallback_with_embedded_newline(self):
+        formula = '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),"Size \n(sq ft)")'
+        self.assertEqual(extract_spreadsheet._parse_xludf_fallback(formula), "Size \n(sq ft)")
+
+    def test_numeric_fallback(self):
+        formula = '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),759.0)'
+        self.assertEqual(extract_spreadsheet._parse_xludf_fallback(formula), 759.0)
+
+    def test_quoted_string_fallback_with_a_pound_sign(self):
+        formula = '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),"£296")'
+        self.assertEqual(extract_spreadsheet._parse_xludf_fallback(formula), "£296")
+
+    def test_not_a_formula_at_all_returns_none(self):
+        self.assertIsNone(extract_spreadsheet._parse_xludf_fallback("just plain text"))
+        self.assertIsNone(extract_spreadsheet._parse_xludf_fallback(None))
+        self.assertIsNone(extract_spreadsheet._parse_xludf_fallback(759.0))
+
+    def test_a_different_kind_of_formula_returns_none_rather_than_guessing(self):
+        self.assertIsNone(extract_spreadsheet._parse_xludf_fallback("=SUM(A1:A10)"))
+
+
+class ResolveCellValueTests(unittest.TestCase):
+    def _cell(self, value):
+        cell = MagicMock()
+        cell.value = value
+        return cell
+
+    def test_prefers_the_cached_value_when_present(self):
+        value_cell = self._cell("Area")
+        formula_cell = self._cell('=IFERROR(__xludf.DUMMYFUNCTION("..."),"Area")')
+        self.assertEqual(extract_spreadsheet._resolve_cell_value(value_cell, formula_cell), "Area")
+
+    def test_falls_back_to_the_formula_when_the_cache_is_missing(self):
+        value_cell = self._cell(None)
+        formula_cell = self._cell('=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),"Building")')
+        self.assertEqual(extract_spreadsheet._resolve_cell_value(value_cell, formula_cell), "Building")
+
+    def test_a_genuinely_blank_cell_stays_none(self):
+        value_cell = self._cell(None)
+        formula_cell = self._cell(None)
+        self.assertIsNone(extract_spreadsheet._resolve_cell_value(value_cell, formula_cell))
+
+
+class ReadSpreadsheetXludfIntegrationTests(unittest.TestCase):
+    """
+    Builds a workbook via openpyxl containing REAL cached-value-missing
+    formula cells (assigning a formula string to a cell and saving it
+    without ever letting a real spreadsheet engine compute/cache a result
+    is exactly what "no cached value available" means) - end-to-end proof
+    that read_spreadsheet resolves such a file's real header/data text
+    correctly, not just the underlying helper functions in isolation.
+    """
+
+    def _build_xlsx_bytes(self) -> bytes:
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = '=IFERROR(__xludf.DUMMYFUNCTION("IMPORTRANGE(""url"",""range"")"),"Building")'
+        ws["B1"] = '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),"Size \n(sq ft)")'
+        ws["A2"] = '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),"28 Bruton Street")'
+        ws["B2"] = '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),759.0)'
+        buffer = BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    def test_headers_resolve_to_real_text_not_formula_text(self):
+        df = extract_spreadsheet.read_spreadsheet(self._build_xlsx_bytes(), ".xlsx")
+        self.assertEqual(list(df.columns), ["Building", "Size \n(sq ft)"])
+
+    def test_data_rows_resolve_to_real_values_not_formula_text(self):
+        df = extract_spreadsheet.read_spreadsheet(self._build_xlsx_bytes(), ".xlsx")
+        self.assertEqual(df.iloc[0]["Building"], "28 Bruton Street")
+        self.assertEqual(df.iloc[0]["Size \n(sq ft)"], 759.0)
+
+    def test_a_plain_non_formula_workbook_is_completely_unaffected(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "Building"
+        ws["B1"] = "Size (sq ft)"
+        ws["A2"] = "28 Bruton Street"
+        ws["B2"] = 759
+        buffer = BytesIO()
+        wb.save(buffer)
+
+        df = extract_spreadsheet.read_spreadsheet(buffer.getvalue(), ".xlsx")
+
+        self.assertEqual(list(df.columns), ["Building", "Size (sq ft)"])
+        self.assertEqual(df.iloc[0]["Building"], "28 Bruton Street")
+        self.assertEqual(df.iloc[0]["Size (sq ft)"], 759)
 
 
 if __name__ == "__main__":

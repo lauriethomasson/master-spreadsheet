@@ -19,6 +19,7 @@ as every other source type.
 """
 
 import hashlib
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -49,7 +50,7 @@ EXTRA_SYNONYMS = {
     "desks_max": ("desks",),
     "rent_pcm": ("marketing price based on min term pcm",),
     "rent_psf": ("marketing price based on min term psf",),
-    "brochure_link": ("brochure pdf", "link to file"),
+    "brochure_link": ("brochure pdf", "link to file", "link to brochure", "brochure link", "link to brochure pdf"),
     "address_1": ("property address 1", "address"),
     "postcode": ("property postcode",),
     "lat": ("latitude",),
@@ -74,6 +75,64 @@ def _build_field_synonyms() -> dict:
 FIELD_SYNONYMS = _build_field_synonyms()
 
 
+# Matches the exact shape of a Google Sheets/IMPORTRANGE .xlsx export's
+# formula cells - e.g. '=IFERROR(__xludf.DUMMYFUNCTION("..."),"Area")' or
+# '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),759.0)'. Google's
+# export wraps every formula-derived cell this way; __xludf.DUMMYFUNCTION
+# is a Google-only placeholder that can never actually execute in any real
+# spreadsheet engine, so IFERROR always falls through to its second
+# argument - which is exactly the real value a spreadsheet program would
+# show for that cell. Greedy .* for the DUMMYFUNCTION argument naturally
+# backtracks to the RIGHTMOST "), <fallback>)" split, correctly separating
+# the (possibly comma/paren-containing) inner call from the real fallback
+# even when the inner argument itself contains nested parens/commas (e.g.
+# an IMPORTRANGE(...) call). re.DOTALL since the fallback itself can
+# contain a real embedded newline (confirmed against a real export, e.g.
+# a "Size \n(sq ft)" header).
+_XLUDF_FORMULA_RE = re.compile(r"^=IFERROR\(__xludf\.DUMMYFUNCTION\(.*\),\s*(.+)\)$", re.DOTALL)
+
+
+def _parse_xludf_fallback(formula):
+    """
+    Extracts the literal fallback value straight out of a Google Sheets
+    export formula's own text - the last-resort path for a cell whose
+    cached value (openpyxl's data_only=True) genuinely isn't present
+    (can happen if the file was downloaded without ever being opened/
+    recalculated by a real spreadsheet program first). Returns None for
+    anything that isn't recognizably this exact shape, rather than
+    guessing - a caller falls back to treating the cell as blank.
+    """
+    if not isinstance(formula, str) or not formula.startswith("=IFERROR(__xludf.DUMMYFUNCTION("):
+        return None
+    match = _XLUDF_FORMULA_RE.match(formula)
+    if not match:
+        return None
+    fallback = match.group(1).strip()
+    if len(fallback) >= 2 and fallback.startswith('"') and fallback.endswith('"'):
+        return fallback[1:-1].replace('""', '"')
+    try:
+        return float(fallback) if "." in fallback else int(fallback)
+    except ValueError:
+        return fallback
+
+
+def _resolve_cell_value(value_cell, formula_cell):
+    """
+    value_cell/formula_cell are the SAME cell read from two separate
+    load_workbook() calls, one with data_only=True (the last-calculated
+    result) and one with data_only=False (the raw formula) - openpyxl
+    only exposes one or the other per loaded workbook, never both from a
+    single load. Prefers the cached value; falls back to parsing it
+    straight out of the formula text (see _parse_xludf_fallback) only when
+    the cache is genuinely missing for what really is a formula cell -
+    never applied to an actually-blank cell, which has no formula to
+    parse in the first place and correctly stays None either way.
+    """
+    if value_cell.value is not None:
+        return value_cell.value
+    return _parse_xludf_fallback(formula_cell.value)
+
+
 def read_spreadsheet(data: bytes, suffix: str) -> pd.DataFrame:
     """
     Reads an uploaded provider spreadsheet's raw headers/rows exactly as the
@@ -88,22 +147,35 @@ def read_spreadsheet(data: bytes, suffix: str) -> pd.DataFrame:
     "Open" or "View") - which column ends up mapped to brochure_link isn't
     known yet at read time, so every column gets this treatment, not just
     ones that already look like a link column.
+
+    Loads the workbook twice - once per openpyxl data_only mode - so every
+    cell's cached value is available AND its raw formula text is available
+    as a fallback (see _resolve_cell_value): confirmed necessary against a
+    real Google Sheets/IMPORTRANGE export (Kitt's Availability), whose
+    every header/data cell is a formula wrapping __xludf.DUMMYFUNCTION -
+    reading only the formula (the old behavior) surfaced that raw formula
+    text as if it were the real header/value.
     """
     if suffix == ".csv":
         return pd.read_csv(BytesIO(data))
 
-    wb = load_workbook(BytesIO(data))
-    ws = wb.active
-    headers = [cell.value for cell in ws[1]]
+    wb_values = load_workbook(BytesIO(data), data_only=True)
+    ws_values = wb_values.active
+    wb_formulas = load_workbook(BytesIO(data), data_only=False)
+    ws_formulas = wb_formulas.active
+
+    headers = [
+        _resolve_cell_value(vcell, fcell) for vcell, fcell in zip(ws_values[1], ws_formulas[1])
+    ]
     records = []
-    for row in ws.iter_rows(min_row=2):
+    for value_row, formula_row in zip(ws_values.iter_rows(min_row=2), ws_formulas.iter_rows(min_row=2)):
         record = {}
-        for col_idx, cell in enumerate(row):
+        for col_idx, (vcell, fcell) in enumerate(zip(value_row, formula_row)):
             header = headers[col_idx]
-            if cell.hyperlink is not None:
-                record[header] = cell.hyperlink.target
+            if vcell.hyperlink is not None:
+                record[header] = vcell.hyperlink.target
             else:
-                record[header] = cell.value
+                record[header] = _resolve_cell_value(vcell, fcell)
         records.append(record)
     return pd.DataFrame(records, columns=headers)
 
