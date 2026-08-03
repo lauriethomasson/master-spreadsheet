@@ -1,5 +1,6 @@
 import gc
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,235 @@ from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
 RENDER_DPI = 72
+
+# --- Per-row PDF hyperlink extraction ---
+#
+# Some tabular/schedule-style PDFs (e.g. a per-floor availability table with
+# its own "Link to Brochure" column, rendered as a small "Here"/"View" link
+# per row) embed a genuine, distinct hyperlink per unit as a PDF link
+# annotation - invisible to Gemini's vision-based extraction (see extract(),
+# which only ever shows Gemini rendered page IMAGES, never the underlying
+# text/link layer), so without this step every such unit falls through to
+# finalize_brochure_link's rule 3 (the whole uploaded PDF as a fallback
+# link), losing the real per-row destination entirely.
+#
+# The join problem this solves: Gemini's returned units carry no page/
+# position back-reference on their own, so a link found via PyMuPDF (tied
+# to a page + page-coordinate rect) has nothing to attach to. PAGE_INDEX_KEY
+# (added to the extraction prompt/schema below) gives each unit a page to
+# search on; that unit's own floor_unit/size_sqft values (already extracted
+# for every unit regardless of this feature) are then located as literal
+# text on that page via PyMuPDF's word-level bounding boxes, giving each
+# unit an approximate row position to compare against each candidate link's
+# own rect position.
+#
+# Deliberately conservative in three independent ways, any one of which
+# leaves every unit on a page completely untouched (falling through to the
+# existing rule-3 PDF fallback exactly as before this feature existed):
+# a page needs at least MIN_UNITS_FOR_PER_ROW_LINKS Gemini units placed on
+# it (page_index), at least MIN_LINKS_FOR_PER_ROW_LINKS distinct small
+# (LINK_CAPTION_MAX_HEIGHT-or-under) URI link annotations on it, and each
+# individual unit needs its row locatable on the page AND exactly one
+# candidate link near that row (never more than one - see
+# _attach_per_row_pdf_links) before a link is ever attached to it.
+PAGE_INDEX_KEY = "page_index"
+MIN_UNITS_FOR_PER_ROW_LINKS = 2
+MIN_LINKS_FOR_PER_ROW_LINKS = 2
+LINK_CAPTION_MAX_HEIGHT = 20  # points - typical caption text is ~8-12pt; a floorplan/logo/photo link runs much taller
+ROW_Y_TOLERANCE = 12  # points - how close a link's and a unit's row y-center must be to count as "the same row"
+
+
+def _page_uri_links(page) -> list:
+    """
+    Every genuine external-URL link annotation on `page`, as {"uri", "rect"}
+    - filtered to fitz.LINK_URI links with a real uri only. PDFs also embed
+    internal navigation links (LINK_GOTO, kind 4 - "next page"/"back to
+    contents" arrows, uri=None) which have nothing to attach to a unit's
+    brochure_link and would otherwise inflate the link count on nearly
+    every page of a real multi-page brochure (confirmed against
+    city-tower-brochure.pdf: page-turn arrows appear as 3-4 LINK_GOTO
+    annotations on almost every one of its 45 pages).
+    """
+    links = []
+    for link in page.get_links():
+        if link.get("kind") != fitz.LINK_URI:
+            continue
+        uri = link.get("uri")
+        if not uri:
+            continue
+        rect = fitz.Rect(link["from"])
+        links.append({"uri": uri, "rect": rect, "y_center": (rect.y0 + rect.y1) / 2})
+    return links
+
+
+def _is_caption_sized(rect) -> bool:
+    return rect.height <= LINK_CAPTION_MAX_HEIGHT
+
+
+def _tokenize(text) -> list:
+    return [t for t in re.findall(r"[a-z0-9]+", str(text).lower()) if len(t) >= 2]
+
+
+# Generic words that recur across many different rows' floor_unit labels
+# ("3rd Floor", "5th Floor", "Ground Floor", "Suite 12", "Suite 4C") and so
+# carry no distinguishing power on their own - matching on one of these
+# alone would confidently (and wrongly) "locate" a row via a word that's
+# actually sitting in a completely different row's label on the same page.
+_FLOOR_UNIT_STOPWORDS = {"floor", "floors", "suite", "unit", "office", "level", "the", "of", "and"}
+
+
+def _find_unit_row_y(page_words: list, floor_unit, size_sqft):
+    """
+    Approximate y-center (page coordinates) of a unit's own row on the page
+    `page_words` (PyMuPDF's page.get_text("words")) came from - located by
+    searching for the unit's own floor_unit label and/or size_sqft value
+    verbatim among the page's words, reusing values Gemini already extracts
+    for every unit rather than requiring a brand-new dedicated field.
+
+    size_sqft is preferred when it matches exactly once on the page - a
+    specific number is far less likely to coincidentally repeat elsewhere
+    on a busy page than a short, common floor-label word (e.g. "1st").
+    Falls back to the median y-center of every word matching a token (2+
+    chars, excluding _FLOOR_UNIT_STOPWORDS - "Floor"/"Suite"/etc. recur
+    across every row's label and would confidently match the wrong row's
+    text) of floor_unit. Returns None if neither anchor can be located at
+    all - callers must treat that as "this unit can't be geometrically
+    placed on this page", never guess a position.
+    """
+    if size_sqft:
+        try:
+            size_str = str(int(size_sqft)) if float(size_sqft).is_integer() else str(size_sqft)
+        except (TypeError, ValueError):
+            size_str = None
+        if size_str:
+            size_hits = [w for w in page_words if re.sub(r"[^\d.]", "", w[4]) == size_str]
+            if len(size_hits) == 1:
+                w = size_hits[0]
+                return (w[1] + w[3]) / 2
+
+    if floor_unit:
+        tokens = set(_tokenize(floor_unit)) - _FLOOR_UNIT_STOPWORDS
+        if tokens:
+            y_hits = [(w[1] + w[3]) / 2 for w in page_words if _tokenize(w[4]) and _tokenize(w[4])[0] in tokens]
+            if y_hits:
+                y_hits.sort()
+                return y_hits[len(y_hits) // 2]
+
+    return None
+
+
+def _brochure_column_x_range(page_words: list):
+    """
+    Approximate x-range (page coordinates) of a "Link to Brochure"-style
+    column, located from the page's OWN header text - confirmed necessary
+    against a real Kitt's-style availability table, where each row has
+    THREE separate link columns (Link to Brochure, Floor Plan, High Res
+    Images), all rendered as the same "Here" caption text at the exact
+    same row y-position. Without this, a row's y-position alone can't
+    tell those three apart - _attach_per_row_pdf_links would see 3
+    "nearby" links and (correctly, given no other information) treat the
+    row as ambiguous, attaching nothing at all.
+
+    Finds the word "brochure" (case-insensitive, trailing punctuation
+    stripped) sitting HIGHEST on the page (smallest y0) - the column
+    header itself, not a coincidental mention of the word elsewhere (e.g.
+    inside a prose special_features cell lower down the same page).
+    Returns None if the page has no such word at all, meaning no column-
+    based disambiguation is possible on this page.
+    """
+    candidates = [w for w in page_words if w[4].strip(".,:;").lower() == "brochure"]
+    if not candidates:
+        return None
+    header_word = min(candidates, key=lambda w: w[1])
+    # Widened left by 40pt to also cover "Link to" (the words immediately
+    # before "Brochure" in a "Link to Brochure" header) sitting in the same
+    # column, and slightly right too, so a link rect that doesn't align
+    # pixel-perfectly with the header word's own width still counts.
+    return (header_word[0] - 40, header_word[2] + 10)
+
+
+def _in_x_range(rect, x_range) -> bool:
+    x_lo, x_hi = x_range
+    return x_lo <= rect.x0 <= x_hi or x_lo <= rect.x1 <= x_hi
+
+
+def _nearby_caption_text(page_words: list, rect, pad: float = 2.0) -> str:
+    """
+    Visible words overlapping `rect` (expanded by `pad` points) - the
+    caption text a link sits on (e.g. "Here"). Used only for logging/
+    debugging visibility into what _attach_per_row_pdf_links matched, never
+    for the row-matching join itself - the link's own rect already IS its
+    row position, independent of whatever text happens to be on it.
+    """
+    expanded = fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad)
+    hits = [w[4] for w in page_words if fitz.Rect(w[:4]).intersects(expanded)]
+    return " ".join(hits)
+
+
+def _attach_per_row_pdf_links(pdf_path: Path, units: list) -> None:
+    """
+    Mutates each eligible unit's "brochure_link" in place with a genuine,
+    per-row PDF-embedded hyperlink, when one can be confidently located -
+    see the module-level comment above for the full design/conservatism
+    rationale. Runs once per page that has enough corroborating units AND
+    enough corroborating links (both gates independent - see module
+    constants); does nothing at all to units on any page that doesn't
+    clear both, or to a unit whose row can't be located, or whose row has
+    zero or more than one candidate link nearby (ambiguous - left for the
+    existing rule-3 PDF fallback rather than guessing).
+    """
+    units_by_page = {}
+    for unit in units:
+        page_index = unit.pop(PAGE_INDEX_KEY, None)
+        if isinstance(page_index, int):
+            units_by_page.setdefault(page_index, []).append(unit)
+
+    if not units_by_page:
+        return
+
+    doc = fitz.open(pdf_path)
+    try:
+        for page_index, page_units in units_by_page.items():
+            if len(page_units) < MIN_UNITS_FOR_PER_ROW_LINKS or not (0 <= page_index < doc.page_count):
+                continue
+            page = doc[page_index]
+            links = [l for l in _page_uri_links(page) if _is_caption_sized(l["rect"])]
+            if len(links) < MIN_LINKS_FOR_PER_ROW_LINKS:
+                continue
+
+            page_words = page.get_text("words")
+            # When a row has several distinct link columns (e.g. a real
+            # Kitt's-style table's Link to Brochure / Floor Plan / High Res
+            # Images, all rendered as the same "Here" caption at the same
+            # row y) - narrow to the Brochure column specifically BEFORE
+            # counting candidates, rather than treating same-row links in
+            # unrelated columns as ambiguous.
+            brochure_x_range = _brochure_column_x_range(page_words)
+
+            for unit in page_units:
+                row_y = _find_unit_row_y(page_words, unit.get("floor_unit"), unit.get("size_sqft"))
+                if row_y is None:
+                    continue
+                nearby = [l for l in links if abs(l["y_center"] - row_y) <= ROW_Y_TOLERANCE]
+                if brochure_x_range is not None:
+                    nearby = [l for l in nearby if _in_x_range(l["rect"], brochure_x_range)]
+                if len(nearby) == 1:
+                    unit["brochure_link"] = nearby[0]["uri"]
+                    print(
+                        f"[extract] page {page_index}: attached per-row link {nearby[0]['uri']!r} to unit "
+                        f"{unit.get('floor_unit')!r} (caption text near link: "
+                        f"{_nearby_caption_text(page_words, nearby[0]['rect'])!r})",
+                        file=sys.stderr,
+                    )
+                elif len(nearby) > 1:
+                    print(
+                        f"[extract] page {page_index}: {len(nearby)} candidate links near unit "
+                        f"{unit.get('floor_unit')!r}'s row — ambiguous, leaving for the PDF fallback.",
+                        file=sys.stderr,
+                    )
+    finally:
+        doc.close()
+
 
 PROMPT = """You are extracting structured data from a commercial office property brochure.
 You will be shown the pages of the brochure as images. Read all pages carefully,
@@ -47,6 +277,9 @@ that's expected and correct. If the document describes multiple unrelated proper
 building/address_1/postcode/submarket should reflect its own specific property, not another unit's.
 
 Also extract for each unit:
+- page_index: the 0-based index of the page (counting the images shown to you, in order,
+  starting at 0 for the first page) where THIS SPECIFIC unit's own row/section is stated. If a
+  unit's information spans multiple pages, use the page where its floor_unit/size_sqft is given.
 - floor_unit: the floor/suite/unit label (e.g. "5th Floor West", "Office 302", "Suite 4C")
 - size_sqft: the area in square feet as a plain number, no commas or units. If a range is given
   (e.g. "2,123–4,454 sq ft" across multiple workspaces), do NOT guess an average — leave this null
@@ -93,6 +326,7 @@ Return your answer as a single JSON object with this exact structure:
       "address_1": "...",
       "postcode": "...",
       "submarket": "..." or null,
+      "page_index": integer,
       "floor_unit": "..." or null,
       "size_sqft": number or null,
       "desks_max": integer or null,
@@ -148,6 +382,13 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
     raw = call_gemini(client, PROMPT, images)
     del images
     gc.collect()
+
+    # Runs BEFORE finalize_brochure_link below, and mutates page_index out of
+    # each unit dict as it goes - so a unit that gets a genuine per-row link
+    # here has it in place as "brochure_link" by the time finalize_brochure_
+    # link's rule 1 sees it, skipping rule 3's PDF-fallback entirely; a unit
+    # this doesn't apply to is completely unaffected either way.
+    _attach_per_row_pdf_links(pdf_path, raw.get("units", []))
 
     brochure = {
         "internal_ref": raw.get("provider"),
