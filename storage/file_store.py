@@ -248,17 +248,26 @@ def get_saved_header_mapping(header_hash: str) -> dict:
     return json.loads(blob_store.read_bytes(path))
 
 
-def save_header_mapping(header_hash: str, headers: list, mapping: dict) -> None:
+def save_header_mapping(
+    header_hash: str, headers: list, mapping: dict, provider: str = None
+) -> None:
     """
     Persists a user-confirmed column mapping for this exact header set,
     keyed by header_hash - so the same provider's recurring spreadsheet
     format (e.g. a monthly export with unchanged headers) only needs
-    confirming once. headers is stored alongside the mapping purely for
+    confirming once. provider is the user-confirmed provider for formats
+    that do not contain their own provider column; it is reused for every
+    later upload with the same header format. headers is stored alongside
+    the mapping purely for
     human inspection/debugging (e.g. reading header_mappings/*.json
     directly to see what a hash corresponds to) - lookups only ever use
     the hash itself.
     """
     path = f"{HEADER_MAPPINGS_PREFIX}/{header_hash}.json"
     blob_store.write_bytes(
-        path, json.dumps({"headers": headers, "mapping": mapping}, indent=2).encode("utf-8")
+        path,
+        json.dumps(
+            {"headers": headers, "mapping": mapping, "provider": provider},
+            indent=2,
+        ).encode("utf-8"),
     )
