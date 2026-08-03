@@ -65,13 +65,4 @@ def compute_rent(fields: dict) -> dict:
         elif psf and not pcm:
             fields["rent_pcm"] = round((size * psf) / 12, 2)
 
-    size_min = fields.get("size_sqft_min")
-    size_max = fields.get("size_sqft_max")
-    psf_min = fields.get("rent_psf_min")
-    psf_max = fields.get("rent_psf_max")
-    if size_min and psf_min and not fields.get("rent_pcm_min"):
-        fields["rent_pcm_min"] = round((size_min * psf_min) / 12, 2)
-    if size_max and psf_max and not fields.get("rent_pcm_max"):
-        fields["rent_pcm_max"] = round((size_max * psf_max) / 12, 2)
-
     return fields

@@ -34,13 +34,7 @@ WIDE_TEXT_COLUMNS = [
 ]
 
 RANGE_COLUMNS = [
-    "size_sqft_min",
-    "size_sqft_max",
     "desks_min",
-    "rent_psf_min",
-    "rent_psf_max",
-    "rent_pcm_min",
-    "rent_pcm_max",
 ]
 
 # Unlike RANGE_COLUMNS (hidden only when every row is empty), these are

@@ -73,25 +73,25 @@ Also extract for each unit:
     same line — handle both at once (e.g. "48-72 + 5 MR" → desks_min=48, desks_max=72,
     special_features includes "+5 MR").
   - A plain single number with no "+" qualifier needs no special_features note for desks.
-- sq ft: a single number → size_sqft (leave size_sqft_min/max null). A range → size_sqft_min/max
-  (leave size_sqft null).
+- sq ft: a single number → size_sqft. If a range is given instead (e.g. "2,123–4,454 sq ft"
+  across multiple workspaces), do NOT guess an average — leave size_sqft null and note the range
+  in special_features instead.
 - price: this is the trickiest field — the SAME word "Price" can mean either a monthly rent
   figure or a per-square-foot rate depending on the document, and the unit is often NOT labeled
   in the text at all. Decide which one you're looking at like this:
   - If the text explicitly says "psf", "per sq ft", or the column header itself says
-    "Price (psf)", it's a per-sqft rate → put it in rent_psf (or rent_psf_min/max if a range).
+    "Price (psf)", it's a per-sqft rate → put it in rent_psf.
   - Otherwise, if a single "Price:" figure is given with NO psf/per-sq-ft wording anywhere near
     it, treat it as a monthly rent total → put it in rent_pcm. A useful sanity check: a monthly
     total is roughly proportional to desk count and sq ft (e.g. a few thousand to a few tens of
     thousands of pounds for a small office); a true per-sqft rate is a much smaller number
     (typically double or triple digits, e.g. £100-£350) that stays roughly constant regardless of
     unit size. If the figure is large relative to the unit's size, it's pcm, not psf.
-  - Never calculate or estimate rent_pcm, rent_pcm_min, or rent_pcm_max yourself — if you've
-    identified a directly-stated pcm figure, put it in rent_pcm; otherwise leave rent_pcm and
-    rent_pcm_min/max null. They are computed downstream in code from size and psf when needed —
-    but only when psf was the one directly stated, never the reverse.
-  - A single-value field and its range counterpart should never both be populated for the same
-    metric — pick whichever the source actually shows.
+  - Never calculate or estimate rent_pcm yourself — if you've identified a directly-stated pcm
+    figure, put it in rent_pcm; otherwise leave it null. It's computed downstream in code from
+    size and psf when needed — but only when psf was the one directly stated, never the reverse.
+  - If the source gives a range for either figure (e.g. "£190 - £230 psf"), do NOT guess an
+    average — leave rent_pcm/rent_psf null and note the range in special_features instead.
 - special_features: the bullet-point features listed for that building (if any), semicolon-joined
   with the desk "+" qualifiers described above, any inline caveat near that specific unit (e.g.
   "Reduced pricing for a limited time only*"), an availability note if one is given (e.g.
@@ -137,14 +137,10 @@ Return your answer as a single JSON object with this exact structure:
       "postcode": null,
       "floor_unit": "..." or null,
       "size_sqft": number or null,
-      "size_sqft_min": number or null,
-      "size_sqft_max": number or null,
       "desks_min": integer or null,
       "desks_max": integer or null,
       "rent_pcm": number or null,
       "rent_psf": number or null,
-      "rent_psf_min": number or null,
-      "rent_psf_max": number or null,
       "brochure_link": "..." or null,
       "special_features": "..." or null,
       "state_of_space": "..." or null

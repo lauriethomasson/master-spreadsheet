@@ -55,14 +55,24 @@ HIDDEN_COLUMNS = ["source_file", "property_id"]
 
 def title_case_label(field_name: str) -> str:
     """Display-only label for a snake_case field name - "internal_ref" ->
-    "Internal Ref", "rent_psf_min" -> "Rent Psf Min" - used for the written
+    "Internal Ref", "rent_pcm" -> "Rent Pcm" - used for the written
     .xlsx header row here and for on-screen column_config labels
     (display_utils.py). Purely cosmetic: the underlying field/column name
     (what schema.py, matching logic, etc. all reference) never changes -
-    see read_xlsx_with_hyperlinks, which reads columns back by their fixed
-    schema position rather than by parsing this text, for exactly that
-    reason."""
+    see _label_to_field_name/read_xlsx_with_hyperlinks, which recovers the
+    real name from this text on every read rather than assuming a fixed
+    position, for exactly that reason."""
     return field_name.replace("_", " ").title()
+
+
+def _label_to_field_name(label: str) -> str:
+    """Exact inverse of title_case_label - "Internal Ref" -> "internal_ref".
+    Lossless for every real field name (all pure lowercase_with_underscores):
+    title_case_label only replaces "_" with " " and capitalizes each word's
+    first letter, so lowercasing and putting the underscores back recovers
+    the original exactly, regardless of whether that field still exists in
+    the CURRENT schema - see read_xlsx_with_hyperlinks."""
+    return label.lower().replace(" ", "_")
 
 
 def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
@@ -133,26 +143,39 @@ def read_xlsx_with_hyperlinks(data: bytes) -> pd.DataFrame:
     actual hyperlink target instead for those columns; every other column
     is read exactly as pd.read_excel would.
 
-    Column names come from ListingRow.model_fields, by fixed position, NOT
-    from row 1's actual cell text - write_rows_to_xlsx always writes columns
-    in that exact order, but row 1's cells hold a Title Case display label
-    (see title_case_label) rather than the real snake_case field name, so
-    parsing them would hand back "Internal Ref" as a DataFrame column name
-    instead of "internal_ref", breaking every downstream field lookup.
+    Column names are recovered from row 1's own cell text via
+    _label_to_field_name, NOT assumed from ListingRow.model_fields by fixed
+    position. Position-based reading was tried and reverted: it silently
+    breaks the moment the on-disk column order doesn't exactly match the
+    CURRENT schema's order - which real files hit in two different ways
+    (confirmed against the actual data/master.xlsx): a field inserted
+    mid-schema after older files were already written (property_id sits
+    right after source_file today, but older files predate it entirely, so
+    every later column is off by one), and a field removed from the
+    schema's MIDDLE rather than its end (this module's own history - the
+    size_sqft_min/max/rent_psf_min/max/rent_pcm_min/max fields used to sit
+    between rent_psf and brochure_link, not at the tail). Reversing each
+    header cell's own text instead is immune to both: every column's
+    identity is read from itself, independent of position, so an old file's
+    different order/extra now-removed columns are simply read correctly (or,
+    for a field no longer in ListingRow, read as a same-named dict key that
+    ListingRow(**cleaned)'s default extra="ignore" then drops harmlessly -
+    see storage/file_store.dataframe_to_listing_rows).
     """
     wb = load_workbook(BytesIO(data))
     ws = wb.active
-    headers = list(ListingRow.model_fields.keys())
+    headers = [_label_to_field_name(cell.value) for cell in ws[1]]
     hyperlink_col_indices = {i for i, h in enumerate(headers) if h in HYPERLINK_COLUMNS}
 
     records = []
     for row in ws.iter_rows(min_row=2):
         record = {}
         for col_idx, cell in enumerate(row):
+            header = headers[col_idx]
             if col_idx in hyperlink_col_indices and cell.hyperlink is not None:
-                record[headers[col_idx]] = cell.hyperlink.target
+                record[header] = cell.hyperlink.target
             else:
-                record[headers[col_idx]] = cell.value
+                record[header] = cell.value
         records.append(record)
     return pd.DataFrame(records, columns=headers)
 

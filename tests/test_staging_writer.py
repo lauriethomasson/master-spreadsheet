@@ -28,7 +28,7 @@ class TitleCaseLabelTests(unittest.TestCase):
     def test_documented_examples(self):
         self.assertEqual(title_case_label("internal_ref"), "Internal Ref")
         self.assertEqual(title_case_label("brochure_link"), "Brochure Link")
-        self.assertEqual(title_case_label("rent_psf_min"), "Rent Psf Min")
+        self.assertEqual(title_case_label("desks_min"), "Desks Min")
         self.assertEqual(title_case_label("size_sqft"), "Size Sqft")
 
     def test_single_word_field(self):
@@ -49,7 +49,7 @@ class WriteRowsToXlsxHeaderTests(unittest.TestCase):
 
         self.assertIn("Internal Ref", header_values)
         self.assertIn("Brochure Link", header_values)
-        self.assertIn("Rent Psf Min", header_values)
+        self.assertIn("Desks Min", header_values)
         self.assertIn("Size Sqft", header_values)
         # None of the raw snake_case names should appear as header text.
         self.assertNotIn("internal_ref", header_values)
@@ -109,6 +109,110 @@ class RoundTripTests(unittest.TestCase):
 
         self.assertEqual(df.iloc[0]["property_id"], "prop-123")
         self.assertEqual(df.iloc[0]["source_file"], "a.pdf")
+
+
+class LegacyColumnCompatibilityTests(unittest.TestCase):
+    """Regression coverage for a real bug found while verifying this exact
+    scenario against the real data/master.xlsx: that file predates the
+    property_id field (inserted mid-schema, not at the end) AND still has
+    the six now-removed range columns (which sat between rent_psf and
+    brochure_link, not at the end either) - reading columns by fixed
+    position against the CURRENT schema silently misaligned every column
+    from "lat" onward (property_id's slot) into the WRONG field, and in
+    this test's case raises a pydantic ValidationError rather than reading
+    correctly. read_xlsx_with_hyperlinks must read each column by its own
+    header text instead, immune to reordering/missing/extra columns."""
+
+    # The real, historical column order/header text of data/master.xlsx -
+    # no property_id, desks_max before desks_min, and the six now-removed
+    # range columns sitting in the middle rather than the end. Snake_case
+    # header text (this predates the Title Case display feature too) -
+    # _label_to_field_name must be a no-op round-trip for text that's
+    # already snake_case, not just for "Title Case" text.
+    _LEGACY_HEADERS = [
+        "internal_ref", "provider", "address_1", "postcode", "source_file", "lat", "lng", "submarket",
+        "building", "floor_unit", "size_sqft", "desks_max", "desks_min", "size_sqft_min", "size_sqft_max",
+        "rent_pcm", "rent_psf", "rent_psf_min", "rent_psf_max", "rent_pcm_min", "rent_pcm_max",
+        "brochure_link", "special_features", "state_of_space", "contacts",
+    ]
+
+    def _legacy_workbook_bytes(self) -> bytes:
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(self._LEGACY_HEADERS)
+        row = {
+            "internal_ref": "Breezblok", "provider": "Breezblok", "building": "John Stow House",
+            "floor_unit": "Office 302", "size_sqft": 1750, "desks_max": 32, "rent_pcm": 18000,
+            "rent_psf": 123.43, "lat": 51.5147, "lng": -0.0785, "submarket": "City of London",
+        }
+        ws.append([row.get(h) for h in self._LEGACY_HEADERS])
+        buffer = BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    def test_reading_a_legacy_reordered_file_does_not_crash(self):
+        df = read_xlsx_with_hyperlinks(self._legacy_workbook_bytes())
+        self.assertEqual(len(df), 1)
+
+    def test_legacy_columns_land_in_their_correct_field_not_shifted(self):
+        # The actual bug: a fixed-position read put "lat"'s value into
+        # "property_id", "submarket"'s value into "lng", etc.
+        df = read_xlsx_with_hyperlinks(self._legacy_workbook_bytes())
+        row = df.iloc[0]
+
+        self.assertEqual(row["building"], "John Stow House")
+        self.assertEqual(row["floor_unit"], "Office 302")
+        self.assertEqual(row["size_sqft"], 1750)
+        self.assertEqual(row["lat"], 51.5147)
+        self.assertEqual(row["submarket"], "City of London")
+        self.assertEqual(row["rent_psf"], 123.43)
+
+    def test_legacy_removed_range_columns_are_dropped_by_listingrow_construction(self):
+        # read_xlsx_with_hyperlinks itself is a generic xlsx->DataFrame
+        # reader - it correctly reads "size_sqft_min" back as a real column
+        # (the file genuinely has it) rather than guessing which fields are
+        # "current schema". Dropping fields ListingRow no longer has is
+        # ListingRow's job (pydantic's default extra="ignore"), exercised
+        # via dataframe_to_listing_rows here.
+        from storage.file_store import dataframe_to_listing_rows
+
+        df = read_xlsx_with_hyperlinks(self._legacy_workbook_bytes())
+        self.assertIn("size_sqft_min", df.columns)  # genuinely present in the file - read correctly
+
+        rows = dataframe_to_listing_rows(df)
+        for removed_field in ("size_sqft_min", "size_sqft_max", "rent_psf_min", "rent_psf_max", "rent_pcm_min", "rent_pcm_max"):
+            self.assertFalse(hasattr(rows[0], removed_field))
+
+    def test_legacy_row_missing_property_id_entirely_converts_cleanly(self):
+        # No property_id column at all in this historical shape - must not
+        # KeyError, and the resulting ListingRow just gets property_id=None.
+        from storage.file_store import dataframe_to_listing_rows
+
+        df = read_xlsx_with_hyperlinks(self._legacy_workbook_bytes())
+        rows = dataframe_to_listing_rows(df)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "John Stow House")
+        self.assertIsNone(rows[0].property_id)
+
+    def test_dataframe_to_listing_rows_ignores_unknown_columns(self):
+        # A separate guarantee from read_xlsx_with_hyperlinks' own fix above:
+        # even if some other caller hands dataframe_to_listing_rows a
+        # DataFrame that genuinely still has an old/unknown column (pydantic's
+        # default extra="ignore" on ListingRow(**cleaned)), it must not raise.
+        import pandas as pd
+
+        from storage.file_store import dataframe_to_listing_rows
+
+        df = pd.DataFrame([{
+            "building": "A", "provider": "P1", "rent_psf_min": 190.0, "size_sqft_min": 2123.0,
+        }])
+        rows = dataframe_to_listing_rows(df)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "A")
+        self.assertFalse(hasattr(rows[0], "rent_psf_min"))
 
 
 if __name__ == "__main__":
