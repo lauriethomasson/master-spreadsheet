@@ -49,6 +49,40 @@ class HeaderHashTests(unittest.TestCase):
         b = extract_spreadsheet.header_hash(["Floor/Unit", "Building"])
         self.assertNotEqual(a, b)
 
+
+class ProviderFilenameInferenceTests(unittest.TestCase):
+    def test_kitts_external_availability_export(self):
+        self.assertEqual(
+            extract_spreadsheet.infer_provider_from_filename(
+                "Kitt's Availability (External).xlsx"
+            ),
+            "Kitt's",
+        )
+
+    def test_workplace_plus_dated_availability_export(self):
+        self.assertEqual(
+            extract_spreadsheet.infer_provider_from_filename(
+                "Workplace Plus - Availability 14th July.xlsx"
+            ),
+            "Workplace Plus",
+        )
+
+    def test_knotel_underscore_export(self):
+        self.assertEqual(
+            extract_spreadsheet.infer_provider_from_filename(
+                "Knotel_Availability_30_06_2026.xlsx"
+            ),
+            "Knotel",
+        )
+
+    def test_union_location_and_date_export(self):
+        self.assertEqual(
+            extract_spreadsheet.infer_provider_from_filename(
+                "UNION - London Bridge & Southbank_2026-07-14 (original).xlsx"
+            ),
+            "UNION",
+        )
+
     def test_different_headers_hash_differently(self):
         a = extract_spreadsheet.header_hash(["Building"])
         b = extract_spreadsheet.header_hash(["Building "])
@@ -339,6 +373,10 @@ class ReadSpreadsheetXludfIntegrationTests(unittest.TestCase):
         self.assertEqual(list(df.columns), ["Building", "Size (sq ft)"])
         self.assertEqual(df.iloc[0]["Building"], "28 Bruton Street")
         self.assertEqual(df.iloc[0]["Size (sq ft)"], 759)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":
