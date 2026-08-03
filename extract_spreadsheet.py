@@ -58,6 +58,7 @@ EXTRA_SYNONYMS = {
     "submarket": ("area",),
     "internal_ref": ("external ref",),
     "provider": ("assigned agents",),
+    "special_features": ("key features",),
 }
 
 

@@ -120,6 +120,50 @@ class SuggestMappingTests(unittest.TestCase):
                 guess = extract_spreadsheet.suggest_mapping([header])
                 self.assertEqual(guess[header], "brochure_link")
 
+    def test_maps_the_real_kitts_key_features_header(self):
+        # "Key Features" (note: trailing space in the real header cell,
+        # stripped by normalize_key) is the real column used by the actual
+        # Kitt's Availability (External).xlsx export for descriptive
+        # amenity/notes text - the same concept as special_features, just
+        # different wording from "Special Features".
+        guess = extract_spreadsheet.suggest_mapping(["Key Features "])
+        self.assertEqual(guess["Key Features "], "special_features")
+
+    def test_real_kitts_header_set_maps_every_genuinely_mappable_column_and_nothing_else(self):
+        # The full real header set from Kitt's Availability (External).xlsx
+        # - confirms the confirm-mapping UI would show a fully correct
+        # mapping on first upload (10 real fields, nothing guessed wrong)
+        # with every genuinely unmappable column still correctly left for
+        # a human to see as "(ignore)", not silently guessed.
+        headers = [
+            "Area", "Building", "Floor/Unit", "Size \n(sq ft)", "Desks \n(max)",
+            "Marketing Price \n(Based on Min Term)\nPCM", "Marketing Price \n(Based on Min Term)\nPSF",
+            "Link to Brochure", "Min. term", "Key Features ", "State of Space", "Legal Structure",
+            "Broker Fee", "Marketing Permission", "Commercial Model", "Patch?",
+            "Unit Lead - Viewings go to this person initially", "Unit Support - back up cover for viewings",
+            "Who Onboarded?", "Landlord/Agent Onboarded", "Other Info", "Access Information",
+            "Link to Floorplan", "Link to High Res Images", "Matterport Link",
+        ]
+        guess = extract_spreadsheet.suggest_mapping(headers)
+
+        expected_mapped = {
+            "Area": "submarket",
+            "Building": "building",
+            "Floor/Unit": "floor_unit",
+            "Size \n(sq ft)": "size_sqft",
+            "Desks \n(max)": "desks_max",
+            "Marketing Price \n(Based on Min Term)\nPCM": "rent_pcm",
+            "Marketing Price \n(Based on Min Term)\nPSF": "rent_psf",
+            "Link to Brochure": "brochure_link",
+            "Key Features ": "special_features",
+            "State of Space": "state_of_space",
+        }
+        for header, field in expected_mapped.items():
+            self.assertEqual(guess[header], field, f"{header!r} should map to {field!r}")
+
+        for header in set(headers) - set(expected_mapped):
+            self.assertIsNone(guess[header], f"{header!r} has no real field and must not be guessed")
+
     def test_never_suggests_an_unmappable_field(self):
         guess = extract_spreadsheet.suggest_mapping(["Property Id", "Source File"])
         self.assertIsNone(guess["Property Id"])
