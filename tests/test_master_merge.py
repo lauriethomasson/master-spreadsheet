@@ -66,14 +66,55 @@ class SilentFieldUpdatesTests(unittest.TestCase):
 
 
 class IsDetailLossTests(unittest.TestCase):
-    """The core safeguard: is a free-text update dropping real information?"""
+    """The core safeguard: is a free-text update dropping a genuine item,
+    as opposed to rewording/compressing the same fact into fewer words?"""
 
     def test_full_amenity_list_replaced_by_one_liner_is_flagged(self):
         self.assertTrue(master_merge.is_detail_loss(BOND_STREET_AMENITIES, "Available Q3 2026"))
 
-    def test_short_new_value_flagged_purely_on_length(self):
+    def test_long_single_fact_reworded_much_shorter_is_not_flagged(self):
+        # The actual reported false positive: a much shorter value that's
+        # still the same underlying fact, just reworded/compressed - must
+        # not be flagged purely for being short.
+        old = "Benefits from a large private terrace landscaped with plants, trees and premium Italian outdoor furniture"
+        new = "Private landscaped terrace"
+        self.assertFalse(master_merge.is_detail_loss(old, new))
+
+    def test_comma_only_rewording_with_no_semicolons_is_not_flagged(self):
+        # Neither value has a ";" to itemize on, so this is compared as one
+        # whole-value "item" rather than several - a real, if coarse, trade-
+        # off (see _detail_items' docstring): a legitimate compression like
+        # this is never flagged, at the cost of not being able to tell
+        # "genuinely dropped unrelated amenities" apart from "reworded" when
+        # the source text was never itemized with semicolons to begin with.
         old = "Fully fitted, CAT A+ finish, breakout area, phone booths, kitchen"
         new = "Fitted"
+        self.assertFalse(master_merge.is_detail_loss(old, new))
+
+    def test_semicolon_itemized_drop_with_nothing_replacing_it_is_flagged(self):
+        # With real items (";"-delimited, matching the documented extraction
+        # format), dropping one item entirely - not rewording it, just
+        # removing it - is caught at the individual-item level.
+        old = "Bike racks; passenger lifts; LED lighting; lockers; showers; roof terrace"
+        new = "Bike racks; passenger lifts; LED lighting; lockers; showers"
+        self.assertTrue(master_merge.is_detail_loss(old, new))
+
+    def test_semicolon_itemized_reword_of_every_item_is_not_flagged(self):
+        old = "Bike racks; passenger lifts; roof terrace with panoramic views"
+        new = "Racks for bikes; lifts for passengers; a terrace with panoramic views"
+        self.assertFalse(master_merge.is_detail_loss(old, new))
+
+    def test_comma_within_a_single_semicolon_item_is_not_split(self):
+        # "deposit £36,000 required" is ONE item per the documented format
+        # (extract.py's own example) - splitting on comma would shred it
+        # into "deposit £36" / "000 required", corrupting the comparison.
+        old = "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth"
+        new = "2 meeting rooms; a deposit of £36,000 is required; 50Mb dedicated bandwidth"
+        self.assertFalse(master_merge.is_detail_loss(old, new))
+
+    def test_contacts_dropping_a_whole_person_is_flagged(self):
+        old = "Jane Smith, jane@example.com, 020 1234 5678; John Doe, john@example.com, 020 8765 4321"
+        new = "Jane Smith, jane@example.com, 020 1234 5678"
         self.assertTrue(master_merge.is_detail_loss(old, new))
 
     def test_similar_length_but_mostly_different_content_is_flagged(self):

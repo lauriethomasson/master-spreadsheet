@@ -4,10 +4,13 @@ storage/file_store.py
 Manages staging .xlsx files created by the Upload page and consumed by the
 Review page, which combines every currently-pending file into one table.
 Each staging upload gets its own file plus a sidecar .meta.json tracking
-{filename, timestamp, status, n_rows}, so multiple pending uploads can
-coexist before any of them is approved. Approving marks every pending file's
-status as approved; the underlying .xlsx files are never deleted or edited
-in place after that.
+{filename, timestamp, status, n_rows, content_hash}, so multiple pending
+uploads can coexist before any of them is approved. Approving marks every
+pending file's status as approved; the underlying .xlsx files are never
+deleted or edited in place after that - which is exactly what makes
+content_hash usable as a permanent "has this exact file been processed
+before" ledger (see find_previous_upload_by_hash) covering the upload's
+entire history, not just what's still pending.
 
 Storage itself (local disk vs. a GCS bucket) is delegated entirely to
 storage/blob_store - this module only deals in the same plain path/key
@@ -45,7 +48,7 @@ def _write_meta(xlsx_path: str, meta: dict) -> None:
     blob_store.write_bytes(_meta_path(xlsx_path), json.dumps(meta, indent=2).encode("utf-8"))
 
 
-def save_staging_file(rows: list[ListingRow], original_filename: str) -> str:
+def save_staging_file(rows: list[ListingRow], original_filename: str, content_hash: str = None) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     stem = Path(original_filename).stem
     staging_path = f"{STAGING_PREFIX}/{timestamp}_{stem}.xlsx"
@@ -60,9 +63,54 @@ def save_staging_file(rows: list[ListingRow], original_filename: str) -> str:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "pending_review",
             "n_rows": len(rows),
+            "content_hash": content_hash,
         },
     )
     return staging_path
+
+
+def find_previous_upload_by_hash(content_hash: str) -> str:
+    """
+    The staging path of the most recent previously-processed upload with
+    this exact content_hash (see app.py, which hashes the raw uploaded
+    bytes before extraction), or None if this exact file content has never
+    been uploaded before. Searches every staging entry regardless of status
+    - pending or already approved - since staging .xlsx files are kept
+    forever (see module docstring), making this a permanent ledger rather
+    than something that only catches a re-upload while the first one is
+    still awaiting review.
+
+    A hit lets the caller skip re-extraction entirely and reuse the earlier
+    rows verbatim - besides the wasted API call, re-extracting an unchanged
+    document risks Gemini's own non-determinism producing different wording
+    for a prose field (special_features, contacts) on a document that
+    hasn't actually changed at all, which would otherwise show up as a
+    spurious diff with nothing real behind it.
+
+    Entries written before this existed have no "content_hash" key at all
+    (None via .get()), so they simply never match a fresh hash - no
+    backfill needed for old history to behave correctly.
+    """
+    if not content_hash:
+        return None
+    return _find_previous_upload_by_hash_cached(content_hash, _staging_signature())
+
+
+@st.cache_data(max_entries=8, ttl=3600)
+def _find_previous_upload_by_hash_cached(content_hash: str, signature: tuple) -> str:
+    matches = []
+    for xlsx_path, _ in blob_store.list_with_mtimes(STAGING_PREFIX, ".xlsx"):
+        try:
+            meta = _read_meta(xlsx_path)
+        except FileNotFoundError:
+            continue
+        if meta.get("content_hash") == content_hash:
+            matches.append((meta.get("timestamp", ""), xlsx_path))
+
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
 
 
 def save_original_pdf(data: bytes, original_filename: str) -> str:

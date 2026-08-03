@@ -52,11 +52,22 @@ DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "s
 # noise.
 RISKY_TEXT_FIELDS = ("special_features", "contacts")
 
-# Thresholds for is_detail_loss - a review trigger, not a block, so these are
+# Threshold for _items_similar - a review trigger, not a block, so this is
 # deliberately lenient (a genuinely shorter-but-current update still goes
-# through once a human confirms it in manual review).
-DETAIL_LOSS_LENGTH_RATIO = 0.5
-DETAIL_LOSS_RETENTION_RATIO = 0.5
+# through once a human confirms it in manual review). Expressed as a
+# fraction of the SMALLER item's significant-word count, not the total -
+# see _items_similar's docstring for why.
+ITEM_SIMILARITY_THRESHOLD = 0.5
+
+# Dropped when tokenizing an item for _items_similar - common words that
+# would otherwise register as "shared content" between two items that don't
+# actually share any real subject matter (e.g. "with" appearing in both
+# "terrace with views" and "kitchen with dishwasher" says nothing about
+# whether either one has a counterpart in the other's item list).
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "of", "with", "from", "for", "to",
+    "in", "on", "at", "by", "is", "are", "this", "that", "has", "have",
+})
 
 
 def normalize_key(value) -> str:
@@ -167,44 +178,92 @@ def silent_field_updates(old: dict, new: dict) -> dict:
 
 def _detail_items(text: str) -> list[str]:
     """Splits a free-text list field (special_features, contacts) into its
-    individual items on common list delimiters, for the retained-item check
-    in is_detail_loss. Fragments under 3 chars are dropped - they're almost
-    always leftover punctuation/conjunctions ("a", "&") rather than a real
-    item, and would otherwise pad the retention ratio with matches that mean
-    nothing."""
-    parts = re.split(r"[,;\n•·/]+", text.lower())
+    individual items - on ";" and newline ONLY, matching the delimiters
+    those fields are actually documented to use (see extract.py's
+    extraction prompt for special_features: "a semicolon-separated list...
+    e.g. '2 meeting rooms; deposit £36,000 required'"; schema.py's comment
+    on contacts: "one per line/semicolon"). Deliberately NOT comma - a
+    single genuine item routinely contains one on its own (that exact
+    "£36,000" example), and contacts' own per-person format is "Name,
+    email, phone", so splitting on comma there would shred one contact
+    into three fake items. The cost of this: a value that isn't actually
+    semicolon-itemized (e.g. a single comma-joined sentence with no ";" at
+    all) is treated as ONE item rather than several - see is_detail_loss's
+    docstring for why that's the right trade-off anyway.
+
+    A too-short fragment (stray punctuation/an empty trailing segment from
+    a trailing ";") is dropped; it's not solid enough evidence either way
+    for the similarity check in is_detail_loss to build on.
+    """
+    parts = re.split(r"[;\n]+", text.lower())
     return [p.strip() for p in parts if len(p.strip()) >= 3]
+
+
+def _significant_words(item: str) -> frozenset:
+    """Lowercased alphanumeric tokens with stopwords and very short
+    fragments (len <= 2 - "a", "of", a stray unit fragment) removed - the
+    comparable "content" of one item for _items_similar, order-independent
+    so word-reordering in a rewording never itself looks like a mismatch."""
+    words = re.findall(r"[a-z0-9]+", item.lower())
+    return frozenset(w for w in words if len(w) > 2 and w not in _STOPWORDS)
+
+
+def _items_similar(item_a: str, item_b: str) -> bool:
+    """
+    True if item_a and item_b look like the same underlying fact, tolerating
+    rewording - e.g. "Benefits from a large private terrace landscaped with
+    plants, trees and premium Italian outdoor furniture" and "Private
+    landscaped terrace" are the same fact at different lengths, not two
+    different facts.
+
+    Measured as shared significant words divided by the SMALLER item's
+    word count, not the total (i.e. not a symmetric Jaccard/union-based
+    ratio) - a short rewording's words are typically close to a full subset
+    of the longer original's, so this rewards exactly that shape of match
+    (a compressed paraphrase) rather than penalizing it for not sharing the
+    longer item's other, dropped words too. Order-independent - a set
+    intersection, not a sequence-alignment score - since paraphrasing
+    routinely reorders words ("large private terrace landscaped" vs
+    "private landscaped terrace") without changing the underlying fact.
+    """
+    words_a, words_b = _significant_words(item_a), _significant_words(item_b)
+    if not words_a or not words_b:
+        return False
+    overlap = len(words_a & words_b)
+    return overlap / min(len(words_a), len(words_b)) >= ITEM_SIMILARITY_THRESHOLD
 
 
 def is_detail_loss(old_val, new_val) -> bool:
     """
-    True when `new_val` looks like it may have dropped real information
-    `old_val` had, rather than being a genuine update - e.g. a brochure
-    re-upload's special_features carrying just "Available Q3 2026" over a
-    master row whose special_features already listed six amenities. Flags on
-    either signal:
-      - new_val is under DETAIL_LOSS_LENGTH_RATIO the length of old_val, or
-      - fewer than DETAIL_LOSS_RETENTION_RATIO of old_val's distinct
-        comma/semicolon/newline/bullet-separated items still appear in
-        new_val.
+    True when `new_val` looks like it dropped a genuine item `old_val` had,
+    rather than just rewording/shortening it - e.g. a brochure re-upload's
+    special_features carrying just "Available Q3 2026" over a master row
+    whose special_features listed six amenities (dropped everything), vs.
+    a long single-fact description compressed into a short rewording of the
+    same fact (not a drop at all - see _items_similar).
+
+    Splits both values into items (see _detail_items) and flags if ANY of
+    old_val's items has no reasonably similar counterpart (see
+    _items_similar) anywhere in new_val's items - a real item disappearing
+    with nothing standing in for it, not merely "new_val is short" or
+    "these exact characters aren't in new_val verbatim" - a length or
+    substring check flags legitimate rewording as a false positive (a long
+    fact compressed into a short paraphrase looks identical, by either of
+    those measures, to a fact being deleted outright).
+
     Only called for RISKY_TEXT_FIELDS, and only a review trigger (see that
     constant's docstring) - never applied automatically, callers still let a
     human apply, correct, or skip the field in manual review.
     """
     if _is_blank(old_val) or _is_blank(new_val):
         return False
-    old_text = str(old_val).strip()
-    new_text = str(new_val).strip()
 
-    if len(new_text) < DETAIL_LOSS_LENGTH_RATIO * len(old_text):
-        return True
-
-    old_items = _detail_items(old_text)
+    old_items = _detail_items(str(old_val))
+    new_items = _detail_items(str(new_val))
     if not old_items:
         return False
-    new_lower = new_text.lower()
-    retained = sum(1 for item in old_items if item in new_lower)
-    return (retained / len(old_items)) < DETAIL_LOSS_RETENTION_RATIO
+
+    return any(not any(_items_similar(old_item, new_item) for new_item in new_items) for old_item in old_items)
 
 
 def _fallback_key(row: dict) -> tuple:
