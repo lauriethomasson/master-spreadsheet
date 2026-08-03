@@ -28,6 +28,35 @@ SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
 _MAPPABLE_FIELDS = sorted(f for f in ListingRow.model_fields if f not in extract_spreadsheet.UNMAPPABLE_FIELDS)
 _FIELD_OPTIONS = ["(ignore this column)"] + _MAPPABLE_FIELDS
 
+# Increase this whenever extraction logic changes. This prevents results
+# created by older extraction code from being reused.
+EXTRACTION_VERSION = "2"
+
+
+def infer_provider_from_filename(filename: str) -> str | None:
+    """Infer providers that are clearly identified by the uploaded filename."""
+    normalized = Path(filename).stem.casefold().replace("’", "'")
+
+    if "kitt" in normalized:
+        return "Kitt's"
+
+    return None
+
+
+def fill_missing_provider(rows: list[ListingRow], filename: str) -> None:
+    """Fill provider/internal_ref without overwriting extracted values."""
+    fallback_provider = infer_provider_from_filename(filename)
+
+    if not fallback_provider:
+        return
+
+    for row in rows:
+        if not row.provider:
+            row.provider = fallback_provider
+
+        if not row.internal_ref:
+            row.internal_ref = row.provider or fallback_provider
+
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
 
