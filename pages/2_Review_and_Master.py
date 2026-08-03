@@ -122,7 +122,22 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         st.session_state["export_selected_property_ids"] = set(df.loc[edited.index[edited["Select"]], "property_id"])
     selected_positions = edited.index[edited["Select"]].tolist()
     st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
-    st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
+
+    with st.container(horizontal=True):
+        st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
+        if st.button("Clear selection", key=f"{key}_clear_selection", disabled=not selected_positions):
+            st.session_state["export_selected_property_ids"] = set()
+            st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
+            # Also resets the data_editor's OWN widget state (same reasoning
+            # as _process_manual_edits below) - otherwise its cached
+            # per-checkbox overrides from before this click would just
+            # reapply themselves on the next render, on top of the freshly
+            # all-unchecked Select column this seeds from the now-empty
+            # export_selected_property_ids, leaving every box looking still
+            # checked despite the tracked set genuinely being empty.
+            if key in st.session_state:
+                del st.session_state[key]
+            st.rerun()
 
     return _process_manual_edits(df, key)
 
