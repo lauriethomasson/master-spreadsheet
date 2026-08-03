@@ -202,6 +202,9 @@ with page_setup.setup_page("upload"):
 
                         geocode_rows(rows)
                         reused = False
+                    # Applies to PDFs, spreadsheets, emails and reused rows.
+                    # Existing extracted provider values are not overwritten.
+                    fill_missing_provider(rows, uploaded_file.name)
 
                     # Staged immediately, per file (reused or freshly
                     # extracted alike) - so a failure partway through a
