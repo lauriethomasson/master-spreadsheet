@@ -40,29 +40,12 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
     approved = {}
     for f, (old_val, new_val) in diffs.items():
         is_risky = f in risky_fields
-        cols = st.columns([2, 3, 3, 1])
-        cols[0].markdown(f"**{f}**")
-        cols[1].write("—" if old_val in (None, "") else old_val)
+        st.markdown(f"**{f}**")
         kind = master_merge.field_kind(f)
-        with cols[2]:
-            if kind in ("int", "float"):
-                default = float(new_val) if new_val is not None else 0.0
-                edited = st.number_input(
-                    "New value", value=default, step=(1.0 if kind == "int" else 0.01),
-                    key=f"{key_prefix}_{f}_value", label_visibility="collapsed",
-                )
-                value = int(edited) if kind == "int" else edited
-            else:
-                edited = st.text_input(
-                    "New value", value="" if new_val is None else str(new_val),
-                    key=f"{key_prefix}_{f}_value", label_visibility="collapsed",
-                )
-                value = edited if edited != "" else None
-        with cols[3]:
-            apply_field = st.checkbox(
-                "Apply", value=default_checked and not is_risky,
-                key=f"{key_prefix}_{f}_apply", label_visibility="collapsed",
-            )
+        value = display_utils.render_before_after_editable(old_val, new_val, kind, key=f"{key_prefix}_{f}_value")
+        apply_field = st.checkbox(
+            "Apply this change", value=default_checked and not is_risky, key=f"{key_prefix}_{f}_apply",
+        )
         if is_risky:
             st.caption(
                 "⚠️ This update looks like it may be missing information from the current record — "
@@ -70,7 +53,39 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
             )
         if apply_field:
             approved[f] = value
+        st.divider()
     return approved
+
+
+def _render_let_status_decision(m, key_prefix: str) -> str:
+    """
+    Prominently shown - never inside a collapsed expander like a normal
+    field diff - when a matched row's update contains wording suggesting
+    the property is no longer available (see
+    master_merge.mentions_let_status). Whether this property still belongs
+    in master at all is a more fundamental question than "which fields to
+    accept", so it gets its own explicit choice instead of being folded
+    into the ordinary per-field checkboxes.
+
+    Defaults to "keep" (the non-destructive option) if the reviewer never
+    touches the radio and just clicks Approve - this is a review trigger
+    forcing a human to look, not a trap that silently deletes anything.
+    """
+    st.warning(
+        f"🏷️ **{display_utils.row_label(m.new_row.model_dump())}** — this update's wording suggests "
+        "the property may no longer be available."
+    )
+    for f in m.let_status_fields:
+        old_val, new_val = m.diffs[f]
+        st.markdown(f"**{f}**")
+        display_utils.render_before_after(old_val, new_val)
+
+    choice = st.radio(
+        "What should happen to this property?",
+        ["Keep in master — apply this update", "Remove this property from master entirely"],
+        key=f"{key_prefix}_let_decision",
+    )
+    return "remove" if choice.startswith("Remove") else "keep"
 
 
 def _render_master_table(df: pd.DataFrame, key: str) -> bool:
@@ -197,11 +212,14 @@ def _process_manual_edits(df: pd.DataFrame, key: str) -> bool:
 def _render_approval_confirmation(approval: dict):
     updated_count = approval["updated_count"]
     new_count = approval["new_count"]
+    removed_count = approval.get("removed_count", 0)
     parts = []
     if updated_count:
         parts.append(f"updated {updated_count} propert{'y' if updated_count == 1 else 'ies'}")
     if new_count:
         parts.append(f"added {new_count} new propert{'y' if new_count == 1 else 'ies'}")
+    if removed_count:
+        parts.append(f"removed {removed_count} propert{'y' if removed_count == 1 else 'ies'}")
     summary = ("Approved — " + " and ".join(parts) + ".") if parts else "Approved — no changes were applied."
     st.success(summary)
 
@@ -224,17 +242,17 @@ def _render_approval_confirmation(approval: dict):
                 st.rerun()
 
     if show_details:
-        rows = [
-            {
-                "Property": d["property"],
-                "Field": d["field"],
-                "Change": f"{'—' if d['old'] in (None, '') else d['old']} → {d['new']}",
-            }
-            for d in approval["diff_rows"]
-        ]
-        rows += [{"Property": label, "Field": "(new property)", "Change": "—"} for label in approval["new_labels"]]
-        if rows:
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        diff_rows = approval["diff_rows"]
+        new_labels = approval["new_labels"]
+        removed_labels = approval.get("removed_labels", [])
+        if diff_rows or new_labels or removed_labels:
+            for d in diff_rows:
+                st.markdown(f"**{d['property']}** — {d['field']}")
+                display_utils.render_before_after(d["old"], d["new"])
+            for label in new_labels:
+                st.write(f"🆕 {label} — new property")
+            for label in removed_labels:
+                st.write(f"🗑️ {label} — removed from master")
         else:
             st.caption("No field-level changes to show.")
 
@@ -259,8 +277,8 @@ def _render_manual_edit_confirmation(edit: dict):
             st.rerun()
 
     for d in edit["diff_rows"]:
-        old_display = "—" if d["old"] in (None, "") else d["old"]
-        st.caption(f"{d['property']} — **{d['field']}**: {old_display} → {d['new']}")
+        st.markdown(f"**{d['property']}** — {d['field']}")
+        display_utils.render_before_after(d["old"], d["new"])
 
 
 def _render_full_master_view():
@@ -323,6 +341,12 @@ def _render_pending_review(pending: list):
     risky_changed_ids = {id(m) for m in plan.matched_changed if m.risky_fields}
     any_risky = bool(risky_changed_ids - colliding_changed_ids)
 
+    # See master_merge.mentions_let_status - wording suggesting a property
+    # is no longer available always forces a manual keep/remove decision,
+    # same principle as a same-batch collision never being auto-resolved.
+    let_status_ids = {id(m) for m in plan.matched_changed if m.let_status_fields}
+    any_let_status = bool(let_status_ids)
+
     if any_collisions:
         st.warning(
             "Some rows in this batch appear to target the same property (marked "
@@ -337,6 +361,13 @@ def _render_pending_review(pending: list):
             "being applied automatically."
         )
 
+    if any_let_status:
+        st.warning(
+            "Some updates (marked 🏷️ below) look like they may mean a property is "
+            "no longer available — these always need a manual keep-or-remove "
+            "decision, regardless of auto-accept."
+        )
+
     manual_review = st.toggle(
         "Review each field manually instead of applying automatically",
         key="manual_review_toggle",
@@ -346,7 +377,7 @@ def _render_pending_review(pending: list):
     if auto_accept:
         auto_changed = [
             m for m in plan.matched_changed
-            if id(m) not in colliding_changed_ids and id(m) not in risky_changed_ids
+            if id(m) not in colliding_changed_ids and id(m) not in risky_changed_ids and id(m) not in let_status_ids
         ]
         auto_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
         summary_parts = []
@@ -357,14 +388,15 @@ def _render_pending_review(pending: list):
         if summary_parts:
             st.info(
                 "This will " + " and ".join(summary_parts) + "."
-                + (" Rows flagged above need manual review first." if (any_collisions or any_risky) else "")
+                + (" Rows flagged above need manual review first." if (any_collisions or any_risky or any_let_status) else "")
             )
-        elif not any_collisions and not any_risky:
+        elif not any_collisions and not any_risky and not any_let_status:
             st.info("Nothing to apply automatically — every row already matches the master with no changes.")
 
     updates = {}          # master_index -> {field: approved_value} - real, review-worthy changes only
     silent_by_index = {}  # master_index -> {field: value} - tolerant-formatting fixes, never shown in the diff UI
     new_rows_final = []   # ListingRow objects confirmed as genuinely new
+    removed_indices = set()  # master_index values confirmed no longer available - see _render_let_status_decision
 
     def _apply_silent(m):
         # Applies regardless of auto/manual mode and regardless of whether
@@ -377,12 +409,25 @@ def _render_pending_review(pending: list):
             entry["source_file"] = m.new_row.source_file
 
     if plan.matched_changed:
-        if not auto_accept or colliding_changed_ids or risky_changed_ids:
+        if not auto_accept or colliding_changed_ids or risky_changed_ids or let_status_ids:
             st.subheader("Matched — changes detected")
         for i, m in enumerate(plan.matched_changed):
             is_collision = id(m) in colliding_changed_ids
             is_risky = id(m) in risky_changed_ids
+            is_let_status = id(m) in let_status_ids
             _apply_silent(m)
+
+            if is_let_status:
+                key_prefix = f"matched_{i}_{m.property_id}"
+                decision = _render_let_status_decision(m, key_prefix)
+                if decision == "remove":
+                    removed_indices.add(m.master_index)
+                else:
+                    entry = updates.setdefault(m.master_index, {})
+                    entry.update({f: new_val for f, (old_val, new_val) in m.diffs.items()})
+                    entry["source_file"] = m.new_row.source_file
+                continue
+
             if auto_accept and not is_collision and not is_risky:
                 entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
                 entry["source_file"] = m.new_row.source_file
@@ -485,7 +530,10 @@ def _render_pending_review(pending: list):
     if st.button("Approve → Master", type="primary"):
         with st.spinner("Updating master spreadsheet..."):
             try:
-                diff_rows, new_labels = master_merge.build_approval_summary(plan, updates, new_rows_final)
+                removed_indices_frozen = frozenset(removed_indices)
+                diff_rows, new_labels, removed_labels = master_merge.build_approval_summary(
+                    plan, updates, new_rows_final, removed_indices_frozen,
+                )
 
                 # The version to offer for "Undo this update" is whatever was
                 # newest BEFORE this write - the one write_master() is about
@@ -501,19 +549,24 @@ def _render_pending_review(pending: list):
                 combined_updates = {idx: dict(fields) for idx, fields in silent_by_index.items()}
                 for idx, fields in updates.items():
                     combined_updates.setdefault(idx, {}).update(fields)
-                merged_rows = master_merge.apply_merge(plan.master_records, combined_updates, new_rows_final)
+                merged_rows = master_merge.apply_merge(
+                    plan.master_records, combined_updates, new_rows_final, removed_indices_frozen,
+                )
                 master_writer.write_master(
                     merged_rows,
                     new_count=len(new_rows_final),
                     updated_count=len(updates),
+                    removed_count=len(removed_indices_frozen),
                 )
                 for path in pending:
                     mark_as_approved(path)
                 st.session_state["last_approval"] = {
                     "updated_count": len(updates),
                     "new_count": len(new_rows_final),
+                    "removed_count": len(removed_indices_frozen),
                     "diff_rows": diff_rows,
                     "new_labels": new_labels,
+                    "removed_labels": removed_labels,
                     "version_path": previous_version_path,
                 }
                 st.session_state["show_approval_details"] = False

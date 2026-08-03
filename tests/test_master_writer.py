@@ -81,6 +81,31 @@ class ManualEditVersioningTests(IsolatedCwdTestCase):
         versions = master_writer.list_versions()
         self.assertEqual(versions[0]["label"], "0 updated, 1 new")
 
+    def test_removed_count_appears_in_the_label_when_non_zero(self):
+        master_writer.write_master(
+            [ListingRow(building="A", provider="P1")],
+            new_count=1,
+            updated_count=2,
+            removed_count=1,
+        )
+
+        versions = master_writer.list_versions()
+        self.assertEqual(versions[0]["label"], "2 updated, 1 new, 1 removed")
+
+    def test_removed_count_omitted_from_the_label_when_zero(self):
+        # Matches the existing "0 updated, 1 new" convention - removed_count
+        # is a newer, less common dimension, so a normal approve's label
+        # shouldn't grow a ", 0 removed" suffix just because the param exists.
+        master_writer.write_master(
+            [ListingRow(building="A", provider="P1")],
+            new_count=1,
+            updated_count=0,
+            removed_count=0,
+        )
+
+        versions = master_writer.list_versions()
+        self.assertEqual(versions[0]["label"], "0 updated, 1 new")
+
     def test_manual_edit_creates_a_restorable_version_like_an_approve(self):
         master_writer.write_master([ListingRow(building="Original", provider="P1")])
         first_version = master_writer.list_versions(limit=1)[0]["path"]

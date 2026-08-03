@@ -348,5 +348,172 @@ class BuildManualEditTests(unittest.TestCase):
         self.assertEqual(merged_rows[0].size_sqft, 1200.0)
 
 
+class MentionsLetStatusTests(unittest.TestCase):
+    """The core detection: does this free-text value's wording suggest the
+    property is no longer available? Vocabulary confirmed present in this
+    repo's real sample documents (tests/sample_docs) - see
+    master_merge.LET_STATUS_KEYWORDS' docstring."""
+
+    def test_users_own_starting_vocabulary(self):
+        self.assertTrue(master_merge.mentions_let_status("Status: Let"))
+        self.assertTrue(master_merge.mentions_let_status("This unit has now been Leased"))
+        self.assertTrue(master_merge.mentions_let_status("No longer available"))
+        self.assertTrue(master_merge.mentions_let_status("Withdrawn from the market"))
+
+    def test_confirmed_present_in_real_sample_documents(self):
+        # 40_New_Bond_Street_Brochure.pdf / Office_Space_by_The_Crown_Estate:
+        # a floor's Availability listed as "Under Offer".
+        self.assertTrue(master_merge.mentions_let_status("Under Offer"))
+        # Breezblok.pdf's own brochure: "The centre is now 100% Occupied".
+        self.assertTrue(master_merge.mentions_let_status("The centre is now 100% Occupied"))
+
+    def test_case_insensitive(self):
+        self.assertTrue(master_merge.mentions_let_status("UNDER OFFER"))
+        self.assertTrue(master_merge.mentions_let_status("withdrawn"))
+
+    def test_pre_let_and_similar_compounds_are_not_false_positives(self):
+        # GPE.eml's real wording: "high pre-let demand" / "pre-let at
+        # Elsley" describes a BUILDING's overall leasing momentum, not this
+        # specific unit's own current availability.
+        self.assertFalse(master_merge.mentions_let_status("Last remaining workspace after high pre-let demand."))
+        self.assertFalse(master_merge.mentions_let_status("80% pre-let at Elsley"))
+        self.assertFalse(master_merge.mentions_let_status("Available on a sub-let basis"))
+
+    def test_ordinary_amenity_text_is_not_flagged(self):
+        self.assertFalse(master_merge.mentions_let_status("Bike racks; showers; roof terrace"))
+
+    def test_blank_is_not_flagged(self):
+        self.assertFalse(master_merge.mentions_let_status(None))
+        self.assertFalse(master_merge.mentions_let_status(""))
+
+
+class BuildMergePlanLetStatusTests(unittest.TestCase):
+    """The exact scenario this feature exists for: a re-upload's wording
+    implies a matched property is no longer available."""
+
+    def test_special_features_mentioning_let_flags_the_matched_row(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "Test Provider", "floor_unit": "1st Floor",
+            "postcode": "EC1A 1AA", "special_features": "Bike racks; showers",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="Test Provider", floor_unit="1st Floor",
+            postcode="EC1A 1AA", special_features="Let",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.let_status_fields)
+        # Still a real diff, exactly like risky_fields - the safeguard forces
+        # manual review, it never makes the change disappear.
+        self.assertIn("special_features", matched.diffs)
+
+    def test_state_of_space_mentioning_withdrawn_flags_the_matched_row(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "Test Provider",
+            "state_of_space": "Fully Fitted",
+        }])
+        new_row = ListingRow(building="1 Example Street", provider="Test Provider", state_of_space="Withdrawn")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertIn("state_of_space", plan.matched_changed[0].let_status_fields)
+
+    def test_normal_update_is_not_flagged(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "Test Provider", "special_features": "Bike racks",
+        }])
+        new_row = ListingRow(building="1 Example Street", provider="Test Provider", special_features="Bike racks; showers")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(plan.matched_changed[0].let_status_fields, frozenset())
+
+    def test_new_unmatched_property_is_never_flagged(self):
+        # A brand-new listing has no "let status change" concept - only
+        # MatchedRow carries let_status_fields at all, and this must land
+        # in plan.unmatched, not plan.matched_changed.
+        master_df = _master_df([{"building": "Somewhere Else", "provider": "Other Provider"}])
+        new_row = ListingRow(building="1 Example Street", provider="Test Provider", special_features="Let")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertIs(plan.unmatched[0].new_row, new_row)
+
+
+class ApplyMergeRemovalTests(unittest.TestCase):
+    """Delete-row support added for the "remove from master entirely"
+    decision - confirmed via investigation that no such capability existed
+    anywhere in the codebase before this."""
+
+    def _records(self, rows):
+        return [ListingRow(**r).model_dump() for r in rows]
+
+    def test_removed_index_is_dropped_from_the_result(self):
+        master_records = self._records([
+            {"building": "A", "provider": "P1"},
+            {"building": "B", "provider": "P2"},
+            {"building": "C", "provider": "P3"},
+        ])
+
+        result = master_merge.apply_merge(master_records, {}, [], removed_indices=frozenset({1}))
+
+        self.assertEqual([r.building for r in result], ["A", "C"])
+
+    def test_other_rows_and_new_rows_are_unaffected(self):
+        master_records = self._records([{"building": "A", "provider": "P1"}, {"building": "B", "provider": "P2"}])
+        new_row = ListingRow(building="C", provider="P3")
+
+        result = master_merge.apply_merge(
+            master_records, {0: {"provider": "Updated"}}, [new_row], removed_indices=frozenset({1}),
+        )
+
+        self.assertEqual([r.building for r in result], ["A", "C"])
+        self.assertEqual(result[0].provider, "Updated")
+
+    def test_an_update_for_a_removed_index_is_moot_not_an_error(self):
+        master_records = self._records([{"building": "A", "provider": "P1"}])
+
+        result = master_merge.apply_merge(
+            master_records, {0: {"provider": "Should never apply"}}, [], removed_indices=frozenset({0}),
+        )
+
+        self.assertEqual(result, [])
+
+    def test_no_removed_indices_behaves_exactly_as_before(self):
+        master_records = self._records([{"building": "A", "provider": "P1"}])
+        result = master_merge.apply_merge(master_records, {}, [])
+        self.assertEqual(len(result), 1)
+
+
+class BuildApprovalSummaryRemovalTests(unittest.TestCase):
+    def test_removed_labels_reflect_the_removed_property(self):
+        master_df = _master_df([
+            {"building": "A", "provider": "P1", "floor_unit": "1st Floor"},
+            {"building": "B", "provider": "P2"},
+        ])
+        plan = master_merge.build_merge_plan([], master_df)
+
+        diff_rows, new_labels, removed_labels = master_merge.build_approval_summary(
+            plan, {}, [], removed_indices=frozenset({0}),
+        )
+
+        self.assertEqual(removed_labels, ["A — P1 — 1st Floor"])
+        self.assertEqual(diff_rows, [])
+        self.assertEqual(new_labels, [])
+
+    def test_no_removals_gives_an_empty_list(self):
+        master_df = _master_df([{"building": "A", "provider": "P1"}])
+        plan = master_merge.build_merge_plan([], master_df)
+
+        _, _, removed_labels = master_merge.build_approval_summary(plan, {}, [])
+
+        self.assertEqual(removed_labels, [])
+
+
 if __name__ == "__main__":
     unittest.main()

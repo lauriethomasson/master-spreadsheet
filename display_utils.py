@@ -17,6 +17,56 @@ from staging_writer import HYPERLINK_DISPLAY_TEXT, title_case_label
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
+
+def render_before_after(old_val, new_val) -> None:
+    """
+    Side-by-side Before/After display for one changed field's old and new
+    value - a small muted "BEFORE" label over the old value, a small
+    accent-colored "AFTER" label over the new value, each in its own
+    bordered half-width box (st.columns(..., border=True), native to
+    Streamlit - no custom CSS/HTML needed) so long free-text values
+    (special_features, contacts) wrap onto as many lines as needed rather
+    than being squished onto one, and old vs new stay directly comparable
+    at a glance. Read-only - see render_before_after_editable for the
+    manual per-field review UI, where "After" is an input, not static text.
+    """
+    old_col, after_col = st.columns(2, border=True)
+    with old_col:
+        st.caption("BEFORE")
+        st.write("—" if old_val in (None, "") else old_val)
+    with after_col:
+        st.caption(":red[AFTER]")
+        st.write("—" if new_val in (None, "") else new_val)
+
+
+def render_before_after_editable(old_val, new_val, kind: str, key: str):
+    """
+    Like render_before_after, but "After" is an editable input
+    (st.number_input for an int/float field, st.text_input otherwise)
+    rather than static text - used by the manual per-field review UI, where
+    a reviewer can correct the incoming value, not just accept/reject it
+    verbatim. Returns the input's current value (int/float per kind, or
+    the text - None if left blank - for a str field).
+    """
+    old_col, after_col = st.columns(2, border=True)
+    with old_col:
+        st.caption("BEFORE")
+        st.write("—" if old_val in (None, "") else old_val)
+    with after_col:
+        st.caption(":red[AFTER]")
+        if kind in ("int", "float"):
+            default = float(new_val) if new_val is not None else 0.0
+            edited = st.number_input(
+                "New value", value=default, step=(1.0 if kind == "int" else 0.01),
+                key=key, label_visibility="collapsed",
+            )
+            return int(edited) if kind == "int" else edited
+        edited = st.text_input(
+            "New value", value="" if new_val is None else str(new_val),
+            key=key, label_visibility="collapsed",
+        )
+        return edited if edited != "" else None
+
 # Columns holding a URL - rendered as a clickable link with a fixed label
 # instead of the raw URL (which would otherwise make the table unreadable).
 LINK_COLUMNS = [

@@ -81,6 +81,7 @@ def log_master_write(
     version_path: str = None,
     timestamp: str = None,
     fields_changed: int = None,
+    removed_count: int = None,
 ):
     entry = {
         "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
@@ -92,6 +93,7 @@ def log_master_write(
         "updated_count": updated_count,
         "version_path": version_path,
         "fields_changed": fields_changed,
+        "removed_count": removed_count,
     }
     blob_store.append_text(LOG_PATH, json.dumps(entry) + "\n")
     print(f"[master_writer] {entry}", file=sys.stderr)
@@ -160,8 +162,13 @@ def list_versions(limit: int = None) -> list:
             n = entry.get("fields_changed") or 0
             label = f"Manual edit: {n} field{'s' if n != 1 else ''} changed"
         else:
-            new_c, upd_c = entry.get("new_count"), entry.get("updated_count")
-            label = f"{upd_c or 0} updated, {new_c or 0} new" if (new_c is not None or upd_c is not None) else "Approved upload"
+            new_c, upd_c, rem_c = entry.get("new_count"), entry.get("updated_count"), entry.get("removed_count")
+            if new_c is not None or upd_c is not None or rem_c is not None:
+                label = f"{upd_c or 0} updated, {new_c or 0} new"
+                if rem_c:
+                    label += f", {rem_c} removed"
+            else:
+                label = "Approved upload"
         result.append({"path": path, "timestamp": entry["timestamp"], "label": label})
     return result
 
@@ -173,6 +180,7 @@ def write_master(
     updated_count: int = None,
     source: str = "approve",
     fields_changed: int = None,
+    removed_count: int = None,
 ):
     # Grouped by provider regardless of what order the merge upstream
     # produced (matched rows keep their prior on-disk position, new rows
@@ -218,6 +226,7 @@ def write_master(
         version_path=version_path,
         timestamp=stamp,
         fields_changed=fields_changed,
+        removed_count=removed_count,
     )
 
 

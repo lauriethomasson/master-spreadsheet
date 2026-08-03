@@ -52,6 +52,49 @@ DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "s
 # noise.
 RISKY_TEXT_FIELDS = ("special_features", "contacts")
 
+# Free-text fields where wording indicating a property is no longer on the
+# market might appear - the two descriptive prose fields, never a matching
+# key or a structured numeric field. Checked against a MATCHED row's DIFF
+# (the new value only - see build_merge_plan) since a status that was
+# already there unchanged never shows up as a diff at all.
+LET_STATUS_FIELDS = ("special_features", "state_of_space")
+
+# Checked against this repo's real sample documents (tests/sample_docs)
+# rather than assumed - "Let"/"Leased"/"No longer available"/"Withdrawn"
+# are the user's own starting vocabulary; "Under Offer" and "Occupied" are
+# confirmed present in real documents in this repo: 40_New_Bond_Street_
+# Brochure.pdf's Schedule of Areas lists a floor's Availability as "Under
+# Offer" (also repeated across Office_Space_by_The_Crown_Estate_-_July_2026.
+# pdf), and Breezblok.pdf's own brochure states "The centre is now 100%
+# Occupied" - the exact live scenario this feature exists for: a
+# re-upload's wording implying a unit is no longer genuinely available.
+LET_STATUS_KEYWORDS = (
+    "let", "leased", "no longer available", "withdrawn", "under offer", "occupied",
+)
+
+
+def mentions_let_status(text) -> bool:
+    """
+    True if text contains wording suggesting the property is no longer on
+    the market - see LET_STATUS_KEYWORDS. Word-boundary matching throughout,
+    with "let" specifically excluding the "pre-let"/"re-let"/"sub-let"
+    compound forms (confirmed present in these same sample documents, e.g.
+    GPE.eml's "high pre-let demand" note about a DIFFERENT building's
+    overall leasing momentum) - those describe a leasing trend, not this
+    specific unit's own current availability, and would otherwise be a
+    false positive on real data.
+    """
+    if _is_blank(text):
+        return False
+    lowered = str(text).lower()
+    for kw in LET_STATUS_KEYWORDS:
+        pattern = rf"\b{re.escape(kw)}\b"
+        if kw == "let":
+            pattern = r"(?<!pre-)(?<!re-)(?<!sub-)" + pattern
+        if re.search(pattern, lowered):
+            return True
+    return False
+
 # Threshold for _items_similar - a review trigger, not a block, so this is
 # deliberately lenient (a genuinely shorter-but-current update still goes
 # through once a human confirms it in manual review). Expressed as a
@@ -346,6 +389,7 @@ class MatchedRow:
     match_tier: str  # "postcode" or "fallback"
     silent_updates: dict = field(default_factory=dict)  # see silent_field_updates - never shown in the diff-review UI
     risky_fields: frozenset = field(default_factory=frozenset)  # see is_detail_loss - forces manual review, like a collision
+    let_status_fields: frozenset = field(default_factory=frozenset)  # see mentions_let_status - forces manual review, like a collision
 
 
 @dataclass
@@ -405,7 +449,12 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             risky_fields = frozenset(
                 f for f in diffs if f in RISKY_TEXT_FIELDS and is_detail_loss(*diffs[f])
             )
-            matched = MatchedRow(master_idx, old_rec["property_id"], new_row, diffs, tier, silent, risky_fields)
+            let_status_fields = frozenset(
+                f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])
+            )
+            matched = MatchedRow(
+                master_idx, old_rec["property_id"], new_row, diffs, tier, silent, risky_fields, let_status_fields,
+            )
             (matched_changed if diffs else matched_unchanged).append(matched)
         else:
             unmatched.append(UnmatchedRow(new_row, _suggest_similar(new_dict, master_records)))
@@ -423,7 +472,7 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
     return MergePlan(master_records, matched_changed, matched_unchanged, unmatched, collisions, unmatched_collisions)
 
 
-def apply_merge(master_records: list, updates: dict, new_rows: list) -> list:
+def apply_merge(master_records: list, updates: dict, new_rows: list, removed_indices: frozenset = frozenset()) -> list:
     """
     master_records: full current master (property_id already backfilled), as
     plain dicts, in original order - untouched rows pass through verbatim.
@@ -431,9 +480,17 @@ def apply_merge(master_records: list, updates: dict, new_rows: list) -> list:
     least one approved change - only the approved fields are overlaid.
     new_rows: fully-formed ListingRow objects (property_id already assigned)
     confirmed as genuinely new, appended after all existing rows.
+    removed_indices: master_index values to drop entirely - e.g. a property
+    confirmed no longer available (see mentions_let_status) where the
+    reviewer chose "remove" rather than "keep with update". A removed
+    index is skipped even if it also has an entry in updates - removal is
+    the more fundamental decision, so any field-level update for that same
+    row is moot.
     """
     result = []
     for i, rec in enumerate(master_records):
+        if i in removed_indices:
+            continue
         merged = dict(rec)
         if i in updates:
             merged.update(updates[i])
@@ -515,16 +572,19 @@ def pending_status_line(n_uploads: int, plan: MergePlan) -> str:
     return headline
 
 
-def build_approval_summary(plan: MergePlan, updates: dict, new_rows_final: list) -> tuple:
+def build_approval_summary(
+    plan: MergePlan, updates: dict, new_rows_final: list, removed_indices: frozenset = frozenset(),
+) -> tuple:
     """
     Compact, read-only diff data for a post-approve confirmation UI - plan/
     updates/new_rows_final are all local to whatever render pass computed
     them and typically gone by the time the confirmation is shown (e.g.
     after a Streamlit rerun), so this is what a caller persists instead.
-    Returns (diff_rows, new_labels): diff_rows is a list of
+    Returns (diff_rows, new_labels, removed_labels): diff_rows is a list of
     {"property", "field", "old", "new"} dicts (one per approved field
     change), new_labels is a list of row_label() strings for genuinely new
-    properties.
+    properties, removed_labels is a list of row_label() strings for
+    properties removed entirely (see apply_merge's removed_indices).
     """
     diff_rows = []
     for master_index, fields in updates.items():
@@ -535,4 +595,5 @@ def build_approval_summary(plan: MergePlan, updates: dict, new_rows_final: list)
                 continue  # internal bookkeeping, not a meaningful change to show
             diff_rows.append({"property": label, "field": field_name, "old": old_rec.get(field_name), "new": new_val})
     new_labels = [row_label(r.model_dump()) for r in new_rows_final]
-    return diff_rows, new_labels
+    removed_labels = [row_label(plan.master_records[i]) for i in removed_indices]
+    return diff_rows, new_labels, removed_labels
