@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from schema import ListingRow
-from storage import file_store
+from storage import blob_store, file_store
 
 SAMPLE_DOCS = Path(__file__).resolve().parent / "sample_docs"
 
@@ -163,6 +163,70 @@ class RealPdfContentHashDedupTests(IsolatedCwdTestCase):
 
         self.assertNotEqual(original_hash, modified_hash)
         self.assertIsNone(file_store.find_previous_upload_by_hash(modified_hash))
+
+
+class DiscardPendingStagingFilesTests(IsolatedCwdTestCase):
+    def test_discarded_file_no_longer_appears_as_pending(self):
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A", provider="P1")], "a.pdf", content_hash="hash-a",
+        )
+        self.assertIn(staging_path, file_store.list_pending_staging_files())
+
+        file_store.discard_pending_staging_files([staging_path])
+
+        self.assertNotIn(staging_path, file_store.list_pending_staging_files())
+
+    def test_discarded_file_is_forgotten_by_the_hash_ledger(self):
+        # A discard is a real rejection, not a status change - a later
+        # re-upload of the exact same bytes must be treated as genuinely
+        # new (re-extracted), not silently reused from the discarded run.
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A", provider="P1")], "a.pdf", content_hash="hash-a",
+        )
+        file_store.discard_pending_staging_files([staging_path])
+
+        self.assertIsNone(file_store.find_previous_upload_by_hash("hash-a"))
+
+    def test_the_underlying_xlsx_and_meta_are_both_actually_gone(self):
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A", provider="P1")], "a.pdf", content_hash="hash-a",
+        )
+        file_store.discard_pending_staging_files([staging_path])
+
+        self.assertFalse(blob_store.exists(staging_path))
+        self.assertFalse(blob_store.exists(file_store._meta_path(staging_path)))
+
+    def test_discarding_one_file_leaves_other_pending_files_untouched(self):
+        first = file_store.save_staging_file([ListingRow(building="A", provider="P1")], "a.pdf", content_hash="hash-a")
+        second = file_store.save_staging_file([ListingRow(building="B", provider="P2")], "b.pdf", content_hash="hash-b")
+
+        file_store.discard_pending_staging_files([first])
+
+        remaining = file_store.list_pending_staging_files()
+        self.assertNotIn(first, remaining)
+        self.assertIn(second, remaining)
+        self.assertEqual(file_store.find_previous_upload_by_hash("hash-b"), second)
+
+    def test_discarding_an_already_approved_file_does_not_error(self):
+        # Not a path the UI takes (discard only ever targets currently-
+        # pending files - see list_pending_staging_files), but the
+        # underlying deletion itself has no reason to care about status,
+        # and blob_store.delete is already a safe no-op on a missing path.
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A", provider="P1")], "a.pdf", content_hash="hash-a",
+        )
+        file_store.mark_as_approved(staging_path)
+
+        file_store.discard_pending_staging_files([staging_path])
+
+        self.assertFalse(blob_store.exists(staging_path))
+
+    def test_discarding_an_empty_list_does_nothing(self):
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A", provider="P1")], "a.pdf", content_hash="hash-a",
+        )
+        file_store.discard_pending_staging_files([])
+        self.assertIn(staging_path, file_store.list_pending_staging_files())
 
 
 class HeaderMappingPersistenceTests(IsolatedCwdTestCase):

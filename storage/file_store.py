@@ -186,6 +186,31 @@ def mark_as_approved(path: str) -> None:
     _write_meta(path, meta)
 
 
+def discard_pending_staging_files(paths: list) -> None:
+    """
+    Permanently deletes each staging .xlsx and its .meta.json sidecar -
+    used when a user discards a pending upload without approving it (see
+    pages/2_Review_and_Master.py). Unlike mark_as_approved, this removes
+    the files entirely rather than changing their status: a discard means
+    nothing was ever written to master.xlsx, so there's no version to
+    create and nothing worth keeping around.
+
+    Deliberately real deletion, not a "discarded" status alongside
+    pending/approved: because the meta.json (and its content_hash) is
+    gone afterward, a later re-upload of the exact same bytes is
+    correctly treated as genuinely new by find_previous_upload_by_hash
+    rather than "already seen" - the right behavior for content a user
+    explicitly rejected, as opposed to one they approved. No explicit
+    cache-clear needed - _staging_signature() (used by every @st.cache_data
+    lookup in this module) is a tuple of every meta.json's own (name, mtime),
+    so it changes the moment these sidecars disappear, same as every other
+    mutation path here.
+    """
+    for path in paths:
+        blob_store.delete(path)
+        blob_store.delete(_meta_path(path))
+
+
 def clean_value(value):
     if pd.isna(value):
         return None

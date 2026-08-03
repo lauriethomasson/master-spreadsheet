@@ -13,6 +13,7 @@ from storage import blob_store
 from storage.file_store import (
     clean_value,
     dataframe_to_listing_rows,
+    discard_pending_staging_files,
     list_pending_staging_files,
     load_staging_as_dataframe,
     mark_as_approved,
@@ -329,6 +330,45 @@ def _render_full_master_view():
         )
 
 
+def _render_discard_pending(pending: list, new_rows: list):
+    """
+    Lets a reviewer walk away from a pending batch entirely rather than
+    being stuck reviewing something they never meant to act on (e.g. the
+    wrong file was uploaded). Whole-batch, not per-file: the pending-review
+    UI already has no per-file grouping at all - every pending file's rows
+    are combined into one diff/plan and one "Approve -> Master" button
+    covers the lot, so "discard" applies at the same granularity. Per-file
+    discard would need its own "pending files" list UI first, which
+    doesn't exist today.
+
+    Two-click confirm, same pattern as "Restore this version" in the
+    Version history section below - this is a real, permanent deletion
+    with no undo (unlike a master.xlsx change, which is always versioned),
+    so a single click isn't enough.
+    """
+    if st.button("Discard this pending upload" if len(pending) == 1 else "Discard all pending uploads", key="discard_pending"):
+        st.session_state["discard_pending_confirm"] = True
+
+    if st.session_state.get("discard_pending_confirm"):
+        n = len(new_rows)
+        st.warning(
+            f"Are you sure? This will permanently discard {n} pending propert{'y' if n == 1 else 'ies'} "
+            f"across {len(pending)} file{'s' if len(pending) != 1 else ''} — no changes will be applied to "
+            "master, and this cannot be undone (nothing was ever written to master.xlsx, so there's no "
+            "version to restore)."
+        )
+        confirm_cols = st.columns(2)
+        if confirm_cols[0].button("Confirm discard", key="discard_pending_confirm_btn", type="primary"):
+            discard_pending_staging_files(pending)
+            st.session_state.pop("discard_pending_confirm", None)
+            st.session_state["just_discarded"] = n
+            st.rerun()
+        if confirm_cols[1].button("Cancel", key="discard_pending_cancel"):
+            st.session_state.pop("discard_pending_confirm", None)
+            st.rerun()
+    st.divider()
+
+
 def _render_pending_review(pending: list):
     with st.spinner("Loading..."):
         combined_df = display_utils.sort_by_provider(pd.concat(
@@ -402,6 +442,8 @@ def _render_pending_review(pending: list):
             )
         elif not any_collisions and not any_risky and not any_let_status:
             st.info("Nothing to apply automatically — every row already matches the master with no changes.")
+
+    _render_discard_pending(pending, new_rows)
 
     updates = {}          # master_index -> {field: approved_value} - real, review-worthy changes only
     silent_by_index = {}  # master_index -> {field: value} - tolerant-formatting fixes, never shown in the diff UI
@@ -587,6 +629,10 @@ def _render_pending_review(pending: list):
 
 with page_setup.setup_page("review"):
     st.title("Review & Master Spreadsheet")
+
+    just_discarded = st.session_state.pop("just_discarded", None)
+    if just_discarded:
+        st.success(f"Discarded {just_discarded} pending propert{'y' if just_discarded == 1 else 'ies'}.")
 
     pending = list_pending_staging_files()
 
