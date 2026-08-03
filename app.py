@@ -7,18 +7,26 @@ import streamlit as st
 
 import extract
 import extract_email
+import extract_spreadsheet
 import page_flow
 import page_setup
 from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 from geocode import geocode_rows
+from schema import ListingRow
 from storage.file_store import (
     dataframe_to_listing_rows,
     find_previous_upload_by_hash,
+    get_saved_header_mapping,
     load_staging_as_dataframe,
+    save_header_mapping,
     save_original_pdf,
     save_staging_file,
 )
+
+SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
+_MAPPABLE_FIELDS = sorted(f for f in ListingRow.model_fields if f not in extract_spreadsheet.UNMAPPABLE_FIELDS)
+_FIELD_OPTIONS = ["(ignore this column)"] + _MAPPABLE_FIELDS
 
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
@@ -26,10 +34,59 @@ with page_setup.setup_page("upload"):
     st.session_state.setdefault("recent_uploads", [])
 
     uploaded_files = st.file_uploader(
-        "Upload one or more PDF brochures or .eml emails",
-        type=["pdf", "eml"],
+        "Upload one or more PDF brochures, .eml emails, or provider .xlsx/.csv spreadsheets",
+        type=["pdf", "eml", "xlsx", "csv"],
         accept_multiple_files=True,
     )
+
+    # Spreadsheet uploads need a header->field mapping before they can be
+    # extracted at all - unlike PDF/eml (always routed through Gemini),
+    # there's no way to build a ListingRow from a spreadsheet row without
+    # first knowing which column is which. Resolved (or, on first sight of a
+    # given header set, confirmed by a human right here) BEFORE the Extract
+    # button's loop below, since that loop has no good way to pause for
+    # input mid-iteration. Keyed by header_hash, not per-file, so several
+    # files sharing one provider's recurring format only need confirming
+    # once - see storage.file_store.get_saved_header_mapping/save_header_mapping.
+    unresolved_mappings = {}
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            suffix = Path(uploaded_file.name).suffix.lower()
+            if suffix not in SPREADSHEET_SUFFIXES:
+                continue
+            df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
+            headers = list(df.columns)
+            h_hash = extract_spreadsheet.header_hash(headers)
+            if get_saved_header_mapping(h_hash) is not None:
+                continue
+            entry = unresolved_mappings.setdefault(h_hash, {"headers": headers, "filenames": []})
+            entry["filenames"].append(uploaded_file.name)
+
+    for h_hash, info in unresolved_mappings.items():
+        with st.expander(f"Confirm column mapping — {', '.join(info['filenames'])}", expanded=True):
+            st.write(
+                "This spreadsheet's column headers haven't been seen before. Confirm which "
+                "field each column belongs to (or leave it as **ignore** if it doesn't map to "
+                "anything) - this is only asked once per header format; the same provider's "
+                "future uploads with these exact headers will reuse this mapping automatically."
+            )
+            guess = extract_spreadsheet.suggest_mapping(info["headers"])
+            chosen = {}
+            for header in info["headers"]:
+                default = guess.get(header) or "(ignore this column)"
+                default_index = _FIELD_OPTIONS.index(default) if default in _FIELD_OPTIONS else 0
+                choice = st.selectbox(
+                    str(header), _FIELD_OPTIONS, index=default_index, key=f"map_{h_hash}_{header}",
+                )
+                chosen[header] = None if choice == "(ignore this column)" else choice
+
+            mapped_fields = [f for f in chosen.values() if f]
+            duplicate_fields = {f for f in mapped_fields if mapped_fields.count(f) > 1}
+            if duplicate_fields:
+                st.warning(f"Each field can only be mapped from one column - fix: {', '.join(sorted(duplicate_fields))}")
+            elif st.button("Confirm mapping", key=f"confirm_{h_hash}"):
+                save_header_mapping(h_hash, info["headers"], chosen)
+                st.rerun()
 
     if uploaded_files and st.button("Extract"):
         total = len(uploaded_files)
@@ -63,6 +120,22 @@ with page_setup.setup_page("upload"):
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
                         reused = True
+                    elif suffix in SPREADSHEET_SUFFIXES:
+                        # No temp file, no Gemini call - a spreadsheet is
+                        # already one row per property; the only thing
+                        # needed is the header->field mapping confirmed
+                        # above, before this button could even be clicked.
+                        df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
+                        h_hash = extract_spreadsheet.header_hash(list(df.columns))
+                        saved = get_saved_header_mapping(h_hash)
+                        if saved is None:
+                            raise ValueError(
+                                f"{uploaded_file.name}: column mapping not confirmed yet - "
+                                "confirm it above, then click Extract again."
+                            )
+                        rows = extract_spreadsheet.build_rows(df, saved["mapping"], source_file=uploaded_file.name)
+                        geocode_rows(rows)
+                        reused = False
                     else:
                         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                             tmp.write(uploaded_file.getvalue())

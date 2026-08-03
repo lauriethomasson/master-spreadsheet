@@ -202,3 +202,38 @@ def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
             continue
         rows.append(ListingRow(**cleaned))
     return rows
+
+
+HEADER_MAPPINGS_PREFIX = "header_mappings"
+
+
+def get_saved_header_mapping(header_hash: str) -> dict:
+    """
+    The confirmed {header: field_name_or_None} mapping previously saved for
+    this exact header set (see extract_spreadsheet.header_hash) - None if
+    this format has never been confirmed before, meaning the Upload page
+    must show the confirm-mapping UI rather than proceeding straight to
+    extraction. Never cached (unlike the staging helpers above): confirming
+    a mapping happens at most once per distinct provider format, so there's
+    no repeated-lookup cost worth caching against a stale result.
+    """
+    path = f"{HEADER_MAPPINGS_PREFIX}/{header_hash}.json"
+    if not blob_store.exists(path):
+        return None
+    return json.loads(blob_store.read_bytes(path))
+
+
+def save_header_mapping(header_hash: str, headers: list, mapping: dict) -> None:
+    """
+    Persists a user-confirmed column mapping for this exact header set,
+    keyed by header_hash - so the same provider's recurring spreadsheet
+    format (e.g. a monthly export with unchanged headers) only needs
+    confirming once. headers is stored alongside the mapping purely for
+    human inspection/debugging (e.g. reading header_mappings/*.json
+    directly to see what a hash corresponds to) - lookups only ever use
+    the hash itself.
+    """
+    path = f"{HEADER_MAPPINGS_PREFIX}/{header_hash}.json"
+    blob_store.write_bytes(
+        path, json.dumps({"headers": headers, "mapping": mapping}, indent=2).encode("utf-8")
+    )

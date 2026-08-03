@@ -190,6 +190,13 @@ def log_geocode_failure(row: ListingRow, reason: str):
 
 
 def geocode_row(row: ListingRow) -> ListingRow:
+    # Already has real coordinates (e.g. a provider spreadsheet's own Lat/Lng
+    # columns, mapped straight through by extract_spreadsheet.py) - calling
+    # out to the API would be a wasted lookup at best, and at worst replaces
+    # a correct source-provided coordinate with a worse guess.
+    if row.lat is not None and row.lng is not None:
+        return row
+
     # --- Tier 1: Geocoding API ---
     if row.address_1 and row.postcode:
         query = f"{row.address_1}, {row.postcode}, UK"

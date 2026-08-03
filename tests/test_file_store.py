@@ -18,6 +18,7 @@ test's directory. Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_file_store -v
 """
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -28,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from schema import ListingRow
 from storage import file_store
+
+SAMPLE_DOCS = Path(__file__).resolve().parent / "sample_docs"
 
 
 class IsolatedCwdTestCase(unittest.TestCase):
@@ -113,6 +116,73 @@ class ContentHashDedupTests(IsolatedCwdTestCase):
         found = file_store.find_previous_upload_by_hash("hash-a")
 
         self.assertEqual(found, second)
+
+
+class RealPdfContentHashDedupTests(IsolatedCwdTestCase):
+    """
+    The tests above all use a literal synthetic content_hash string (e.g.
+    "hash-a"), never a real SHA256 of actual file bytes - covering the
+    ledger/lookup logic itself, but never exercising real PDF byte-hashing
+    end-to-end (see the earlier investigation this closes the gap on).
+    These hash an actual sample PDF exactly as app.py does
+    (hashlib.sha256(file_bytes).hexdigest()), proving the mechanism against
+    a real file's real content, not an arbitrary stand-in string.
+    """
+
+    def _real_pdf_bytes(self) -> bytes:
+        return (SAMPLE_DOCS / "Breezblok.pdf").read_bytes()
+
+    def test_identical_real_pdf_bytes_are_detected_as_a_duplicate(self):
+        original_bytes = self._real_pdf_bytes()
+        original_hash = hashlib.sha256(original_bytes).hexdigest()
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="Breezblok", provider="Breezblok")], "Breezblok.pdf", content_hash=original_hash,
+        )
+
+        # A re-upload of the exact same bytes (any filename - app.py hashes
+        # raw bytes before ever looking at the name) must hash identically
+        # and resolve to the same previously-staged file.
+        reupload_bytes = self._real_pdf_bytes()
+        reupload_hash = hashlib.sha256(reupload_bytes).hexdigest()
+
+        self.assertEqual(original_hash, reupload_hash)
+        self.assertEqual(file_store.find_previous_upload_by_hash(reupload_hash), staging_path)
+
+    def test_a_single_changed_byte_is_correctly_not_a_duplicate(self):
+        original_bytes = self._real_pdf_bytes()
+        original_hash = hashlib.sha256(original_bytes).hexdigest()
+        file_store.save_staging_file(
+            [ListingRow(building="Breezblok", provider="Breezblok")], "Breezblok.pdf", content_hash=original_hash,
+        )
+
+        # Simulates a re-exported/re-saved copy with the same visual content
+        # but different underlying bytes (e.g. rewritten producer metadata) -
+        # exactly the documented limitation of a byte-exact hash scheme.
+        modified_bytes = original_bytes[:-1] + bytes([original_bytes[-1] ^ 0x01])
+        modified_hash = hashlib.sha256(modified_bytes).hexdigest()
+
+        self.assertNotEqual(original_hash, modified_hash)
+        self.assertIsNone(file_store.find_previous_upload_by_hash(modified_hash))
+
+
+class HeaderMappingPersistenceTests(IsolatedCwdTestCase):
+    def test_no_mapping_saved_yet_returns_none(self):
+        self.assertIsNone(file_store.get_saved_header_mapping("some-hash"))
+
+    def test_saved_mapping_round_trips(self):
+        headers = ["Building", "Floor/Unit"]
+        mapping = {"Building": "building", "Floor/Unit": "floor_unit"}
+        file_store.save_header_mapping("hash-a", headers, mapping)
+
+        saved = file_store.get_saved_header_mapping("hash-a")
+
+        self.assertEqual(saved["headers"], headers)
+        self.assertEqual(saved["mapping"], mapping)
+
+    def test_different_hash_never_matches_a_saved_mapping(self):
+        file_store.save_header_mapping("hash-a", ["Building"], {"Building": "building"})
+
+        self.assertIsNone(file_store.get_saved_header_mapping("hash-b"))
 
 
 if __name__ == "__main__":
