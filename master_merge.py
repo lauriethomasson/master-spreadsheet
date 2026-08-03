@@ -383,6 +383,56 @@ def apply_merge(master_records: list, updates: dict, new_rows: list) -> list:
     return result
 
 
+def build_manual_edit(master_records: list, edited_rows: dict) -> tuple:
+    """
+    Turns a data_editor "edited_rows" delta - {row_position: {column: new_value,
+    ...}, ...}, straight from the Master default view's direct cell-editing
+    grid (see pages/2_Review_and_Master.py) - into the same shape a normal
+    approve produces, so a manual edit rides the exact same write_master()/
+    versioning/undo mechanism:
+
+      - merged_rows: the complete new master row list (list[ListingRow]) -
+        every row unchanged except the ones edited, via apply_merge with no
+        new rows.
+      - diff_rows: [{"property", "field", "old", "new"}, ...], one entry per
+        genuinely changed field - the same shape build_approval_summary
+        produces, so the manual-edit confirmation banner can show "what
+        changed" exactly like the approve-confirmation banner already does.
+      - fields_changed: total count of individual field-level changes across
+        every edited row - what the "Manual edit: N field(s) changed" version
+        label and the pinned confirmation banner both report.
+
+    Only keys that are real ListingRow fields are treated as an edit - the
+    grid also carries a UI-only "Select" checkbox column (for row-selection/
+    export) that is never itself a ListingRow field, and ends up in this same
+    edited_rows dict whenever a row's checkbox was toggled in the same
+    render as a real field edit. Silently ignored here rather than raising,
+    since the caller has no other way to tell "just a checkbox" apart from
+    "a real edit" - a row whose only changes are non-ListingRow keys
+    contributes nothing to updates/diff_rows/fields_changed.
+    """
+    updates = {}
+    diff_rows = []
+    for row_pos, cols in edited_rows.items():
+        real_changes = {c: v for c, v in cols.items() if c in ListingRow.model_fields}
+        if not real_changes:
+            continue
+        row_pos = int(row_pos)
+        updates[row_pos] = real_changes
+
+        old_rec = master_records[row_pos]
+        label = row_label(old_rec)
+        for field_name, new_val in real_changes.items():
+            diff_rows.append({
+                "property": label, "field": field_name,
+                "old": old_rec.get(field_name), "new": new_val,
+            })
+
+    fields_changed = sum(len(v) for v in updates.values())
+    merged_rows = apply_merge(master_records, updates, [])
+    return merged_rows, diff_rows, fields_changed
+
+
 def pending_status_line(n_uploads: int, plan: MergePlan) -> str:
     """
     Plain, sentence-case summary of what a pending batch actually contains -

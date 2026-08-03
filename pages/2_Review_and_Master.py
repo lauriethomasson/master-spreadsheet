@@ -11,6 +11,7 @@ import page_setup
 from schema import ListingRow
 from storage import blob_store
 from storage.file_store import (
+    clean_value,
     dataframe_to_listing_rows,
     list_pending_staging_files,
     load_staging_as_dataframe,
@@ -72,38 +73,109 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
     return approved
 
 
-def _render_master_table(df: pd.DataFrame, key: str):
+def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     """
-    Full master, browsable and row-selectable (for the export step) - every
-    column but Select is disabled so this stays a read/select view, never a
-    silent side door for editing master data outside the diff-and-merge flow.
+    Full master, browsable, directly editable, and row-selectable (for the
+    export step). Every visible column is a real edit target except Select,
+    which is a UI-only checkbox never itself a ListingRow field (see
+    master_merge.build_manual_edit) - hidden columns (property_id,
+    source_file) are simply absent from display_df, so they can't be edited
+    through this UI at all, same as before.
 
-    The current selection (full rows, all columns including the ones hidden
-    from this display) is written to session_state on every render, not just
-    on a button click - Streamlit reruns this whole script on each checkbox
-    toggle, so by the time the user clicks the shared "Export →" nav button
-    at the bottom of the page, session_state already reflects whatever is
-    currently checked.
+    Row selection is tracked by property_id in session_state, not by the
+    data_editor's own positional widget state - a saved edit reloads the
+    master (freshly re-sorted; see sort_by_provider), which can shift a
+    row's position, and Streamlit's data_editor state is keyed by position.
+    Trusting that position across a reload risks silently reapplying a
+    stale selection (or edit - see _process_manual_edits) to the wrong row.
+    property_id is immune to re-sorting, so it survives that reload intact.
+
+    Returns True if a real field edit was saved this render - the caller
+    should st.rerun() so the rest of the page reflects the fresh master
+    (download button bytes, write-log caption, Version history) rather than
+    the pre-edit snapshot already in hand.
     """
     visible = display_utils.visible_columns(df)
     display_df = df[visible].copy()
-    display_df.insert(0, "Select", False)
+
+    selected_ids = st.session_state.get("export_selected_property_ids", set())
+    display_df.insert(
+        0, "Select",
+        df["property_id"].isin(selected_ids) if "property_id" in df.columns else False,
+    )
+
     edited = st.data_editor(
         display_df,
         column_config={
             "Select": st.column_config.CheckboxColumn(required=True),
             **display_utils.link_column_config(display_df),
             **display_utils.wide_text_column_config(display_df),
+            **display_utils.numeric_column_config(display_df),
         },
-        disabled=[c for c in display_df.columns if c != "Select"],
         width="stretch",
         height=600,
         key=key,
     )
 
+    if "property_id" in df.columns:
+        st.session_state["export_selected_property_ids"] = set(df.loc[edited.index[edited["Select"]], "property_id"])
     selected_positions = edited.index[edited["Select"]].tolist()
     st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
     st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
+
+    return _process_manual_edits(df, key)
+
+
+def _process_manual_edits(df: pd.DataFrame, key: str) -> bool:
+    """
+    Checks the data_editor's own edit-tracking state (st.session_state[key])
+    for real field edits since it was last reset, and if there are any,
+    saves them to master.xlsx immediately - see build_manual_edit for how
+    the delta becomes a full row list. Returns True iff a save happened.
+
+    Deliberately processes the WHOLE delta in one shot rather than assuming
+    "one cell changed" - a multi-cell paste lands as several changed cells
+    in a single edited_rows dict on one rerun, and that whole batch becomes
+    exactly one save/one version, not one per cell. Combined with
+    data_editor only committing a text edit on blur/Enter (never per
+    keystroke), this is what keeps a burst of typing or a paste from
+    spawning a version per character/cell.
+    """
+    state = st.session_state.get(key)
+    edited_rows = state.get("edited_rows", {}) if state else {}
+    if not edited_rows:
+        return False
+
+    master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
+    merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+    if fields_changed == 0:
+        return False  # only "Select" checkboxes changed this render - not a data edit
+
+    # The version to offer for Undo is whatever was newest BEFORE this edit
+    # writes a new one - same reasoning as the approve flow's previous_version_path.
+    previous_versions = master_writer.list_versions(limit=1)
+    previous_version_path = previous_versions[0]["path"] if previous_versions else None
+
+    try:
+        master_writer.write_master(merged_rows, source="manual_edit", fields_changed=fields_changed)
+    except Exception as e:
+        st.error(f"Edit failed, master was not changed: {e}")
+        return False
+
+    st.session_state["last_manual_edit"] = {
+        "fields_changed": fields_changed,
+        "diff_rows": diff_rows,
+        "version_path": previous_version_path,
+    }
+    # Resets the widget's own edited_rows/added_rows/deleted_rows tracking -
+    # the freshly-reloaded, re-sorted master on the next render is the sole
+    # source of truth from here; reapplying this positional delta onto it
+    # risks landing on the wrong row if this edit touched the sort key
+    # itself (provider) and shifted row order. Select state isn't lost by
+    # this - it's already been captured into export_selected_property_ids
+    # (keyed by property_id, immune to the same reordering) above.
+    del st.session_state[key]
+    return True
 
 
 def _render_approval_confirmation(approval: dict):
@@ -151,10 +223,38 @@ def _render_approval_confirmation(approval: dict):
             st.caption("No field-level changes to show.")
 
 
+def _render_manual_edit_confirmation(edit: dict):
+    """
+    Pinned above the table (called before _render_master_table) so it stays
+    visible regardless of which row was edited - unlike the approval
+    confirmation, this always shows its diff inline rather than behind a
+    "View what changed" toggle, since there's normally just one or a
+    handful of changed fields to show, not a whole batch of approvals.
+    """
+    n = edit["fields_changed"]
+    st.success(f"Cell updated — {n} field{'s' if n != 1 else ''} changed.")
+
+    if edit.get("version_path"):
+        if st.button("Undo", key="undo_manual_edit"):
+            with st.spinner("Undoing..."):
+                master_writer.restore_version(edit["version_path"])
+            st.session_state.pop("last_manual_edit", None)
+            st.session_state["just_restored"] = edit["version_path"]
+            st.rerun()
+
+    for d in edit["diff_rows"]:
+        old_display = "—" if d["old"] in (None, "") else d["old"]
+        st.caption(f"{d['property']} — **{d['field']}**: {old_display} → {d['new']}")
+
+
 def _render_full_master_view():
     last_approval = st.session_state.get("last_approval")
     if last_approval:
         _render_approval_confirmation(last_approval)
+
+    last_manual_edit = st.session_state.get("last_manual_edit")
+    if last_manual_edit:
+        _render_manual_edit_confirmation(last_manual_edit)
 
     if not master_writer.master_exists():
         st.info("No master spreadsheet yet — approve an upload to create one.")
@@ -163,7 +263,8 @@ def _render_full_master_view():
     with st.spinner("Loading..."):
         df = display_utils.sort_by_provider(master_writer.load_master_as_dataframe())
 
-    _render_master_table(df, key="master_table_default_view")
+    if _render_master_table(df, key="master_table_default_view"):
+        st.rerun()
 
     st.download_button(
         "Download master.xlsx",

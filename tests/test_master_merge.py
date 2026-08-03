@@ -199,5 +199,113 @@ class CollisionTests(unittest.TestCase):
         self.assertEqual(len(plan.collisions[0]), 2)
 
 
+class BuildManualEditTests(unittest.TestCase):
+    """The Master default view's direct cell-editing feature - a data_editor
+    'edited_rows' delta turned into a full row list + a diff summary, via
+    the exact same shape/mechanism as a normal approve's apply_merge."""
+
+    def _master_records(self, rows: list[dict]) -> list[dict]:
+        return [ListingRow(**r).model_dump() for r in rows]
+
+    def test_single_cell_edit(self):
+        master_records = self._master_records([
+            {"building": "40 New Bond Street", "provider": "Workplace Plus", "size_sqft": 5000.0},
+        ])
+        edited_rows = {0: {"size_sqft": 6000.0}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(fields_changed, 1)
+        self.assertEqual(merged_rows[0].size_sqft, 6000.0)
+        self.assertEqual(len(diff_rows), 1)
+        self.assertEqual(diff_rows[0]["field"], "size_sqft")
+        self.assertEqual(diff_rows[0]["old"], 5000.0)
+        self.assertEqual(diff_rows[0]["new"], 6000.0)
+
+    def test_lat_lng_are_editable_like_any_other_field(self):
+        master_records = self._master_records([
+            {"building": "40 New Bond Street", "provider": "Workplace Plus", "lat": None, "lng": None},
+        ])
+        edited_rows = {0: {"lat": 51.5142, "lng": -0.1494}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(fields_changed, 2)
+        self.assertEqual(merged_rows[0].lat, 51.5142)
+        self.assertEqual(merged_rows[0].lng, -0.1494)
+
+    def test_unrelated_rows_pass_through_unchanged(self):
+        master_records = self._master_records([
+            {"building": "A", "provider": "P1", "size_sqft": 1000.0},
+            {"building": "B", "provider": "P2", "size_sqft": 2000.0},
+        ])
+        edited_rows = {1: {"size_sqft": 2500.0}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(merged_rows[0].size_sqft, 1000.0)  # untouched
+        self.assertEqual(merged_rows[1].size_sqft, 2500.0)
+        self.assertEqual(fields_changed, 1)
+
+    def test_ui_only_select_checkbox_column_is_ignored(self):
+        # "Select" is bolted onto the grid for row-selection/export - never a
+        # ListingRow field, so toggling it alone must never trigger a save.
+        master_records = self._master_records([
+            {"building": "A", "provider": "P1"},
+        ])
+        edited_rows = {0: {"Select": True}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(fields_changed, 0)
+        self.assertEqual(diff_rows, [])
+        self.assertEqual(merged_rows[0].building, "A")  # unchanged
+
+    def test_select_toggle_bundled_with_a_real_edit_only_counts_the_real_edit(self):
+        master_records = self._master_records([
+            {"building": "A", "provider": "P1", "size_sqft": 1000.0},
+        ])
+        edited_rows = {0: {"Select": True, "size_sqft": 1500.0}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(fields_changed, 1)
+        self.assertEqual(merged_rows[0].size_sqft, 1500.0)
+
+    def test_multi_cell_batch_is_a_single_result_not_per_cell(self):
+        # A multi-cell paste lands as several changed cells across rows in
+        # one edited_rows dict - this must produce one combined result
+        # (the caller then does exactly one write_master()/version for it),
+        # not something the caller would need to split into several saves.
+        master_records = self._master_records([
+            {"building": "A", "provider": "P1", "size_sqft": 1000.0, "state_of_space": "Cat A"},
+            {"building": "B", "provider": "P2", "size_sqft": 2000.0},
+        ])
+        edited_rows = {
+            0: {"size_sqft": 1100.0, "state_of_space": "Fully Fitted"},
+            1: {"size_sqft": 2200.0},
+        }
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(fields_changed, 3)
+        self.assertEqual(len(diff_rows), 3)
+        self.assertEqual(merged_rows[0].size_sqft, 1100.0)
+        self.assertEqual(merged_rows[0].state_of_space, "Fully Fitted")
+        self.assertEqual(merged_rows[1].size_sqft, 2200.0)
+
+    def test_string_row_position_keys_are_handled(self):
+        # Some Streamlit versions have reported edited_rows keys as strings
+        # rather than ints after JSON round-tripping - build_manual_edit
+        # must not silently drop or crash on these.
+        master_records = self._master_records([{"building": "A", "provider": "P1", "size_sqft": 1000.0}])
+        edited_rows = {"0": {"size_sqft": 1200.0}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+
+        self.assertEqual(fields_changed, 1)
+        self.assertEqual(merged_rows[0].size_sqft, 1200.0)
+
+
 if __name__ == "__main__":
     unittest.main()

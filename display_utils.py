@@ -11,7 +11,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from master_merge import row_label  # noqa: F401 - re-exported for display_utils.row_label(...) call sites
+from master_merge import field_kind, row_label  # noqa: F401 - row_label re-exported for display_utils.row_label(...) call sites
+from schema import ListingRow
 from staging_writer import HYPERLINK_DISPLAY_TEXT
 
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -88,6 +89,27 @@ def wide_text_column_config(df: pd.DataFrame) -> dict:
         for col in WIDE_TEXT_COLUMNS
         if col in df.columns
     }
+
+
+def numeric_column_config(df: pd.DataFrame) -> dict:
+    """column_config forcing every int/float ListingRow field present in df
+    into an explicit NumberColumn, for the Master default view's direct
+    cell-editing grid - without this, an editable numeric column's edit
+    widget depends on pandas' inferred dtype for that column, which silently
+    degrades to a free-text input if inference doesn't land on a numeric
+    dtype (e.g. a column that happens to be all-null this load). An explicit
+    NumberColumn always gives a real numeric input and, on edit, a real
+    Python int/float back - never a string needing separate parsing."""
+    config = {}
+    for col in df.columns:
+        if col not in ListingRow.model_fields:
+            continue
+        kind = field_kind(col)
+        if kind == "int":
+            config[col] = st.column_config.NumberColumn(step=1)
+        elif kind == "float":
+            config[col] = st.column_config.NumberColumn(step=0.01)
+    return config
 
 
 def sort_by_provider(df: pd.DataFrame) -> pd.DataFrame:

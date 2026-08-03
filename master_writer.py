@@ -80,6 +80,7 @@ def log_master_write(
     updated_count: int = None,
     version_path: str = None,
     timestamp: str = None,
+    fields_changed: int = None,
 ):
     entry = {
         "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
@@ -90,6 +91,7 @@ def log_master_write(
         "new_count": new_count,
         "updated_count": updated_count,
         "version_path": version_path,
+        "fields_changed": fields_changed,
     }
     blob_store.append_text(LOG_PATH, json.dumps(entry) + "\n")
     print(f"[master_writer] {entry}", file=sys.stderr)
@@ -154,6 +156,9 @@ def list_versions(limit: int = None) -> list:
         source = entry.get("source", "approve")
         if source.startswith("restore:"):
             label = f"Restored from {source.split(':', 1)[1]}"
+        elif source == "manual_edit":
+            n = entry.get("fields_changed") or 0
+            label = f"Manual edit: {n} field{'s' if n != 1 else ''} changed"
         else:
             new_c, upd_c = entry.get("new_count"), entry.get("updated_count")
             label = f"{upd_c or 0} updated, {new_c or 0} new" if (new_c is not None or upd_c is not None) else "Approved upload"
@@ -166,6 +171,8 @@ def write_master(
     master_path: str = DEFAULT_MASTER_PATH,
     new_count: int = None,
     updated_count: int = None,
+    source: str = "approve",
+    fields_changed: int = None,
 ):
     # Grouped by provider regardless of what order the merge upstream
     # produced (matched rows keep their prior on-disk position, new rows
@@ -193,7 +200,7 @@ def write_master(
         data = buffer.getvalue()
         blob_store.write_bytes(master_path, data)
     except Exception as e:
-        log_master_write(success=False, error=str(e), source="approve")
+        log_master_write(success=False, error=str(e), source=source)
         raise
 
     # Milliseconds, not just seconds - two writes landing in the same second
@@ -205,11 +212,12 @@ def write_master(
     log_master_write(
         success=True,
         row_count=len(approved_rows),
-        source="approve",
+        source=source,
         new_count=new_count,
         updated_count=updated_count,
         version_path=version_path,
         timestamp=stamp,
+        fields_changed=fields_changed,
     )
 
 
