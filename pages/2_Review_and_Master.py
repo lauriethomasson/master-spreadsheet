@@ -223,6 +223,14 @@ def _render_approval_confirmation(approval: dict):
     summary = ("Approved — " + " and ".join(parts) + ".") if parts else "Approved — no changes were applied."
     st.success(summary)
 
+    # Removals get their own red/danger confirmation, always visible (not
+    # gated behind "View what changed") - a property leaving master
+    # entirely is a materially different, higher-stakes event than a
+    # normal field update or a new property being added, and shouldn't be
+    # lost in the same green "Approved" styling.
+    for label in approval.get("removed_labels", []):
+        st.error(f"Removed: {label}")
+
     show_details = st.session_state.get("show_approval_details", False)
     # horizontal=True sizes each button to its own content instead of
     # stretching across equal-width st.columns - that's what kept "Undo this
