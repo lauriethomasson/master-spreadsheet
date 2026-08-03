@@ -7,7 +7,9 @@ docstring): a genuine per-unit link, resolved through one landing-page hop
 if needed (confirmed: GPE, whose per-property link is a landing page
 containing the real brochure PDF's link, not the PDF itself) > discard
 anything generic (a bare company homepage with no listing-specific path) >
-default to the uploaded PDF's own filename > null for emails.
+default to the uploaded PDF's own persisted-file URL (or its bare filename,
+in local-disk dev mode where there's nothing to persist it to) > null for
+emails.
 
 resolve_brochure_link never discards a working link on its own - on any
 failure (network error, timeout, no document link found), the original URL
@@ -302,7 +304,7 @@ def resolve_email_tracking_links(text: str) -> str:
     return re.sub(r"<(https?://\S+?)>", _replace, text)
 
 
-def finalize_brochure_link(raw_link, *, is_pdf: bool, own_filename: str):
+def finalize_brochure_link(raw_link, *, is_pdf: bool, pdf_fallback_link: str):
     """
     Applies the full brochure_link priority order to whatever Gemini
     returned for one unit:
@@ -316,9 +318,14 @@ def finalize_brochure_link(raw_link, *, is_pdf: bool, own_filename: str):
        listing-specific path) - discarded entirely, treated as though
        nothing was found.
     3. Nothing genuine found (1 empty, 2 discarded) and the source is a
-       PDF - defaults to the uploaded PDF's own filename, since it
-       genuinely is the brochure for the majority of PDF uploads. This is
-       the expected default, not a last-resort fallback.
+       PDF - defaults to pdf_fallback_link, since the PDF genuinely is the
+       brochure for the majority of PDF uploads. This is the expected
+       default, not a last-resort fallback. pdf_fallback_link should be a
+       real, directly-fetchable URL to the uploaded PDF itself (see
+       storage/file_store.save_original_pdf) whenever one is available -
+       a bare filename with no scheme/host isn't a clickable link at all,
+       just the closest thing callers had before original uploads started
+       being persisted anywhere.
     4. Nothing genuine found and the source is an email - stays null; an
        email is not itself a brochure.
 
@@ -344,6 +351,6 @@ def finalize_brochure_link(raw_link, *, is_pdf: bool, own_filename: str):
         return resolve_brochure_link(raw_link)
 
     if is_pdf:
-        return own_filename
+        return pdf_fallback_link
 
     return None

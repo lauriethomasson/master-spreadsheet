@@ -11,7 +11,7 @@ import page_setup
 from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 from geocode import geocode_rows
-from storage.file_store import save_staging_file
+from storage.file_store import save_original_pdf, save_staging_file
 
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
@@ -39,7 +39,16 @@ with page_setup.setup_page("upload"):
 
                     try:
                         if suffix == ".pdf":
-                            rows = extract.extract(tmp_path, original_filename=uploaded_file.name)
+                            # Persisted before extraction (from the bytes we
+                            # already have in memory, not the temp file about
+                            # to be deleted below) so the PDF-fallback
+                            # brochure_link rule has a real, permanent URL to
+                            # point at instead of just the bare filename - see
+                            # finalize_brochure_link's rule 3.
+                            brochure_url = save_original_pdf(uploaded_file.getvalue(), uploaded_file.name)
+                            rows = extract.extract(
+                                tmp_path, original_filename=uploaded_file.name, brochure_url=brochure_url
+                            )
                         elif suffix == ".eml":
                             rows = extract_email.extract(tmp_path, original_filename=uploaded_file.name)
                         else:

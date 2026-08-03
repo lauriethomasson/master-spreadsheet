@@ -27,6 +27,7 @@ from staging_writer import read_xlsx_with_hyperlinks, write_rows_to_xlsx
 from storage import blob_store
 
 STAGING_PREFIX = "staging"
+BROCHURES_PREFIX = "brochures"
 
 
 def _meta_path(xlsx_path: str) -> str:
@@ -62,6 +63,33 @@ def save_staging_file(rows: list[ListingRow], original_filename: str) -> str:
         },
     )
     return staging_path
+
+
+def save_original_pdf(data: bytes, original_filename: str) -> str:
+    """
+    Persists the original uploaded PDF's own bytes (not the rows extracted
+    from it), so brochure_link's PDF-fallback rule (see
+    brochure_link_resolver.finalize_brochure_link's rule 3) has a real,
+    permanently-fetchable file to point at - previously the upload's temp
+    file was deleted right after extraction with nothing kept anywhere, so
+    that fallback could only ever be the bare original filename.
+
+    Uploaded public=True (see blob_store.write_bytes) - unlike staging/master/
+    versions, this one specific prefix is meant to be linked to directly
+    from a spreadsheet cell, so it has to be world-readable.
+
+    Returns the object's public URL. In local-disk dev mode (no
+    GCS_BUCKET_NAME) there's no HTTP server to expose a local file through,
+    so this returns None and callers should fall back to the bare filename,
+    exactly as before this existed.
+    """
+    if not blob_store.using_gcs():
+        return None
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stem = Path(original_filename).stem
+    path = f"{BROCHURES_PREFIX}/{timestamp}_{stem}.pdf"
+    blob_store.write_bytes(path, data, public=True)
+    return blob_store.public_url(path)
 
 
 def _staging_signature() -> tuple:

@@ -225,7 +225,7 @@ def extract(eml_path: Path, original_filename: str = None) -> list[ListingRow]:
         last_building = unit["building"]
 
         unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=False, own_filename=filename
+            unit.get("brochure_link"), is_pdf=False, pdf_fallback_link=filename
         )
 
         fields = ExtractedFields(**brochure, **unit).model_dump()

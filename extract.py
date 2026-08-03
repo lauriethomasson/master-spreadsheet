@@ -124,7 +124,7 @@ def render_pages(pdf_path: Path) -> list[types.Part]:
     return parts
 
 
-def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
+def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = None) -> list[ListingRow]:
     """
     original_filename is the name the user actually uploaded — pdf_path itself
     is often a temp file (pages/1_Upload.py copies the upload there before
@@ -132,8 +132,16 @@ def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
     something a person should ever see in a brochure_link fallback or in the
     source_file column. Defaults to pdf_path.name for CLI usage, where pdf_path
     already is the real file.
+
+    brochure_url is the uploaded PDF's own persisted-file URL (see
+    storage/file_store.save_original_pdf), used as the PDF-fallback rule's
+    brochure_link value (see finalize_brochure_link's rule 3) whenever the
+    caller has one - i.e. whenever storage is GCS-backed. Falls back to the
+    bare filename for CLI usage and local-disk dev mode, where there's
+    nothing to point a real URL at.
     """
     filename = original_filename or pdf_path.name
+    pdf_fallback_link = brochure_url or filename
 
     client = get_client()
     images = render_pages(pdf_path)
@@ -162,7 +170,7 @@ def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
         last_building = unit["building"]
 
         unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=True, own_filename=filename
+            unit.get("brochure_link"), is_pdf=True, pdf_fallback_link=pdf_fallback_link
         )
 
         fields = ExtractedFields(**brochure, **unit).model_dump()

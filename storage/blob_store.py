@@ -23,8 +23,10 @@ carries over unchanged either way.
 
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
 
@@ -80,15 +82,46 @@ def _content_type_for(path: str) -> str:
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if path.endswith(".json") or path.endswith(".meta.json"):
         return "application/json"
+    if path.endswith(".pdf"):
+        return "application/pdf"
     return "text/plain"
 
 
-def write_bytes(path: str, data: bytes) -> None:
+def write_bytes(path: str, data: bytes, public: bool = False) -> None:
+    """
+    public=True additionally requests predefined_acl="publicRead" on the GCS
+    object, so public_url(path) actually resolves instead of 403ing - used
+    for brochures/ (see storage/file_store.save_original_pdf), never for
+    staging/master/versions/log, which must stay private. No effect in
+    local-disk mode - there's no HTTP server to expose a local file to
+    regardless of any ACL concept.
+
+    A bucket with uniform bucket-level access enabled rejects predefined_acl
+    outright (object-level ACLs are disabled by that setting) - caught and
+    logged rather than failing the upload, since the object itself still
+    lands successfully; public reads would then need to come from a
+    bucket-level IAM binding (allUsers: objectViewer) instead, which is an
+    infra-side decision this module has no way to make or verify.
+    """
     if using_gcs():
+        blob = _get_bucket().blob(path)
+        content_type = _content_type_for(path)
         # A single upload is already atomic from every reader's point of view -
         # GCS never exposes a partially-written object - so unlike the local
         # backend, no temp-object-then-rename dance is needed here.
-        _get_bucket().blob(path).upload_from_string(data, content_type=_content_type_for(path))
+        if public:
+            try:
+                blob.upload_from_string(data, content_type=content_type, predefined_acl="publicRead")
+                return
+            except Exception as e:
+                print(
+                    f"[blob_store] WARNING: could not set predefined_acl=publicRead on {path!r} ({e!r}) - "
+                    "this bucket likely has uniform bucket-level access, where object-level ACLs are "
+                    "disabled. The object was still uploaded, but public_url() will 404/403 until the "
+                    "bucket's own IAM policy grants allUsers the Storage Object Viewer role.",
+                    file=sys.stderr,
+                )
+        blob.upload_from_string(data, content_type=content_type)
         return
 
     local_path = Path(path)
@@ -107,6 +140,27 @@ def write_bytes(path: str, data: bytes) -> None:
         if os.path.exists(temp_name):
             os.remove(temp_name)
         raise
+
+
+def public_url(path: str) -> str:
+    """
+    Permanent, directly-fetchable URL for a blob written with
+    write_bytes(..., public=True) - https://storage.googleapis.com/<bucket>/
+    <path> is GCS's standard public-object URL form, valid indefinitely
+    (unlike a signed URL, which necessarily expires) as long as the bucket's
+    IAM policy actually grants allUsers read access. Only meaningful in GCS
+    mode - local-disk storage has nothing serving it over HTTP, so there's
+    no equivalent concept there; callers must check using_gcs() (or handle
+    the resulting RuntimeError) and fall back to something else in local dev.
+    """
+    if not using_gcs():
+        raise RuntimeError("public_url() requires GCS_BUCKET_NAME - local-disk storage has no public URL")
+    # quote(..., safe="/") - object names routinely contain spaces (e.g. an
+    # uploaded filename's stem, see storage/file_store.save_original_pdf),
+    # which must be percent-encoded for this to be a valid URL at all; "/" is
+    # left alone since it's the pseudo-folder separator GCS blob names use,
+    # not a character within a path segment that needs encoding.
+    return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{quote(path, safe='/')}"
 
 
 def append_text(path: str, text: str) -> None:
