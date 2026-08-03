@@ -22,7 +22,7 @@ def _empty_master_df() -> pd.DataFrame:
     return pd.DataFrame(columns=list(ListingRow.model_fields.keys()))
 
 
-def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool) -> dict:
+def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset()) -> dict:
     """
     Renders one line per changed field: name, old value, editable new value,
     and its OWN apply/skip checkbox - field-level, not row-level, so a
@@ -30,9 +30,15 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool) -> d
     than an all-or-nothing choice for the whole row. Returns only the
     fields whose checkbox is checked, using whatever value is currently
     entered (letting a reviewer correct a value, not just accept/reject it).
+
+    risky_fields (see master_merge.is_detail_loss) starts unchecked
+    regardless of default_checked, and gets an explicit warning - the point
+    is a reviewer has to notice and opt in, not just uncheck something that
+    would otherwise apply silently.
     """
     approved = {}
     for f, (old_val, new_val) in diffs.items():
+        is_risky = f in risky_fields
         cols = st.columns([2, 3, 3, 1])
         cols[0].markdown(f"**{f}**")
         cols[1].write("—" if old_val in (None, "") else old_val)
@@ -53,7 +59,13 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool) -> d
                 value = edited if edited != "" else None
         with cols[3]:
             apply_field = st.checkbox(
-                "Apply", value=default_checked, key=f"{key_prefix}_{f}_apply", label_visibility="collapsed"
+                "Apply", value=default_checked and not is_risky,
+                key=f"{key_prefix}_{f}_apply", label_visibility="collapsed",
+            )
+        if is_risky:
+            st.caption(
+                "⚠️ This update looks like it may be missing information from the current record — "
+                "review carefully before applying."
             )
         if apply_field:
             approved[f] = value
@@ -183,11 +195,25 @@ def _render_pending_review(pending: list):
     colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}
     any_collisions = bool(colliding_changed_ids or colliding_unmatched_ids)
 
+    # See master_merge.is_detail_loss - a matched row whose special_features/
+    # contacts update looks like it dropped real information is forced into
+    # manual review exactly like a same-batch collision, rather than being
+    # auto-appliable.
+    risky_changed_ids = {id(m) for m in plan.matched_changed if m.risky_fields}
+    any_risky = bool(risky_changed_ids - colliding_changed_ids)
+
     if any_collisions:
         st.warning(
             "Some rows in this batch appear to target the same property (marked "
             "⚠️ below) — these always need a manual pick before the rest can be "
             "applied, rather than write order silently deciding a winner."
+        )
+
+    if any_risky:
+        st.warning(
+            "Some updates (marked ⚠️ below) look like they may be missing detail "
+            "compared to what's already stored — these need a manual look before "
+            "being applied automatically."
         )
 
     manual_review = st.toggle(
@@ -197,7 +223,10 @@ def _render_pending_review(pending: list):
     auto_accept = not manual_review
 
     if auto_accept:
-        auto_changed = [m for m in plan.matched_changed if id(m) not in colliding_changed_ids]
+        auto_changed = [
+            m for m in plan.matched_changed
+            if id(m) not in colliding_changed_ids and id(m) not in risky_changed_ids
+        ]
         auto_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
         summary_parts = []
         if auto_changed:
@@ -207,9 +236,9 @@ def _render_pending_review(pending: list):
         if summary_parts:
             st.info(
                 "This will " + " and ".join(summary_parts) + "."
-                + (" Rows involved in a collision above need manual review first." if any_collisions else "")
+                + (" Rows flagged above need manual review first." if (any_collisions or any_risky) else "")
             )
-        elif not any_collisions:
+        elif not any_collisions and not any_risky:
             st.info("Nothing to apply automatically — every row already matches the master with no changes.")
 
     updates = {}          # master_index -> {field: approved_value} - real, review-worthy changes only
@@ -227,18 +256,19 @@ def _render_pending_review(pending: list):
             entry["source_file"] = m.new_row.source_file
 
     if plan.matched_changed:
-        if not auto_accept or colliding_changed_ids:
+        if not auto_accept or colliding_changed_ids or risky_changed_ids:
             st.subheader("Matched — changes detected")
         for i, m in enumerate(plan.matched_changed):
             is_collision = id(m) in colliding_changed_ids
+            is_risky = id(m) in risky_changed_ids
             _apply_silent(m)
-            if auto_accept and not is_collision:
+            if auto_accept and not is_collision and not is_risky:
                 entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
                 entry["source_file"] = m.new_row.source_file
                 updates[m.master_index] = entry
                 continue
 
-            prefix = "⚠️ " if is_collision else ""
+            prefix = "⚠️ " if (is_collision or is_risky) else ""
             label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
             key_prefix = f"matched_{i}_{m.property_id}"
             # Two colliding rows both targeting the same master property share
@@ -246,7 +276,9 @@ def _render_pending_review(pending: list):
             # an explicit, per-iteration key is required here, or Streamlit
             # can't tell the two expanders apart and silently renders only one.
             with st.expander(label, key=f"{key_prefix}_expander"):
-                approved_fields = _render_field_rows(m.diffs, key_prefix, default_checked=not is_collision)
+                approved_fields = _render_field_rows(
+                    m.diffs, key_prefix, default_checked=not is_collision, risky_fields=m.risky_fields
+                )
             if approved_fields:
                 entry = updates.setdefault(m.master_index, {})
                 entry.update(approved_fields)
@@ -314,7 +346,13 @@ def _render_pending_review(pending: list):
                         diffs = master_merge.diff_fields(old_rec, row_dict)
                         st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
                         if diffs:
-                            approved_fields = _render_field_rows(diffs, f"{key_prefix}_link", default_checked=True)
+                            risky_fields = frozenset(
+                                f for f in diffs
+                                if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
+                            )
+                            approved_fields = _render_field_rows(
+                                diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
+                            )
                             if approved_fields:
                                 entry = updates.setdefault(target_index, {})
                                 entry.update(approved_fields)

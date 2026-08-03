@@ -43,6 +43,21 @@ from storage.file_store import clean_value
 # (see pages/2_Review_and_Master.py) - neither belongs in a field-by-field diff.
 DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "source_file")]
 
+# Free-text list fields where a re-upload replacing a detailed value with a
+# much shorter one is a red flag rather than a normal update - a brochure
+# re-upload has, in practice, replaced a full amenities list with a one-line
+# availability status (see is_detail_loss). Deliberately not every str field:
+# short descriptive fields like state_of_space don't have this "list of
+# distinct items" shape, so a length/retention check on them would just be
+# noise.
+RISKY_TEXT_FIELDS = ("special_features", "contacts")
+
+# Thresholds for is_detail_loss - a review trigger, not a block, so these are
+# deliberately lenient (a genuinely shorter-but-current update still goes
+# through once a human confirms it in manual review).
+DETAIL_LOSS_LENGTH_RATIO = 0.5
+DETAIL_LOSS_RETENTION_RATIO = 0.5
+
 
 def normalize_key(value) -> str:
     """Lowercase, strip punctuation, collapse whitespace - deliberately
@@ -150,6 +165,48 @@ def silent_field_updates(old: dict, new: dict) -> dict:
     return updates
 
 
+def _detail_items(text: str) -> list[str]:
+    """Splits a free-text list field (special_features, contacts) into its
+    individual items on common list delimiters, for the retained-item check
+    in is_detail_loss. Fragments under 3 chars are dropped - they're almost
+    always leftover punctuation/conjunctions ("a", "&") rather than a real
+    item, and would otherwise pad the retention ratio with matches that mean
+    nothing."""
+    parts = re.split(r"[,;\n•·/]+", text.lower())
+    return [p.strip() for p in parts if len(p.strip()) >= 3]
+
+
+def is_detail_loss(old_val, new_val) -> bool:
+    """
+    True when `new_val` looks like it may have dropped real information
+    `old_val` had, rather than being a genuine update - e.g. a brochure
+    re-upload's special_features carrying just "Available Q3 2026" over a
+    master row whose special_features already listed six amenities. Flags on
+    either signal:
+      - new_val is under DETAIL_LOSS_LENGTH_RATIO the length of old_val, or
+      - fewer than DETAIL_LOSS_RETENTION_RATIO of old_val's distinct
+        comma/semicolon/newline/bullet-separated items still appear in
+        new_val.
+    Only called for RISKY_TEXT_FIELDS, and only a review trigger (see that
+    constant's docstring) - never applied automatically, callers still let a
+    human apply, correct, or skip the field in manual review.
+    """
+    if _is_blank(old_val) or _is_blank(new_val):
+        return False
+    old_text = str(old_val).strip()
+    new_text = str(new_val).strip()
+
+    if len(new_text) < DETAIL_LOSS_LENGTH_RATIO * len(old_text):
+        return True
+
+    old_items = _detail_items(old_text)
+    if not old_items:
+        return False
+    new_lower = new_text.lower()
+    retained = sum(1 for item in old_items if item in new_lower)
+    return (retained / len(old_items)) < DETAIL_LOSS_RETENTION_RATIO
+
+
 def _fallback_key(row: dict) -> tuple:
     return (
         normalize_key(row.get("building")),
@@ -229,6 +286,7 @@ class MatchedRow:
     diffs: dict
     match_tier: str  # "postcode" or "fallback"
     silent_updates: dict = field(default_factory=dict)  # see silent_field_updates - never shown in the diff-review UI
+    risky_fields: frozenset = field(default_factory=frozenset)  # see is_detail_loss - forces manual review, like a collision
 
 
 @dataclass
@@ -285,7 +343,10 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             old_rec = master_records[master_idx]
             diffs = diff_fields(old_rec, new_dict)
             silent = silent_field_updates(old_rec, new_dict)
-            matched = MatchedRow(master_idx, old_rec["property_id"], new_row, diffs, tier, silent)
+            risky_fields = frozenset(
+                f for f in diffs if f in RISKY_TEXT_FIELDS and is_detail_loss(*diffs[f])
+            )
+            matched = MatchedRow(master_idx, old_rec["property_id"], new_row, diffs, tier, silent, risky_fields)
             (matched_changed if diffs else matched_unchanged).append(matched)
         else:
             unmatched.append(UnmatchedRow(new_row, _suggest_similar(new_dict, master_records)))
