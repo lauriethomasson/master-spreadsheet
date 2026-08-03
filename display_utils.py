@@ -13,7 +13,7 @@ import streamlit as st
 
 from master_merge import field_kind, row_label  # noqa: F401 - row_label re-exported for display_utils.row_label(...) call sites
 from schema import ListingRow
-from staging_writer import HYPERLINK_DISPLAY_TEXT
+from staging_writer import HYPERLINK_DISPLAY_TEXT, title_case_label
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
@@ -64,6 +64,20 @@ def visible_columns(df: pd.DataFrame) -> list:
     return [c for c in columns if c not in ALWAYS_HIDDEN_COLUMNS]
 
 
+def label_column_config(df: pd.DataFrame) -> dict:
+    """
+    Base column_config giving every column in df a Title Case display label
+    (e.g. "internal_ref" -> "Internal Ref") via title_case_label - purely
+    cosmetic, the underlying column name a caller matches/edits by never
+    changes. Meant to be spread into a column_config dict FIRST, ahead of
+    link_column_config/wide_text_column_config/numeric_column_config below -
+    each of those also sets its own label for the columns it covers, so
+    spreading them afterward overrides this generic entry for those columns
+    while still ending up with a real label everywhere.
+    """
+    return {col: st.column_config.Column(label=title_case_label(col)) for col in df.columns}
+
+
 def link_column_config(df: pd.DataFrame) -> dict:
     """column_config for st.dataframe/st.data_editor: renders every column in
     LINK_COLUMNS that's actually present in df as a clickable link showing a
@@ -71,7 +85,7 @@ def link_column_config(df: pd.DataFrame) -> dict:
     before (LinkColumn behaves like a text input when edited) - this only
     changes how a cell is displayed, not what's stored."""
     return {
-        col: st.column_config.LinkColumn(display_text=HYPERLINK_DISPLAY_TEXT)
+        col: st.column_config.LinkColumn(label=title_case_label(col), display_text=HYPERLINK_DISPLAY_TEXT)
         for col in LINK_COLUMNS
         if col in df.columns
     }
@@ -85,7 +99,7 @@ def wide_text_column_config(df: pd.DataFrame) -> dict:
     available by downloading the .xlsx (which has its own wrap-text/row-
     height formatting - see staging_writer.write_rows_to_xlsx)."""
     return {
-        col: st.column_config.TextColumn(width="large")
+        col: st.column_config.TextColumn(label=title_case_label(col), width="large")
         for col in WIDE_TEXT_COLUMNS
         if col in df.columns
     }
@@ -106,9 +120,9 @@ def numeric_column_config(df: pd.DataFrame) -> dict:
             continue
         kind = field_kind(col)
         if kind == "int":
-            config[col] = st.column_config.NumberColumn(step=1)
+            config[col] = st.column_config.NumberColumn(label=title_case_label(col), step=1)
         elif kind == "float":
-            config[col] = st.column_config.NumberColumn(step=0.01)
+            config[col] = st.column_config.NumberColumn(label=title_case_label(col), step=0.01)
     return config
 
 

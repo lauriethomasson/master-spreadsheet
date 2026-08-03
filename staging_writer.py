@@ -53,6 +53,18 @@ DATA_ROW_HEIGHT = 60
 HIDDEN_COLUMNS = ["source_file", "property_id"]
 
 
+def title_case_label(field_name: str) -> str:
+    """Display-only label for a snake_case field name - "internal_ref" ->
+    "Internal Ref", "rent_psf_min" -> "Rent Psf Min" - used for the written
+    .xlsx header row here and for on-screen column_config labels
+    (display_utils.py). Purely cosmetic: the underlying field/column name
+    (what schema.py, matching logic, etc. all reference) never changes -
+    see read_xlsx_with_hyperlinks, which reads columns back by their fixed
+    schema position rather than by parsing this text, for exactly that
+    reason."""
+    return field_name.replace("_", " ").title()
+
+
 def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
     """
     output is a filesystem path (str/Path) OR a writable binary stream (e.g.
@@ -67,7 +79,7 @@ def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
     ws = wb.active
     ws.title = "Listings"
 
-    ws.append(fields)
+    ws.append([title_case_label(f) for f in fields])
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(vertical="center")
@@ -120,10 +132,17 @@ def read_xlsx_with_hyperlinks(data: bytes) -> pd.DataFrame:
     "Open Brochure" on every read-back after a write - reads the cell's
     actual hyperlink target instead for those columns; every other column
     is read exactly as pd.read_excel would.
+
+    Column names come from ListingRow.model_fields, by fixed position, NOT
+    from row 1's actual cell text - write_rows_to_xlsx always writes columns
+    in that exact order, but row 1's cells hold a Title Case display label
+    (see title_case_label) rather than the real snake_case field name, so
+    parsing them would hand back "Internal Ref" as a DataFrame column name
+    instead of "internal_ref", breaking every downstream field lookup.
     """
     wb = load_workbook(BytesIO(data))
     ws = wb.active
-    headers = [cell.value for cell in ws[1]]
+    headers = list(ListingRow.model_fields.keys())
     hyperlink_col_indices = {i for i, h in enumerate(headers) if h in HYPERLINK_COLUMNS}
 
     records = []

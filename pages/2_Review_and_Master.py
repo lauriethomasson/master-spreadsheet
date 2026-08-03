@@ -107,6 +107,7 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     edited = st.data_editor(
         display_df,
         column_config={
+            **display_utils.label_column_config(display_df),
             "Select": st.column_config.CheckboxColumn(required=True),
             **display_utils.link_column_config(display_df),
             **display_utils.wide_text_column_config(display_df),
@@ -270,6 +271,10 @@ def _render_full_master_view():
         "Download master.xlsx",
         blob_store.read_bytes(master_writer.DEFAULT_MASTER_PATH),
         file_name="master.xlsx",
+        # See pages/3_Export.py's download_button for why this is required -
+        # without it, raw bytes always infer "application/octet-stream"
+        # regardless of file_name's extension.
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="download_master_default_view",
     )
 

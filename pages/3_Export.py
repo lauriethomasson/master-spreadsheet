@@ -30,6 +30,7 @@ with page_setup.setup_page("export"):
             num_rows="fixed",
             width="stretch",
             column_config={
+                **display_utils.label_column_config(selected_df[visible]),
                 **display_utils.link_column_config(selected_df[visible]),
                 **display_utils.wide_text_column_config(selected_df[visible]),
             },
@@ -46,6 +47,13 @@ with page_setup.setup_page("export"):
             "Download export.xlsx",
             buffer.getvalue(),
             file_name="export.xlsx",
+            # Without this, Streamlit infers "application/octet-stream" for
+            # any raw bytes payload regardless of file_name's extension (see
+            # streamlit.runtime.download_data_util.convert_data_to_bytes_and_
+            # infer_mime) - a generic, unrecognized-binary Content-Type that
+            # browsers/download managers can treat with more suspicion than
+            # a properly-typed Office document.
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_export",
         )
 
