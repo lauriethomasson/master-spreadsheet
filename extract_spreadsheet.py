@@ -76,6 +76,34 @@ def _build_field_synonyms() -> dict:
 FIELD_SYNONYMS = _build_field_synonyms()
 
 
+_PROVIDER_SUFFIX_RE = re.compile(
+    r"(?:\s*[-_]\s*)?(?:live[\s_-]+)?availability(?=$|[\s_-])(?:[\s_-]+update)?(?:.*)?$",
+    re.IGNORECASE,
+)
+_DATED_SUFFIX_RE = re.compile(
+    r"(?:\s*[-_]\s*)?(?:\d{1,2}(?:st|nd|rd|th)?[\s_-]+[a-z]+|\d{4}[\s_-]\d{1,2}[\s_-]\d{1,2}|\d{1,2}[\s_-]\d{1,2}[\s_-]\d{2,4}).*$",
+    re.IGNORECASE,
+)
+
+
+def infer_provider_from_filename(filename: str) -> str | None:
+    """
+    Returns the provider prefix from recurring availability-export names.
+
+    This is a fallback for spreadsheets whose cells contain no provider at
+    all (confirmed for Kitt's Availability (External).xlsx). It deliberately
+    removes only recognisable export/date suffixes rather than treating an
+    arbitrary whole filename as a company name.
+    """
+    stem = Path(filename).stem.replace("’", "'").strip()
+    stem = re.sub(r"\s*\([^)]*(?:external|original|copy)[^)]*\)\s*$", "", stem, flags=re.IGNORECASE)
+    provider = _PROVIDER_SUFFIX_RE.sub("", stem).strip(" -_")
+    provider = _DATED_SUFFIX_RE.sub("", provider).strip(" -_")
+    if " - " in provider:
+        provider = provider.split(" - ", 1)[0].strip()
+    return provider or None
+
+
 # Matches the exact shape of a Google Sheets/IMPORTRANGE .xlsx export's
 # formula cells - e.g. '=IFERROR(__xludf.DUMMYFUNCTION("..."),"Area")' or
 # '=IFERROR(__xludf.DUMMYFUNCTION("""COMPUTED_VALUE"""),759.0)'. Google's
