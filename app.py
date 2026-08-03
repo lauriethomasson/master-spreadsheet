@@ -30,7 +30,7 @@ _FIELD_OPTIONS = ["(ignore this column)"] + _MAPPABLE_FIELDS
 
 # Increase this whenever extraction logic changes. This prevents results
 # created by older extraction code from being reused.
-EXTRACTION_VERSION = "2"
+EXTRACTION_VERSION = "3"
 
 
 def infer_provider_from_filename(filename: str) -> str | None:
