@@ -106,18 +106,22 @@ def _render_approval_confirmation(approval: dict):
     st.success(summary)
 
     show_details = st.session_state.get("show_approval_details", False)
-    action_cols = st.columns([1, 1, 3])
-    if action_cols[0].button("Hide details" if show_details else "View what changed", key="toggle_approval_details"):
-        st.session_state["show_approval_details"] = not show_details
-        st.rerun()
-
-    if approval.get("version_path"):
-        if action_cols[1].button("Undo this update", key="undo_last_approval"):
-            with st.spinner("Undoing..."):
-                master_writer.restore_version(approval["version_path"])
-            st.session_state.pop("last_approval", None)
-            st.session_state["just_restored"] = approval["version_path"]
+    # horizontal=True sizes each button to its own content instead of
+    # stretching across equal-width st.columns - that's what kept "Undo this
+    # update" stranded far to the right of "View what changed" rather than
+    # sitting right beside it.
+    with st.container(horizontal=True):
+        if st.button("Hide details" if show_details else "View what changed", key="toggle_approval_details"):
+            st.session_state["show_approval_details"] = not show_details
             st.rerun()
+
+        if approval.get("version_path"):
+            if st.button("Undo this update", key="undo_last_approval"):
+                with st.spinner("Undoing..."):
+                    master_writer.restore_version(approval["version_path"])
+                st.session_state.pop("last_approval", None)
+                st.session_state["just_restored"] = approval["version_path"]
+                st.rerun()
 
     if show_details:
         rows = [
