@@ -39,14 +39,20 @@ def render_before_after(old_val, new_val) -> None:
         st.write("—" if new_val in (None, "") else new_val)
 
 
-def render_before_after_editable(old_val, new_val, kind: str, key: str):
+def render_before_after_editable(old_val, new_val, kind: str, key: str, multiline: bool = False):
     """
     Like render_before_after, but "After" is an editable input
-    (st.number_input for an int/float field, st.text_input otherwise)
-    rather than static text - used by the manual per-field review UI, where
-    a reviewer can correct the incoming value, not just accept/reject it
-    verbatim. Returns the input's current value (int/float per kind, or
-    the text - None if left blank - for a str field).
+    (st.number_input for an int/float field, st.text_area/st.text_input
+    otherwise) rather than static text - used by the manual per-field
+    review UI, where a reviewer can correct the incoming value, not just
+    accept/reject it verbatim. Returns the input's current value (int/float
+    per kind, or the text - None if left blank - for a str field).
+
+    multiline should be True for long free-text fields (see
+    display_utils.WIDE_TEXT_COLUMNS) - st.text_input is a single-line box
+    that truncates rather than wraps, which would defeat the whole point of
+    the side-by-side Before/After layout for exactly the fields (special_
+    features, contacts) where comparing full text at a glance matters most.
     """
     old_col, after_col = st.columns(2, border=True)
     with old_col:
@@ -61,6 +67,12 @@ def render_before_after_editable(old_val, new_val, kind: str, key: str):
                 key=key, label_visibility="collapsed",
             )
             return int(edited) if kind == "int" else edited
+        if multiline:
+            edited = st.text_area(
+                "New value", value="" if new_val is None else str(new_val),
+                key=key, label_visibility="collapsed",
+            )
+            return edited if edited != "" else None
         edited = st.text_input(
             "New value", value="" if new_val is None else str(new_val),
             key=key, label_visibility="collapsed",

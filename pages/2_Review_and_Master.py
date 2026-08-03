@@ -42,7 +42,9 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
         is_risky = f in risky_fields
         st.markdown(f"**{f}**")
         kind = master_merge.field_kind(f)
-        value = display_utils.render_before_after_editable(old_val, new_val, kind, key=f"{key_prefix}_{f}_value")
+        value = display_utils.render_before_after_editable(
+            old_val, new_val, kind, key=f"{key_prefix}_{f}_value", multiline=f in display_utils.WIDE_TEXT_COLUMNS,
+        )
         apply_field = st.checkbox(
             "Apply this change", value=default_checked and not is_risky, key=f"{key_prefix}_{f}_apply",
         )
