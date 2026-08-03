@@ -30,32 +30,19 @@ _FIELD_OPTIONS = ["(ignore this column)"] + _MAPPABLE_FIELDS
 
 # Increase this whenever extraction logic changes. This prevents results
 # created by older extraction code from being reused.
-EXTRACTION_VERSION = "3"
+EXTRACTION_VERSION = "4"
 
 
-def infer_provider_from_filename(filename: str) -> str | None:
-    """Infer providers that are clearly identified by the uploaded filename."""
-    normalized = Path(filename).stem.casefold().replace("’", "'")
-
-    if "kitt" in normalized:
-        return "Kitt's"
-
-    return None
-
-
-def fill_missing_provider(rows: list[ListingRow], filename: str) -> None:
-    """Fill provider/internal_ref without overwriting extracted values."""
-    fallback_provider = infer_provider_from_filename(filename)
-
-    if not fallback_provider:
-        return
-
+def fill_missing_provider(rows: list[ListingRow], fallback_provider: str = None) -> None:
+    """Fill missing provider data without overwriting values from the source."""
+    fallback_provider = (fallback_provider or "").strip() or None
     for row in rows:
-        if not row.provider:
+        if not row.provider and fallback_provider:
             row.provider = fallback_provider
 
-        if not row.internal_ref:
-            row.internal_ref = row.provider or fallback_provider
+        if not row.internal_ref and row.provider:
+            row.internal_ref = row.provider
+
 
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
@@ -67,6 +54,21 @@ with page_setup.setup_page("upload"):
         type=["pdf", "eml", "xlsx", "csv"],
         accept_multiple_files=True,
     )
+
+    # Branding or provider columns can be unclear or incomplete. Let the
+    # uploader supply a per-file fallback without guessing from filenames.
+    provider_overrides = {}
+    if uploaded_files:
+        with st.expander("Provider overrides (optional)"):
+            st.write(
+                "Only fill these in when the provider cannot be identified from the file. "
+                "An extracted provider always takes priority."
+            )
+            for uploaded_file in uploaded_files:
+                provider_overrides[uploaded_file.name] = st.text_input(
+                    f"Provider / internal ref — {uploaded_file.name}",
+                    key=f"provider_override_{uploaded_file.name}",
+                ).strip()
 
     # Spreadsheet uploads need a header->field mapping before they can be
     # extracted at all - unlike PDF/eml (always routed through Gemini),
@@ -86,9 +88,16 @@ with page_setup.setup_page("upload"):
             df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
             headers = list(df.columns)
             h_hash = extract_spreadsheet.header_hash(headers)
-            if get_saved_header_mapping(h_hash) is not None:
+            saved = get_saved_header_mapping(h_hash)
+            mapping_has_provider_column = bool(
+                saved and "provider" in saved.get("mapping", {}).values()
+            )
+            if saved is not None and (mapping_has_provider_column or saved.get("provider")):
                 continue
-            entry = unresolved_mappings.setdefault(h_hash, {"headers": headers, "filenames": []})
+            entry = unresolved_mappings.setdefault(
+                h_hash,
+                {"headers": headers, "filenames": [], "saved": saved},
+            )
             entry["filenames"].append(uploaded_file.name)
 
     for h_hash, info in unresolved_mappings.items():
@@ -99,7 +108,8 @@ with page_setup.setup_page("upload"):
                 "anything) - this is only asked once per header format; the same provider's "
                 "future uploads with these exact headers will reuse this mapping automatically."
             )
-            guess = extract_spreadsheet.suggest_mapping(info["headers"])
+            saved = info.get("saved") or {}
+            guess = saved.get("mapping") or extract_spreadsheet.suggest_mapping(info["headers"])
             chosen = {}
             for header in info["headers"]:
                 default = guess.get(header) or "(ignore this column)"
@@ -109,12 +119,24 @@ with page_setup.setup_page("upload"):
                 )
                 chosen[header] = None if choice == "(ignore this column)" else choice
 
+            provider = st.text_input(
+                "Provider / internal ref for this spreadsheet format",
+                value=saved.get("provider") or "",
+                key=f"provider_{h_hash}",
+                help=(
+                    "Saved with this column format and reused automatically for future uploads. "
+                    "Leave blank only when a column above is mapped to provider."
+                ),
+            ).strip()
+
             mapped_fields = [f for f in chosen.values() if f]
             duplicate_fields = {f for f in mapped_fields if mapped_fields.count(f) > 1}
             if duplicate_fields:
                 st.warning(f"Each field can only be mapped from one column - fix: {', '.join(sorted(duplicate_fields))}")
+            elif "provider" not in mapped_fields and not provider:
+                st.warning("Enter the provider, or map one of the spreadsheet columns to provider.")
             elif st.button("Confirm mapping", key=f"confirm_{h_hash}"):
-                save_header_mapping(h_hash, info["headers"], chosen)
+                save_header_mapping(h_hash, info["headers"], chosen, provider=provider or None)
                 st.rerun()
 
     if uploaded_files and st.button("Extract"):
@@ -125,6 +147,7 @@ with page_setup.setup_page("upload"):
             for i, uploaded_file in enumerate(uploaded_files, start=1):
                 with st.spinner(f"Processing {i} of {total}: {uploaded_file.name}..."):
                     suffix = Path(uploaded_file.name).suffix.lower()
+                    source_provider = provider_overrides.get(uploaded_file.name)
 
                     # Hashed before anything else, from the bytes already in
                     # memory - a byte-identical re-upload (same content, any
@@ -172,6 +195,7 @@ with page_setup.setup_page("upload"):
                                 "confirm it above, then click Extract again."
                             )
                         rows = extract_spreadsheet.build_rows(df, saved["mapping"], source_file=uploaded_file.name)
+                        source_provider = saved.get("provider") or source_provider
                         geocode_rows(rows)
                         reused = False
                     else:
@@ -203,8 +227,14 @@ with page_setup.setup_page("upload"):
                         geocode_rows(rows)
                         reused = False
                     # Applies to PDFs, spreadsheets, emails and reused rows.
-                    # Existing extracted provider values are not overwritten.
-                    fill_missing_provider(rows, uploaded_file.name)
+                    # Existing extracted provider values are not overwritten;
+                    # internal_ref mirrors any provider when it is blank.
+                    fill_missing_provider(rows, source_provider)
+                    if any(not row.provider or not row.internal_ref for row in rows):
+                        raise ValueError(
+                            f"{uploaded_file.name}: provider could not be identified. "
+                            "Enter a provider override above, then click Extract again."
+                        )
 
                     # Staged immediately, per file (reused or freshly
                     # extracted alike) - so a failure partway through a
