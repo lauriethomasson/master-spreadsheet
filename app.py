@@ -143,7 +143,16 @@ with page_setup.setup_page("upload"):
                     # since PDF containers embed producer metadata that
                     # changes across a re-save even when the rendered pages
                     # don't.
-                    content_hash = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+                    # Include the extraction version in the hash. Therefore, identical files
+                    # are reused only when they were processed by the current extraction logic.
+                    file_bytes = uploaded_file.getvalue()
+                    versioned_content = (
+                        EXTRACTION_VERSION.encode("utf-8")
+                        + b"\0"
+                        + file_bytes
+                    )
+                    content_hash = hashlib.sha256(versioned_content).hexdigest()
+
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
 
                     if previous_staging_path:
