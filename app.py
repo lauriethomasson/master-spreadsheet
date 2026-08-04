@@ -89,6 +89,27 @@ def fill_missing_provider(rows: list[ListingRow], filename: str, apply_filename_
             row.internal_ref = row.provider or fallback_provider
 
 
+def fill_missing_submarket_from_structural_header(rows: list[ListingRow], headers: list, filename: str) -> None:
+    """
+    Fill submarket from a recognized provider's own structural fallback
+    (see extract_spreadsheet.structural_submarket_fallback) without
+    overwriting a genuinely-extracted value - a no-op for any format that
+    fallback doesn't apply to. Runs before geocode_rows' own geocoded-
+    neighbourhood fallback (see geocode.py) - this constant, file-level
+    value is 100% reliable when it applies at all, whereas that one is only
+    ever a secondary, best-effort attempt for whatever this doesn't cover
+    (confirmed necessary: Google has no neighbourhood-polygon data at all
+    for the real Clerkenwell & Farringdon addresses this was built for).
+    """
+    submarket = extract_spreadsheet.structural_submarket_fallback(headers, filename)
+    if not submarket:
+        return
+
+    for row in rows:
+        if not row.submarket:
+            row.submarket = submarket
+
+
 # A house/building number is a strong, simple signal that `building` holds
 # a real street address rather than just a proper name - confirmed against
 # the real Kitt's Availability file (35 of 42 real building values contain
@@ -168,6 +189,14 @@ with page_setup.setup_page("upload"):
             headers = list(df.columns)
             h_hash = extract_spreadsheet.header_hash(headers)
             mapping = extract_spreadsheet.suggest_mapping(headers)
+            # Before ever reaching a human rescue prompt: a known provider's
+            # OWN recognizable format (e.g. UNION's "by-area" exports) may
+            # structurally hide a critical field from any header-text-based
+            # match at all - see apply_provider_structural_fallback's own
+            # docstring. Runs first so a first-ever upload of a brand new
+            # area never prompts in the first place, not just formats
+            # already rescued once before.
+            mapping = extract_spreadsheet.apply_provider_structural_fallback(mapping, headers, uploaded_file.name)
             saved_rescue = get_saved_critical_field_rescue(h_hash)
             rescue = saved_rescue["assignments"] if saved_rescue else {}
             mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
@@ -278,6 +307,14 @@ with page_setup.setup_page("upload"):
                         headers = list(df.columns)
                         h_hash = extract_spreadsheet.header_hash(headers)
                         mapping = extract_spreadsheet.suggest_mapping(headers)
+                        # Same fallback applied at upload time above (see its
+                        # comment there) - must run here too, or a format that
+                        # fallback resolves (suppressing the rescue prompt)
+                        # would still hit the "missing required field" error
+                        # below the moment Extract is actually clicked.
+                        mapping = extract_spreadsheet.apply_provider_structural_fallback(
+                            mapping, headers, uploaded_file.name
+                        )
                         saved_rescue = get_saved_critical_field_rescue(h_hash)
                         rescue = saved_rescue["assignments"] if saved_rescue else {}
                         mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
@@ -289,6 +326,7 @@ with page_setup.setup_page("upload"):
                             )
 
                         rows = extract_spreadsheet.build_rows(df, mapping, source_file=uploaded_file.name)
+                        fill_missing_submarket_from_structural_header(rows, headers, uploaded_file.name)
                         geocode_rows(rows)
                         reused = False
                     else:

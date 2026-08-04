@@ -165,35 +165,64 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         # left behind by a provider-name fix that changed the match key -
         # see master_merge.py's own module docstring on why provider is
         # part of the key at all) - no separate delete mechanism invented.
-        if st.button(
+        remove_clicked = st.button(
             f"Remove {len(selected_positions)} selected row(s)",
             key=f"{key}_remove_selected", disabled=not selected_positions,
-        ):
-            master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
-            removed_indices = frozenset(selected_positions)
-            removed_labels = [master_merge.row_label(master_records[i]) for i in sorted(removed_indices)]
+        )
 
-            # The version to offer for Undo is whatever was newest BEFORE
-            # this write creates a new one - same reasoning as the approve/
-            # manual-edit flows' own previous_version_path.
-            previous_versions = master_writer.list_versions(limit=1)
-            previous_version_path = previous_versions[0]["path"] if previous_versions else None
+        # Feedback for this action lives right here, inline in the same row
+        # as the button, rather than as a separate banner above the table -
+        # a removal is a small, frequent, low-ceremony action (unlike an
+        # upload approval's own multi-row diff), so its own confirmation
+        # stays equally lightweight rather than pushing the table down.
+        if remove_clicked:
+            with st.spinner("Removing..."):
+                master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
+                removed_indices = frozenset(selected_positions)
 
-            merged_rows = master_merge.apply_merge(master_records, {}, [], removed_indices=removed_indices)
-            try:
-                master_writer.write_master(merged_rows, source="manual_removal", removed_count=len(removed_indices))
-            except Exception as e:
-                st.error(f"Removal failed, master was not changed: {e}")
+                # The version to offer for Undo is whatever was newest BEFORE
+                # this write creates a new one - same reasoning as the approve/
+                # manual-edit flows' own previous_version_path.
+                previous_versions = master_writer.list_versions(limit=1)
+                previous_version_path = previous_versions[0]["path"] if previous_versions else None
+
+                merged_rows = master_merge.apply_merge(master_records, {}, [], removed_indices=removed_indices)
+                try:
+                    master_writer.write_master(
+                        merged_rows, source="manual_removal", removed_count=len(removed_indices)
+                    )
+                except Exception as e:
+                    write_failed = e
+                else:
+                    write_failed = None
+
+            if write_failed:
+                st.error(f"Removal failed, master was not changed: {write_failed}")
             else:
                 st.session_state["export_selected_property_ids"] = set()
                 st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
                 if key in st.session_state:
                     del st.session_state[key]
                 st.session_state["last_removal"] = {
-                    "removed_labels": removed_labels,
+                    "count": len(removed_indices),
                     "version_path": previous_version_path,
                 }
                 st.rerun()
+        else:
+            # Popped, not just read - shown once right on the rerun
+            # immediately after the removal above, then gone, rather than
+            # persisting in (page-wide, cross-navigation) session state
+            # until someone happens to click Undo - see the equivalent fix
+            # for last_approval/last_manual_edit in _render_full_master_view.
+            last_removal = st.session_state.pop("last_removal", None)
+            if last_removal:
+                n = last_removal["count"]
+                st.markdown(f":red[✓ {n} row{'s' if n != 1 else ''} removed]")
+                if last_removal.get("version_path") and st.button("Undo", key=f"{key}_undo_manual_removal"):
+                    with st.spinner("Undoing..."):
+                        master_writer.restore_version(last_removal["version_path"])
+                    st.session_state["just_restored"] = last_removal["version_path"]
+                    st.rerun()
 
     return _process_manual_edits(df, key)
 
@@ -330,34 +359,16 @@ def _render_manual_edit_confirmation(edit: dict):
         display_utils.render_before_after(d["old"], d["new"])
 
 
-def _render_removal_confirmation(removal: dict):
-    """Same shape/placement as _render_manual_edit_confirmation - a manual
-    row removal rides the exact same write_master()/versioning/undo path,
-    just with its own source string ("manual_removal") so the version-
-    history label stays distinguishable (see master_writer.list_versions)."""
-    n = len(removal["removed_labels"])
-    st.success(f"Removed {n} row{'s' if n != 1 else ''}.")
-
-    if removal.get("version_path"):
-        if st.button("Undo", key="undo_manual_removal"):
-            with st.spinner("Undoing..."):
-                master_writer.restore_version(removal["version_path"])
-            st.session_state.pop("last_removal", None)
-            st.session_state["just_restored"] = removal["version_path"]
-            st.rerun()
-
-    for label in removal["removed_labels"]:
-        st.write(f"🗑️ {label}")
-
-
 def _render_full_master_view():
     # Popped, not just read - a flash confirmation shown once right after its
     # own write, same convention already used by just_discarded/just_restored
-    # below. Previously these three used .get(), so nothing ever cleared them
+    # below. Previously these two used .get(), so nothing ever cleared them
     # except their own "Undo" button - session state is shared across every
-    # page in this app, so a removal's confirmation (and its 🗑️ markers)
-    # kept reappearing on every future visit to this view, long after the
-    # write it described, with no relation to what's actually happened since.
+    # page in this app, so a confirmation kept reappearing on every future
+    # visit to this view, long after the write it described, with no
+    # relation to what's actually happened since. (Removal's own equivalent
+    # confirmation is rendered inline next to its button - see
+    # _render_master_table - not as a banner here.)
     last_approval = st.session_state.pop("last_approval", None)
     if last_approval:
         _render_approval_confirmation(last_approval)
@@ -365,10 +376,6 @@ def _render_full_master_view():
     last_manual_edit = st.session_state.pop("last_manual_edit", None)
     if last_manual_edit:
         _render_manual_edit_confirmation(last_manual_edit)
-
-    last_removal = st.session_state.pop("last_removal", None)
-    if last_removal:
-        _render_removal_confirmation(last_removal)
 
     if not master_writer.master_exists():
         st.info("No master spreadsheet yet — approve an upload to create one.")

@@ -152,6 +152,123 @@ class ApplyCriticalFieldRescueTests(unittest.TestCase):
         self.assertEqual(rows[0].building, "55 Goswell Road")
 
 
+class ApplyProviderStructuralFallbackTests(unittest.TestCase):
+    """
+    UNION's "by-area" format headers the Building column with the area's
+    own name - different per file, so no synonym/fuzzy match can ever catch
+    it (see REAL_UNION_BY_AREA_HEADERS/ApplyCriticalFieldRescueTests above).
+    apply_provider_structural_fallback resolves this automatically, from
+    the first upload of a brand new area onward, once the filename is
+    recognized as UNION - no per-area rescue ever needed.
+    """
+
+    def test_real_clerkenwell_and_farringdon_file_resolves_automatically(self):
+        mapping = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+        mapping = extract_spreadsheet.apply_provider_structural_fallback(
+            mapping, REAL_UNION_BY_AREA_HEADERS,
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+        )
+        self.assertEqual(mapping["Clerkenwell & Farringdon"], "building")
+        self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, {}), [])
+
+    def test_every_real_by_area_variant_seen_so_far_resolves_automatically(self):
+        # Each is a genuinely different area name/filename - including one
+        # never seen when this fix was proposed (London Bridge & Southbank)
+        # and one using "Category" rather than "Current spec" - proving
+        # this generalizes rather than being another one-off patch.
+        cases = [
+            (["Fitzrovia & Marylebone", "Floor", "Current spec", "Size sq.ft",
+              "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
+             "UNION - Availability - June 26 - Fitzrovia & Marylebone.xlsx", "Fitzrovia & Marylebone"),
+            (["Mayfair / St James", "Floor", "Current spec", "Size sq.ft",
+              "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
+             "UNION - Availability - June 26 - Mayfair & St James.xlsx", "Mayfair / St James"),
+            (["Midtown", "Floor", "Current spec", "Size sq.ft",
+              "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
+             "UNION - Availability - June 26 - Midtown.xlsx", "Midtown"),
+            (["London Bridge / Southbank", "Floor", "Category", "Size sq.ft",
+              "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
+             "UNION - Availabiliy - June 26 - London Bridge & Southbank.xlsx", "London Bridge / Southbank"),
+            # The real leading blank column present in the actual files
+            # (dropped from REAL_UNION_BY_AREA_HEADERS as irrelevant to what
+            # that constant tests) - confirms this isn't sensitive to a
+            # fixed absolute column index, only to the run of fixed headers.
+            ([None, "Soho / Covent Garden", "Floor", "Current spec", "Size sq.ft",
+              "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure"],
+             "UNION - Availability - June 26 - Soho & Covent Garden.xlsx", "Soho / Covent Garden"),
+        ]
+        for headers, filename, expected_building_header in cases:
+            with self.subTest(filename=filename):
+                mapping = extract_spreadsheet.suggest_mapping(headers)
+                mapping = extract_spreadsheet.apply_provider_structural_fallback(mapping, headers, filename)
+                self.assertEqual(mapping[expected_building_header], "building")
+                self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, {}), [])
+
+    def test_real_kitts_and_full_union_headers_are_unaffected(self):
+        # Both already map "building" on their own - the fallback must be
+        # a complete no-op for them, not just harmless.
+        kitts_headers = ["Area", "Building", "Floor/Unit", "Link to Brochure"]
+        for headers, filename in (
+            (REAL_UNION_HEADERS, "UNION - Shoreditch_2026-07-14.xlsx"),
+            (kitts_headers, "Kitt's Availability (External).xlsx"),
+        ):
+            with self.subTest(filename=filename):
+                mapping = extract_spreadsheet.suggest_mapping(headers)
+                fallback_mapping = extract_spreadsheet.apply_provider_structural_fallback(
+                    mapping, headers, filename
+                )
+                self.assertEqual(fallback_mapping, mapping)
+
+    def test_never_overrides_an_already_mapped_building(self):
+        mapping = {"Building": "building", "Clerkenwell & Farringdon": None}
+        fallback_mapping = extract_spreadsheet.apply_provider_structural_fallback(
+            mapping, ["Building", "Clerkenwell & Farringdon"],
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+        )
+        self.assertEqual(fallback_mapping["Building"], "building")
+        self.assertIsNone(fallback_mapping["Clerkenwell & Farringdon"])
+
+    def test_does_not_fire_for_an_unrecognized_provider_even_with_the_same_layout(self):
+        # The exact real UNION by-area fingerprint, but from a filename that
+        # isn't UNION - a coincidental structural match on a genuinely
+        # different provider must never misfire.
+        mapping = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+        mapping = extract_spreadsheet.apply_provider_structural_fallback(
+            mapping, REAL_UNION_BY_AREA_HEADERS, "SomeOtherAgent - Availability.xlsx",
+        )
+        self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, {}), ["building"])
+
+    def test_never_mutates_the_mapping_passed_in(self):
+        mapping = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+        original = dict(mapping)
+        extract_spreadsheet.apply_provider_structural_fallback(
+            mapping, REAL_UNION_BY_AREA_HEADERS,
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+        )
+        self.assertEqual(mapping, original)
+
+    def test_automatic_fallback_produces_real_rows_for_every_real_missing_submarket_address(self):
+        # End-to-end, no human rescue involved at all - the same real
+        # Clerkenwell & Farringdon rows currently missing submarket
+        # (see geocode.py's SubmarketBackfillTests) actually extract with
+        # the right building value straight away.
+        addresses = ["55 Goswell Road", "13 Northburgh Street", "50 Great Sutton Street"]
+        df = pd.DataFrame([
+            {h: None for h in REAL_UNION_BY_AREA_HEADERS} | {"Clerkenwell & Farringdon": address}
+            for address in addresses
+        ])
+        mapping = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+        mapping = extract_spreadsheet.apply_provider_structural_fallback(
+            mapping, REAL_UNION_BY_AREA_HEADERS,
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+        )
+        self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, {}), [])
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="union.xlsx")
+
+        self.assertEqual([r.building for r in rows], addresses)
+
+
 class UnresolvedCriticalFieldsTests(unittest.TestCase):
     def test_a_field_with_no_rescue_entry_at_all_is_unresolved(self):
         mapping = {"Floor": "floor_unit"}

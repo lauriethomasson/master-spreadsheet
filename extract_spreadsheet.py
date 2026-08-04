@@ -372,6 +372,115 @@ def unresolved_critical_fields(mapping: dict, rescue: dict) -> list:
     return [field for field in missing if field not in rescue]
 
 
+# UNION's own "by-area" export convention (see CRITICAL_FIELDS' comment
+# above) headers what's structurally always the Building column with the
+# area's own name instead of a recognizable field name - confirmed against
+# every real by-area file seen so far ("Clerkenwell & Farringdon",
+# "Fitzrovia & Marylebone", "Soho / Covent Garden", "Mayfair / St James",
+# "Midtown", "London Bridge / Southbank"): always the column immediately
+# BEFORE this exact fixed run of headers - Floor, "Current spec" or
+# "Category", Size sq.ft, Minimum Term, Monthly Rate, Price p/sq.ft,
+# Brochure. Matched as a contiguous run rather than fixed absolute column
+# indices, since a real file sometimes has a genuinely blank column before
+# the area-name one and sometimes doesn't - "immediately before this run"
+# holds either way, "always column N" doesn't. Deliberately keyed on the
+# WHOLE surrounding run, not "this one column is unmapped" alone, and only
+# ever consulted for a filename already recognized as a specific known
+# provider (see _leading_known_provider) - a coincidental run match on some
+# other provider's genuinely different layout must never misfire into
+# treating an unrelated column as Building. UNION's OTHER real export
+# format (the current full Shoreditch-style one) already has a real
+# "Building" header and maps automatically without ever reaching this.
+_PROVIDER_BUILDING_FALLBACK_RUNS = {
+    "UNION": (
+        ("floor",),
+        ("current spec", "category"),
+        ("size sqft",),
+        ("minimum term",),
+        ("monthly rate",),
+        ("price psqft",),
+        ("brochure",),
+    ),
+}
+
+
+def _structural_building_header(provider: str, headers: list) -> str:
+    """
+    Returns the header text sitting immediately before a known provider's
+    own fixed run of headers (see _PROVIDER_BUILDING_FALLBACK_RUNS) if that
+    exact run appears contiguously in `headers` - None for an unrecognized
+    provider, no match at all, or more than one match (genuinely ambiguous
+    - stay conservative rather than guess which one).
+    """
+    run = _PROVIDER_BUILDING_FALLBACK_RUNS.get(provider)
+    if not run:
+        return None
+
+    normalized = [normalize_key(h) for h in headers]
+    matches = [
+        i for i in range(1, len(normalized) - len(run) + 1)
+        if all(normalized[i + offset] in allowed for offset, allowed in enumerate(run))
+    ]
+    if len(matches) != 1:
+        return None
+
+    building_header = headers[matches[0] - 1]
+    if building_header is None or not str(building_header).strip():
+        return None
+    return building_header
+
+
+def structural_submarket_fallback(headers: list, filename: str) -> str:
+    """
+    The same area-name header text used to resolve UNION's by-area
+    Building column (see apply_provider_structural_fallback/
+    _structural_building_header) IS ALSO the submarket for every row in
+    that file - constant per file, by construction (a separate export per
+    area, e.g. "Clerkenwell & Farringdon.xlsx"), with no per-row Area/
+    submarket column to read one from at all. Returns None under the exact
+    same conditions _structural_building_header would (unrecognized
+    provider, no fingerprint match) - this only ever makes sense for a file
+    that actually needed that fallback in the first place.
+
+    100% reliable when it applies at all - no API call, no dependency on
+    Google's own neighbourhood-polygon coverage (confirmed patchy: reliable
+    for Mayfair/Fitzrovia/Soho, but Google has no sublocality data at all
+    for the real Clerkenwell & Farringdon addresses this was built for -
+    see geocode.py's own submarket-backfill comment). The caller should
+    apply this BEFORE that geocoded fallback, not after - this is a known-
+    correct constant when it's available, that one's only ever a secondary,
+    best-effort attempt for whatever this doesn't cover.
+    """
+    provider = _leading_known_provider(re.findall(r"[A-Za-z0-9']+", Path(filename).stem))
+    return _structural_building_header(provider, headers)
+
+
+def apply_provider_structural_fallback(mapping: dict, headers: list, filename: str) -> dict:
+    """
+    Automatic, provider-specific fallback for "building" when a provider's
+    OWN recognizable export format structurally hides it from any header-
+    TEXT-based mapping at all (synonym or fuzzy - see
+    _structural_building_header) - e.g. UNION's "by-area" exports, which
+    header that column with the area's own name, different per file, with
+    no vocabulary in common with "building" any text-based match could ever
+    catch. Runs BEFORE the human rescue overlay (apply_critical_field_
+    rescue), not instead of it - a saved/human rescue for a genuinely novel
+    future layout from the same provider still always wins. Only ever fills
+    "building", and only when suggest_mapping's own normal pass left it
+    unmapped. Returns a new dict; never mutates the mapping passed in.
+    """
+    mapping = dict(mapping)
+    if "building" in mapping.values():
+        return mapping
+
+    provider = _leading_known_provider(re.findall(r"[A-Za-z0-9']+", Path(filename).stem))
+    building_header = _structural_building_header(provider, headers)
+    if building_header is not None:
+        mapping[building_header] = "building"
+
+    return mapping
+
+
 def suggest_mapping(headers: list) -> dict:
     """
     Best-guess {header: field_name_or_None} mapping - applied automatically

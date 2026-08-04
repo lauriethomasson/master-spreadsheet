@@ -27,6 +27,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import app
 from schema import ListingRow
 
+# The real UNION "by-area" header set (see tests/test_extract_spreadsheet.py's
+# REAL_UNION_BY_AREA_HEADERS - reproduced here rather than imported, since
+# this file's own real-header comment above explains why real provider
+# header text lives directly in test files rather than committed fixtures).
+_REAL_UNION_BY_AREA_HEADERS = [
+    "Clerkenwell & Farringdon", "Floor", "Current spec", "Size sq.ft",
+    "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure",
+]
+
 
 class FillMissingProviderTests(unittest.TestCase):
     def test_spreadsheet_source_gets_the_filename_guess(self):
@@ -131,6 +140,62 @@ class FillMissingAddressFromBuildingTests(unittest.TestCase):
         app.fill_missing_address_from_building(rows, apply_building_fallback=True)
 
         self.assertIsNone(rows[0].address_1)
+
+
+class FillMissingSubmarketFromStructuralHeaderTests(unittest.TestCase):
+    def test_real_union_by_area_format_fills_submarket_from_its_own_header(self):
+        # The real rows this was built for - Google's own geocoded-
+        # neighbourhood fallback (see geocode.py) has no data at all for
+        # this specific area, so this file-level constant is the only
+        # reliable source for submarket here.
+        rows = [
+            ListingRow(building="55 Goswell Road"),
+            ListingRow(building="13 Northburgh Street"),
+        ]
+
+        app.fill_missing_submarket_from_structural_header(
+            rows, _REAL_UNION_BY_AREA_HEADERS,
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+        )
+
+        self.assertEqual(rows[0].submarket, "Clerkenwell & Farringdon")
+        self.assertEqual(rows[1].submarket, "Clerkenwell & Farringdon")
+
+    def test_never_overrides_a_genuinely_extracted_submarket(self):
+        rows = [ListingRow(building="55 Goswell Road", submarket="Farringdon")]
+
+        app.fill_missing_submarket_from_structural_header(
+            rows, _REAL_UNION_BY_AREA_HEADERS,
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+        )
+
+        self.assertEqual(rows[0].submarket, "Farringdon")
+
+    def test_other_providers_formats_are_unaffected(self):
+        # Kitt's already has a real Area column mapped straight through -
+        # this fallback must be a complete no-op for it, not just harmless.
+        kitts_headers = ["Area", "Building", "Floor/Unit"]
+        rows = [ListingRow(building="28 Bruton Street", submarket=None)]
+
+        app.fill_missing_submarket_from_structural_header(
+            rows, kitts_headers, "Kitt's Availability (External).xlsx"
+        )
+
+        self.assertIsNone(rows[0].submarket)
+
+    def test_the_full_union_format_with_a_real_building_header_is_unaffected(self):
+        # Has a genuine "Area" column of its own (mapped separately by
+        # suggest_mapping) - this structural fallback must never fire for
+        # it at all, since _structural_building_header only matches the
+        # by-area format's fixed fingerprint, not this one.
+        full_union_headers = ["Area", "Building", "Floor/Unit", "Brochure PDF"]
+        rows = [ListingRow(building="16 Dufour's Place", submarket=None)]
+
+        app.fill_missing_submarket_from_structural_header(
+            rows, full_union_headers, "UNION - Shoreditch_2026-07-14.xlsx"
+        )
+
+        self.assertIsNone(rows[0].submarket)
 
 
 if __name__ == "__main__":
