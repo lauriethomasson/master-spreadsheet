@@ -5,7 +5,6 @@ import streamlit as st
 
 import display_utils
 import master_merge
-import master_regeocode
 import master_writer
 import page_flow
 import page_setup
@@ -293,85 +292,6 @@ def _render_manual_edit_confirmation(edit: dict):
         display_utils.render_before_after(d["old"], d["new"])
 
 
-def _render_regeocode_confirmation(edit: dict):
-    """
-    Same shape/placement as _render_manual_edit_confirmation - a re-geocode
-    pass IS a manual edit as far as write_master/versioning/undo are
-    concerned, just with its own source string ("re-geocode") so the
-    version-history label stays distinguishable from a genuine typed
-    correction (see master_writer.list_versions).
-    """
-    n = edit["fields_changed"]
-    st.success(f"Re-checked coordinates — {n} field{'s' if n != 1 else ''} changed.")
-
-    if edit.get("version_path"):
-        if st.button("Undo", key="undo_regeocode"):
-            with st.spinner("Undoing..."):
-                master_writer.restore_version(edit["version_path"])
-            st.session_state.pop("last_regeocode", None)
-            st.session_state["just_restored"] = edit["version_path"]
-            st.rerun()
-
-    for d in edit["diff_rows"]:
-        st.markdown(f"**{d['property']}** — {d['field']}")
-        display_utils.render_before_after(d["old"], d["new"])
-
-
-def _render_regeocode_suspects(df: pd.DataFrame):
-    """
-    Surfaces master rows worth re-checking against the CURRENT geocode_row
-    logic (see master_regeocode.find_suspect_rows) - added after a real
-    geocoding bug (a compound "Name, Street Address" building value like
-    "Bridge House, 22 Newman Street" producing confidently wrong
-    coordinates, or outright zero-results) was found already sitting in
-    master data with no way to notice it otherwise - a wrong-but-plausible
-    match has no error signal at all, unlike a failed lookup. Collapsed by
-    default so it doesn't compete with the main table once the current
-    backlog is cleared; absent entirely once there's nothing left to flag.
-    """
-    master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
-    suspects = master_regeocode.find_suspect_rows(master_records)
-    if not suspects:
-        return
-
-    with st.expander(
-        f"⚠️ {len(suspects)} propert{'y' if len(suspects) == 1 else 'ies'} worth re-checking coordinates for",
-        expanded=False,
-    ):
-        st.write(
-            "These rows have a building name that combines a name and a street address "
-            "(or have no coordinates on file at all) - a pattern that has previously "
-            "produced wrong or missing coordinates. Re-checking re-runs geocoding with "
-            "the current logic; a row only changes if the result is actually different."
-        )
-        for s in suspects:
-            st.write(f"- **{s['row_label']}** — {s['reason']}")
-
-        if st.button(f"Re-check coordinates for all {len(suspects)}", key="regeocode_suspects_button"):
-            with st.spinner("Re-checking..."):
-                indices = [s["index"] for s in suspects]
-                merged_rows, diff_rows, fields_changed = master_regeocode.regeocode_rows(master_records, indices)
-
-            if fields_changed == 0:
-                st.info("Re-checked — no changes were needed.")
-                return
-
-            previous_versions = master_writer.list_versions(limit=1)
-            previous_version_path = previous_versions[0]["path"] if previous_versions else None
-            try:
-                master_writer.write_master(merged_rows, source="re-geocode", fields_changed=fields_changed)
-            except Exception as e:
-                st.error(f"Re-geocode failed, master was not changed: {e}")
-                return
-
-            st.session_state["last_regeocode"] = {
-                "fields_changed": fields_changed,
-                "diff_rows": diff_rows,
-                "version_path": previous_version_path,
-            }
-            st.rerun()
-
-
 def _render_full_master_view():
     last_approval = st.session_state.get("last_approval")
     if last_approval:
@@ -381,18 +301,12 @@ def _render_full_master_view():
     if last_manual_edit:
         _render_manual_edit_confirmation(last_manual_edit)
 
-    last_regeocode = st.session_state.get("last_regeocode")
-    if last_regeocode:
-        _render_regeocode_confirmation(last_regeocode)
-
     if not master_writer.master_exists():
         st.info("No master spreadsheet yet — approve an upload to create one.")
         return
 
     with st.spinner("Loading..."):
         df = display_utils.sort_by_provider(master_writer.load_master_as_dataframe())
-
-    _render_regeocode_suspects(df)
 
     if _render_master_table(df, key="master_table_default_view"):
         st.rerun()

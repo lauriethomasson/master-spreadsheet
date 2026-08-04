@@ -71,26 +71,6 @@ class ManualEditVersioningTests(IsolatedCwdTestCase):
         versions = master_writer.list_versions()
         self.assertEqual(versions[0]["label"], "Manual edit: 3 fields changed")
 
-    def test_regeocode_version_label_is_singular_for_one_field(self):
-        master_writer.write_master(
-            [ListingRow(building="A", provider="P1", lat=51.5, lng=-0.1)],
-            source="re-geocode",
-            fields_changed=1,
-        )
-
-        versions = master_writer.list_versions()
-        self.assertEqual(versions[0]["label"], "Re-geocoded: 1 field changed")
-
-    def test_regeocode_version_label_is_plural_for_several_fields(self):
-        master_writer.write_master(
-            [ListingRow(building="A", provider="P1", lat=51.5, lng=-0.1)],
-            source="re-geocode",
-            fields_changed=4,
-        )
-
-        versions = master_writer.list_versions()
-        self.assertEqual(versions[0]["label"], "Re-geocoded: 4 fields changed")
-
     def test_normal_approve_label_is_unaffected(self):
         master_writer.write_master(
             [ListingRow(building="A", provider="P1")],

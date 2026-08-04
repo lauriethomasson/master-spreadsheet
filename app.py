@@ -34,9 +34,24 @@ _NO_SUCH_COLUMN = "(no such column)"
 # renders (awkwardly) rather than crashing.
 _CRITICAL_FIELD_LABELS = {"building": "the building name"}
 
-# Increase this whenever extraction logic changes. This prevents results
-# created by older extraction code from being reused.
+# Increase this whenever PDF/email extraction logic changes. This prevents
+# results created by older extraction code from being reused.
 EXTRACTION_VERSION = "3"
+
+# Spreadsheet extraction has no Gemini call and is fully deterministic - the
+# only way its cached result could ever go stale is a change to
+# extract_spreadsheet.py's own mapping/guessing logic itself (suggest_
+# mapping, guess_provider_name, FIELD_SYNONYMS, etc.), never anything
+# EXTRACTION_VERSION above is meant to track. Confirmed to have actually
+# gone stale this way: a real fix to that logic landed without EXTRACTION_
+# VERSION being bumped (it has no reason to know spreadsheet logic even
+# changed), so a byte-identical re-upload of an already-staged spreadsheet
+# kept silently reusing its pre-fix cached rows - dedup working exactly as
+# designed, just against the wrong invalidation signal for this source
+# type. Hashing extract_spreadsheet.py's own source directly instead makes
+# invalidation for the spreadsheet path automatic and self-maintaining - no
+# version number to remember, ever, for this source type specifically.
+_SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(Path(extract_spreadsheet.__file__).read_bytes()).hexdigest()
 
 
 def fill_missing_provider(rows: list[ListingRow], filename: str, apply_filename_guess: bool) -> None:
@@ -221,15 +236,27 @@ with page_setup.setup_page("upload"):
                     # since PDF containers embed producer metadata that
                     # changes across a re-save even when the rendered pages
                     # don't.
-                    # Include the extraction version in the hash. Therefore, identical files
-                    # are reused only when they were processed by the current extraction logic.
+                    #
+                    # Folded into the hash alongside the file bytes, so a
+                    # logic change invalidates any already-staged result: for
+                    # PDF/email, EXTRACTION_VERSION (a human-maintained
+                    # counter - see its own comment for why spreadsheets use
+                    # a different mechanism); for a spreadsheet,
+                    # _SPREADSHEET_LOGIC_FINGERPRINT instead (a hash of
+                    # extract_spreadsheet.py's own source - automatic,
+                    # nothing to remember to bump).
                     file_bytes = uploaded_file.getvalue()
-                    versioned_content = (
-                        EXTRACTION_VERSION.encode("utf-8")
-                        + b"\0"
-                        + file_bytes
-                    )
-                    content_hash = hashlib.sha256(versioned_content).hexdigest()
+                    if suffix in SPREADSHEET_SUFFIXES:
+                        content_hash = hashlib.sha256(
+                            _SPREADSHEET_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes
+                        ).hexdigest()
+                    else:
+                        versioned_content = (
+                            EXTRACTION_VERSION.encode("utf-8")
+                            + b"\0"
+                            + file_bytes
+                        )
+                        content_hash = hashlib.sha256(versioned_content).hexdigest()
 
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
 
