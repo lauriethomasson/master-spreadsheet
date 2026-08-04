@@ -1,4 +1,5 @@
 import hashlib
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,27 +33,31 @@ _NO_SUCH_COLUMN = "(no such column)"
 EXTRACTION_VERSION = "3"
 
 
-def fill_missing_provider(rows: list[ListingRow], filename: str) -> None:
+def fill_missing_provider(rows: list[ListingRow], filename: str, apply_filename_guess: bool) -> None:
     """
-    Fill provider/internal_ref without overwriting extracted values -
-    applies to PDFs, spreadsheets, emails and reused rows alike, since a
-    filename-based guess is just as reasonable a fallback for any of them
-    (see extract_spreadsheet.guess_provider_name). Supersedes an earlier,
-    narrower infer_provider_from_filename that only recognized "kitt" as a
-    hardcoded special case - guess_provider_name is the general version of
-    exactly the same idea (strip boilerplate words/dates/parentheticals
-    from the filename), not limited to one provider.
+    Fill provider/internal_ref from a filename-derived guess (see
+    extract_spreadsheet.guess_provider_name) without overwriting extracted
+    values - but only when apply_filename_guess is True, which the caller
+    sets for spreadsheet-sourced rows only, never PDF/email.
 
-    guess_provider_name always returns a non-empty guess (falling back to
-    the bare filename stem rather than blank) - unlike the old function,
-    which returned None for anything that wasn't "kitt". That means a row
-    Gemini genuinely left provider-less on purpose (a landlord-direct
-    brochure with no presenting agent - see schema.ExtractedFields'
-    provider/internal_ref comments) now gets a filename-derived guess
-    filled in too, for PDF/email uploads specifically, not just
-    spreadsheets. Applied here anyway, per explicit direction: a
-    reasonable guess beats a blank field even for those sources.
+    A spreadsheet has no equivalent judgment call to make: if no column
+    states a provider, nothing else in the data ever will, so the filename
+    is the best signal available. A PDF/email brochure is different -
+    Gemini's own extraction already decided whether a provider genuinely
+    exists, and a blank provider there is frequently a deliberate,
+    meaningful answer, not a missed extraction (see schema.ExtractedFields'
+    provider/internal_ref comments - a landlord-direct brochure has no
+    presenting agent at all, e.g. a real "40 New Bond Street" brochure with
+    no contacts). Applying a filename-derived guess there would fabricate
+    an agent for a listing that genuinely has none - misrepresenting a
+    landlord-direct listing as agent-represented. So for PDF/email,
+    apply_filename_guess is always False and this function leaves
+    provider/internal_ref exactly as extraction produced them, same as
+    before guess_provider_name existed at all.
     """
+    if not apply_filename_guess:
+        return
+
     fallback_provider = extract_spreadsheet.guess_provider_name(filename)
 
     for row in rows:
@@ -61,6 +66,49 @@ def fill_missing_provider(rows: list[ListingRow], filename: str) -> None:
 
         if not row.internal_ref:
             row.internal_ref = row.provider or fallback_provider
+
+
+# A house/building number is a strong, simple signal that `building` holds
+# a real street address rather than just a proper name - confirmed against
+# the real Kitt's Availability file (35 of 42 real building values contain
+# a digit - "28 Bruton Street", "33 Cavendish Square", compound ones like
+# "Bridge House, 22 Newman Street" - and all 7 without one are genuine
+# name-only buildings - "Albion Mills", "Flat Iron", "Orion House" - not a
+# single false positive/negative found) and both real UNION "by-area"
+# files (9/11 and 14/14 respectively, same clean split).
+_ADDRESS_LIKE_RE = re.compile(r"\d")
+
+
+def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fallback: bool) -> None:
+    """
+    Copies building's value into address_1 when address_1 has no value at
+    all AND building looks address-like (see _ADDRESS_LIKE_RE) - never
+    overwrites a real, already-populated address_1, from a mapped column
+    or from geocode_rows' own (more accurate, API-verified) address lookup;
+    this is only ever a last-resort fallback for whatever's still missing
+    after that, which is exactly why the caller must run this AFTER
+    geocode_rows, not before - filling address_1 first would make
+    geocode_row see it as already present and skip its own lookup.
+
+    apply_building_fallback is True for spreadsheet-sourced rows only, same
+    scoping as fill_missing_provider's apply_filename_guess and for the
+    same reason: a blank address_1 on a PDF/email row is frequently
+    Gemini's own deliberate, meaningful answer, not a missed extraction
+    (see schema.ExtractedFields' own address_1 comment - "not every source,
+    e.g. email listings, states a street address" - never fabricate).
+    building holding an address-like string doesn't change that judgment
+    call for those sources. A spreadsheet has no equivalent judgment call:
+    if no column states an address and geocoding couldn't resolve one
+    either, building's own value is the best signal left.
+    """
+    if not apply_building_fallback:
+        return
+
+    for row in rows:
+        if row.address_1:
+            continue
+        if row.building and _ADDRESS_LIKE_RE.search(row.building):
+            row.address_1 = row.building
 
 
 with page_setup.setup_page("upload"):
@@ -227,9 +275,24 @@ with page_setup.setup_page("upload"):
 
                         geocode_rows(rows)
                         reused = False
-                    # Applies to PDFs, spreadsheets, emails and reused rows.
-                    # Existing extracted provider values are not overwritten.
-                    fill_missing_provider(rows, uploaded_file.name)
+                    # Both fallbacks below only ever apply to spreadsheet-
+                    # sourced rows, reused or fresh alike (a reused row's
+                    # suffix is still the current re-upload's own suffix,
+                    # since content_hash only matches when the bytes - and
+                    # therefore the file type - are identical). Run AFTER
+                    # geocode_rows() above (already true for every branch:
+                    # the spreadsheet/PDF/email branches call it directly,
+                    # and a reused row was already fully geocoded in a
+                    # prior run) - see fill_missing_address_from_building's
+                    # own docstring for why the ordering matters.
+                    is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
+
+                    # Existing extracted provider values are never
+                    # overwritten - see fill_missing_provider's own
+                    # docstring for why PDF/email must never get this guess.
+                    fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=is_spreadsheet_source)
+
+                    fill_missing_address_from_building(rows, apply_building_fallback=is_spreadsheet_source)
 
                     # Staged immediately, per file (reused or freshly
                     # extracted alike) - so a failure partway through a
