@@ -28,6 +28,12 @@ from storage.file_store import (
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
 _NO_SUCH_COLUMN = "(no such column)"
 
+# Plain-language label for each extract_spreadsheet.CRITICAL_FIELDS entry,
+# used in the rescue prompt's wording - falls back to the raw field name
+# for anything not listed here, so a future CRITICAL_FIELDS addition still
+# renders (awkwardly) rather than crashing.
+_CRITICAL_FIELD_LABELS = {"building": "the building name"}
+
 # Increase this whenever extraction logic changes. This prevents results
 # created by older extraction code from being reused.
 EXTRACTION_VERSION = "3"
@@ -159,13 +165,24 @@ with page_setup.setup_page("upload"):
             entry["filenames"].append(uploaded_file.name)
 
     for h_hash, info in pending_rescues.items():
-        with st.expander(f"Missing required field(s) — {', '.join(info['filenames'])}", expanded=True):
+        # Plain-language, non-technical wording (still references the
+        # actual unresolved field name(s) via _CRITICAL_FIELD_LABELS, in
+        # case CRITICAL_FIELDS ever grows beyond just "building") - the
+        # "different column layouts" phrasing is deliberately explicit
+        # about what "asked again" is actually keyed on (this exact header
+        # set, see header_hash), since "files shaped like this one" reads
+        # ambiguously as "this provider's files in general" - a real UNION
+        # export has a genuinely different header set per area (Clerkenwell
+        # & Farringdon vs. Fitzrovia & Marylebone), each needing its own
+        # one-time answer, not one answer for "UNION" as a whole.
+        field_labels = " or ".join(_CRITICAL_FIELD_LABELS.get(f, f) for f in info["unresolved"])
+        with st.expander(f"We need your help with one column — {', '.join(info['filenames'])}", expanded=True):
             st.write(
-                f"Couldn't automatically find a column for: **{', '.join(info['unresolved'])}**. Pick "
-                "the column that holds each one, or confirm this format genuinely has none - this is "
-                "only asked once per header format; the same provider's future uploads with these "
-                "exact headers will reuse this answer automatically. Every other column still maps "
-                "automatically either way."
+                f"We couldn't automatically figure out which column has {field_labels}. Please "
+                "select it below, or let us know this file doesn't have one. Everything else was "
+                "matched correctly. If this provider sends other files with different column "
+                "layouts (for example, a separate export per area), you may be asked this again "
+                "for each new layout — but you won't be asked again for this exact one."
             )
             options = [_NO_SUCH_COLUMN] + [str(h) for h in info["headers"]]
             assignments = {}

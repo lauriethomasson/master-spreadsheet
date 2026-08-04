@@ -1,4 +1,4 @@
-"""
+﻿"""
 geocode.py
 
 Resolves lat/lng for a ListingRow using a two-tier strategy:
@@ -14,10 +14,23 @@ but its own record has no street_number/route/postal_code component at all
 match with no structured address on file), falls back to reverse-geocoding
 those coordinates through the legacy Geocoding API, which often has address
 data for a location that Places' own record lacks.
+
+When `building` is itself a compound "Name, Street Address" value (e.g.
+"Bridge House, 22 Newman Street" - a real Kitt's Availability building),
+the Places query tries the address portion alone FIRST, falling back to the
+full compound value only if that fails - see split_compound_building's own
+docstring for why: appending submarket + "London, UK" to an already-
+compound value gives the matcher two competing location signals (a building
+name shared by several real buildings across London, plus a specific-but-
+different street), confirmed against the real API to sometimes return zero
+results entirely and sometimes a confident but genuinely wrong match
+hundreds of meters to over a kilometer away - silently, since a wrong-but-
+plausible match has no error signal at all, unlike a zero-results failure.
 """
 
 import json
 import os
+import re
 import sys
 
 import httpx
@@ -174,6 +187,33 @@ def _address_line1_and_postcode(address_components: list, name_key: str = "longT
     return address_1, postcode
 
 
+def split_compound_building(building: str) -> tuple:
+    """
+    Returns (name_part, address_part) if `building` looks like a "Name,
+    Street Address" or "Name - Street Address" compound value - the part
+    before the separator has no digit (name-like), the part after has one
+    (address-like, a house/building number). None otherwise - a plain
+    building name ("Kent House") or a plain address ("28 Bruton Street")
+    with no competing name token is unaffected either way.
+
+    Confirmed against every real compound building value in the actual
+    Kitt's Availability file: address_part alone resolved correctly via
+    the Places API in every case tested (Bridge House/22 Newman Street,
+    Imperial House/8 Kean Street, Whitfield Court/30-32 Whitfield Street,
+    and 6 others that already matched correctly even with the full
+    compound value) - see geocode_row's own docstring for why the full
+    compound value is unreliable.
+    """
+    for sep in (", ", " - "):
+        if sep not in building:
+            continue
+        name_part, _, address_part = building.partition(sep)
+        name_part, address_part = name_part.strip(), address_part.strip()
+        if name_part and address_part and not re.search(r"\d", name_part) and re.search(r"\d", address_part):
+            return name_part, address_part
+    return None
+
+
 FAILURES = []
 
 
@@ -209,13 +249,26 @@ def geocode_row(row: ListingRow) -> ListingRow:
 
     # --- Tier 2: Places API Text Search (fallback) ---
     if row.building:
-        query_parts = [row.building]
-        if row.submarket:
-            query_parts.append(row.submarket)
-        query_parts.append("London, UK")
-        query = ", ".join(query_parts)
+        # A compound building value tries its address portion alone
+        # FIRST (see split_compound_building/this module's own
+        # docstring) - the full building value is always tried too, but
+        # only as a fallback if the address-only attempt doesn't produce
+        # an in-bbox match, never as the first/preferred query.
+        compound = split_compound_building(row.building)
+        candidates = ([compound[1]] if compound else []) + [row.building]
 
-        result = call_places_text_search(query)
+        result = {"status": "ZERO_RESULTS"}
+        for candidate in candidates:
+            query_parts = [candidate]
+            if row.submarket:
+                query_parts.append(row.submarket)
+            query_parts.append("London, UK")
+            query = ", ".join(query_parts)
+
+            result = call_places_text_search(query)
+            if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
+                break
+
         if result["status"] == "OK" and within_london_bbox(result["lat"], result["lng"]):
             row.lat = result["lat"]
             row.lng = result["lng"]
