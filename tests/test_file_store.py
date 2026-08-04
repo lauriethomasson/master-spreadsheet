@@ -25,6 +25,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from schema import ListingRow
@@ -229,24 +231,72 @@ class DiscardPendingStagingFilesTests(IsolatedCwdTestCase):
         self.assertIn(staging_path, file_store.list_pending_staging_files())
 
 
-class HeaderMappingPersistenceTests(IsolatedCwdTestCase):
-    def test_no_mapping_saved_yet_returns_none(self):
-        self.assertIsNone(file_store.get_saved_header_mapping("some-hash"))
+class DataframeToListingRowsTests(IsolatedCwdTestCase):
+    def test_a_row_with_no_building_but_a_non_blank_other_field_is_skipped_not_crashed(self):
+        # Grounded in a real Kitt's Availability row: a spreadsheet-
+        # author's own section-header/note, every column blank except one
+        # unrelated mapped field. Not all-blank, so the old "skip only if
+        # every field is None" check let it through to
+        # ListingRow(building=None, ...), which raised and aborted the
+        # WHOLE file's extraction over this one non-property row.
+        df = pd.DataFrame([
+            {"building": "City Tower", "provider": "Breezblok"},
+            {"building": None, "provider": None, "submarket": "COMING SOON / ADDITIONAL OPTIONS TO SHARE"},
+        ])
 
-    def test_saved_mapping_round_trips(self):
-        headers = ["Building", "Floor/Unit"]
-        mapping = {"Building": "building", "Floor/Unit": "floor_unit"}
-        file_store.save_header_mapping("hash-a", headers, mapping)
+        rows = file_store.dataframe_to_listing_rows(df)
 
-        saved = file_store.get_saved_header_mapping("hash-a")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "City Tower")
+
+    def test_a_whitespace_only_building_is_also_skipped(self):
+        df = pd.DataFrame([{"building": "   ", "provider": "Breezblok"}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertEqual(len(rows), 0)
+
+    def test_a_genuinely_all_blank_row_is_still_skipped(self):
+        df = pd.DataFrame([
+            {"building": "City Tower", "provider": "Breezblok"},
+            {"building": None, "provider": None},
+        ])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertEqual(len(rows), 1)
+
+
+class CriticalFieldRescuePersistenceTests(IsolatedCwdTestCase):
+    def test_no_rescue_saved_yet_returns_none(self):
+        self.assertIsNone(file_store.get_saved_critical_field_rescue("some-hash"))
+
+    def test_saved_rescue_round_trips(self):
+        headers = ["Clerkenwell & Farringdon", "Floor"]
+        assignments = {"building": "Clerkenwell & Farringdon"}
+        file_store.save_critical_field_rescue("hash-a", headers, assignments)
+
+        saved = file_store.get_saved_critical_field_rescue("hash-a")
 
         self.assertEqual(saved["headers"], headers)
-        self.assertEqual(saved["mapping"], mapping)
+        self.assertEqual(saved["assignments"], assignments)
 
-    def test_different_hash_never_matches_a_saved_mapping(self):
-        file_store.save_header_mapping("hash-a", ["Building"], {"Building": "building"})
+    def test_different_hash_never_matches_a_saved_rescue(self):
+        file_store.save_critical_field_rescue("hash-a", ["Floor"], {"building": "Floor"})
 
-        self.assertIsNone(file_store.get_saved_header_mapping("hash-b"))
+        self.assertIsNone(file_store.get_saved_critical_field_rescue("hash-b"))
+
+    def test_a_none_assignment_round_trips_as_none_not_dropped(self):
+        # A confirmed "genuinely no such column" answer must survive the
+        # round trip as None, not be silently omitted from the saved JSON -
+        # unresolved_critical_fields relies on the key being present at all
+        # to tell "confirmed blank" apart from "never asked".
+        file_store.save_critical_field_rescue("hash-a", ["Floor"], {"building": None})
+
+        saved = file_store.get_saved_critical_field_rescue("hash-a")
+
+        self.assertIn("building", saved["assignments"])
+        self.assertIsNone(saved["assignments"]["building"])
 
 
 if __name__ == "__main__":

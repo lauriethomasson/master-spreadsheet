@@ -17,38 +17,43 @@ from schema import ListingRow
 from storage.file_store import (
     dataframe_to_listing_rows,
     find_previous_upload_by_hash,
-    get_saved_header_mapping,
+    get_saved_critical_field_rescue,
     load_staging_as_dataframe,
-    save_header_mapping,
+    save_critical_field_rescue,
     save_original_pdf,
     save_staging_file,
 )
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
-_MAPPABLE_FIELDS = sorted(f for f in ListingRow.model_fields if f not in extract_spreadsheet.UNMAPPABLE_FIELDS)
-_FIELD_OPTIONS = ["(ignore this column)"] + _MAPPABLE_FIELDS
+_NO_SUCH_COLUMN = "(no such column)"
 
 # Increase this whenever extraction logic changes. This prevents results
 # created by older extraction code from being reused.
 EXTRACTION_VERSION = "3"
 
 
-def infer_provider_from_filename(filename: str) -> str | None:
-    """Infer providers that are clearly identified by the uploaded filename."""
-    normalized = Path(filename).stem.casefold().replace("’", "'")
-
-    if "kitt" in normalized:
-        return "Kitt's"
-
-    return None
-
-
 def fill_missing_provider(rows: list[ListingRow], filename: str) -> None:
-    """Fill provider/internal_ref without overwriting extracted values."""
-    fallback_provider = infer_provider_from_filename(filename)
+    """
+    Fill provider/internal_ref without overwriting extracted values -
+    applies to PDFs, spreadsheets, emails and reused rows alike, since a
+    filename-based guess is just as reasonable a fallback for any of them
+    (see extract_spreadsheet.guess_provider_name). Supersedes an earlier,
+    narrower infer_provider_from_filename that only recognized "kitt" as a
+    hardcoded special case - guess_provider_name is the general version of
+    exactly the same idea (strip boilerplate words/dates/parentheticals
+    from the filename), not limited to one provider.
 
-    if not fallback_provider:
-        return
+    guess_provider_name always returns a non-empty guess (falling back to
+    the bare filename stem rather than blank) - unlike the old function,
+    which returned None for anything that wasn't "kitt". That means a row
+    Gemini genuinely left provider-less on purpose (a landlord-direct
+    brochure with no presenting agent - see schema.ExtractedFields'
+    provider/internal_ref comments) now gets a filename-derived guess
+    filled in too, for PDF/email uploads specifically, not just
+    spreadsheets. Applied here anyway, per explicit direction: a
+    reasonable guess beats a blank field even for those sources.
+    """
+    fallback_provider = extract_spreadsheet.guess_provider_name(filename)
 
     for row in rows:
         if not row.provider:
@@ -56,6 +61,7 @@ def fill_missing_provider(rows: list[ListingRow], filename: str) -> None:
 
         if not row.internal_ref:
             row.internal_ref = row.provider or fallback_provider
+
 
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
@@ -68,16 +74,22 @@ with page_setup.setup_page("upload"):
         accept_multiple_files=True,
     )
 
-    # Spreadsheet uploads need a header->field mapping before they can be
-    # extracted at all - unlike PDF/eml (always routed through Gemini),
-    # there's no way to build a ListingRow from a spreadsheet row without
-    # first knowing which column is which. Resolved (or, on first sight of a
-    # given header set, confirmed by a human right here) BEFORE the Extract
-    # button's loop below, since that loop has no good way to pause for
-    # input mid-iteration. Keyed by header_hash, not per-file, so several
-    # files sharing one provider's recurring format only need confirming
-    # once - see storage.file_store.get_saved_header_mapping/save_header_mapping.
-    unresolved_mappings = {}
+    # Column mapping itself is fully automatic (see suggest_mapping) - but a
+    # genuinely CRITICAL field (extract_spreadsheet.CRITICAL_FIELDS) going
+    # unmapped isn't safe to drop silently the way an ordinary column is:
+    # building is schema-required, so a spreadsheet whose building column
+    # goes unmapped produces ZERO rows outright, not just one blank field
+    # per row (confirmed against two real UNION "by-area" export files,
+    # whose building-name column is headered with the area's own name -
+    # text that's different per file and shares no vocabulary with
+    # "building" that any synonym or fuzzy match could ever catch).
+    # Resolved (or, on first sight of a given header format still missing
+    # one, confirmed by a human right here) BEFORE the Extract button's
+    # loop below - every OTHER column keeps mapping automatically either
+    # way, and this is only ever asked once per header format, not once per
+    # file - see storage.file_store.get_saved_critical_field_rescue/
+    # save_critical_field_rescue.
+    pending_rescues = {}
     if uploaded_files:
         for uploaded_file in uploaded_files:
             suffix = Path(uploaded_file.name).suffix.lower()
@@ -86,35 +98,36 @@ with page_setup.setup_page("upload"):
             df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
             headers = list(df.columns)
             h_hash = extract_spreadsheet.header_hash(headers)
-            if get_saved_header_mapping(h_hash) is not None:
+            mapping = extract_spreadsheet.suggest_mapping(headers)
+            saved_rescue = get_saved_critical_field_rescue(h_hash)
+            rescue = saved_rescue["assignments"] if saved_rescue else {}
+            mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
+            unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
+            if not unresolved:
                 continue
-            entry = unresolved_mappings.setdefault(h_hash, {"headers": headers, "filenames": []})
+            entry = pending_rescues.setdefault(
+                h_hash, {"headers": headers, "filenames": [], "unresolved": unresolved}
+            )
             entry["filenames"].append(uploaded_file.name)
 
-    for h_hash, info in unresolved_mappings.items():
-        with st.expander(f"Confirm column mapping — {', '.join(info['filenames'])}", expanded=True):
+    for h_hash, info in pending_rescues.items():
+        with st.expander(f"Missing required field(s) — {', '.join(info['filenames'])}", expanded=True):
             st.write(
-                "This spreadsheet's column headers haven't been seen before. Confirm which "
-                "field each column belongs to (or leave it as **ignore** if it doesn't map to "
-                "anything) - this is only asked once per header format; the same provider's "
-                "future uploads with these exact headers will reuse this mapping automatically."
+                f"Couldn't automatically find a column for: **{', '.join(info['unresolved'])}**. Pick "
+                "the column that holds each one, or confirm this format genuinely has none - this is "
+                "only asked once per header format; the same provider's future uploads with these "
+                "exact headers will reuse this answer automatically. Every other column still maps "
+                "automatically either way."
             )
-            guess = extract_spreadsheet.suggest_mapping(info["headers"])
-            chosen = {}
-            for header in info["headers"]:
-                default = guess.get(header) or "(ignore this column)"
-                default_index = _FIELD_OPTIONS.index(default) if default in _FIELD_OPTIONS else 0
-                choice = st.selectbox(
-                    str(header), _FIELD_OPTIONS, index=default_index, key=f"map_{h_hash}_{header}",
-                )
-                chosen[header] = None if choice == "(ignore this column)" else choice
-
-            mapped_fields = [f for f in chosen.values() if f]
-            duplicate_fields = {f for f in mapped_fields if mapped_fields.count(f) > 1}
-            if duplicate_fields:
-                st.warning(f"Each field can only be mapped from one column - fix: {', '.join(sorted(duplicate_fields))}")
-            elif st.button("Confirm mapping", key=f"confirm_{h_hash}"):
-                save_header_mapping(h_hash, info["headers"], chosen)
+            options = [_NO_SUCH_COLUMN] + [str(h) for h in info["headers"]]
+            assignments = {}
+            for field in info["unresolved"]:
+                choice = st.selectbox(f'Column for "{field}"', options, key=f"rescue_{h_hash}_{field}")
+                assignments[field] = None if choice == _NO_SUCH_COLUMN else choice
+            if assignments.get("building") is None:
+                st.warning('Confirming "(no such column)" for building means this format will produce zero rows.')
+            if st.button("Confirm", key=f"confirm_rescue_{h_hash}"):
+                save_critical_field_rescue(h_hash, info["headers"], assignments)
                 st.rerun()
 
     if uploaded_files and st.button("Extract"):
@@ -161,17 +174,29 @@ with page_setup.setup_page("upload"):
                     elif suffix in SPREADSHEET_SUFFIXES:
                         # No temp file, no Gemini call - a spreadsheet is
                         # already one row per property; the only thing
-                        # needed is the header->field mapping confirmed
-                        # above, before this button could even be clicked.
+                        # needed is a header->field mapping, worked out
+                        # automatically here (see suggest_mapping) with no
+                        # per-column human confirmation step - a non-
+                        # critical column suggest_mapping can't place is
+                        # simply dropped. A CRITICAL field (building) is
+                        # different - see the rescue block above, resolved
+                        # (or confirmed genuinely absent) before this
+                        # button could even be clicked.
                         df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
-                        h_hash = extract_spreadsheet.header_hash(list(df.columns))
-                        saved = get_saved_header_mapping(h_hash)
-                        if saved is None:
+                        headers = list(df.columns)
+                        h_hash = extract_spreadsheet.header_hash(headers)
+                        mapping = extract_spreadsheet.suggest_mapping(headers)
+                        saved_rescue = get_saved_critical_field_rescue(h_hash)
+                        rescue = saved_rescue["assignments"] if saved_rescue else {}
+                        mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
+                        unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
+                        if unresolved:
                             raise ValueError(
-                                f"{uploaded_file.name}: column mapping not confirmed yet - "
-                                "confirm it above, then click Extract again."
+                                f"{uploaded_file.name}: missing required field(s) {', '.join(unresolved)} - "
+                                "confirm the column above, then click Extract again."
                             )
-                        rows = extract_spreadsheet.build_rows(df, saved["mapping"], source_file=uploaded_file.name)
+
+                        rows = extract_spreadsheet.build_rows(df, mapping, source_file=uploaded_file.name)
                         geocode_rows(rows)
                         reused = False
                     else:

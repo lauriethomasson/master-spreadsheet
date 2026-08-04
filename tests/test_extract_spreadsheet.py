@@ -1,8 +1,9 @@
 """
 Regression tests for extract_spreadsheet.py - the header-mapping path for
 uploaded provider .xlsx/.csv spreadsheets (see the module docstring for the
-overall flow: read_spreadsheet -> header_hash -> suggest_mapping/confirm ->
-build_rows).
+overall flow: read_spreadsheet -> suggest_mapping (exact match, then a
+conservative fuzzy fallback) -> unresolved_critical_fields (a targeted
+rescue prompt, only if a CRITICAL field didn't map) -> build_rows).
 
 Header strings used here for the "real UNION format" cases are taken
 verbatim from the actual current-format UNION export files (checked
@@ -37,6 +38,19 @@ REAL_UNION_HEADERS = [
     "Contacts", "Floor Plan", "High Res Images",
 ]
 
+# The OTHER real UNION export format actually seen in production - a much
+# simpler "by-area" sheet (checked directly against the real Clerkenwell &
+# Farringdon / Fitzrovia & Marylebone files, not guessed) whose building-
+# name column is headered with the area's own name rather than any generic
+# label - this is genuinely a different real format from REAL_UNION_HEADERS
+# above, not a variant of it. Blank/nan-header columns present in the real
+# files are omitted here since they carry no data and aren't relevant to
+# what this constant tests.
+REAL_UNION_BY_AREA_HEADERS = [
+    "Clerkenwell & Farringdon", "Floor", "Current spec", "Size sq.ft",
+    "Minimum Term", "Monthly Rate", "Price p/sq.ft", "Brochure",
+]
+
 
 class HeaderHashTests(unittest.TestCase):
     def test_same_headers_same_order_hash_identically(self):
@@ -53,6 +67,110 @@ class HeaderHashTests(unittest.TestCase):
         a = extract_spreadsheet.header_hash(["Building"])
         b = extract_spreadsheet.header_hash(["Building "])
         self.assertNotEqual(a, b)
+
+
+class UnmappedCriticalFieldsTests(unittest.TestCase):
+    def test_no_missing_fields_when_building_maps(self):
+        mapping = {"Building": "building", "Floor": "floor_unit"}
+        self.assertEqual(extract_spreadsheet.unmapped_critical_fields(mapping), [])
+
+    def test_building_missing_when_unmapped(self):
+        mapping = {"Floor": "floor_unit"}
+        self.assertEqual(extract_spreadsheet.unmapped_critical_fields(mapping), ["building"])
+
+    def test_address_1_is_deliberately_not_critical(self):
+        # Considered (no fallback fills it in, unlike provider's filename-
+        # based guess), but ruled out - see CRITICAL_FIELDS' own comment -
+        # because the real Kitt's Availability file has NO address column
+        # at all and must still be fully automatic; making address_1
+        # critical would prompt for a rescue on Kitt's every single time.
+        mapping = {"Building": "building"}  # no column maps to address_1
+        self.assertEqual(extract_spreadsheet.unmapped_critical_fields(mapping), [])
+
+    def test_real_union_by_area_headers_leave_building_unmapped(self):
+        # The real UNION "by-area" export format - its building-name
+        # column is headered with the area's own name, not any generic
+        # label, so it never exact- or fuzzy-matches "building" (see
+        # REAL_UNION_BY_AREA_HEADERS).
+        mapping = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+        self.assertEqual(extract_spreadsheet.unmapped_critical_fields(mapping), ["building"])
+
+    def test_real_kitts_and_full_union_headers_leave_nothing_critical_missing(self):
+        # Both real formats map "building" on their own already - the
+        # rescue mechanism must never interrupt either of them.
+        kitts_headers = [
+            "Area", "Building", "Floor/Unit", "Link to Brochure", "Key Features ", "State of Space",
+        ]
+        for headers in (REAL_UNION_HEADERS, kitts_headers):
+            with self.subTest(headers=headers):
+                mapping = extract_spreadsheet.suggest_mapping(headers)
+                self.assertEqual(extract_spreadsheet.unmapped_critical_fields(mapping), [])
+
+
+class ApplyCriticalFieldRescueTests(unittest.TestCase):
+    def test_assigns_the_rescued_header_to_the_field(self):
+        mapping = {"Clerkenwell & Farringdon": None, "Floor": "floor_unit"}
+        rescued = extract_spreadsheet.apply_critical_field_rescue(
+            mapping, {"building": "Clerkenwell & Farringdon"}
+        )
+        self.assertEqual(rescued["Clerkenwell & Farringdon"], "building")
+
+    def test_a_none_assignment_leaves_the_field_unmapped(self):
+        mapping = {"Floor": "floor_unit"}
+        rescued = extract_spreadsheet.apply_critical_field_rescue(mapping, {"building": None})
+        self.assertNotIn("building", rescued.values())
+
+    def test_never_mutates_the_mapping_passed_in(self):
+        mapping = {"Floor": "floor_unit"}
+        extract_spreadsheet.apply_critical_field_rescue(mapping, {"building": "Floor"})
+        self.assertEqual(mapping["Floor"], "floor_unit")
+
+    def test_a_humans_choice_overrides_whatever_suggest_mapping_guessed(self):
+        mapping = {"Floor": "floor_unit"}
+        rescued = extract_spreadsheet.apply_critical_field_rescue(mapping, {"building": "Floor"})
+        self.assertEqual(rescued["Floor"], "building")
+
+    def test_rescuing_the_real_union_by_area_format_produces_real_rows(self):
+        # End-to-end: the exact rescue a human would make in the app for
+        # this real format (assign the area-name-headered column to
+        # building) - confirms it actually unblocks extraction, not just
+        # that the mapping dict looks right in isolation.
+        df = pd.DataFrame([
+            {h: None for h in REAL_UNION_BY_AREA_HEADERS} | {
+                "Clerkenwell & Farringdon": "55 Goswell Road", "Floor": "3rd (South)", "Size sq.ft": 624,
+            },
+        ])
+        mapping = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+        mapping = extract_spreadsheet.apply_critical_field_rescue(
+            mapping, {"building": "Clerkenwell & Farringdon"}
+        )
+        self.assertEqual(extract_spreadsheet.unmapped_critical_fields(mapping), [])
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="union.xlsx")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "55 Goswell Road")
+
+
+class UnresolvedCriticalFieldsTests(unittest.TestCase):
+    def test_a_field_with_no_rescue_entry_at_all_is_unresolved(self):
+        mapping = {"Floor": "floor_unit"}
+        self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, {}), ["building"])
+
+    def test_a_confirmed_blank_field_is_not_unresolved(self):
+        # A rescue entry of None means "a human already confirmed this
+        # format genuinely has no such column" - must not keep prompting
+        # for it on every future upload of the same format.
+        mapping = {"Floor": "floor_unit"}
+        rescue = {"building": None}
+        self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, rescue), [])
+
+    def test_a_real_rescue_assignment_resolves_the_field(self):
+        rescue = {"building": "Clerkenwell & Farringdon"}
+        mapping = extract_spreadsheet.apply_critical_field_rescue(
+            {"Clerkenwell & Farringdon": None}, rescue
+        )
+        self.assertEqual(extract_spreadsheet.unresolved_critical_fields(mapping, rescue), [])
 
 
 class SuggestMappingTests(unittest.TestCase):
@@ -170,6 +288,71 @@ class SuggestMappingTests(unittest.TestCase):
         self.assertIsNone(guess["Source File"])
 
 
+class SuggestMappingFuzzyFallbackTests(unittest.TestCase):
+    def test_catches_near_miss_variants_of_a_fields_own_name_or_synonym(self):
+        # None of these exact-match FIELD_SYNONYMS - each is a plausible
+        # real-world rewording (pluralization, added punctuation/
+        # parentheses, an extra connective word) that a human confirming
+        # the mapping would obviously accept, so the fuzzy fallback should
+        # too, with no synonym-table entry needed.
+        cases = {
+            "Rent PCM": "rent_pcm",
+            "Rent (PCM)": "rent_pcm",
+            "Special Feature": "special_features",
+            "State of the Space": "state_of_space",
+            "Assigned Agent": "provider",
+            "Brochure Link": "brochure_link",
+        }
+        for header, field in cases.items():
+            with self.subTest(header=header):
+                guess = extract_spreadsheet.suggest_mapping([header])
+                self.assertEqual(guess[header], field, f"{header!r} should fuzzy-match {field!r}")
+
+    def test_does_not_force_a_match_for_genuinely_unrelated_headers(self):
+        # These are real UNION/Kitt's columns with no ListingRow equivalent
+        # at all - confirmed during the fuzzy-match threshold investigation
+        # to be the closest real-world near-misses seen (up to 0.667
+        # bidirectional word similarity against some field, well under the
+        # 0.84 threshold) - included here as a standing regression check
+        # against the threshold ever being loosened past that headroom.
+        headers = [
+            "For Sale", "To Let", "Min. Term", "Legal Structure", "Broker Fee",
+            "Floor Plan", "High Res Images", "Patch?", "Marketing Permission",
+            "Commercial Model", "Who Onboarded?", "Landlord/Agent Onboarded",
+            "Other Info", "Access Information", "Link to Floorplan",
+            "Link to High Res Images", "Matterport Link",
+        ]
+        for header in headers:
+            with self.subTest(header=header):
+                guess = extract_spreadsheet.suggest_mapping([header])
+                self.assertIsNone(guess[header], f"{header!r} should not be fuzzy-matched to anything")
+
+    def test_never_fuzzy_matches_an_unmappable_field(self):
+        # "Property Id" is close enough in shape to trip a looser fuzzy
+        # design onto an unrelated real field (e.g. "property postcode") -
+        # property_id/source_file must stay unreachable even via the fuzzy
+        # pass, same as the exact-match pass already guarantees.
+        guess = extract_spreadsheet.suggest_mapping(["Property Id", "Source File"])
+        self.assertIsNone(guess["Property Id"])
+        self.assertIsNone(guess["Source File"])
+
+    def test_fuzzy_pass_never_double_maps_a_field_already_used_by_an_exact_match(self):
+        # "Special Features" exact-matches special_features first; "Key
+        # Feature" (singular, a plausible fuzzy near-miss of the "Key
+        # Features" synonym) must be left unmapped rather than stealing the
+        # same field a real column already claimed.
+        guess = extract_spreadsheet.suggest_mapping(["Special Features", "Key Feature"])
+        self.assertEqual(guess["Special Features"], "special_features")
+        self.assertIsNone(guess["Key Feature"])
+
+    def test_fuzzy_pass_never_double_maps_a_field_between_two_fuzzy_candidates(self):
+        # Both are plausible near-misses of the same field - only the first
+        # (in header order) should win, exactly like the exact-match pass.
+        guess = extract_spreadsheet.suggest_mapping(["Rent PCM", "Rent (PCM)"])
+        self.assertEqual(guess["Rent PCM"], "rent_pcm")
+        self.assertIsNone(guess["Rent (PCM)"])
+
+
 class BuildRowsTests(unittest.TestCase):
     def test_applies_mapping_and_sets_source_file(self):
         df = pd.DataFrame([
@@ -197,6 +380,63 @@ class BuildRowsTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].building, "City Tower")
+
+    def test_a_row_with_blank_building_but_a_non_blank_other_field_is_skipped_not_crashed(self):
+        # Grounded in a real Kitt's Availability row: a spreadsheet-
+        # author's own section-header/note ("COMING SOON / ADDITIONAL
+        # OPTIONS TO SHARE" in the Area column), every other column -
+        # including Building - blank. Not all-blank, so the old "skip only
+        # if every field is None" check let it straight through to
+        # ListingRow(building=None, ...), which raised and aborted the
+        # WHOLE file's extraction over this one non-property row.
+        df = pd.DataFrame([
+            {"Building": "City Tower", "Floor/Unit": "5th Floor"},
+            {"Building": None, "Floor/Unit": None, "Area": "COMING SOON / ADDITIONAL OPTIONS TO SHARE"},
+        ])
+        mapping = {"Building": "building", "Floor/Unit": "floor_unit", "Area": "submarket"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="kitts.xlsx")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "City Tower")
+
+    def test_a_fractional_value_in_an_int_field_is_rounded_not_a_crash(self):
+        # Grounded in a real Kitt's Availability row: desks_max resolved
+        # to 38.257143 (almost certainly a computed/averaged cell caught
+        # up in the mapped column range) - desks_max is Optional[int], and
+        # Pydantic's int validation rejects a fractional float outright,
+        # which previously aborted the WHOLE file's extraction over this
+        # one cell.
+        df = pd.DataFrame([{"Building": "33 Cavendish Square", "Desks": 38.257143}])
+        mapping = {"Building": "building", "Desks": "desks_max"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="kitts.xlsx")
+
+        self.assertEqual(rows[0].desks_max, 38)
+
+    def test_a_whole_number_float_in_an_int_field_still_comes_through_correctly(self):
+        df = pd.DataFrame([{"Building": "City Tower", "Desks": 12.0}])
+        mapping = {"Building": "building", "Desks": "desks_max"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
+
+        self.assertEqual(rows[0].desks_max, 12)
+
+    def test_a_genuinely_blank_cell_in_an_int_field_is_none_not_a_crash(self):
+        # Grounded in a real Kitt's Availability file: most of its 949 rows
+        # are blank padding rows below the real data (skipped already, via
+        # the blank-building check) - but the real desks_max column has its
+        # own genuinely blank cells among real rows too, which pandas reads
+        # back as an actual float NaN, not None. isinstance(nan, float) is
+        # True, so it slid straight through the "already a real number"
+        # branch as if it were one - round(nan) then raised ValueError and
+        # aborted the WHOLE file's extraction over this one blank cell.
+        df = pd.DataFrame([{"Building": "City Tower", "Desks": float("nan")}])
+        mapping = {"Building": "building", "Desks": "desks_max"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="kitts.xlsx")
+
+        self.assertIsNone(rows[0].desks_max)
 
     def test_non_numeric_placeholder_in_a_numeric_column_becomes_none_not_a_crash(self):
         # Grounded in a real current-format UNION file: its Lat/Lng columns
@@ -235,6 +475,40 @@ class BuildRowsTests(unittest.TestCase):
         rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
 
         self.assertEqual(rows[0].building, "City Tower")
+
+    def test_build_rows_never_fills_in_a_provider_on_its_own(self):
+        # Provider fallback is app.py's fill_missing_provider's job now
+        # (applied uniformly to every upload type, not just spreadsheets) -
+        # build_rows itself must leave a genuinely unmapped provider as
+        # None, not guess at one.
+        df = pd.DataFrame([{"Building": "City Tower"}])
+        mapping = {"Building": "building"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
+
+        self.assertIsNone(rows[0].provider)
+        self.assertIsNone(rows[0].internal_ref)
+
+
+class GuessProviderNameTests(unittest.TestCase):
+    def test_strips_parenthetical_asides_and_boilerplate_words(self):
+        # The real filename this feature was built for.
+        self.assertEqual(
+            extract_spreadsheet.guess_provider_name("Kitt's Availability (External).xlsx"), "Kitt's"
+        )
+
+    def test_strips_embedded_dates(self):
+        guess = extract_spreadsheet.guess_provider_name("UNION - Soho & Covent Garden_2026-07-17.xlsx")
+        self.assertNotIn("2026", guess)
+        self.assertNotIn("07", guess)
+
+    def test_falls_back_to_the_stem_when_nothing_is_left(self):
+        # Every word here is boilerplate - stripping all of them would
+        # leave an empty guess, which must never happen.
+        self.assertEqual(extract_spreadsheet.guess_provider_name("Availability Export.xlsx"), "Availability Export")
+
+    def test_csv_extension_is_stripped_too(self):
+        self.assertEqual(extract_spreadsheet.guess_provider_name("Breezblok.csv"), "Breezblok")
 
 
 class ParseXludfFallbackTests(unittest.TestCase):

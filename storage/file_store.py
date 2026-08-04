@@ -220,45 +220,63 @@ def clean_value(value):
 
 
 def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
+    """
+    Skips any row with no building name, rather than only a row that's
+    ENTIRELY blank - confirmed necessary against a real spreadsheet
+    (Kitt's Availability), which had a spreadsheet-author's own section-
+    header/note row mixed into the data range (Area="COMING SOON /
+    ADDITIONAL OPTIONS TO SHARE", every other column - including Building -
+    blank). That row isn't all-blank, so the old check let it through
+    straight into ListingRow(building=None, ...), which fails validation
+    (building is a required str) and aborts the WHOLE file's extraction
+    over one non-property row. Without a building name a row can never
+    become a real property either way, so skipping it here is exactly as
+    safe as the all-blank check already was, just correctly broader -
+    matches extract.py's own "no building and no prior unit to inherit
+    from - skipping" handling for the same underlying situation in the
+    PDF/email extraction path.
+    """
     rows = []
     for record in df.to_dict(orient="records"):
         cleaned = {key: clean_value(value) for key, value in record.items()}
-        if all(value is None for value in cleaned.values()):
+        building = cleaned.get("building")
+        if building is None or (isinstance(building, str) and not building.strip()):
             continue
         rows.append(ListingRow(**cleaned))
     return rows
 
 
-HEADER_MAPPINGS_PREFIX = "header_mappings"
+CRITICAL_FIELD_RESCUES_PREFIX = "critical_field_rescues"
 
 
-def get_saved_header_mapping(header_hash: str) -> dict:
+def get_saved_critical_field_rescue(header_hash: str) -> dict:
     """
-    The confirmed {header: field_name_or_None} mapping previously saved for
-    this exact header set (see extract_spreadsheet.header_hash) - None if
-    this format has never been confirmed before, meaning the Upload page
-    must show the confirm-mapping UI rather than proceeding straight to
-    extraction. Never cached (unlike the staging helpers above): confirming
-    a mapping happens at most once per distinct provider format, so there's
-    no repeated-lookup cost worth caching against a stale result.
+    The human-confirmed {field_name: header_or_None} rescue previously saved
+    for this exact header set (see extract_spreadsheet.header_hash) - None
+    if this format's critical fields have never needed rescuing before (or
+    never needed rescuing at all, when every critical field already maps
+    automatically). Deliberately narrow: unlike the removed full-column
+    header-mapping persistence, this only ever remembers the specific
+    field(s) suggest_mapping couldn't place on its own - every other column
+    still maps automatically on every upload, confirmed or not.
     """
-    path = f"{HEADER_MAPPINGS_PREFIX}/{header_hash}.json"
+    path = f"{CRITICAL_FIELD_RESCUES_PREFIX}/{header_hash}.json"
     if not blob_store.exists(path):
         return None
     return json.loads(blob_store.read_bytes(path))
 
 
-def save_header_mapping(header_hash: str, headers: list, mapping: dict) -> None:
+def save_critical_field_rescue(header_hash: str, headers: list, assignments: dict) -> None:
     """
-    Persists a user-confirmed column mapping for this exact header set,
-    keyed by header_hash - so the same provider's recurring spreadsheet
-    format (e.g. a monthly export with unchanged headers) only needs
-    confirming once. headers is stored alongside the mapping purely for
-    human inspection/debugging (e.g. reading header_mappings/*.json
-    directly to see what a hash corresponds to) - lookups only ever use
-    the hash itself.
+    Persists a human-confirmed critical-field rescue for this exact header
+    set, keyed by header_hash - so the same provider's recurring format
+    (e.g. a monthly UNION export whose building column is headered with the
+    area's own name) only needs rescuing once. headers is stored alongside
+    the assignments purely for human inspection/debugging (e.g. reading
+    critical_field_rescues/*.json directly to see what a hash corresponds
+    to) - lookups only ever use the hash itself.
     """
-    path = f"{HEADER_MAPPINGS_PREFIX}/{header_hash}.json"
+    path = f"{CRITICAL_FIELD_RESCUES_PREFIX}/{header_hash}.json"
     blob_store.write_bytes(
-        path, json.dumps({"headers": headers, "mapping": mapping}, indent=2).encode("utf-8")
+        path, json.dumps({"headers": headers, "assignments": assignments}, indent=2).encode("utf-8")
     )
