@@ -156,7 +156,7 @@ def list_pending_staging_files() -> list[str]:
     return _list_pending_staging_files_cached(_staging_signature())
 
 
-@st.cache_data(max_entries=4, ttl=3600)
+@st.cache_data(max_entries=4, ttl=3600, show_spinner="Checking for pending uploads...")
 def _list_pending_staging_files_cached(signature: tuple) -> list[str]:
     pending = []
     for xlsx_path, _ in blob_store.list_with_mtimes(STAGING_PREFIX, ".xlsx"):

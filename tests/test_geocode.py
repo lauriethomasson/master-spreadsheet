@@ -25,14 +25,19 @@ import geocode
 
 class SkipAlreadyGeocodedRowsTests(unittest.TestCase):
     def test_row_with_existing_lat_lng_never_calls_any_geocoding_api(self):
-        row = ListingRow(building="City Tower", provider="Breezblok", lat=51.5, lng=-0.1)
+        # submarket is already set here specifically so the new submarket
+        # backfill (see SubmarketBackfillTests) has nothing to do - this
+        # test is only about the lat/lng skip itself.
+        row = ListingRow(building="City Tower", provider="Breezblok", lat=51.5, lng=-0.1, submarket="The City")
 
         with patch("geocode.call_geocoding_api") as mock_geocoding, \
-             patch("geocode.call_places_text_search") as mock_places:
+             patch("geocode.call_places_text_search") as mock_places, \
+             patch("geocode.call_reverse_geocoding_api") as mock_reverse:
             result = geocode.geocode_row(row)
 
         mock_geocoding.assert_not_called()
         mock_places.assert_not_called()
+        mock_reverse.assert_not_called()
         self.assertEqual(result.lat, 51.5)
         self.assertEqual(result.lng, -0.1)
 
@@ -43,6 +48,87 @@ class SkipAlreadyGeocodedRowsTests(unittest.TestCase):
             geocode.geocode_row(row)
 
         mock_places.assert_called_once()
+
+
+class SubmarketBackfillTests(unittest.TestCase):
+    """
+    Google's Geocoding/Places APIs never return neighbourhood-level detail
+    in a forward lookup's own top result (confirmed against real UNION rows
+    missing submarket - the most specific component there is
+    postal_town="London", not useful) - but a reverse-geocode of the
+    resolved coordinates pools several results together and does surface a
+    "sublocality"/"sublocality_level_1" component with the real neighbourhood
+    name (confirmed "Mayfair", "Fitzrovia", "Soho" for real addresses on
+    Dering Street, Mortimer Street, Wardour Street respectively). See
+    _submarket_from_components/_backfill_submarket_from_coords.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    _SUBLOCALITY_COMPONENTS = [
+        {"long_name": "Fitzrovia", "types": ["political", "sublocality", "sublocality_level_1"]},
+        {"long_name": "London", "types": ["postal_town"]},
+    ]
+
+    def test_row_with_existing_lat_lng_but_no_submarket_gets_backfilled(self):
+        row = ListingRow(building="City Tower", provider="Breezblok", lat=51.5188, lng=-0.1381)
+
+        with patch(
+            "geocode.call_reverse_geocoding_api",
+            return_value={"status": "OK", "address_components": self._SUBLOCALITY_COMPONENTS},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_called_once_with(51.5188, -0.1381)
+        self.assertEqual(row.submarket, "Fitzrovia")
+
+    def test_never_overwrites_a_genuinely_extracted_submarket(self):
+        row = ListingRow(building="City Tower", provider="Breezblok", lat=51.5188, lng=-0.1381, submarket="Noho")
+
+        with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.submarket, "Noho")
+
+    def test_tier_1_geocoding_api_success_backfills_submarket(self):
+        row = ListingRow(building="16 Mortimer Street", address_1="16 Mortimer Street", postcode="W1T 3JL")
+
+        with patch("geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5188, "lng": -0.1381}), \
+             patch(
+                 "geocode.call_reverse_geocoding_api",
+                 return_value={"status": "OK", "address_components": self._SUBLOCALITY_COMPONENTS},
+             ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.submarket, "Fitzrovia")
+
+    def test_tier_2_places_success_backfills_submarket_with_a_single_reverse_call(self):
+        # Places' own record has neither address_1/postcode nor submarket -
+        # both are missing, so both must be filled from ONE shared reverse-
+        # geocode call, not two separate ones.
+        row = ListingRow(building="Kent House")
+        reverse_components = [
+            {"long_name": "16", "types": ["street_number"]},
+            {"long_name": "Mortimer Street", "types": ["route"]},
+            {"long_name": "W1T 3JL", "types": ["postal_code"]},
+            {"long_name": "Fitzrovia", "types": ["political", "sublocality", "sublocality_level_1"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5188, "lng": -0.1381, "address_components": []},
+        ), patch(
+            "geocode.call_reverse_geocoding_api",
+            return_value={"status": "OK", "address_components": reverse_components},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_called_once()
+        self.assertEqual(row.address_1, "16 Mortimer Street")
+        self.assertEqual(row.postcode, "W1T 3JL")
+        self.assertEqual(row.submarket, "Fitzrovia")
 
 
 class SplitCompoundBuildingTests(unittest.TestCase):

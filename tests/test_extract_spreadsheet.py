@@ -555,6 +555,9 @@ class GuessProviderNameTests(unittest.TestCase):
         # Every real UNION "by-area" export filename seen so far - each is
         # a genuinely different header format (see CRITICAL_FIELDS'
         # comment), but should still guess the same underlying provider.
+        # None of these areas is on any stopword list - see
+        # _KNOWN_PROVIDER_NAMES - "UNION" is recognized as the whole answer
+        # regardless of what area name follows it.
         cases = [
             "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
             "UNION - Availability - June 26 - Fitzrovia & Marylebone.xlsx",
@@ -571,6 +574,38 @@ class GuessProviderNameTests(unittest.TestCase):
                 "Kitt's Availability (External) - Live Availability.pdf"
             ),
             "Kitt's",
+        )
+
+    def test_a_brand_new_area_never_seen_before_still_guesses_union_correctly(self):
+        # The real trigger for this design: a new UNION by-area export for
+        # an area not covered by any previous fix (previously "London
+        # Bridge"/"Southwark" would have leaked straight into the guess,
+        # same as every other new area before it) - proves the fix is
+        # general, not just another entry added reactively for this one.
+        self.assertEqual(
+            extract_spreadsheet.guess_provider_name(
+                "UNION - Availability - June 26 - London Bridge & Southwark.xlsx"
+            ),
+            "UNION",
+        )
+
+    def test_an_entirely_novel_area_name_also_works_with_no_list_update_needed(self):
+        # Not a real filename seen yet - demonstrates the design handles
+        # ANY future area, not just ones added to a list after the fact.
+        self.assertEqual(
+            extract_spreadsheet.guess_provider_name(
+                "UNION - Availability - September 26 - Bermondsey & Elephant and Castle.xlsx"
+            ),
+            "UNION",
+        )
+
+    def test_a_provider_name_that_merely_starts_with_the_same_letters_is_not_matched(self):
+        # _leading_known_provider matches a whole word, not a prefix - a
+        # hypothetical different provider whose name happens to start with
+        # the same characters as a known one must never be misidentified.
+        self.assertEqual(
+            extract_spreadsheet.guess_provider_name("Unionville Estates Availability.xlsx"),
+            "Unionville Estates",
         )
 
 

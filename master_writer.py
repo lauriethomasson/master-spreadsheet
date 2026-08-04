@@ -54,7 +54,7 @@ def load_master_as_dataframe(master_path: str = DEFAULT_MASTER_PATH) -> pd.DataF
     return _load_master_as_dataframe_cached(master_path, blob_store.get_mtime(master_path))
 
 
-@st.cache_data(max_entries=4, ttl=3600)
+@st.cache_data(max_entries=4, ttl=3600, show_spinner="Loading master spreadsheet...")
 def _load_master_as_dataframe_cached(master_path: str, mtime: float) -> pd.DataFrame:
     return read_xlsx_with_hyperlinks(blob_store.read_bytes(master_path))
 
@@ -65,7 +65,7 @@ def get_master_write_log(log_path: str = LOG_PATH) -> list:
     return _get_master_write_log_cached(log_path, blob_store.get_mtime(log_path))
 
 
-@st.cache_data(max_entries=4, ttl=3600)
+@st.cache_data(max_entries=4, ttl=3600, show_spinner="Loading version history...")
 def _get_master_write_log_cached(log_path: str, mtime: float) -> list:
     text = blob_store.read_bytes(log_path).decode("utf-8")
     return [json.loads(line) for line in text.splitlines() if line.strip()]

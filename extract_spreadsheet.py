@@ -440,18 +440,35 @@ _PROVIDER_GUESS_STOPWORDS = frozenset({
     "schedule", "listing", "listings", "spreadsheet", "sheet", "data",
 })
 
-# London area/borough names that recur in real provider filenames,
-# describing WHERE an export covers, not who produced it - confirmed
-# against the real UNION "by-area" filename convention, a separate export
-# per area (e.g. "UNION - Availability - June 26 - Clerkenwell &
-# Farringdon.xlsx", "... - Fitzrovia & Marylebone.xlsx", "... - Soho &
-# Covent Garden.xlsx", "UNION - Shoreditch_2026-07-14.xlsx"). Same
-# evidence-grounded principle as _PROVIDER_GUESS_STOPWORDS above -
-# deliberately just the areas actually seen in a real filename so far, not
-# a speculative attempt at every London place name.
-_AREA_NAME_STOPWORDS = frozenset({
-    "clerkenwell", "farringdon", "fitzrovia", "marylebone", "soho", "covent", "garden", "shoreditch",
-})
+# Providers this pipeline already recognizes by name - once a filename's
+# leading word(s) match one of these, guess_provider_name trusts that as
+# the whole answer and ignores everything after it (area, date,
+# "Availability", etc.) rather than trying to strip each irrelevant word
+# individually. Replaces an earlier area-name stopword list that had to be
+# manually re-extended every time UNION exported a new London area's file
+# ("Fitzrovia & Marylebone", then "Clerkenwell & Farringdon", then
+# "Shoreditch", then "London Bridge & Southwark", ...) - an open-ended,
+# recurring cost for a provider whose filenames are otherwise completely
+# predictable. A provider name, unlike a London area name, is a small,
+# slow-growing set - once it's here, no future filename from that provider
+# needs fixing again, regardless of what area/date/wording follows it.
+_KNOWN_PROVIDER_NAMES = ("UNION", "Kitt's")
+
+
+def _leading_known_provider(words: list) -> str:
+    """
+    Returns the canonically-cased provider name if `words` (see
+    guess_provider_name's own word-splitting) starts with the same word
+    sequence as one of _KNOWN_PROVIDER_NAMES, case-insensitively - None
+    otherwise. Whole-word sequence matching, not a prefix/substring check,
+    so a hypothetical provider like "Unionville" is never mistaken for
+    "UNION".
+    """
+    for provider in _KNOWN_PROVIDER_NAMES:
+        provider_words = re.findall(r"[A-Za-z0-9']+", provider)
+        if [w.lower() for w in words[:len(provider_words)]] == [w.lower() for w in provider_words]:
+            return provider
+    return None
 
 # Numeric date-like substrings ("2026-07-17", "2026_07_17", "17.07.2026")
 # commonly embedded in a recurring export's filename - describe when the
@@ -487,28 +504,42 @@ def guess_provider_name(filename: str) -> str:
     Best-guess provider name derived from an uploaded spreadsheet's own
     filename - applied automatically to every spreadsheet upload with no
     column mapping to provider (see app.py's fill_missing_provider), never
-    confirmed by a human. Strips the extension, parenthetical/bracketed
-    asides (almost always describe the file - "(External)", "[DRAFT]" -
-    not who's presenting it), embedded dates (both plain numeric - see
-    _FILENAME_DATE_RE - and a month name paired with a number - see
-    _MONTH_YEAR_RE), known London area names (see _AREA_NAME_STOPWORDS),
-    and a small set of generic boilerplate words that recur across many
-    providers' own export filenames (see _PROVIDER_GUESS_STOPWORDS) - e.g.
-    "Kitt's Availability (External).xlsx" -> "Kitt's", "UNION -
-    Availability - June 26 - Fitzrovia & Marylebone.xlsx" -> "UNION".
-    Falls back to the bare filename stem (extension stripped only) if
-    stripping everything would leave nothing at all, rather than guessing
-    blank.
+    confirmed by a human.
+
+    First checks whether the filename starts with an already-known provider
+    name (see _KNOWN_PROVIDER_NAMES/_leading_known_provider) - if so, that
+    name alone is the answer, and everything else in the filename (area,
+    date, "Availability", etc.) is ignored outright rather than stripped
+    word-by-word. This is what lets a provider like UNION - whose by-area
+    export filenames otherwise change every time - never need fixing again
+    for a new area.
+
+    Otherwise falls back to word-by-word stripping: extension, parenthetical/
+    bracketed asides (almost always describe the file - "(External)",
+    "[DRAFT]" - not who's presenting it), embedded dates (both plain numeric
+    - see _FILENAME_DATE_RE - and a month name paired with a number - see
+    _MONTH_YEAR_RE), and a small set of generic boilerplate words that recur
+    across many providers' own export filenames (see
+    _PROVIDER_GUESS_STOPWORDS) - e.g. "Availability Export.xlsx" -> both
+    words are stopwords, nothing survives, falls back to the raw stem
+    itself (see below) rather than guessing blank.
+
+    Examples: "Kitt's Availability (External).xlsx" -> "Kitt's" (known-
+    provider match), "UNION - Availability - June 26 - Fitzrovia &
+    Marylebone.xlsx" -> "UNION" (known-provider match, regardless of area),
+    "Breezblok.csv" -> "Breezblok" (no known provider, nothing to strip).
     """
     stem = Path(filename).stem
+
+    known = _leading_known_provider(re.findall(r"[A-Za-z0-9']+", stem))
+    if known:
+        return known
+
     stripped = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", stem)
     stripped = _FILENAME_DATE_RE.sub(" ", stripped)
     stripped = _MONTH_YEAR_RE.sub(" ", stripped)
     words = re.findall(r"[A-Za-z0-9']+", stripped)
-    kept = [
-        w for w in words
-        if w.lower() not in _PROVIDER_GUESS_STOPWORDS and w.lower() not in _AREA_NAME_STOPWORDS
-    ]
+    kept = [w for w in words if w.lower() not in _PROVIDER_GUESS_STOPWORDS]
     guess = " ".join(kept).strip()
     return guess or stem
 

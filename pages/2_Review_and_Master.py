@@ -351,15 +351,22 @@ def _render_removal_confirmation(removal: dict):
 
 
 def _render_full_master_view():
-    last_approval = st.session_state.get("last_approval")
+    # Popped, not just read - a flash confirmation shown once right after its
+    # own write, same convention already used by just_discarded/just_restored
+    # below. Previously these three used .get(), so nothing ever cleared them
+    # except their own "Undo" button - session state is shared across every
+    # page in this app, so a removal's confirmation (and its 🗑️ markers)
+    # kept reappearing on every future visit to this view, long after the
+    # write it described, with no relation to what's actually happened since.
+    last_approval = st.session_state.pop("last_approval", None)
     if last_approval:
         _render_approval_confirmation(last_approval)
 
-    last_manual_edit = st.session_state.get("last_manual_edit")
+    last_manual_edit = st.session_state.pop("last_manual_edit", None)
     if last_manual_edit:
         _render_manual_edit_confirmation(last_manual_edit)
 
-    last_removal = st.session_state.get("last_removal")
+    last_removal = st.session_state.pop("last_removal", None)
     if last_removal:
         _render_removal_confirmation(last_removal)
 

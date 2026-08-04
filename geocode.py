@@ -15,6 +15,17 @@ match with no structured address on file), falls back to reverse-geocoding
 those coordinates through the legacy Geocoding API, which often has address
 data for a location that Places' own record lacks.
 
+Separately, also backfills submarket (never overwriting a genuinely-extracted
+value) once coordinates are known from any source - source-provided,
+Geocoding API, or Places - by reverse-geocoding those coordinates and reading
+a "sublocality"/"sublocality_level_1" component (Google's equivalent of a
+London neighbourhood name, e.g. "Fitzrovia", "Soho", "Mayfair"). Confirmed
+necessary against real UNION rows missing submarket: neither the Geocoding
+API nor Places' own forward-lookup result ever carries anything more specific
+than postal_town="London" — the neighbourhood-level component only shows up
+in a reverse-geocode's pooled results, never a forward address/Places lookup's
+own top result. See _submarket_from_components/_backfill_submarket_from_coords.
+
 When `building` is itself a compound "Name, Street Address" value (e.g.
 "Bridge House, 22 Newman Street" - a real Kitt's Availability building),
 the Places query tries the address portion alone FIRST, falling back to the
@@ -187,6 +198,51 @@ def _address_line1_and_postcode(address_components: list, name_key: str = "longT
     return address_1, postcode
 
 
+def _submarket_from_components(address_components: list, name_key: str = "long_name") -> str:
+    """
+    A political "sublocality"/"sublocality_level_1" component is Google's
+    equivalent of a London neighbourhood name (e.g. "Fitzrovia", "Soho",
+    "Mayfair") - confirmed against real UNION rows previously missing
+    submarket (addresses on Dering Street, Mortimer Street, Wardour Street
+    each reverse-geocode to exactly the neighbourhood a Londoner would
+    expect, not just "London"). "neighborhood" is checked too as a fallback
+    type, though it never appeared in any real response seen so far.
+
+    This never appears in a forward Geocoding/Places lookup's own top
+    (most specific, street-level) result - confirmed against the same real
+    addresses, whose top result only ever carries postal_town="London".
+    It only surfaces via a reverse-geocode of the resolved coordinates,
+    which returns several results at different specificity levels and pools
+    every result's components together (see call_reverse_geocoding_api)
+    rather than just the first - that's why this is only ever called with
+    reverse-geocode output, never a forward lookup's.
+    """
+    for comp in address_components:
+        types = comp.get("types", [])
+        if "sublocality" in types or "neighborhood" in types:
+            return comp[name_key]
+    return None
+
+
+def _backfill_submarket_from_coords(row: ListingRow, lat: float, lng: float) -> None:
+    """
+    Fills row.submarket from a reverse-geocode of coordinates already
+    trusted (either source-provided or just resolved a few lines above) -
+    never overwrites a genuinely-extracted value (the row.submarket guard
+    below). Applies regardless of source type (spreadsheet/PDF/email),
+    since geocode_row is the one shared code path for all of them - no
+    per-source-type wiring needed. This is purely an additional read at
+    coordinates already known, with no risk to lat/lng itself.
+    """
+    if row.submarket:
+        return
+    reverse = call_reverse_geocoding_api(lat, lng)
+    if reverse["status"] == "OK":
+        submarket = _submarket_from_components(reverse.get("address_components", []))
+        if submarket:
+            row.submarket = submarket
+
+
 def split_compound_building(building: str) -> tuple:
     """
     Returns (name_part, address_part) if `building` looks like a "Name,
@@ -235,6 +291,7 @@ def geocode_row(row: ListingRow) -> ListingRow:
     # out to the API would be a wasted lookup at best, and at worst replaces
     # a correct source-provided coordinate with a worse guess.
     if row.lat is not None and row.lng is not None:
+        _backfill_submarket_from_coords(row, row.lat, row.lng)
         return row
 
     # --- Tier 1: Geocoding API ---
@@ -244,6 +301,7 @@ def geocode_row(row: ListingRow) -> ListingRow:
         if result["status"] == "OK":
             row.lat = result["lat"]
             row.lng = result["lng"]
+            _backfill_submarket_from_coords(row, row.lat, row.lng)
             return row
         # fall through to Places if Geocoding fails despite having an address
 
@@ -282,11 +340,14 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 if not row.postcode and postcode:
                     row.postcode = postcode
 
-            if not row.address_1 or not row.postcode:
-                # Places matched real coordinates but its own record has no street
-                # address on file (e.g. Kent House — a correct, well-disambiguated
-                # match with a "premise"-only record) - reverse-geocode the
-                # coordinates we already trust as a second attempt to fill this in.
+            if not row.address_1 or not row.postcode or not row.submarket:
+                # Places matched real coordinates but its own record is missing
+                # something (no street address on file at all - e.g. Kent House, a
+                # correct, well-disambiguated match with a "premise"-only record -
+                # and/or no submarket, see _submarket_from_components) -
+                # reverse-geocode the coordinates we already trust as a second
+                # attempt to fill in whichever of these is still missing. One call
+                # covers both, since both read the exact same pooled components.
                 reverse = call_reverse_geocoding_api(row.lat, row.lng)
                 if reverse["status"] == "OK":
                     address_1, postcode = _address_line1_and_postcode(
@@ -296,6 +357,10 @@ def geocode_row(row: ListingRow) -> ListingRow:
                         row.address_1 = address_1
                     if not row.postcode and postcode:
                         row.postcode = postcode
+                    if not row.submarket:
+                        submarket = _submarket_from_components(reverse.get("address_components", []))
+                        if submarket:
+                            row.submarket = submarket
 
                 if not row.address_1 or not row.postcode:
                     log_geocode_failure(
