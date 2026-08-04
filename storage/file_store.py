@@ -96,7 +96,7 @@ def find_previous_upload_by_hash(content_hash: str) -> str:
     return _find_previous_upload_by_hash_cached(content_hash, _staging_signature())
 
 
-@st.cache_data(max_entries=8, ttl=3600)
+@st.cache_data(max_entries=8, ttl=3600, show_spinner="Checking for a previous upload of this file...")
 def _find_previous_upload_by_hash_cached(content_hash: str, signature: tuple) -> str:
     matches = []
     for xlsx_path, _ in blob_store.list_with_mtimes(STAGING_PREFIX, ".xlsx"):
@@ -175,7 +175,7 @@ def load_staging_as_dataframe(path: str) -> pd.DataFrame:
     return _load_staging_as_dataframe_cached(path, blob_store.get_mtime(path))
 
 
-@st.cache_data(max_entries=8, ttl=3600)
+@st.cache_data(max_entries=8, ttl=3600, show_spinner="Loading previous results...")
 def _load_staging_as_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
     return read_xlsx_with_hyperlinks(blob_store.read_bytes(path))
 

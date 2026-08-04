@@ -37,6 +37,140 @@ class NormalizeKeyTests(unittest.TestCase):
         self.assertEqual(master_merge.normalize_key(None), "")
 
 
+class BuildingHasNoDigitsTests(unittest.TestCase):
+    def test_a_plain_name_has_no_digits(self):
+        self.assertTrue(master_merge._building_has_no_digits("Kent House"))
+
+    def test_a_numbered_address_has_digits(self):
+        self.assertFalse(master_merge._building_has_no_digits("138 Cheapside"))
+
+    def test_a_compound_values_own_address_part_still_disqualifies_it(self):
+        # The digit lives in the address part, not the name - checked on
+        # the WHOLE value, not just the name part, so this stays excluded
+        # just like a bare numbered address (see BUILDING_FUZZY_MATCH_
+        # THRESHOLD's own comment on why numbered addresses are excluded).
+        self.assertFalse(master_merge._building_has_no_digits("Bridge House, 22 Newman Street"))
+
+    def test_a_compound_value_with_no_digits_anywhere_is_eligible(self):
+        # A real example: "The Rochester, Rochester Mews" has no house
+        # number at all in either part.
+        self.assertTrue(master_merge._building_has_no_digits("The Rochester, Rochester Mews"))
+
+    def test_blank_is_not_eligible_either_way(self):
+        self.assertFalse(master_merge._building_has_no_digits(None))
+
+
+class FuzzyBuildingMatchTests(unittest.TestCase):
+    def _rows(self, buildings_and_providers_and_floors):
+        return [
+            {"building": b, "provider": p, "floor_unit": f}
+            for b, p, f in buildings_and_providers_and_floors
+        ]
+
+    def test_a_real_typo_matches(self):
+        # The actual real-data pair: same provider/floor_unit, building
+        # name reworded by extraction non-determinism between two uploads.
+        master_records = self._rows([("Thirty Lighterman", "Kitt's", "3rd")])
+        new_dict = {"building": "Thirty Lightman", "provider": "Kitt's", "floor_unit": "3rd"}
+
+        idx = master_merge._fuzzy_building_match(new_dict, [0], master_records)
+
+        self.assertEqual(idx, 0)
+
+    def test_a_numbered_address_near_miss_never_matches(self):
+        # Confirmed against real master data: a genuinely different real
+        # property routinely scores just as high or higher than an actual
+        # typo (see BUILDING_FUZZY_MATCH_THRESHOLD's own comment) - a
+        # numbered address must never reach the fuzzy tier at all.
+        master_records = self._rows([("138 Cheapside", "Kitt's", "1st")])
+        new_dict = {"building": "139 Cheapside", "provider": "Kitt's", "floor_unit": "1st"}
+
+        self.assertIsNone(master_merge._fuzzy_building_match(new_dict, [0], master_records))
+
+    def test_the_real_confirmed_false_positive_risk_never_matches(self):
+        # "20 St James's Square" vs "30 St James's Square" - confirmed
+        # different real properties (different postcodes) in real master
+        # data, scoring HIGHER than either genuine typo pair.
+        master_records = self._rows([("20 St James's Square", "Kitt's", "1st")])
+        new_dict = {"building": "30 St James's Square", "provider": "Kitt's", "floor_unit": "1st"}
+
+        self.assertIsNone(master_merge._fuzzy_building_match(new_dict, [0], master_records))
+
+    def test_ambiguous_when_more_than_one_candidate_clears_the_threshold(self):
+        master_records = self._rows([
+            ("Thirty Lighterman", "Kitt's", "3rd"),
+            ("Thirty Lightman", "Kitt's", "3rd"),
+        ])
+        new_dict = {"building": "Thirty Lightmann", "provider": "Kitt's", "floor_unit": "3rd"}
+
+        self.assertIsNone(master_merge._fuzzy_building_match(new_dict, [0, 1], master_records))
+
+    def test_a_candidate_outside_the_anchor_never_gets_considered(self):
+        # build_merge_plan only ever passes candidates sharing the exact
+        # provider+floor_unit anchor (see _fuzzy_anchor_key) - this directly
+        # tests that a mismatched real-data pair (different provider AND
+        # postcode, "Conran Building" vs "Cowan Building") is never even
+        # offered as a candidate once anchored correctly.
+        master_records = self._rows([("Conran Building", "Kitt's", "3rd")])
+        new_dict = {"building": "Cowan Building", "provider": "", "floor_unit": "3rd"}
+
+        # Simulating build_merge_plan's own anchor lookup: candidate_indices
+        # would be empty here since the anchors (provider) differ.
+        self.assertEqual(master_merge._fuzzy_anchor_key(master_records[0]), ("kitts", "3rd"))
+        self.assertNotEqual(master_merge._fuzzy_anchor_key(master_records[0]), master_merge._fuzzy_anchor_key(new_dict))
+
+    def test_unrelated_pure_name_buildings_stay_below_threshold(self):
+        # The closest unrelated real pair found across the whole project's
+        # real building-name data.
+        master_records = self._rows([("Orion House", "Kitt's", "1st")])
+        new_dict = {"building": "York House", "provider": "Kitt's", "floor_unit": "1st"}
+
+        self.assertIsNone(master_merge._fuzzy_building_match(new_dict, [0], master_records))
+
+
+class BuildMergePlanFuzzyBuildingTests(unittest.TestCase):
+    def test_a_typo_only_building_name_matches_via_the_fuzzy_tier(self):
+        master_df = _master_df([{"building": "Thirty Lighterman", "provider": "Kitt's", "floor_unit": "3rd"}])
+        new_row = ListingRow(building="Thirty Lightman", provider="Kitt's", floor_unit="3rd")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.match_tier, "fuzzy_building")
+        self.assertEqual(matched.master_index, 0)
+
+    def test_an_exact_match_never_falls_through_to_the_fuzzy_tier(self):
+        master_df = _master_df([{"building": "Kent House", "provider": "Kitt's", "floor_unit": "3rd"}])
+        new_row = ListingRow(building="Kent House", provider="Kitt's", floor_unit="3rd")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertIn(matched.match_tier, ("postcode", "fallback"))
+
+    def test_a_numbered_address_near_miss_is_unmatched_not_fuzzy_matched(self):
+        master_df = _master_df([{"building": "138 Cheapside", "provider": "Kitt's", "floor_unit": "1st"}])
+        new_row = ListingRow(building="139 Cheapside", provider="Kitt's", floor_unit="1st")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 0)
+
+    def test_different_provider_never_reaches_the_fuzzy_tier(self):
+        # The real "Conran Building"/"Cowan Building" case - provider also
+        # differs (a separate, pre-existing duplicate from the provider-name
+        # bug, not something this tier is meant to fix) - correctly stays
+        # unmatched rather than guessing.
+        master_df = _master_df([{"building": "Conran Building", "provider": "Kitt's", "floor_unit": "3rd"}])
+        new_row = ListingRow(building="Cowan Building", provider=None, floor_unit="3rd")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+
+
 class DiffFieldsTests(unittest.TestCase):
     def test_changed_value_is_a_diff(self):
         diffs = master_merge.diff_fields({"building": "A"}, {"building": "B"})

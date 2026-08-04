@@ -160,6 +160,44 @@ def _brochure_column_x_range(page_words: list):
     return (header_word[0] - 40, header_word[2] + 10)
 
 
+def _floor_plan_column_x_range(page_words: list):
+    """
+    Mirrors _brochure_column_x_range, but locates a "Floorplan"/"Floor
+    Plan" column header instead (e.g. the real Kitt's-style table's "Link
+    to Floorplan" column - seen rendered as either one word or two,
+    handled here as either shape) - used as a NEGATIVE signal in
+    _attach_per_row_pdf_links: on a page with no separate Brochure column
+    at all (_brochure_column_x_range returns None there), a row's only
+    nearby link landing in THIS column's x-range is a floor plan, not a
+    brochure - confirmed necessary since a floor plan is a genuinely
+    different document from the brochure (see the Gemini extraction
+    prompt's own brochure_link instructions), so it must be excluded from
+    consideration entirely rather than attached for lack of anything
+    else - leaving that unit to the existing PDF-wide fallback (or null)
+    exactly as if no per-row link existed on the page at all.
+    """
+    single_word = [w for w in page_words if w[4].strip(".,:;").lower() == "floorplan"]
+    if single_word:
+        header_word = min(single_word, key=lambda w: w[1])
+        return (header_word[0] - 40, header_word[2] + 10)
+
+    # "Floor" immediately followed by "Plan" as two separate words on the
+    # same row - PyMuPDF's own word-level text extraction always splits on
+    # whitespace regardless of how the source PDF's text was originally
+    # inserted/rendered, so "Floor Plan" (one header, two words) is at
+    # least as common a real shape as the single-word "Floorplan".
+    floor_words = [w for w in page_words if w[4].strip(".,:;").lower() == "floor"]
+    plan_words = [w for w in page_words if w[4].strip(".,:;").lower() == "plan"]
+    pairs = [
+        (fw, pw) for fw in floor_words for pw in plan_words
+        if abs((fw[1] + fw[3]) / 2 - (pw[1] + pw[3]) / 2) < 4 and 0 <= pw[0] - fw[2] < 20
+    ]
+    if not pairs:
+        return None
+    floor_word, plan_word = min(pairs, key=lambda pair: pair[0][1])
+    return (floor_word[0] - 40, plan_word[2] + 10)
+
+
 def _in_x_range(rect, x_range) -> bool:
     x_lo, x_hi = x_range
     return x_lo <= rect.x0 <= x_hi or x_lo <= rect.x1 <= x_hi
@@ -217,6 +255,15 @@ def _attach_per_row_pdf_links(pdf_path: Path, units: list) -> None:
             # counting candidates, rather than treating same-row links in
             # unrelated columns as ambiguous.
             brochure_x_range = _brochure_column_x_range(page_words)
+            # No separate Brochure column on this page at all - if there's
+            # a Floorplan column instead, its links are excluded from
+            # consideration entirely (see _floor_plan_column_x_range) so a
+            # row whose ONLY per-row link is that floor plan never gets it
+            # attached as brochure_link. Skipped when brochure_x_range was
+            # already found, since a genuinely separate Floorplan column
+            # sitting alongside a Brochure column is already correctly
+            # disambiguated by narrowing to the Brochure column instead.
+            floor_plan_x_range = None if brochure_x_range is not None else _floor_plan_column_x_range(page_words)
 
             for unit in page_units:
                 row_y = _find_unit_row_y(page_words, unit.get("floor_unit"), unit.get("size_sqft"))
@@ -225,6 +272,8 @@ def _attach_per_row_pdf_links(pdf_path: Path, units: list) -> None:
                 nearby = [l for l in links if abs(l["y_center"] - row_y) <= ROW_Y_TOLERANCE]
                 if brochure_x_range is not None:
                     nearby = [l for l in nearby if _in_x_range(l["rect"], brochure_x_range)]
+                elif floor_plan_x_range is not None:
+                    nearby = [l for l in nearby if not _in_x_range(l["rect"], floor_plan_x_range)]
                 if len(nearby) == 1:
                     unit["brochure_link"] = nearby[0]["uri"]
                     print(
@@ -291,15 +340,20 @@ Also extract for each unit:
   the document. Do not calculate this yourself — leave null if not directly given.
 - rent_psf: rent per square foot as a plain number, ONLY if explicitly stated in the document. Do not
   calculate this yourself — leave null if not directly given.
-- brochure_link: a URL for this specific unit/listing (e.g. a "view listing" or floorplan link), if one is
-  clearly given for it. If the document instead has one shared portfolio-level link that applies to the
-  whole document (not to any one specific listing), use that for every unit. Never take a link that belongs
-  to one specific listing and reuse it for a different, unrelated unit — leave it null for units that don't
-  have their own link when the only link found belongs to another listing. This must be a link to an actual
-  brochure, floorplan, or listing-specific page — NEVER a generic company homepage, "contact us" page, or
-  top-level marketing domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific property page
-  under that domain). If the only link present is a generic company URL with no listing-specific path, leave
-  this null rather than populating it with a non-brochure link.
+- brochure_link: a URL for this specific unit/listing (e.g. a "view listing" or brochure/document link), if
+  one is clearly given for it. A floor plan link is NOT a brochure_link — it's a genuinely different
+  document (a drawing, not the brochure), even when it's the only per-row link given for a unit. If the only
+  link available for a unit is explicitly labeled/described as a floor plan (e.g. "Floor Plan", "Floorplan",
+  "View floorplan"), leave brochure_link null for that unit rather than substituting it — same principle as
+  never substituting a generic company homepage (below). If the document instead has one shared portfolio-
+  level link that applies to the whole document (not to any one specific listing), use that for every unit.
+  Never take a link that belongs to one specific listing and reuse it for a different, unrelated unit —
+  leave it null for units that don't have their own link when the only link found belongs to another
+  listing. This must be a link to an actual brochure or listing-specific page — NEVER a generic company
+  homepage, "contact us" page, top-level marketing domain (e.g. "www.workspace.co.uk" on its own, as opposed
+  to a specific property page under that domain), or a floor plan. If the only link present is a generic
+  company URL with no listing-specific path, leave this null rather than populating it with a non-brochure
+  link.
   HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out", "manage
   preferences", "manage your subscription", or "email preferences", it must NEVER be used as a brochure_link,
   even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.

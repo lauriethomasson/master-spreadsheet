@@ -71,6 +71,26 @@ class ManualEditVersioningTests(IsolatedCwdTestCase):
         versions = master_writer.list_versions()
         self.assertEqual(versions[0]["label"], "Manual edit: 3 fields changed")
 
+    def test_manual_removal_version_label_is_singular_for_one_row(self):
+        master_writer.write_master(
+            [ListingRow(building="A", provider="P1")],
+            source="manual_removal",
+            removed_count=1,
+        )
+
+        versions = master_writer.list_versions()
+        self.assertEqual(versions[0]["label"], "Removed 1 row")
+
+    def test_manual_removal_version_label_is_plural_for_several_rows(self):
+        master_writer.write_master(
+            [ListingRow(building="A", provider="P1")],
+            source="manual_removal",
+            removed_count=5,
+        )
+
+        versions = master_writer.list_versions()
+        self.assertEqual(versions[0]["label"], "Removed 5 rows")
+
     def test_normal_approve_label_is_unaffected(self):
         master_writer.write_master(
             [ListingRow(building="A", provider="P1")],

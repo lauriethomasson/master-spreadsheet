@@ -157,6 +157,44 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
                 del st.session_state[key]
             st.rerun()
 
+        # Reuses the exact same apply_merge/write_master path a let-status
+        # removal (during upload review, see removed_indices above) already
+        # rides - same versioning/undo/write-log, just triggered directly
+        # from the master table's own row selection instead of from an
+        # upload-merge diff. Added for one-time duplicate cleanup (e.g. rows
+        # left behind by a provider-name fix that changed the match key -
+        # see master_merge.py's own module docstring on why provider is
+        # part of the key at all) - no separate delete mechanism invented.
+        if st.button(
+            f"Remove {len(selected_positions)} selected row(s)",
+            key=f"{key}_remove_selected", disabled=not selected_positions,
+        ):
+            master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
+            removed_indices = frozenset(selected_positions)
+            removed_labels = [master_merge.row_label(master_records[i]) for i in sorted(removed_indices)]
+
+            # The version to offer for Undo is whatever was newest BEFORE
+            # this write creates a new one - same reasoning as the approve/
+            # manual-edit flows' own previous_version_path.
+            previous_versions = master_writer.list_versions(limit=1)
+            previous_version_path = previous_versions[0]["path"] if previous_versions else None
+
+            merged_rows = master_merge.apply_merge(master_records, {}, [], removed_indices=removed_indices)
+            try:
+                master_writer.write_master(merged_rows, source="manual_removal", removed_count=len(removed_indices))
+            except Exception as e:
+                st.error(f"Removal failed, master was not changed: {e}")
+            else:
+                st.session_state["export_selected_property_ids"] = set()
+                st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
+                if key in st.session_state:
+                    del st.session_state[key]
+                st.session_state["last_removal"] = {
+                    "removed_labels": removed_labels,
+                    "version_path": previous_version_path,
+                }
+                st.rerun()
+
     return _process_manual_edits(df, key)
 
 
@@ -292,6 +330,26 @@ def _render_manual_edit_confirmation(edit: dict):
         display_utils.render_before_after(d["old"], d["new"])
 
 
+def _render_removal_confirmation(removal: dict):
+    """Same shape/placement as _render_manual_edit_confirmation - a manual
+    row removal rides the exact same write_master()/versioning/undo path,
+    just with its own source string ("manual_removal") so the version-
+    history label stays distinguishable (see master_writer.list_versions)."""
+    n = len(removal["removed_labels"])
+    st.success(f"Removed {n} row{'s' if n != 1 else ''}.")
+
+    if removal.get("version_path"):
+        if st.button("Undo", key="undo_manual_removal"):
+            with st.spinner("Undoing..."):
+                master_writer.restore_version(removal["version_path"])
+            st.session_state.pop("last_removal", None)
+            st.session_state["just_restored"] = removal["version_path"]
+            st.rerun()
+
+    for label in removal["removed_labels"]:
+        st.write(f"🗑️ {label}")
+
+
 def _render_full_master_view():
     last_approval = st.session_state.get("last_approval")
     if last_approval:
@@ -300,6 +358,10 @@ def _render_full_master_view():
     last_manual_edit = st.session_state.get("last_manual_edit")
     if last_manual_edit:
         _render_manual_edit_confirmation(last_manual_edit)
+
+    last_removal = st.session_state.get("last_removal")
+    if last_removal:
+        _render_removal_confirmation(last_removal)
 
     if not master_writer.master_exists():
         st.info("No master spreadsheet yet — approve an upload to create one.")

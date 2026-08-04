@@ -161,6 +161,9 @@ def list_versions(limit: int = None) -> list:
         elif source == "manual_edit":
             n = entry.get("fields_changed") or 0
             label = f"Manual edit: {n} field{'s' if n != 1 else ''} changed"
+        elif source == "manual_removal":
+            n = entry.get("removed_count") or 0
+            label = f"Removed {n} row{'s' if n != 1 else ''}"
         else:
             new_c, upd_c, rem_c = entry.get("new_count"), entry.get("updated_count"), entry.get("removed_count")
             if new_c is not None or upd_c is not None or rem_c is not None:

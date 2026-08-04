@@ -317,6 +317,89 @@ def _fallback_key(row: dict) -> tuple:
     )
 
 
+# Similarity floor for the fuzzy building-name tier below (see
+# _fuzzy_building_match) - validated against every real building name seen
+# across Kitt's/UNION/Knotel/MetSpace data in this project: the two real
+# extraction-nondeterminism typos actually seen ("Thirty Lighterman" vs
+# "Thirty Lightman" -> 0.938, "Conran Building" vs "Coman Building" ->
+# 0.897) both clear this comfortably, while the closest UNRELATED pure-name
+# pair in that same real dataset ("Orion House" vs "York House" - the
+# "York House, 23 Kingsway" compound's name part) tops out at 0.762 - a
+# real, checked margin, not a guess.
+BUILDING_FUZZY_MATCH_THRESHOLD = 0.85
+
+_DIGIT_RE = re.compile(r"\d")
+
+
+def _building_name_only(building) -> str:
+    """The NAME part of a compound "Name, Street Address" building value
+    (e.g. "Bridge House, 22 Newman Street" -> "Bridge House") - same
+    concept as geocode.split_compound_building, applied here so a compound
+    value's address portion never leaks into the fuzzy comparison below.
+    A non-compound value passes through unchanged."""
+    text = str(building)
+    return text.split(", ", 1)[0] if ", " in text else text
+
+
+def _building_has_no_digits(building) -> bool:
+    """A numbered address ("138 Cheapside") must never be fuzzy-matched -
+    confirmed against real master data that a genuinely DIFFERENT real
+    property routinely scores HIGHER than a genuine typo does ("20 St
+    James's Square" vs "30 St James's Square", different postcodes, both
+    real listings -> 0.950; "108 Cannon Street" vs "120 Cannon Street" ->
+    0.941 - both above either real typo pair's own score). Checks the WHOLE
+    value, deliberately NOT just the name part of a compound "Name, Street
+    Address" building (see _building_name_only) - a compound value's own
+    address portion is exactly as much a numbered address as a bare one,
+    so it's excluded from this tier entirely too, not just fuzzy-matched
+    on its name part alone. Only a genuinely digit-free building (a pure
+    name, with no address suffix at all) is eligible; a numbered address
+    stays exact-match-only, exactly as before this tier existed."""
+    if _is_blank(building):
+        return False
+    return not _DIGIT_RE.search(str(building))
+
+
+def _fuzzy_anchor_key(row: dict) -> tuple:
+    """Same anchor as _fallback_key, but WITHOUT building - the fuzzy
+    building-name tier's grouping key, since building itself is the one
+    field this tier ever tolerates a near-miss on. provider+floor_unit
+    must still match exactly; postcode is deliberately not required here
+    either (a pure-name building routinely has no postcode stated at all
+    on some sources), but every candidate still needs a real fuzzy score
+    above BUILDING_FUZZY_MATCH_THRESHOLD to match at all."""
+    return (normalize_key(row.get("provider")), normalize_key(row.get("floor_unit")))
+
+
+def _fuzzy_building_match(new_dict: dict, candidate_indices: list, master_records: list) -> int:
+    """
+    Among master rows sharing new_dict's exact _fuzzy_anchor_key (provider+
+    floor_unit), returns the single master_index whose building name is a
+    safe fuzzy match for new_dict's building - or None if new_dict's
+    building is a numbered address (see _building_has_no_digits), no
+    candidate clears BUILDING_FUZZY_MATCH_THRESHOLD, or more than one does
+    (ambiguous - exactly as unsafe to auto-apply as the existing fallback
+    tier's own ">1 candidates" case, so it falls through the same way:
+    unmatched, for a human to resolve).
+    """
+    new_building = new_dict.get("building")
+    if not _building_has_no_digits(new_building):
+        return None
+    new_key = normalize_key(_building_name_only(new_building))
+
+    matches = []
+    for idx in candidate_indices:
+        old_building = master_records[idx].get("building")
+        if not _building_has_no_digits(old_building):
+            continue
+        old_key = normalize_key(_building_name_only(old_building))
+        ratio = difflib.SequenceMatcher(None, new_key, old_key).ratio()
+        if ratio >= BUILDING_FUZZY_MATCH_THRESHOLD:
+            matches.append(idx)
+
+    return matches[0] if len(matches) == 1 else None
+
+
 def _primary_key(row: dict):
     if _is_blank(row.get("postcode")):
         return None
@@ -419,11 +502,13 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
 
     primary_index = {}
     fallback_index = {}
+    fuzzy_anchor_index = {}
     for i, rec in enumerate(master_records):
         pk = _primary_key(rec)
         if pk:
             primary_index.setdefault(pk, []).append(i)
         fallback_index.setdefault(_fallback_key(rec), []).append(i)
+        fuzzy_anchor_index.setdefault(_fuzzy_anchor_key(rec), []).append(i)
 
     matched_changed, matched_unchanged, unmatched = [], [], []
 
@@ -441,6 +526,18 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             # 0 or >1 candidates both fall through as unmatched - an
             # ambiguous fallback match is exactly as unsafe to auto-apply as
             # no match at all.
+            else:
+                # Last resort: same provider+floor_unit exactly, building
+                # name close enough to be the same real property reworded
+                # by extraction non-determinism (e.g. Gemini spelling a
+                # building name slightly differently between two uploads of
+                # the same source) - see _fuzzy_building_match for the real
+                # data this threshold was validated against, and why a
+                # numbered address never reaches this tier at all.
+                fuzzy_candidates = fuzzy_anchor_index.get(_fuzzy_anchor_key(new_dict), [])
+                fuzzy_idx = _fuzzy_building_match(new_dict, fuzzy_candidates, master_records)
+                if fuzzy_idx is not None:
+                    master_idx, tier = fuzzy_idx, "fuzzy_building"
 
         if master_idx is not None:
             old_rec = master_records[master_idx]

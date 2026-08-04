@@ -258,6 +258,158 @@ def _make_multi_link_column_pdf(rows: list) -> Path:
     return tmp_path
 
 
+def _make_floor_plan_only_pdf(rows: list, header_text: str = "Floor Plan") -> Path:
+    """
+    rows: list of (floor_unit, size_sqft, floor_plan_url) - models a page
+    whose ONLY per-row link column is a Floor Plan column, with NO
+    separate Brochure column at all - a genuinely distinct real shape from
+    _make_multi_link_column_pdf's three-column table (which always has a
+    real Brochure column too). header_text lets a caller check both real
+    renderings this header is seen as ("Floor Plan" two words, or
+    "Floorplan" one word - see _floor_plan_column_x_range).
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=500, height=40 + 30 * len(rows))
+    col_x = {"floor_unit": 50, "size": 150, "floor_plan": 250}
+
+    header_y = 20
+    page.insert_text((col_x["floor_unit"], header_y), "Floor/Unit", fontsize=11)
+    page.insert_text((col_x["size"], header_y), "Size (sq ft)", fontsize=11)
+    page.insert_text((col_x["floor_plan"], header_y), header_text, fontsize=11)
+
+    row_ys = []
+    y = 60
+    for floor_unit, size_sqft, floor_plan_url in rows:
+        page.insert_text((col_x["floor_unit"], y), str(floor_unit), fontsize=11)
+        page.insert_text((col_x["size"], y), str(size_sqft), fontsize=11)
+        if floor_plan_url:
+            page.insert_text((col_x["floor_plan"], y), "Here", fontsize=11)
+        row_ys.append(y)
+        y += 30
+
+    words = page.get_text("words")
+
+    def _link_at(x_target, y_target, url):
+        candidates = [w for w in words if w[4] == "Here" and abs(w[0] - x_target) < 5 and abs((w[1] + w[3]) / 2 - y_target) < 8]
+        assert candidates, f"test setup failed to place a 'Here' caption near x={x_target} y={y_target}"
+        w = candidates[0]
+        rect = fitz.Rect(w[0] - 1, w[1] - 1, w[2] + 1, w[3] + 1)
+        page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": url})
+
+    for (floor_unit, size_sqft, floor_plan_url), row_y in zip(rows, row_ys):
+        if floor_plan_url:
+            _link_at(col_x["floor_plan"], row_y, floor_plan_url)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    doc.save(str(tmp_path))
+    doc.close()
+    return tmp_path
+
+
+class FloorPlanOnlyColumnTests(unittest.TestCase):
+    """
+    A page whose only per-row link column is a Floor Plan column, with no
+    separate Brochure column at all - previously, with no "brochure" header
+    word to disambiguate by, _attach_per_row_pdf_links fell back to pure
+    row-proximity with no check on the link's own column at all, so this
+    floor plan link got attached as brochure_link. Fixed via
+    _floor_plan_column_x_range acting as a negative signal.
+    """
+
+    def test_a_lone_floor_plan_link_is_never_attached_as_brochure_link(self):
+        # Two rows, matching MIN_UNITS_FOR_PER_ROW_LINKS - with only one
+        # unit, the whole page would be skipped before ever reaching the
+        # row-matching logic this test means to exercise, and brochure_link
+        # would trivially stay None regardless of whether the fix works.
+        pdf_path = _make_floor_plan_only_pdf([
+            ("1st", 759, "https://example.com/floorplan-1"),
+            ("2nd", 1003, "https://example.com/floorplan-2"),
+        ])
+        try:
+            units = [
+                {"floor_unit": "1st", "size_sqft": 759, "brochure_link": None, "page_index": 0},
+                {"floor_unit": "2nd", "size_sqft": 1003, "brochure_link": None, "page_index": 0},
+            ]
+            extract._attach_per_row_pdf_links(pdf_path, units)
+
+            self.assertIsNone(units[0]["brochure_link"])
+            self.assertIsNone(units[1]["brochure_link"])
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_the_single_word_floorplan_header_is_also_recognized(self):
+        pdf_path = _make_floor_plan_only_pdf(
+            [
+                ("1st", 759, "https://example.com/floorplan-1"),
+                ("2nd", 1003, "https://example.com/floorplan-2"),
+            ],
+            header_text="Floorplan",
+        )
+        try:
+            units = [
+                {"floor_unit": "1st", "size_sqft": 759, "brochure_link": None, "page_index": 0},
+                {"floor_unit": "2nd", "size_sqft": 1003, "brochure_link": None, "page_index": 0},
+            ]
+            extract._attach_per_row_pdf_links(pdf_path, units)
+
+            self.assertIsNone(units[0]["brochure_link"])
+            self.assertIsNone(units[1]["brochure_link"])
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_this_never_affects_a_page_that_genuinely_has_a_brochure_column_too(self):
+        # Regression guard: the negative signal must only ever apply when
+        # _brochure_column_x_range found nothing at all - a real Brochure
+        # column sitting alongside a Floor Plan column (already covered by
+        # MultiLinkColumnDisambiguationTests) must keep working exactly as
+        # before. Two rows, matching MIN_UNITS_FOR_PER_ROW_LINKS.
+        pdf_path = _make_multi_link_column_pdf([
+            ("1st", 759, "https://example.com/brochure-1", "https://example.com/floorplan-1", None),
+            ("2nd", 1003, "https://example.com/brochure-2", "https://example.com/floorplan-2", None),
+        ])
+        try:
+            units = [
+                {"floor_unit": "1st", "size_sqft": 759, "brochure_link": None, "page_index": 0},
+                {"floor_unit": "2nd", "size_sqft": 1003, "brochure_link": None, "page_index": 0},
+            ]
+            extract._attach_per_row_pdf_links(pdf_path, units)
+
+            self.assertEqual(units[0]["brochure_link"], "https://example.com/brochure-1")
+            self.assertEqual(units[1]["brochure_link"], "https://example.com/brochure-2")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+
+class FloorPlanColumnXRangeTests(unittest.TestCase):
+    def test_finds_the_single_word_header(self):
+        words = [(240, 20, 300, 30, "Floorplan", 0, 0, 0)]
+        x_range = extract._floor_plan_column_x_range(words)
+        self.assertIsNotNone(x_range)
+
+    def test_finds_the_two_word_header(self):
+        words = [
+            (240, 20, 270, 30, "Floor", 0, 0, 0),
+            (272, 20, 300, 30, "Plan", 0, 0, 1),
+        ]
+        x_range = extract._floor_plan_column_x_range(words)
+        self.assertIsNotNone(x_range)
+        self.assertTrue(x_range[0] <= 240)
+        self.assertTrue(x_range[1] >= 300)
+
+    def test_none_when_no_floor_plan_header_present(self):
+        words = [(50, 20, 100, 30, "Brochure", 0, 0, 0)]
+        self.assertIsNone(extract._floor_plan_column_x_range(words))
+
+    def test_floor_and_plan_on_different_rows_do_not_count(self):
+        words = [
+            (240, 20, 270, 30, "Floor", 0, 0, 0),
+            (272, 200, 300, 210, "Plan", 0, 5, 0),
+        ]
+        self.assertIsNone(extract._floor_plan_column_x_range(words))
+
+
 class MultiLinkColumnDisambiguationTests(unittest.TestCase):
     """
     Grounded directly in a real Kitt's Availability PDF the user supplied

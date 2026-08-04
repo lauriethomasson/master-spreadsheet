@@ -108,17 +108,20 @@ Also extract for each unit:
 - brochure_link: any link-tracking redirects in the email body have already been resolved to their
   real destination before you see this text, so a URL you see here can be used directly — but only
   treat it as THIS unit's brochure_link candidate if it sits close to that specific building/listing
-  name (e.g. directly on the building name's own line, or on a "Brochure"/"Floorplan"/"View listing"
-  line immediately next to that unit's block). A link floating elsewhere in the email — a header logo,
-  a social media icon, a "view in browser" link, a sender's signature/website link — does NOT qualify,
-  even if it's the only link in the email, and should NOT be reused as a fallback. Never take a link
-  that belongs to one specific listing and reuse it for a different, unrelated unit — if the document
-  has one shared portfolio-level link that clearly applies to the whole email (not to any one specific
-  listing), use that for every unit instead. This must be a link to an actual brochure, floorplan, or
-  listing-specific page — NEVER a generic company homepage, "contact us" page, or top-level marketing
+  name (e.g. directly on the building name's own line, or on a "Brochure"/"View listing" line
+  immediately next to that unit's block). A floor plan link is NOT a brochure_link — it's a genuinely
+  different document (a drawing, not the brochure) — so a "Floorplan"/"Floor Plan"/"View floorplan"
+  line does NOT qualify either, even if it's the only link near that unit's block; leave brochure_link
+  null for that unit rather than substituting it. A link floating elsewhere in the email — a header
+  logo, a social media icon, a "view in browser" link, a sender's signature/website link — does NOT
+  qualify, even if it's the only link in the email, and should NOT be reused as a fallback. Never take
+  a link that belongs to one specific listing and reuse it for a different, unrelated unit — if the
+  document has one shared portfolio-level link that clearly applies to the whole email (not to any one
+  specific listing), use that for every unit instead. This must be a link to an actual brochure or
+  listing-specific page — NEVER a generic company homepage, "contact us" page, top-level marketing
   domain (e.g. "www.workspace.co.uk" on its own, as opposed to a specific property page under that
-  domain). If the only link present is a generic company URL with no listing-specific path, leave this
-  null rather than populating it with a non-brochure link.
+  domain), or a floor plan. If the only link present is a generic company URL with no listing-specific
+  path, leave this null rather than populating it with a non-brochure link.
   HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out",
   "manage preferences", "manage your subscription", or "email preferences" — anywhere in the email,
   regardless of how close it also is to a building name — it must NEVER be used as a brochure_link,
