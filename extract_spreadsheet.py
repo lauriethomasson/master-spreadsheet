@@ -74,17 +74,34 @@ CRITICAL_FIELDS = ("building",)
 # Extra known header variants (already in normalize_key's output form - see
 # _build_field_synonyms) beyond a field's own name/title-case label, drawn
 # from real provider spreadsheets actually seen (not speculative guesses) -
-# e.g. UNION's current export format uses "Floor/Unit", "Size (sq ft)",
-# "Marketing Price (Based on Min Term) PCM", etc. An unrecognized header
-# simply gets no guess (mapped to None) rather than a forced fuzzy pick -
-# the confirm-mapping UI is where a human resolves that, not this table.
+# e.g. UNION's current (full) export format uses "Floor/Unit", "Size (sq
+# ft)", "Marketing Price (Based on Min Term) PCM", etc.; UNION's OTHER real
+# "by-area" export format (a separate, genuinely different header set - no
+# Area/Building/Address columns at all, see CRITICAL_FIELDS above) uses its
+# own distinct wording instead - "Current spec", "Monthly Rate", "Price
+# p/sq.ft", "Brochure" - added below once confirmed against that real file.
+# These 4 specifically were tried against the fuzzy fallback first and
+# rejected deliberately, not by oversight - none cleared the 0.84
+# bidirectional-coverage gate (best real score was "Brochure" at 0.762
+# against "brochure link", still failing because "link" has literally no
+# counterpart in a single-word header - a structural gap, not a close
+# miss), and the two next-closest ("Price p/sq.ft" at 0.631, "Current
+# spec" at 0.528) sit well inside the range of already-confirmed false
+# positives (e.g. "For Sale"/"To Let" false-matched at 0.667 during the
+# fuzzy-threshold investigation) - loosening the threshold to reach these
+# would reopen exactly those false positives, not just add safe coverage.
+# An unrecognized header simply gets no guess (mapped to None, dropped)
+# rather than a forced fuzzy pick.
 EXTRA_SYNONYMS = {
     "floor_unit": ("floorunit", "floor"),
     "size_sqft": ("size sq ft", "sq ft"),
     "desks_max": ("desks",),
-    "rent_pcm": ("marketing price based on min term pcm",),
-    "rent_psf": ("marketing price based on min term psf",),
-    "brochure_link": ("brochure pdf", "link to file", "link to brochure", "brochure link", "link to brochure pdf"),
+    "rent_pcm": ("marketing price based on min term pcm", "monthly rate"),
+    "rent_psf": ("marketing price based on min term psf", "price psqft"),
+    "brochure_link": (
+        "brochure pdf", "link to file", "link to brochure", "brochure link", "link to brochure pdf", "brochure",
+    ),
+    "state_of_space": ("current spec",),
     "address_1": ("property address 1", "address"),
     "postcode": ("property postcode",),
     "lat": ("latitude",),
@@ -423,6 +440,19 @@ _PROVIDER_GUESS_STOPWORDS = frozenset({
     "schedule", "listing", "listings", "spreadsheet", "sheet", "data",
 })
 
+# London area/borough names that recur in real provider filenames,
+# describing WHERE an export covers, not who produced it - confirmed
+# against the real UNION "by-area" filename convention, a separate export
+# per area (e.g. "UNION - Availability - June 26 - Clerkenwell &
+# Farringdon.xlsx", "... - Fitzrovia & Marylebone.xlsx", "... - Soho &
+# Covent Garden.xlsx", "UNION - Shoreditch_2026-07-14.xlsx"). Same
+# evidence-grounded principle as _PROVIDER_GUESS_STOPWORDS above -
+# deliberately just the areas actually seen in a real filename so far, not
+# a speculative attempt at every London place name.
+_AREA_NAME_STOPWORDS = frozenset({
+    "clerkenwell", "farringdon", "fitzrovia", "marylebone", "soho", "covent", "garden", "shoreditch",
+})
+
 # Numeric date-like substrings ("2026-07-17", "2026_07_17", "17.07.2026")
 # commonly embedded in a recurring export's filename - describe when the
 # file was produced, not who produced it. No \b anchors: a real filename
@@ -432,25 +462,53 @@ _PROVIDER_GUESS_STOPWORDS = frozenset({
 # separator shape is already specific enough not to need one.
 _FILENAME_DATE_RE = re.compile(r"\d{4}[-_./]\d{1,2}[-_./]\d{1,2}|\d{1,2}[-_./]\d{1,2}[-_./]\d{2,4}")
 
+# A month name paired with a short number, in either order ("June 26",
+# "Jun 2026", "26 June") - confirmed necessary against the real UNION
+# filename convention ("UNION - Availability - June 26 - Fitzrovia &
+# Marylebone.xlsx"), whose "June 26" previously survived _FILENAME_DATE_RE
+# untouched (that regex only matches an all-numeric date with punctuation
+# separators between the groups - "June 26" has neither: no punctuation,
+# and "June" isn't a digit group) and leaked straight into the guess as two
+# unrelated-looking words. Matched and stripped as one whole phrase, before
+# word-splitting, same as _FILENAME_DATE_RE - splitting first would lose
+# the ability to recognize "June" + "26" as a single date, since "26" alone
+# is far too generic a number to safely strip as a stopword on its own.
+_MONTH_NAME_RE = (
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?"
+    r"|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+)
+_MONTH_YEAR_RE = re.compile(
+    rf"\b{_MONTH_NAME_RE}\.?\s+\d{{1,4}}\b|\b\d{{1,4}}\s+{_MONTH_NAME_RE}\.?\b", re.IGNORECASE
+)
+
 
 def guess_provider_name(filename: str) -> str:
     """
     Best-guess provider name derived from an uploaded spreadsheet's own
-    filename - the pre-filled default for the one-time per-header-format
-    provider-name prompt (see app.py), never applied unconfirmed. Strips
-    the extension, parenthetical/bracketed asides (almost always describe
-    the file - "(External)", "[DRAFT]" - not who's presenting it), embedded
-    dates, and a small set of generic boilerplate words that recur across
-    many providers' own export filenames (see _PROVIDER_GUESS_STOPWORDS) -
-    e.g. "Kitt's Availability (External).xlsx" -> "Kitt's". Falls back to
-    the bare filename stem (extension stripped only) if stripping
-    everything would leave nothing at all, rather than guessing blank.
+    filename - applied automatically to every spreadsheet upload with no
+    column mapping to provider (see app.py's fill_missing_provider), never
+    confirmed by a human. Strips the extension, parenthetical/bracketed
+    asides (almost always describe the file - "(External)", "[DRAFT]" -
+    not who's presenting it), embedded dates (both plain numeric - see
+    _FILENAME_DATE_RE - and a month name paired with a number - see
+    _MONTH_YEAR_RE), known London area names (see _AREA_NAME_STOPWORDS),
+    and a small set of generic boilerplate words that recur across many
+    providers' own export filenames (see _PROVIDER_GUESS_STOPWORDS) - e.g.
+    "Kitt's Availability (External).xlsx" -> "Kitt's", "UNION -
+    Availability - June 26 - Fitzrovia & Marylebone.xlsx" -> "UNION".
+    Falls back to the bare filename stem (extension stripped only) if
+    stripping everything would leave nothing at all, rather than guessing
+    blank.
     """
     stem = Path(filename).stem
     stripped = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", stem)
     stripped = _FILENAME_DATE_RE.sub(" ", stripped)
+    stripped = _MONTH_YEAR_RE.sub(" ", stripped)
     words = re.findall(r"[A-Za-z0-9']+", stripped)
-    kept = [w for w in words if w.lower() not in _PROVIDER_GUESS_STOPWORDS]
+    kept = [
+        w for w in words
+        if w.lower() not in _PROVIDER_GUESS_STOPWORDS and w.lower() not in _AREA_NAME_STOPWORDS
+    ]
     guess = " ".join(kept).strip()
     return guess or stem
 

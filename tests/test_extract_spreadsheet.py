@@ -287,6 +287,31 @@ class SuggestMappingTests(unittest.TestCase):
         self.assertIsNone(guess["Property Id"])
         self.assertIsNone(guess["Source File"])
 
+    def test_real_union_by_area_header_set_maps_every_genuinely_mappable_column(self):
+        # The full real header set from the UNION "by-area" export format
+        # (see REAL_UNION_BY_AREA_HEADERS) - "Current spec", "Monthly
+        # Rate", "Price p/sq.ft", and "Brochure" previously left every one
+        # of these 4 real columns unmapped even after the fuzzy fallback
+        # (none cleared the 0.84 bidirectional-coverage gate - see
+        # EXTRA_SYNONYMS' own comment for the actual scores computed), so
+        # real rows from this format had rent_pcm/rent_psf/brochure_link/
+        # state_of_space permanently blank. "Minimum Term" genuinely has
+        # no ListingRow equivalent and must stay unmapped.
+        guess = extract_spreadsheet.suggest_mapping(REAL_UNION_BY_AREA_HEADERS)
+
+        expected_mapped = {
+            "Floor": "floor_unit",
+            "Current spec": "state_of_space",
+            "Size sq.ft": "size_sqft",
+            "Monthly Rate": "rent_pcm",
+            "Price p/sq.ft": "rent_psf",
+            "Brochure": "brochure_link",
+        }
+        for header, field in expected_mapped.items():
+            self.assertEqual(guess[header], field, f"{header!r} should map to {field!r}")
+
+        self.assertIsNone(guess["Minimum Term"])
+
 
 class SuggestMappingFuzzyFallbackTests(unittest.TestCase):
     def test_catches_near_miss_variants_of_a_fields_own_name_or_synonym(self):
@@ -509,6 +534,44 @@ class GuessProviderNameTests(unittest.TestCase):
 
     def test_csv_extension_is_stripped_too(self):
         self.assertEqual(extract_spreadsheet.guess_provider_name("Breezblok.csv"), "Breezblok")
+
+    def test_strips_a_month_name_and_number_date_with_no_punctuation_between_them(self):
+        # The real UNION by-area filename convention - "June 26" has
+        # neither punctuation between the month and the number nor an
+        # all-numeric shape, so _FILENAME_DATE_RE alone doesn't catch it;
+        # it previously leaked straight into the guess as "UNION June 26
+        # Fitzrovia Marylebone".
+        self.assertEqual(
+            extract_spreadsheet.guess_provider_name(
+                "UNION - Availability - June 26 - Fitzrovia & Marylebone.xlsx"
+            ),
+            "UNION",
+        )
+
+    def test_strips_a_number_then_month_name_date_too(self):
+        self.assertEqual(extract_spreadsheet.guess_provider_name("UNION - 26 June.xlsx"), "UNION")
+
+    def test_strips_known_london_area_names(self):
+        # Every real UNION "by-area" export filename seen so far - each is
+        # a genuinely different header format (see CRITICAL_FIELDS'
+        # comment), but should still guess the same underlying provider.
+        cases = [
+            "UNION - Availability - June 26 - Clerkenwell & Farringdon.xlsx",
+            "UNION - Availability - June 26 - Fitzrovia & Marylebone.xlsx",
+            "UNION - Availability - June 26 - Soho & Covent Garden.xlsx",
+            "UNION - Shoreditch_2026-07-14.xlsx",
+        ]
+        for filename in cases:
+            with self.subTest(filename=filename):
+                self.assertEqual(extract_spreadsheet.guess_provider_name(filename), "UNION")
+
+    def test_the_real_kitts_pdf_filename_still_guesses_correctly(self):
+        self.assertEqual(
+            extract_spreadsheet.guess_provider_name(
+                "Kitt's Availability (External) - Live Availability.pdf"
+            ),
+            "Kitt's",
+        )
 
 
 class ParseXludfFallbackTests(unittest.TestCase):
