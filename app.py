@@ -24,19 +24,11 @@ from storage.file_store import (
     find_previous_upload_by_hash,
     get_saved_critical_field_rescue,
     load_staging_as_dataframe,
-    save_critical_field_rescue,
     save_original_pdf,
     save_staging_file,
 )
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
-_NO_SUCH_COLUMN = "(no such column)"
-
-# Plain-language label for each extract_spreadsheet.CRITICAL_FIELDS entry,
-# used in the rescue prompt's wording - falls back to the raw field name
-# for anything not listed here, so a future CRITICAL_FIELDS addition still
-# renders (awkwardly) rather than crashing.
-_CRITICAL_FIELD_LABELS = {"building": "the building name"}
 
 # Increase this whenever PDF/email extraction logic changes. This prevents
 # results created by older extraction code from being reused.
@@ -206,85 +198,20 @@ with page_setup.setup_page("upload"):
         accept_multiple_files=True,
     )
 
-    # Column mapping itself is fully automatic (see suggest_mapping) - but a
+    # Column mapping itself is fully automatic (see suggest_mapping). A
     # genuinely CRITICAL field (extract_spreadsheet.CRITICAL_FIELDS) going
-    # unmapped isn't safe to drop silently the way an ordinary column is:
-    # building is schema-required, so a spreadsheet whose building column
-    # goes unmapped produces ZERO rows outright, not just one blank field
-    # per row (confirmed against two real UNION "by-area" export files,
-    # whose building-name column is headered with the area's own name -
-    # text that's different per file and shares no vocabulary with
-    # "building" that any synonym or fuzzy match could ever catch).
-    # Resolved (or, on first sight of a given header format still missing
-    # one, confirmed by a human right here) BEFORE the Extract button's
-    # loop below - every OTHER column keeps mapping automatically either
-    # way, and this is only ever asked once per header format, not once per
-    # file - see storage.file_store.get_saved_critical_field_rescue/
-    # save_critical_field_rescue.
-    pending_rescues = {}
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            suffix = Path(uploaded_file.name).suffix.lower()
-            if suffix not in SPREADSHEET_SUFFIXES:
-                continue
-            df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
-            headers = list(df.columns)
-            h_hash = extract_spreadsheet.header_hash(headers)
-            mapping = extract_spreadsheet.suggest_mapping(headers)
-            # Before ever reaching a human rescue prompt: a known provider's
-            # OWN recognizable format (e.g. UNION's "by-area" exports) may
-            # structurally hide a critical field from any header-text-based
-            # match at all - see apply_provider_structural_fallback's own
-            # docstring. Runs first so a first-ever upload of a brand new
-            # area never prompts in the first place, not just formats
-            # already rescued once before.
-            mapping = extract_spreadsheet.apply_provider_structural_fallback(mapping, headers, uploaded_file.name)
-            saved_rescue = get_saved_critical_field_rescue(h_hash)
-            rescue = saved_rescue["assignments"] if saved_rescue else {}
-            mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
-            unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
-            if not unresolved:
-                continue
-            entry = pending_rescues.setdefault(
-                h_hash, {"headers": headers, "filenames": [], "unresolved": unresolved}
-            )
-            entry["filenames"].append(uploaded_file.name)
-
-    for h_hash, info in pending_rescues.items():
-        # Plain-language, non-technical wording (still references the
-        # actual unresolved field name(s) via _CRITICAL_FIELD_LABELS, in
-        # case CRITICAL_FIELDS ever grows beyond just "building") - the
-        # "different column layouts" phrasing is deliberately explicit
-        # about what "asked again" is actually keyed on (this exact header
-        # set, see header_hash), since "files shaped like this one" reads
-        # ambiguously as "this provider's files in general" - a real UNION
-        # export has a genuinely different header set per area (Clerkenwell
-        # & Farringdon vs. Fitzrovia & Marylebone), each needing its own
-        # one-time answer, not one answer for "UNION" as a whole.
-        field_labels = " or ".join(_CRITICAL_FIELD_LABELS.get(f, f) for f in info["unresolved"])
-        with st.expander(f"We need your help with one column — {', '.join(info['filenames'])}", expanded=True):
-            st.write(
-                f"We couldn't automatically figure out which column has {field_labels}. Please "
-                "select it below, or let us know this file doesn't have one. Everything else was "
-                "matched correctly. If this provider sends other files with different column "
-                "layouts (for example, a separate export per area), you may be asked this again "
-                "for each new layout — but you won't be asked again for this exact one."
-            )
-            options = [_NO_SUCH_COLUMN] + [str(h) for h in info["headers"]]
-            assignments = {}
-            for field in info["unresolved"]:
-                choice = st.selectbox(f'Column for "{field}"', options, key=f"rescue_{h_hash}_{field}")
-                assignments[field] = None if choice == _NO_SUCH_COLUMN else choice
-            if assignments.get("building") is None:
-                st.warning(
-                    'Confirming "(no such column)" for building means this file will be sent to '
-                    "AI-based extraction instead of column-mapping (see extract_spreadsheet_gemini.py) - "
-                    "slower and with a small ongoing cost per upload, but able to handle a layout with "
-                    "no single building column at all."
-                )
-            if st.button("Confirm", key=f"confirm_rescue_{h_hash}"):
-                save_critical_field_rescue(h_hash, info["headers"], assignments)
-                st.rerun()
+    # unmapped used to stop here for a human to manually pick which column
+    # has it - removed: a sheet with no single consistent header row at all
+    # (confirmed against a real Copthall Estates file, whose row 1 is just a
+    # title string) has no legitimate column for a human to pick in the
+    # first place, so that prompt's own dropdown offered nonsense options
+    # ("nan", "1", the title text itself) rather than a real choice. Building
+    # unresolved this way now falls straight through to extract_spreadsheet_
+    # gemini.extract_sheet in the Extract-time loop below, unconditionally -
+    # no prompt, no confirmation, no interruption. A PREVIOUSLY saved rescue
+    # answer (from before this change) is still read and applied there (see
+    # get_saved_critical_field_rescue) - only creating a NEW one via a human
+    # prompt is gone, not the ability to honor an existing one.
 
     if uploaded_files and st.button("Extract"):
         total = len(uploaded_files)

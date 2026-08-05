@@ -14,15 +14,21 @@ None} mapping automatically (exact synonym match, then a conservative
 fuzzy fallback - no per-column human confirmation step) -> if every
 CRITICAL_FIELDS entry mapped successfully, build_rows() applies the
 mapping straight away. If a critical field didn't map (e.g. a provider
-whose export uses the area name itself as the building-column header -
-see unmapped_critical_fields), the caller (app.py) shows a narrow, one-
-field-at-a-time confirmation prompt instead of the removed full-column
-confirm-mapping UI, and remembers that specific field's assignment for
-this exact header set going forward (storage.file_store.
-get_saved_critical_field_rescue/save_critical_field_rescue, keyed by
-header_hash) - every OTHER column still maps automatically, confirmed or
-not. Rows then flow through the same geocode_rows()/save_staging_file()
-steps as every other source type.
+whose export uses the area name itself as the building-column header, or a
+sheet with no single consistent header row at all - see
+unmapped_critical_fields), the caller (app.py) falls back to Gemini text
+extraction (extract_spreadsheet_gemini.extract_sheet) for that sheet,
+automatically and without asking a human - a per-column confirmation
+prompt used to exist here but was removed: a sheet with no real header row
+has no legitimate column for a person to pick in the first place, only
+nonsense pseudo-header options. get_saved_critical_field_rescue/
+apply_critical_field_rescue (storage.file_store, keyed by header_hash)
+still apply an ALREADY-saved rescue answer from before that prompt was
+removed, so an old answer keeps working, but save_critical_field_rescue
+itself (which created a new one) is unused now - kept in place rather than
+deleted, dormant, in case a future caller wants to set one
+programmatically. Rows then flow through the same geocode_rows()/
+save_staging_file() steps as every other source type.
 """
 
 import difflib
