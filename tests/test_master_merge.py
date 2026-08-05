@@ -50,6 +50,54 @@ class NormalizePostcodeTests(unittest.TestCase):
         self.assertEqual(master_merge._normalize_postcode("w1t 4pw"), "w1t4pw")
 
 
+class CanonicalizeProviderNameTests(unittest.TestCase):
+    def test_plus_symbol_variant_is_corrected(self):
+        self.assertEqual(master_merge.canonicalize_provider_name("Workplace+"), "Workplace Plus")
+
+    def test_all_caps_plus_variant_is_corrected(self):
+        # Real Gemini output, seen live on repeated extraction of the same
+        # real "77 Gracechurch Street" brochure.
+        self.assertEqual(master_merge.canonicalize_provider_name("WORKPLACE+"), "Workplace Plus")
+
+    def test_already_canonical_is_unchanged(self):
+        # The document's own literal text ("At Workplace Plus, we believe...").
+        self.assertEqual(master_merge.canonicalize_provider_name("Workplace Plus"), "Workplace Plus")
+
+    def test_case_only_variant_is_corrected(self):
+        # Real spreadsheet data: "Metspace" vs "MetSpace" elsewhere.
+        self.assertEqual(master_merge.canonicalize_provider_name("Metspace"), "MetSpace")
+        self.assertEqual(master_merge.canonicalize_provider_name("metspace"), "MetSpace")
+
+    def test_apostrophe_insensitive(self):
+        self.assertEqual(master_merge.canonicalize_provider_name("Kitts"), "Kitt's")
+
+    def test_slash_spacing_variant_is_corrected(self):
+        self.assertEqual(master_merge.canonicalize_provider_name("JLL/HK London"), "JLL / HK London")
+
+    def test_unknown_provider_passes_through_unchanged(self):
+        # Not on KNOWN_PROVIDERS - never guessed at, never coerced toward
+        # the nearest known name.
+        self.assertEqual(master_merge.canonicalize_provider_name("Newco Realty"), "Newco Realty")
+
+    def test_blank_passes_through_unchanged(self):
+        self.assertIsNone(master_merge.canonicalize_provider_name(None))
+        self.assertEqual(master_merge.canonicalize_provider_name(""), "")
+
+
+class CanonicalizeProvidersTests(unittest.TestCase):
+    def test_mutates_every_row_in_place(self):
+        rows = [
+            ListingRow(building="A", provider="Workplace+"),
+            ListingRow(building="B", provider="WORKPLACE+"),
+            ListingRow(building="C", provider="Newco Realty"),
+            ListingRow(building="D", provider=None),
+        ]
+
+        master_merge.canonicalize_providers(rows)
+
+        self.assertEqual([r.provider for r in rows], ["Workplace Plus", "Workplace Plus", "Newco Realty", None])
+
+
 class BuildingHasNoDigitsTests(unittest.TestCase):
     def test_a_plain_name_has_no_digits(self):
         self.assertTrue(master_merge._building_has_no_digits("Kent House"))

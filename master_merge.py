@@ -141,6 +141,79 @@ def _normalize_postcode(value) -> str:
     return re.sub(r"\s+", "", normalize_key(value))
 
 
+def _canonical_provider_key(value) -> str:
+    """Comparison key for canonicalize_provider_name - like normalize_key,
+    but "+"/"&" are expanded to their word form FIRST. normalize_key alone
+    would just delete "+"/"&" as punctuation, losing the concept they stand
+    for entirely (e.g. "Workplace+" would become "workplace", one word, not
+    "workplaceplus" - and could then spuriously equal some unrelated
+    single-word provider). All whitespace is then stripped, like
+    _normalize_postcode, so "Workplace Plus" and "Workplace+" compare equal
+    regardless of spacing."""
+    text = str(value or "").replace("+", " plus ").replace("&", " and ")
+    return re.sub(r"\s+", "", normalize_key(text))
+
+
+# Known real providers seen across uploads so far, in their correct verbatim
+# spelling - derived from every distinct provider value observed in real
+# data this project has processed so far (see canonicalize_provider_name's
+# docstring for the specific confirmed variants this was checked against).
+# Deliberately a small, explicit, hand-maintained list rather than a
+# general-purpose fuzzy match against anything: this only ever corrects
+# TOWARD one of these specific, already-confirmed-real names, never invents
+# a "closest" canonical spelling for a provider that isn't on it.
+KNOWN_PROVIDERS = (
+    "Business Cube",
+    "GPE",
+    "JLL / HK London",
+    "Kitt's",
+    "Knotel",
+    "MetSpace",
+    "UNION",
+    "Workplace Plus",
+)
+
+_CANONICAL_PROVIDER_BY_KEY = {_canonical_provider_key(p): p for p in KNOWN_PROVIDERS}
+
+
+def canonicalize_provider_name(value):
+    """
+    Corrects value to its known-correct spelling from KNOWN_PROVIDERS when
+    it's a recognizable variant of one of them (case, "+"/"Plus"/"&"/"and",
+    or minor punctuation/whitespace difference - see _canonical_provider_
+    key); returns value completely unchanged otherwise, including for every
+    provider not yet on that list. That's deliberate: the point is to fix
+    known, already-confirmed spelling drift for names this project has
+    already seen, not to guess at correctness for one it hasn't - a
+    genuinely new real provider should be added to KNOWN_PROVIDERS once
+    confirmed, not silently matched against something close on the list by
+    a looser heuristic. Same "conservative, human catches it" philosophy as
+    normalize_key itself, applied one level earlier - fixing the value at
+    the source instead of loosening how match keys compare it.
+
+    Confirmed against real extraction non-determinism: the same real "77
+    Gracechurch Street" brochure PDF, extracted repeatedly, returned
+    "Workplace Plus" (its own literal document text - "At Workplace Plus,
+    we believe..."), "Workplace+", and "WORKPLACE+" across different runs -
+    all three canonicalize to "Workplace Plus" here. Real spreadsheet data
+    separately shows "MetSpace" vs "Metspace" the same way.
+    """
+    if _is_blank(value):
+        return value
+    return _CANONICAL_PROVIDER_BY_KEY.get(_canonical_provider_key(value), value)
+
+
+def canonicalize_providers(rows: list[ListingRow]) -> None:
+    """Applies canonicalize_provider_name to every row's provider in place -
+    the list[ListingRow]-mutating counterpart to app.py's fill_missing_
+    provider/fill_missing_address_from_building, meant to run right
+    alongside them: after extraction/mapping (Gemini or spreadsheet) has
+    produced a provider value, before that row is ever used for matching or
+    diffing."""
+    for row in rows:
+        row.provider = canonicalize_provider_name(row.provider)
+
+
 def field_kind(field_name: str) -> str:
     """"int" | "float" | "str" - derived from ListingRow's own type hints
     (via typing.get_args on the Optional[...] annotation) rather than a

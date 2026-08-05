@@ -302,6 +302,14 @@ how many properties or units it covers):
 - provider: the company/agent presenting this brochure (e.g. "Breezblok", "GPE", "The Crown Estate Workplaces").
   Some brochures are produced directly by a landlord/developer with no presenting agent named anywhere —
   in that case leave this null rather than guessing or using the building/property name as a stand-in.
+  Transcribe the name EXACTLY as it is printed wherever it appears as a name in running text (not a URL
+  or email address, which never reflect the name's real spacing/punctuation/case) — like copying an exact
+  quotation, not paraphrasing it. Preserve special characters and symbols precisely (e.g. a name printed
+  as "Workplace+" stays "Workplace+", never expanded to "Workplace Plus"; a name printed as "Workplace
+  Plus" stays "Workplace Plus", never condensed to "Workplace+"). Preserve the exact capitalization shown
+  (e.g. don't write "WORKPLACE+" if the document prints "Workplace+", and don't write "Metspace" if the
+  document prints "MetSpace"). Never substitute a spelling you recognize from general knowledge of the
+  company's branding elsewhere — use only what this specific document actually shows.
 - contacts: every contact person or generic contact listed in the document (e.g. "Sales" if no named
   person is given). Format each contact as "Name, email, phone" — omit any of the three pieces that
   aren't given. If there are multiple contacts, join them with "; ".

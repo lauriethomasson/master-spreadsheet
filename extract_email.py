@@ -41,8 +41,14 @@ The email body has this general shape:
 Extract the following email-level information (who sent this, not which property it's about):
 - provider: the company/agent whose availability this is (e.g. "GPE", "MetSpace"). This is
   usually clear from the branding/sender context, not necessarily the literal email address
-  domain or legal entity name (e.g. use "MetSpace" not "Metspace London LTD"). If genuinely
-  no sender/branding is identifiable, leave this null rather than guessing.
+  domain or legal entity name (e.g. use "MetSpace" not "Metspace London LTD" or a domain like
+  "metspace.co.uk"). If genuinely no sender/branding is identifiable, leave this null rather
+  than guessing. Once you've identified which branded occurrence of the name to use, transcribe
+  THAT occurrence's spacing, symbols, and capitalization EXACTLY as printed there — like copying
+  an exact quotation, not paraphrasing it (e.g. a signature reading "Workplace+" stays
+  "Workplace+", never expanded to "Workplace Plus" or upper-cased to "WORKPLACE+"; "MetSpace"
+  stays "MetSpace", never "Metspace"). Never substitute a spelling you recognize from general
+  knowledge of the company's branding elsewhere — use only what this specific message shows.
 - contacts: every named contact person listed (typically in a "Get in touch"/"Contact" section),
   each as "Name, email, phone" — omit whichever of email/phone isn't given for that person. Join
   multiple contacts with "; ".

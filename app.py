@@ -14,6 +14,7 @@ import page_setup
 from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 from geocode import geocode_rows
+from master_merge import canonicalize_providers
 from schema import ListingRow
 from storage.file_store import (
     dataframe_to_listing_rows,
@@ -373,6 +374,12 @@ with page_setup.setup_page("upload"):
                     # overwritten - see fill_missing_provider's own
                     # docstring for why PDF/email must never get this guess.
                     fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=is_spreadsheet_source)
+
+                    # Fixes known spelling/capitalization drift (e.g. Gemini's
+                    # own extraction non-determinism on "Workplace Plus" vs
+                    # "Workplace+" vs "WORKPLACE+") before these rows ever
+                    # reach matching/diffing - see canonicalize_provider_name.
+                    canonicalize_providers(rows)
 
                     fill_missing_address_from_building(rows, apply_building_fallback=is_spreadsheet_source)
 
