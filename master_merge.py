@@ -125,6 +125,21 @@ def normalize_key(value) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _normalize_postcode(value) -> str:
+    """normalize_key() plus full whitespace removal, for postcode specifically.
+
+    A postcode written with or without the space before its inward code
+    ("W1T 4PX" vs "W1T4PX") is the same postcode, purely a formatting
+    difference - not the kind of near-miss normalize_key's own docstring
+    means to preserve as "no match" for a human to catch (that's about
+    genuinely different wording, e.g. a missing "The", not whitespace).
+    _values_equal/_normalize_text already treat this kind of formatting
+    difference as identical for diffing; the match key was the one place
+    still treating them as different postcodes, which could send a
+    postcode-inclusive match to the fallback tier for no real reason."""
+    return re.sub(r"\s+", "", normalize_key(value))
+
+
 def field_kind(field_name: str) -> str:
     """"int" | "float" | "str" - derived from ListingRow's own type hints
     (via typing.get_args on the Optional[...] annotation) rather than a
@@ -403,7 +418,7 @@ def _fuzzy_building_match(new_dict: dict, candidate_indices: list, master_record
 def _primary_key(row: dict):
     if _is_blank(row.get("postcode")):
         return None
-    return _fallback_key(row) + (normalize_key(row.get("postcode")),)
+    return _fallback_key(row) + (_normalize_postcode(row.get("postcode")),)
 
 
 def row_label(row_dict: dict) -> str:

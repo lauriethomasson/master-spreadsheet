@@ -37,6 +37,19 @@ class NormalizeKeyTests(unittest.TestCase):
         self.assertEqual(master_merge.normalize_key(None), "")
 
 
+class NormalizePostcodeTests(unittest.TestCase):
+    def test_with_and_without_inward_code_space_are_equal(self):
+        # Real reported case: "W1T 4PW" vs "W1T4PW" for the same 77
+        # Charlotte Street unit - normalize_key alone doesn't catch this
+        # (it collapses whitespace runs but doesn't remove them), unlike
+        # _normalize_text which already treats these as identical for
+        # diffing purposes.
+        self.assertEqual(master_merge._normalize_postcode("W1T 4PW"), master_merge._normalize_postcode("W1T4PW"))
+
+    def test_still_case_and_punctuation_insensitive(self):
+        self.assertEqual(master_merge._normalize_postcode("w1t 4pw"), "w1t4pw")
+
+
 class BuildingHasNoDigitsTests(unittest.TestCase):
     def test_a_plain_name_has_no_digits(self):
         self.assertTrue(master_merge._building_has_no_digits("Kent House"))
@@ -148,6 +161,27 @@ class BuildMergePlanFuzzyBuildingTests(unittest.TestCase):
 
         matched = (plan.matched_changed + plan.matched_unchanged)[0]
         self.assertIn(matched.match_tier, ("postcode", "fallback"))
+
+    def test_postcode_whitespace_variant_still_matches_via_postcode_tier(self):
+        # Same real case as NormalizePostcodeTests, at the build_merge_plan
+        # level: a numbered address (fuzzy tier barred, see
+        # BuildingHasNoDigitsTests) whose postcode differs only by the
+        # inward-code space must still hit the postcode tier, not fall
+        # through to fallback/unmatched.
+        master_df = _master_df([{
+            "building": "The Sevens, 77 Charlotte Street", "provider": "Kitt's",
+            "floor_unit": "1st", "postcode": "W1T 4PW",
+        }])
+        new_row = ListingRow(
+            building="The Sevens, 77 Charlotte Street", provider="Kitt's",
+            floor_unit="1st", postcode="W1T4PW",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.match_tier, "postcode")
 
     def test_a_numbered_address_near_miss_is_unmatched_not_fuzzy_matched(self):
         master_df = _master_df([{"building": "138 Cheapside", "provider": "Kitt's", "floor_unit": "1st"}])
