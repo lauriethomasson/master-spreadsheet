@@ -186,6 +186,132 @@ class BuildMergePlanIntraBatchDuplicateTests(unittest.TestCase):
         self.assertEqual(len(plan.unmatched_collisions), 0)
 
 
+class AddressStreetKeyTests(unittest.TestCase):
+    def test_house_number_and_abbreviated_suffix_match_full_street_name(self):
+        # Real pair from the same uploaded Copthall Estates file: a
+        # portfolio-wide rollup sheet vs that provider's own dedicated
+        # per-area sheet for the SAME real building.
+        self.assertEqual(
+            master_merge._address_street_key("89 Charterhouse St"),
+            master_merge._address_street_key("Charterhouse Street"),
+        )
+
+    def test_different_house_numbers_still_share_a_street_key(self):
+        # The street-key alone doesn't disambiguate these - that's
+        # _leading_house_number's job (see the grouping-level tests below),
+        # not this function's.
+        self.assertEqual(
+            master_merge._address_street_key("27 Cannon Street"),
+            master_merge._address_street_key("108 Cannon Street"),
+        )
+
+    def test_blank_building_has_no_address_key(self):
+        self.assertEqual(master_merge._address_street_key(None), "")
+
+    def test_number_only_building_has_no_address_key(self):
+        self.assertEqual(master_merge._address_street_key("89"), "")
+
+
+class LeadingHouseNumberTests(unittest.TestCase):
+    def test_extracts_a_plain_number(self):
+        self.assertEqual(master_merge._leading_house_number("89 Charterhouse St"), "89")
+
+    def test_extracts_a_range(self):
+        self.assertEqual(master_merge._leading_house_number("27-30 Lime Street"), "27-30")
+
+    def test_no_number_returns_none(self):
+        self.assertIsNone(master_merge._leading_house_number("Charterhouse Street"))
+
+    def test_blank_returns_none(self):
+        self.assertIsNone(master_merge._leading_house_number(None))
+
+
+class AddressAwareDuplicateGroupingTests(unittest.TestCase):
+    """The fix confirmed still outstanding after the earlier intra-batch
+    merge-UI work: two pending rows for the same real building, one with a
+    house number and abbreviated street suffix, the other without the
+    number at all, must still be recognized as duplicates of each other."""
+
+    def test_house_number_and_full_street_name_are_grouped(self):
+        # Real pair from the same uploaded Copthall Estates file.
+        rollup_row = ListingRow(
+            building="89 Charterhouse St", provider="Copthall Estates",
+            floor_unit="3rd Floor", source_file="x.xlsx — Portfolio",
+        )
+        per_area_row = ListingRow(
+            building="Charterhouse Street", provider="Copthall Estates",
+            floor_unit="3rd Floor", source_file="x.xlsx — Mid Town",
+        )
+
+        plan = master_merge.build_merge_plan([rollup_row, per_area_row], _empty_master_df_like(rollup_row))
+
+        self.assertEqual(len(plan.unmatched_collisions), 1)
+        self.assertEqual(len(plan.unmatched_collisions[0]), 2)
+
+    def test_different_house_numbers_on_the_same_street_are_not_grouped(self):
+        # Real confirmed-different pair (BUILDING_FUZZY_MATCH_THRESHOLD's
+        # own comment) - sharing a street name must never be enough alone.
+        row_a = ListingRow(building="27 Cannon Street", provider="Kitt's", floor_unit="1st")
+        row_b = ListingRow(building="108 Cannon Street", provider="Kitt's", floor_unit="1st")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _empty_master_df_like(row_a))
+
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+    def test_different_floor_unit_is_not_grouped(self):
+        row_a = ListingRow(building="89 Charterhouse St", provider="Copthall Estates", floor_unit="3rd Floor")
+        row_b = ListingRow(building="Charterhouse Street", provider="Copthall Estates", floor_unit="4th Floor")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _empty_master_df_like(row_a))
+
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+    def test_different_provider_is_not_grouped(self):
+        row_a = ListingRow(building="89 Charterhouse St", provider="Copthall Estates", floor_unit="3rd Floor")
+        row_b = ListingRow(building="Charterhouse Street", provider="A Different Agent", floor_unit="3rd Floor")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _empty_master_df_like(row_a))
+
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+    def test_different_non_blank_postcodes_are_not_grouped(self):
+        row_a = ListingRow(building="89 Charterhouse St", provider="Copthall Estates",
+                            floor_unit="3rd Floor", postcode="EC1A 1AA")
+        row_b = ListingRow(building="Charterhouse Street", provider="Copthall Estates",
+                            floor_unit="3rd Floor", postcode="SW1A 1AA")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _empty_master_df_like(row_a))
+
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+    def test_one_blank_postcode_does_not_block_the_match(self):
+        row_a = ListingRow(building="89 Charterhouse St", provider="Copthall Estates",
+                            floor_unit="3rd Floor", postcode="EC1M 6PE")
+        row_b = ListingRow(building="Charterhouse Street", provider="Copthall Estates", floor_unit="3rd Floor")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _empty_master_df_like(row_a))
+
+        self.assertEqual(len(plan.unmatched_collisions), 1)
+
+    def test_exact_match_pass_and_address_aware_pass_union_into_one_group(self):
+        # Three-way case: two rows share the exact key already (no number on
+        # either), the third only matches via the address-aware key - all
+        # three must end up in the SAME final group, not two separate ones.
+        exact_a = ListingRow(building="Charterhouse Street", provider="Copthall Estates",
+                              floor_unit="3rd Floor", source_file="a")
+        exact_b = ListingRow(building="Charterhouse Street", provider="Copthall Estates",
+                              floor_unit="3rd Floor", source_file="b")
+        address_only = ListingRow(building="89 Charterhouse St", provider="Copthall Estates",
+                                   floor_unit="3rd Floor", source_file="c")
+
+        plan = master_merge.build_merge_plan(
+            [exact_a, exact_b, address_only], _empty_master_df_like(exact_a)
+        )
+
+        self.assertEqual(len(plan.unmatched_collisions), 1)
+        self.assertEqual(len(plan.unmatched_collisions[0]), 3)
+
+
 def _empty_master_df_like(row: ListingRow) -> pd.DataFrame:
     return pd.DataFrame(columns=list(row.model_dump().keys()))
 

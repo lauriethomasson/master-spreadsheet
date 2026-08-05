@@ -568,6 +568,96 @@ def _dedup_key(row: dict):
     return _primary_key(row) or _fallback_key(row)
 
 
+# Common UK street-suffix abbreviations, mapped to their canonical expanded
+# form - see _address_street_key. Deliberately a small, explicit list of
+# genuinely common abbreviations rather than a general transliteration
+# scheme - the same "conservative, human catches it if this doesn't cover a
+# case" philosophy as normalize_key itself.
+_STREET_SUFFIX_EXPANSIONS = {
+    "st": "street", "rd": "road", "ave": "avenue", "av": "avenue",
+    "sq": "square", "ln": "lane", "pl": "place", "ct": "court",
+    "cres": "crescent", "gdns": "gardens", "ter": "terrace",
+}
+
+# A leading house number, e.g. "89", "27-30", "56a" - see
+# _leading_house_number/_address_street_key. Matched against the RAW
+# building string, not normalize_key(building) - normalize_key strips "-"
+# as punctuation, which would mangle a real range like "27-30" into "2730"
+# before this pattern ever saw the hyphen (confirmed against a real
+# Copthall Estates address, "27-30 Lime Street"). \b after the optional
+# letter/range so "27" doesn't partially match inside an unrelated word
+# starting with a digit (there are none in real building names seen so
+# far, but this costs nothing to guard against). Case-insensitive since
+# it runs before any lowercasing.
+_LEADING_HOUSE_NUMBER_RE = re.compile(r"^\s*(\d+[a-z]?(?:-\d+[a-z]?)?)\b", re.IGNORECASE)
+
+
+def _leading_house_number(building):
+    """The leading house-number token building starts with (e.g. "89",
+    "27-30"), lowercased, or None if it doesn't start with one at all - used
+    only to guard _address_street_key's intra-batch grouping (see
+    unmatched_collisions) against merging two genuinely DIFFERENT numbered
+    units on the same street: "27 Cannon Street" and "108 Cannon Street" are
+    a real, confirmed-different pair elsewhere in this project's data
+    (BUILDING_FUZZY_MATCH_THRESHOLD's own comment), and must never collapse
+    together just because they share a street name once their own distinct
+    numbers are stripped."""
+    if _is_blank(building):
+        return None
+    match = _LEADING_HOUSE_NUMBER_RE.match(str(building))
+    return match.group(1).lower() if match else None
+
+
+def _address_street_key(building) -> str:
+    """
+    normalize_key(building) with a leading house number stripped and a
+    common UK street-suffix abbreviation expanded to its canonical form
+    (e.g. "St" -> "Street") - lets unmatched_collisions' address-aware
+    grouping pass recognize "89 Charterhouse St" and "Charterhouse Street"
+    as the same real street, which share no normalize_key() overlap at all
+    otherwise (confirmed against a real pair from the same uploaded
+    Copthall Estates file: a portfolio-wide rollup sheet abbreviates and
+    prefixes a house number onto a building name that provider's own
+    dedicated per-area sheet gives in full, with no number, as its own
+    building-name line).
+
+    ONLY used for intra-batch duplicate grouping, never for matching
+    against master - _primary_key/_fallback_key/normalize_key and the
+    fuzzy-matching tier (_fuzzy_building_match/_building_has_no_digits/
+    BUILDING_FUZZY_MATCH_THRESHOLD) are completely untouched by this
+    function and never call it. That tier's numbered-address exclusion
+    exists specifically because a SIMILARITY-score-based fuzzy match
+    (difflib ratio) scores a genuinely different real property higher than
+    an actual typo often enough to be dangerous on short numbered strings -
+    a real, measured risk documented on BUILDING_FUZZY_MATCH_THRESHOLD
+    itself. This function is a different, more conservative kind of check:
+    a deterministic rule (strip a leading number, expand one suffix
+    abbreviation), paired with _leading_house_number's own guard against
+    merging two rows whose numbers genuinely disagree - not a score that
+    could rank a different property above a real match.
+
+    Returns "" for a blank building (or one that's number-only after
+    stripping) - callers must treat that as "no address-aware key
+    available", never group every such row together.
+    """
+    if _is_blank(building):
+        return ""
+    # Number stripped from the RAW string first (see _LEADING_HOUSE_NUMBER_
+    # RE's own comment on why - normalize_key would destroy a hyphenated
+    # range's "-" before this pattern ever saw it), then the remainder goes
+    # through the usual normalize_key pass for case/punctuation.
+    text = str(building)
+    match = _LEADING_HOUSE_NUMBER_RE.match(text)
+    if match:
+        text = text[match.end():]
+    text = normalize_key(text)
+    words = text.split()
+    if not words:
+        return ""
+    words[-1] = _STREET_SUFFIX_EXPANSIONS.get(words[-1], words[-1])
+    return " ".join(words)
+
+
 def merge_field_choice(values: list) -> tuple:
     """
     For one field across a group of intra-batch duplicate rows (see
@@ -784,12 +874,82 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
         by_master_idx.setdefault(m.master_index, []).append(m)
     collisions = [group for group in by_master_idx.values() if len(group) > 1]
 
-    by_key = {}
-    for u in unmatched:
-        by_key.setdefault(_dedup_key(u.new_row.model_dump()), []).append(u)
-    unmatched_collisions = [group for group in by_key.values() if len(group) > 1]
+    unmatched_collisions = _group_unmatched_duplicates(unmatched)
 
     return MergePlan(master_records, matched_changed, matched_unchanged, unmatched, collisions, unmatched_collisions)
+
+
+def _group_unmatched_duplicates(unmatched: list) -> list:
+    """
+    Groups pending rows that both independently failed to match master but
+    refer to the same real property - two passes feeding one partition
+    (union-find over indices into `unmatched`), not two separate group
+    lists, since a row can plausibly qualify under either:
+
+    1. Exact _dedup_key equality (building+provider+floor_unit[+postcode],
+       normalize_key-tolerant only - the original, still-primary path).
+    2. Address-aware equality (_address_street_key) - same provider and
+       floor_unit, and the SAME street once a leading house number is
+       stripped and a suffix abbreviation expanded (e.g. "89 Charterhouse
+       St" / "Charterhouse Street") - guarded against merging two rows with
+       genuinely different, disagreeing house numbers (_leading_house_
+       number) or genuinely different non-blank postcodes, either of which
+       means a different real property/unit despite the shared street name,
+       not a spelling variant of the same one.
+
+    Returns groups of size > 1 only, exactly like the single-pass version
+    this replaces.
+    """
+    parent = list(range(len(unmatched)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    by_key = {}
+    for i, u in enumerate(unmatched):
+        by_key.setdefault(_dedup_key(u.new_row.model_dump()), []).append(i)
+    for indices in by_key.values():
+        for i in indices[1:]:
+            union(indices[0], i)
+
+    address_groups = {}
+    for i, u in enumerate(unmatched):
+        row = u.new_row.model_dump()
+        street = _address_street_key(row.get("building"))
+        if not street:
+            continue
+        key = (street, normalize_key(row.get("provider")), normalize_key(row.get("floor_unit")))
+        address_groups.setdefault(key, []).append(i)
+
+    for indices in address_groups.values():
+        if len(indices) < 2:
+            continue
+        buildings = [unmatched[i].new_row.building for i in indices]
+        numbers = {n for n in (_leading_house_number(b) for b in buildings) if n is not None}
+        if len(numbers) > 1:
+            continue  # genuinely different numbered units on the same street
+        postcodes = {
+            _normalize_postcode(unmatched[i].new_row.postcode)
+            for i in indices
+            if not _is_blank(unmatched[i].new_row.postcode)
+        }
+        if len(postcodes) > 1:
+            continue  # genuinely different postcodes - real signal against merging
+        for i in indices[1:]:
+            union(indices[0], i)
+
+    components = {}
+    for i in range(len(unmatched)):
+        components.setdefault(find(i), []).append(unmatched[i])
+    return [group for group in components.values() if len(group) > 1]
 
 
 def apply_merge(master_records: list, updates: dict, new_rows: list, removed_indices: frozenset = frozenset()) -> list:
