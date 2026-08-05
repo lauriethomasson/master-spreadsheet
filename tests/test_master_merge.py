@@ -305,6 +305,81 @@ class IsDetailLossTests(unittest.TestCase):
         self.assertFalse(master_merge.is_detail_loss(BOND_STREET_AMENITIES, None))
 
 
+class IsRichnessRegressionTests(unittest.TestCase):
+    """The backstop for is_detail_loss's own documented blind spot: a value
+    with no ";"/newline to itemize on collapses to one "item" for item-loss,
+    so a hard compression of un-itemized text can pass item-loss cleanly
+    even though real content vanished. See RICHNESS_RATIO_THRESHOLD's own
+    comment for the real cases these thresholds were checked against."""
+
+    def test_full_amenity_list_replaced_by_one_liner_is_flagged(self):
+        # Same real pair as IsDetailLossTests - already caught by item-loss
+        # too, but richness must also independently recognize it (ratio 0.25).
+        self.assertTrue(master_merge.is_richness_regression(BOND_STREET_AMENITIES, "Available Q3 2026"))
+
+    def test_comma_only_compression_is_flagged_where_item_loss_misses_it(self):
+        # The actual documented item-loss blind spot (see
+        # test_comma_only_rewording_with_no_semicolons_is_not_flagged) -
+        # ratio 0.10, exactly what this check exists to catch.
+        old = "Fully fitted, CAT A+ finish, breakout area, phone booths, kitchen"
+        new = "Fitted"
+        self.assertFalse(master_merge.is_detail_loss(old, new))
+        self.assertTrue(master_merge.is_richness_regression(old, new))
+
+    def test_long_single_fact_reworded_much_shorter_is_a_known_accepted_false_positive(self):
+        # Same real pair is_detail_loss correctly does NOT flag (a genuine
+        # compressed paraphrase of one fact, not a loss) - richness flags it
+        # anyway (ratio 0.20, even lower than the amenity-loss case above),
+        # because no pure length measure can tell these two cases apart (see
+        # RICHNESS_RATIO_THRESHOLD's comment). Accepted: this only forces a
+        # review a human can immediately dismiss, never a silent discard.
+        old = "Benefits from a large private terrace landscaped with plants, trees and premium Italian outdoor furniture"
+        new = "Private landscaped terrace"
+        self.assertFalse(master_merge.is_detail_loss(old, new))
+        self.assertTrue(master_merge.is_richness_regression(old, new))
+
+    def test_semicolon_reword_with_growth_is_not_flagged(self):
+        old = "Bike racks; passenger lifts; roof terrace with panoramic views"
+        new = "Racks for bikes; lifts for passengers; a terrace with panoramic views"
+        self.assertFalse(master_merge.is_richness_regression(old, new))
+
+    def test_comma_within_a_single_item_with_growth_is_not_flagged(self):
+        old = "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth"
+        new = "2 meeting rooms; a deposit of £36,000 is required; 50Mb dedicated bandwidth"
+        self.assertFalse(master_merge.is_richness_regression(old, new))
+
+    def test_dropping_one_of_six_items_is_not_flagged(self):
+        # Ratio 0.80 - a minor trim, not "meaningfully shorter".
+        old = "Bike racks, passenger lifts, LED lighting, lockers, showers, roof terrace"
+        new = "Bike racks, passenger lifts, LED lighting, lockers, showers"
+        self.assertFalse(master_merge.is_richness_regression(old, new))
+
+    def test_exactly_half_is_not_flagged(self):
+        # Strictly under the threshold, not at-or-under - a clean halving
+        # sits right at the boundary rather than past it.
+        self.assertFalse(master_merge.is_richness_regression("one two three four", "five six"))
+
+    def test_real_gracechurch_street_reword_pair_is_not_flagged(self):
+        # Real data: two listings of the same 77 Gracechurch Street unit,
+        # special_features reworded ("Fully Managed" vs "Managed lease" etc.)
+        # but not shortened (ratio 1.03).
+        old = (
+            "+ 3 meeting rooms + boardroom + executive office + collaboration space; 3-5 years term; "
+            "Fully Managed; Building Concierge; Air Conditioning; Secure Bicycle Storage; Passenger Lifts; "
+            "24/7 Access; Shower & Locker Facilities"
+        )
+        new = (
+            "+ 3 meeting rooms + boardroom + executive office + collaboration space; 3-5 years lease term; "
+            "Managed lease; Building concierge; Air conditioning; Secure bicycle storage; Passenger lifts; "
+            "24/7 access; Shower & locker facilities"
+        )
+        self.assertFalse(master_merge.is_richness_regression(old, new))
+
+    def test_blank_values_never_flagged(self):
+        self.assertFalse(master_merge.is_richness_regression(None, "Available now"))
+        self.assertFalse(master_merge.is_richness_regression(BOND_STREET_AMENITIES, None))
+
+
 class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
     """The exact reported scenario: a re-upload of an existing floor whose
     special_features shrinks from a full amenity list to a one-line
@@ -338,6 +413,32 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
         # auto-accept - see `auto_accept and not is_collision and not is_risky`.
         self.assertIn("special_features", matched.risky_fields)
         self.assertFalse(plan.collisions)  # not a collision - the safeguard is independent of that path
+
+    def test_richness_regression_flags_at_plan_level_where_item_loss_alone_would_not(self):
+        # item-loss's own documented blind spot (no ";" to itemize on) - at
+        # the build_merge_plan level, still ends up in risky_fields (and so
+        # still excluded from auto-accept) because is_richness_regression is
+        # ORed into the same computation, not a separate gate.
+        master_df = _master_df([{
+            "building": "1 Example Street",
+            "provider": "Test Provider",
+            "floor_unit": "1st Floor",
+            "postcode": "EC1A 1AA",
+            "special_features": "Fully fitted, CAT A+ finish, breakout area, phone booths, kitchen",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street",
+            provider="Test Provider",
+            floor_unit="1st Floor",
+            postcode="EC1A 1AA",
+            special_features="Fitted",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.diffs)
+        self.assertIn("special_features", matched.risky_fields)
 
     def test_normal_special_features_update_is_not_flagged(self):
         master_df = _master_df([{

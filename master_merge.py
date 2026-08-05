@@ -46,10 +46,11 @@ DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "s
 # Free-text list fields where a re-upload replacing a detailed value with a
 # much shorter one is a red flag rather than a normal update - a brochure
 # re-upload has, in practice, replaced a full amenities list with a one-line
-# availability status (see is_detail_loss). Deliberately not every str field:
-# short descriptive fields like state_of_space don't have this "list of
-# distinct items" shape, so a length/retention check on them would just be
-# noise.
+# availability status (see is_detail_loss and, for the coarser backstop that
+# catches what item-loss's own documented blind spot misses, is_richness_
+# regression). Deliberately not every str field: short descriptive fields
+# like state_of_space don't have this "list of distinct items" shape, so a
+# length/retention check on them would just be noise.
 RISKY_TEXT_FIELDS = ("special_features", "contacts")
 
 # Free-text fields where wording indicating a property is no longer on the
@@ -324,6 +325,65 @@ def is_detail_loss(old_val, new_val) -> bool:
     return any(not any(_items_similar(old_item, new_item) for new_item in new_items) for old_item in old_items)
 
 
+# Threshold for is_richness_regression - a new value under HALF of the old
+# value's word count is flagged for review even when is_detail_loss finds no
+# missing item. Matches ITEM_SIMILARITY_THRESHOLD's own 0.5, for the same
+# reason: lenient enough that a genuinely current, if terser, update still
+# goes through once a human confirms it - this is a review trigger, never a
+# block.
+#
+# Confirmed against every real/test old-new pair available when this was
+# added: correctly catches the real Bond Street amenity-list-to-one-liner
+# case (ratio 0.25) and the "Fully fitted, CAT A+ finish, breakout area,
+# phone booths, kitchen" -> "Fitted" compression (0.10, is_detail_loss's own
+# documented blind spot - no ";" to itemize on, so item-loss can't see this
+# one at all) without reintroducing a flag on the reword-with-growth cases
+# (1.22, 1.33) or the real Gracechurch St re-listing pair (1.03).
+#
+# One known, accepted false positive: "Benefits from a large private
+# terrace landscaped with plants, trees and premium Italian outdoor
+# furniture" -> "Private landscaped terrace" (0.20) is a legitimate
+# compressed paraphrase of ONE fact - is_detail_loss already recognizes
+# this correctly (see its own tests), but a pure length ratio structurally
+# cannot tell it apart from the amenity-loss case above, since it shrinks
+# by an even larger ratio (0.20 < 0.25). That's an accepted trade-off, not
+# a bug: this check only ever forces a manual review, never a silent
+# discard, so the cost is one extra glance from a human, not a wrong
+# answer applied automatically.
+RICHNESS_RATIO_THRESHOLD = 0.5
+
+
+def is_richness_regression(old_val, new_val) -> bool:
+    """
+    True when new_val's word count is under RICHNESS_RATIO_THRESHOLD of
+    old_val's - a coarse "did this get meaningfully less descriptive" check,
+    independent of is_detail_loss's per-item comparison. Exists for exactly
+    the case is_detail_loss's own docstring documents as its accepted blind
+    spot: text with no ";"/newline to itemize on collapses to a single
+    "item" for is_detail_loss, so a long comma-joined or prose value
+    compressed hard passes item-loss cleanly even though real content
+    vanished (see RICHNESS_RATIO_THRESHOLD's own comment for the real
+    example this exists to catch).
+
+    Doesn't try to tell "reworded" from "genuinely lost" apart - see
+    RICHNESS_RATIO_THRESHOLD's own comment on the terrace-rewording false
+    positive this accepts - it only measures raw shrinkage, and always
+    routes to the same manual-review gate as is_detail_loss rather than
+    deciding anything on its own.
+
+    Deliberately raw whitespace word count, not is_detail_loss's stopword-
+    filtered significant-word count - keeping this a genuinely separate,
+    simpler signal rather than a second implementation of the same
+    semantic-overlap idea.
+    """
+    if _is_blank(old_val) or _is_blank(new_val):
+        return False
+
+    old_words = len(str(old_val).split())
+    new_words = len(str(new_val).split())
+    return new_words / old_words < RICHNESS_RATIO_THRESHOLD
+
+
 def _fallback_key(row: dict) -> tuple:
     return (
         normalize_key(row.get("building")),
@@ -559,7 +619,8 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             diffs = diff_fields(old_rec, new_dict)
             silent = silent_field_updates(old_rec, new_dict)
             risky_fields = frozenset(
-                f for f in diffs if f in RISKY_TEXT_FIELDS and is_detail_loss(*diffs[f])
+                f for f in diffs
+                if f in RISKY_TEXT_FIELDS and (is_detail_loss(*diffs[f]) or is_richness_regression(*diffs[f]))
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])
