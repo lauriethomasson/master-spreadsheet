@@ -18,11 +18,19 @@ fundamentally positional data, not a visual document the way a PDF often is,
 so there's no separate vision-extraction mechanism to build here.
 """
 
+import re
 import sys
 
 from brochure_link_resolver import finalize_brochure_link
 from gemini_client import call_gemini, compute_rent, get_client
+from house_number import LEADING_HOUSE_NUMBER_RE, leading_house_number
 from schema import ExtractedFields, ListingRow
+
+# Strips render_sheet_as_text's own "Row 14: " row-number prefix back off a
+# rendered line before any house-number regex ever sees it - otherwise the
+# row number itself (also a leading digit sequence) would be mistaken for
+# the address's leading house number.
+_ROW_PREFIX_RE = re.compile(r"^Row \d+:\s*")
 
 PROMPT = """You are extracting structured commercial office availability data from ONE SHEET of a
 provider's Excel availability spreadsheet. The sheet has been converted to plain text, one line per
@@ -71,7 +79,10 @@ Then extract EVERY SEPARATE AVAILABLE UNIT:
   column (shape (a)).
 - submarket: the area/station text, from a " - " suffix on a building-name line (shape (b)) or an
   Area-like column (shape (a)).
-- address_1: the street address, if given as its own value (before any postcode).
+- address_1: the street address, if given as its own value (before any postcode). Transcribe it EXACTLY
+  character-for-character as it appears in the source text - especially a hyphenated house-number
+  range like "14-18": never shorten, round, or simplify a range down to a single number (e.g. "14-18
+  Copthall Avenue" must stay "14-18 Copthall Avenue", never become "18 Copthall Avenue").
 - postcode: the UK postcode, if given (often part of the same address text, or its own column).
 - floor_unit: the unit's own label (e.g. "4th Floor", "G/LG East", "4th & 5th (Private Terrace)").
 - size_sqft: the square footage figure for that row.
@@ -155,6 +166,131 @@ def render_sheet_as_text(ws) -> str:
     return "\n".join(lines)
 
 
+def _next_distinct_building(units: list[dict], i: int):
+    """The building name of the next unit after index i whose building
+    differs from unit i's own (units' own iteration order, after inheritance
+    has already backfilled every unit's building - see extract_sheet), or
+    None if every remaining unit shares this one's building or there are no
+    units left. Used only to bound a building's own block in the raw sheet
+    text (see _raw_house_number_for_unit) - several consecutive units
+    legitimately share one building block (one row each for that building's
+    own several available floors), so the block's end is the next DIFFERENT
+    building, not simply the next unit."""
+    current = units[i]["building"]
+    for unit in units[i + 1:]:
+        if unit["building"] != current:
+            return unit["building"]
+    return None
+
+
+def _raw_house_number_for_unit(raw_text: str, building, next_building, postcode):
+    """
+    The leading house-number token (see leading_house_number) of the raw
+    sheet-text line that actually belongs to this unit's address - the
+    ground truth to verify Gemini's own address_1 extraction against, since
+    a regex over the raw text can't drop characters the way an LLM
+    transcription can. Returns None whenever no single raw line can be
+    identified with confidence - callers must then leave Gemini's own
+    extraction untouched rather than risk overriding a correct value from an
+    ambiguous match.
+
+    Two strategies, preferring the more direct one:
+    - postcode given: the address line is whichever raw line contains that
+      exact postcode text - reliable regardless of sheet shape, but only
+      when EXACTLY one raw line contains it (0 or multiple is ambiguous).
+    - no postcode: fall back to this building's own "block" in a repeating-
+      block sheet (see PROMPT's shape (b)) - the lines between this
+      building's own heading line and the next DIFFERENT building's heading
+      line (or end of text) - and take the first line in that block whose
+      own leading cell starts with a house number. Shape (a) (one
+      consistent table, building repeated per row with no distinct heading
+      line) has no such block to find, so this returns None for it - the
+      postcode strategy is the only reliable one there.
+    """
+    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
+
+    if postcode and str(postcode).strip():
+        needle = str(postcode).strip().lower()
+        matches = [line for line in lines if needle in line.lower()]
+        if len(matches) != 1:
+            return None
+        return leading_house_number(matches[0].split("|", 1)[0])
+
+    if not building or not str(building).strip():
+        return None
+    building_key = str(building).strip().lower()
+    start = next((i for i, line in enumerate(lines) if line.strip().lower().startswith(building_key)), None)
+    if start is None:
+        return None
+
+    end = len(lines)
+    if next_building and str(next_building).strip().lower() != building_key:
+        next_key = str(next_building).strip().lower()
+        later = [i for i in range(start + 1, len(lines)) if lines[i].strip().lower().startswith(next_key)]
+        if later:
+            end = later[0]
+
+    candidates = [
+        leading_house_number(lines[i].split("|", 1)[0])
+        for i in range(start + 1, end)
+    ]
+    candidates = [n for n in candidates if n is not None]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _splice_leading_house_number(address_1: str, raw_token: str) -> str:
+    """address_1 with only its OWN leading house-number token replaced by
+    raw_token, everything else Gemini extracted (street name spelling,
+    capitalization, trailing postcode text, etc.) left exactly as-is - never
+    a wholesale replacement with the raw line's own full text, which may
+    carry link labels or other columns' content that don't belong in
+    address_1 at all."""
+    match = LEADING_HOUSE_NUMBER_RE.match(address_1)
+    if match:
+        return raw_token + address_1[match.end():]
+    return f"{raw_token} {address_1.strip()}"
+
+
+def _verify_address_house_numbers(units: list[dict], raw_text: str, sheet_label: str):
+    """
+    Cross-checks every unit's Gemini-extracted address_1 against the raw
+    sheet text its building block came from (see _raw_house_number_for_unit)
+    and corrects it in place whenever the two disagree on the leading house
+    number - the real, confirmed failure mode this guards against: Gemini
+    transcribing "14-18 Copthall Avenue" as just "18 Copthall Avenue",
+    silently dropping the first half of a hyphenated range. Regex parsing of
+    the raw cell text is deterministic and can't drop characters the way an
+    LLM transcription can, so it wins whenever the two disagree.
+
+    Mutates each unit dict's "address_1" in place; a unit with no address_1
+    at all is skipped (nothing to verify). When no raw line can be
+    identified with confidence, the value is left untouched and a warning is
+    printed to stderr (same style as geocode.py's log_geocode_failure) so a
+    silently-unverifiable extraction is still visible in extraction logs,
+    rather than either crashing or guessing.
+    """
+    for i, unit in enumerate(units):
+        address_1 = unit.get("address_1")
+        if not address_1 or not str(address_1).strip():
+            continue
+
+        raw_token = _raw_house_number_for_unit(
+            raw_text, unit.get("building"), _next_distinct_building(units, i), unit.get("postcode")
+        )
+        if raw_token is None:
+            print(
+                f"[extract_spreadsheet_gemini] WARNING: {sheet_label} unit {i} "
+                f"({unit.get('building')!r}) - could not confidently locate this unit's "
+                f"address line in the raw sheet text to verify address_1 {address_1!r} "
+                "against; leaving it as extracted.",
+                file=sys.stderr,
+            )
+            continue
+
+        if raw_token != leading_house_number(address_1):
+            unit["address_1"] = _splice_leading_house_number(address_1, raw_token)
+
+
 def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
     """
     ws: an openpyxl worksheet (already loaded by the caller - see app.py,
@@ -180,7 +316,7 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
         "contacts": raw.get("contacts"),
     }
 
-    rows = []
+    units = []
     last_building = None
     for i, unit in enumerate(raw.get("units", [])):
         if not unit.get("building"):
@@ -193,7 +329,15 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
                 continue
             unit["building"] = last_building
         last_building = unit["building"]
+        units.append(unit)
 
+    # Runs only once every unit's building is resolved (inheritance above) -
+    # _next_distinct_building needs every unit's real building name to find
+    # a block's boundary, not just the ones that restated their own.
+    _verify_address_house_numbers(units, text, sheet_label)
+
+    rows = []
+    for unit in units:
         unit["brochure_link"] = finalize_brochure_link(
             unit.get("brochure_link"), is_pdf=False, pdf_fallback_link=filename
         )

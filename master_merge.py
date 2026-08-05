@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from house_number import LEADING_HOUSE_NUMBER_RE as _LEADING_HOUSE_NUMBER_RE
+from house_number import leading_house_number as _leading_house_number
 from schema import ListingRow
 from storage.file_store import clean_value
 
@@ -589,33 +591,10 @@ _STREET_SUFFIX_EXPANSIONS = {
     "cres": "crescent", "gdns": "gardens", "ter": "terrace",
 }
 
-# A leading house number, e.g. "89", "27-30", "56a" - see
-# _leading_house_number/_address_street_key. Matched against the RAW
-# building string, not normalize_key(building) - normalize_key strips "-"
-# as punctuation, which would mangle a real range like "27-30" into "2730"
-# before this pattern ever saw the hyphen (confirmed against a real
-# Copthall Estates address, "27-30 Lime Street"). \b after the optional
-# letter/range so "27" doesn't partially match inside an unrelated word
-# starting with a digit (there are none in real building names seen so
-# far, but this costs nothing to guard against). Case-insensitive since
-# it runs before any lowercasing.
-_LEADING_HOUSE_NUMBER_RE = re.compile(r"^\s*(\d+[a-z]?(?:-\d+[a-z]?)?)\b", re.IGNORECASE)
-
-
-def _leading_house_number(building):
-    """The leading house-number token building starts with (e.g. "89",
-    "27-30"), lowercased, or None if it doesn't start with one at all - used
-    only to guard _address_street_key's intra-batch grouping (see
-    unmatched_collisions) against merging two genuinely DIFFERENT numbered
-    units on the same street: "27 Cannon Street" and "108 Cannon Street" are
-    a real, confirmed-different pair elsewhere in this project's data
-    (BUILDING_FUZZY_MATCH_THRESHOLD's own comment), and must never collapse
-    together just because they share a street name once their own distinct
-    numbers are stripped."""
-    if _is_blank(building):
-        return None
-    match = _LEADING_HOUSE_NUMBER_RE.match(str(building))
-    return match.group(1).lower() if match else None
+# _leading_house_number is imported from house_number.py (see that module's
+# own docstring) - shared verbatim with extract_spreadsheet_gemini.py's
+# address_1 verification pass, rather than reimplemented here, so the two
+# never drift apart on what counts as "the leading house number".
 
 
 def house_number_changed(old_val, new_val) -> bool:
