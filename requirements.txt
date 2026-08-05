@@ -4,6 +4,16 @@ google-cloud-storage
 pydantic
 openpyxl
 streamlit==1.60.0
+# Streamlit declares starlette<2,>=0.40.0 (a very wide, unpinned transitive
+# range) but its own bundled GZip middleware wrapper (streamlit/web/server/
+# starlette/starlette_gzip_middleware.py) is only actually compatible with
+# older starlette releases - a newer starlette within that same range added
+# a required keyword-only `thread_minimum_size` argument to GZipResponder,
+# which that wrapper never passes, raising a TypeError on every single
+# request. Pinned explicitly to the version confirmed working in this repo's
+# own dev environment, so a fresh build can no longer silently drift onto
+# an incompatible newer release.
+starlette==1.3.1
 pandas
 httpx
 beautifulsoup4
