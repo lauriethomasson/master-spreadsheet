@@ -185,7 +185,19 @@ def _resolve_cell_value(value_cell, formula_cell):
     return _parse_xludf_fallback(formula_cell.value)
 
 
-def read_spreadsheet(data: bytes, suffix: str) -> pd.DataFrame:
+def list_sheet_names(data: bytes, suffix: str) -> list:
+    """
+    Every sheet name in an .xlsx workbook, in file order - [None] for a .csv
+    (which has no sheet concept at all), so a caller can loop `for sheet_name
+    in list_sheet_names(...)` uniformly across both suffixes without a
+    separate branch, passing sheet_name straight through to read_spreadsheet.
+    """
+    if suffix == ".csv":
+        return [None]
+    return list(load_workbook(BytesIO(data), read_only=True).sheetnames)
+
+
+def read_spreadsheet(data: bytes, suffix: str, sheet_name: str = None) -> pd.DataFrame:
     """
     Reads an uploaded provider spreadsheet's raw headers/rows exactly as the
     provider wrote them - unlike storage.file_store.read_xlsx_with_hyperlinks
@@ -193,6 +205,11 @@ def read_spreadsheet(data: bytes, suffix: str) -> pd.DataFrame:
     write_rows_to_xlsx), headers here are whatever text is actually in row 1;
     which one means what is decided later by suggest_mapping/the confirm-
     mapping UI, never assumed from position or a fixed label set.
+
+    sheet_name selects a specific sheet in a multi-sheet .xlsx (see
+    list_sheet_names) - defaults to the workbook's active sheet, preserving
+    prior single-sheet-file behavior for every existing caller. Ignored for
+    .csv, which has only one sheet by construction.
 
     Every .xlsx cell carrying a real hyperlink target uses that target
     instead of its displayed text (e.g. a "Brochure PDF" column showing just
@@ -212,9 +229,9 @@ def read_spreadsheet(data: bytes, suffix: str) -> pd.DataFrame:
         return pd.read_csv(BytesIO(data))
 
     wb_values = load_workbook(BytesIO(data), data_only=True)
-    ws_values = wb_values.active
+    ws_values = wb_values[sheet_name] if sheet_name else wb_values.active
     wb_formulas = load_workbook(BytesIO(data), data_only=False)
-    ws_formulas = wb_formulas.active
+    ws_formulas = wb_formulas[sheet_name] if sheet_name else wb_formulas.active
 
     headers = [
         _resolve_cell_value(vcell, fcell) for vcell, fcell in zip(ws_values[1], ws_formulas[1])

@@ -830,5 +830,49 @@ class ReadSpreadsheetXludfIntegrationTests(unittest.TestCase):
         self.assertEqual(df.iloc[0]["Size (sq ft)"], 759)
 
 
+class ListSheetNamesTests(unittest.TestCase):
+    def test_csv_has_no_sheet_concept(self):
+        self.assertEqual(extract_spreadsheet.list_sheet_names(b"a,b\n1,2\n", ".csv"), [None])
+
+    def test_xlsx_returns_every_sheet_in_file_order(self):
+        wb = Workbook()
+        wb.active.title = "City"
+        wb.create_sheet("Mid Town")
+        wb.create_sheet("Portfolio")
+        buffer = BytesIO()
+        wb.save(buffer)
+
+        names = extract_spreadsheet.list_sheet_names(buffer.getvalue(), ".xlsx")
+
+        self.assertEqual(names, ["City", "Mid Town", "Portfolio"])
+
+
+class ReadSpreadsheetSheetNameTests(unittest.TestCase):
+    def _build_two_sheet_xlsx(self) -> bytes:
+        wb = Workbook()
+        ws1 = wb.active
+        ws1.title = "City"
+        ws1["A1"] = "Building"
+        ws1["A2"] = "28 Lime Street"
+
+        ws2 = wb.create_sheet("Mid Town")
+        ws2["A1"] = "Building"
+        ws2["A2"] = "89 Charterhouse Street"
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    def test_no_sheet_name_defaults_to_active_sheet(self):
+        # Regression check: every pre-existing caller omits sheet_name and
+        # must keep reading the same (active) sheet it always did.
+        df = extract_spreadsheet.read_spreadsheet(self._build_two_sheet_xlsx(), ".xlsx")
+        self.assertEqual(df.iloc[0]["Building"], "28 Lime Street")
+
+    def test_explicit_sheet_name_reads_that_sheet(self):
+        df = extract_spreadsheet.read_spreadsheet(self._build_two_sheet_xlsx(), ".xlsx", sheet_name="Mid Town")
+        self.assertEqual(df.iloc[0]["Building"], "89 Charterhouse Street")
+
+
 if __name__ == "__main__":
     unittest.main()

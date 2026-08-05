@@ -2,13 +2,16 @@ import hashlib
 import re
 import tempfile
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
+from openpyxl import load_workbook
 
 import extract
 import extract_email
 import extract_spreadsheet
+import extract_spreadsheet_gemini
 import page_flow
 import page_setup
 from display_utils import LONDON_TZ
@@ -39,9 +42,9 @@ _CRITICAL_FIELD_LABELS = {"building": "the building name"}
 # results created by older extraction code from being reused.
 EXTRACTION_VERSION = "3"
 
-# Spreadsheet extraction has no Gemini call and is fully deterministic - the
-# only way its cached result could ever go stale is a change to
-# extract_spreadsheet.py's own mapping/guessing logic itself (suggest_
+# Column-header mapping (extract_spreadsheet.py) has no Gemini call and is
+# fully deterministic - the only way its cached result could ever go stale
+# is a change to that module's own mapping/guessing logic itself (suggest_
 # mapping, guess_provider_name, FIELD_SYNONYMS, etc.), never anything
 # EXTRACTION_VERSION above is meant to track. Confirmed to have actually
 # gone stale this way: a real fix to that logic landed without EXTRACTION_
@@ -49,10 +52,18 @@ EXTRACTION_VERSION = "3"
 # changed), so a byte-identical re-upload of an already-staged spreadsheet
 # kept silently reusing its pre-fix cached rows - dedup working exactly as
 # designed, just against the wrong invalidation signal for this source
-# type. Hashing extract_spreadsheet.py's own source directly instead makes
-# invalidation for the spreadsheet path automatic and self-maintaining - no
-# version number to remember, ever, for this source type specifically.
-_SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(Path(extract_spreadsheet.__file__).read_bytes()).hexdigest()
+# type. Hashing the source of both spreadsheet-path modules directly instead
+# makes invalidation automatic and self-maintaining - no version number to
+# remember, ever, for this source type specifically. extract_spreadsheet_
+# gemini.py is included here too even though IT does call Gemini (and so
+# isn't "fully deterministic" the way the comment above once meant) -
+# folding it into the same fingerprint is still correct: a prompt/logic
+# change there must invalidate a cached result exactly like a mapping-logic
+# change does, for the same reason, even though a fresh (non-cached) call to
+# that module was never guaranteed byte-identical to begin with.
+_SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
+    Path(extract_spreadsheet.__file__).read_bytes() + Path(extract_spreadsheet_gemini.__file__).read_bytes()
+).hexdigest()
 
 
 def fill_missing_provider(rows: list[ListingRow], filename: str, apply_filename_guess: bool) -> None:
@@ -133,16 +144,19 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
     geocode_rows, not before - filling address_1 first would make
     geocode_row see it as already present and skip its own lookup.
 
-    apply_building_fallback is True for spreadsheet-sourced rows only, same
-    scoping as fill_missing_provider's apply_filename_guess and for the
+    apply_building_fallback is True for HEADER-MAPPED spreadsheet rows only,
+    same scoping as fill_missing_provider's apply_filename_guess and for the
     same reason: a blank address_1 on a PDF/email row is frequently
     Gemini's own deliberate, meaningful answer, not a missed extraction
     (see schema.ExtractedFields' own address_1 comment - "not every source,
     e.g. email listings, states a street address" - never fabricate).
     building holding an address-like string doesn't change that judgment
-    call for those sources. A spreadsheet has no equivalent judgment call:
-    if no column states an address and geocoding couldn't resolve one
-    either, building's own value is the best signal left.
+    call for those sources - and a spreadsheet row extracted via Gemini
+    (see extract_spreadsheet_gemini.py) has made that exact same judgment
+    call already, so it's scoped out here too. A HEADER-MAPPED spreadsheet
+    row has no equivalent judgment call: if no column states an address and
+    geocoding couldn't resolve one either, building's own value is the best
+    signal left.
     """
     if not apply_building_fallback:
         return
@@ -152,6 +166,33 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
             continue
         if row.building and _ADDRESS_LIKE_RE.search(row.building):
             row.address_1 = row.building
+
+
+def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) -> None:
+    """
+    A cheap, visible sanity check for Gemini-extracted spreadsheet rows only
+    (see extract_spreadsheet_gemini.extract_sheet) - header-mapping has no
+    equivalent failure mode (a mapped column either has real values or it
+    doesn't; there's nothing to "garble"), but Gemini will attempt to
+    produce SOME output regardless of how well it actually understood a
+    malformed or unusual sheet layout, with no exception raised to signal a
+    bad read. Flags - visibly, in the upload UI, not just a stderr log -
+    when a large share of a sheet's extracted units are missing BOTH
+    size_sqft and any rent figure: a real listing almost always states at
+    least one of these, so that combination is a strong signal of a
+    genuinely garbled read rather than a sheet that legitimately never
+    states this data (which would instead miss just one or the other, not
+    both, across most of its rows).
+    """
+    if not rows:
+        return
+    missing = sum(1 for r in rows if r.size_sqft is None and r.rent_pcm is None and r.rent_psf is None)
+    if missing / len(rows) > 0.5:
+        st.warning(
+            f"⚠️ {sheet_label}: {missing} of {len(rows)} extracted row(s) are missing both size and "
+            "rent figures - this may mean the AI misread this sheet's layout. Please check these rows "
+            "carefully before approving."
+        )
 
 
 with page_setup.setup_page("upload"):
@@ -235,7 +276,12 @@ with page_setup.setup_page("upload"):
                 choice = st.selectbox(f'Column for "{field}"', options, key=f"rescue_{h_hash}_{field}")
                 assignments[field] = None if choice == _NO_SUCH_COLUMN else choice
             if assignments.get("building") is None:
-                st.warning('Confirming "(no such column)" for building means this format will produce zero rows.')
+                st.warning(
+                    'Confirming "(no such column)" for building means this file will be sent to '
+                    "AI-based extraction instead of column-mapping (see extract_spreadsheet_gemini.py) - "
+                    "slower and with a small ongoing cost per upload, but able to handle a layout with "
+                    "no single building column at all."
+                )
             if st.button("Confirm", key=f"confirm_rescue_{h_hash}"):
                 save_critical_field_rescue(h_hash, info["headers"], assignments)
                 st.rerun()
@@ -293,42 +339,105 @@ with page_setup.setup_page("upload"):
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
                         reused = True
+                        # Preserves the exact pre-existing behavior for a
+                        # cached result: origin (header-mapped vs Gemini-
+                        # extracted) isn't recoverable from a reloaded
+                        # staging file, so this can't apply the origin-aware
+                        # scoping the fresh-extraction branches below use -
+                        # a properly-processed cached row should already
+                        # have gone through its own real fallback once,
+                        # during the original run that produced it, making
+                        # this a no-op in the overwhelmingly common case
+                        # (both functions only ever fill an actually-blank
+                        # value).
+                        is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
+                        fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=is_spreadsheet_source)
+                        fill_missing_address_from_building(rows, apply_building_fallback=is_spreadsheet_source)
                     elif suffix in SPREADSHEET_SUFFIXES:
-                        # No temp file, no Gemini call - a spreadsheet is
-                        # already one row per property; the only thing
-                        # needed is a header->field mapping, worked out
-                        # automatically here (see suggest_mapping) with no
-                        # per-column human confirmation step - a non-
-                        # critical column suggest_mapping can't place is
-                        # simply dropped. A CRITICAL field (building) is
-                        # different - see the rescue block above, resolved
-                        # (or confirmed genuinely absent) before this
-                        # button could even be clicked.
-                        df = extract_spreadsheet.read_spreadsheet(uploaded_file.getvalue(), suffix)
-                        headers = list(df.columns)
-                        h_hash = extract_spreadsheet.header_hash(headers)
-                        mapping = extract_spreadsheet.suggest_mapping(headers)
-                        # Same fallback applied at upload time above (see its
-                        # comment there) - must run here too, or a format that
-                        # fallback resolves (suppressing the rescue prompt)
-                        # would still hit the "missing required field" error
-                        # below the moment Extract is actually clicked.
-                        mapping = extract_spreadsheet.apply_provider_structural_fallback(
-                            mapping, headers, uploaded_file.name
-                        )
-                        saved_rescue = get_saved_critical_field_rescue(h_hash)
-                        rescue = saved_rescue["assignments"] if saved_rescue else {}
-                        mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
-                        unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
-                        if unresolved:
-                            raise ValueError(
-                                f"{uploaded_file.name}: missing required field(s) {', '.join(unresolved)} - "
-                                "confirm the column above, then click Extract again."
+                        # Column mapping (see suggest_mapping) is tried first,
+                        # per sheet - free and instant, no Gemini call, for
+                        # any sheet shaped like a single consistent table
+                        # (Kitt's/UNION exports). A sheet whose CRITICAL field
+                        # (building) still can't be resolved this way - no
+                        # single column states it at all, e.g. a repeating
+                        # per-building block layout (real Copthall Estates
+                        # files) rather than one table - falls back to
+                        # Gemini text extraction (extract_spreadsheet_gemini)
+                        # for THAT SHEET ONLY, the same text-extraction
+                        # machinery extract_email.py already uses. Each
+                        # sheet in a multi-sheet .xlsx is judged and
+                        # processed independently; a .csv has exactly one
+                        # (see list_sheet_names).
+                        rows = []
+                        header_mapped_rows = []
+                        gemini_rows = []
+                        wb_for_gemini = None  # lazily opened - most files never need it
+                        sheet_names = extract_spreadsheet.list_sheet_names(uploaded_file.getvalue(), suffix)
+                        # A multi-sheet file where every sheet needs the
+                        # Gemini fallback (confirmed against the real
+                        # Copthall Estates file: 6 sheets, ~150s total) gives
+                        # no feedback at all for minutes at a time otherwise -
+                        # the outer st.spinner's own text is fixed for the
+                        # whole file, not updated per sheet.
+                        sheet_progress = st.empty()
+                        for sheet_idx, sheet_name in enumerate(sheet_names, start=1):
+                            if len(sheet_names) > 1:
+                                sheet_progress.caption(
+                                    f"Reading sheet {sheet_idx} of {len(sheet_names)}: {sheet_name}..."
+                                )
+                            df = extract_spreadsheet.read_spreadsheet(
+                                uploaded_file.getvalue(), suffix, sheet_name=sheet_name
                             )
+                            headers = list(df.columns)
+                            h_hash = extract_spreadsheet.header_hash(headers)
+                            mapping = extract_spreadsheet.suggest_mapping(headers)
+                            # Same fallback applied at upload time above (see
+                            # its comment there) - must run here too, or a
+                            # format that fallback resolves (suppressing the
+                            # rescue prompt) would still fall back to Gemini
+                            # unnecessarily the moment Extract is clicked.
+                            mapping = extract_spreadsheet.apply_provider_structural_fallback(
+                                mapping, headers, uploaded_file.name
+                            )
+                            saved_rescue = get_saved_critical_field_rescue(h_hash)
+                            rescue = saved_rescue["assignments"] if saved_rescue else {}
+                            mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
+                            unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
 
-                        rows = extract_spreadsheet.build_rows(df, mapping, source_file=uploaded_file.name)
-                        fill_missing_submarket_from_structural_header(rows, headers, uploaded_file.name)
+                            sheet_label = f"{uploaded_file.name} — {sheet_name}" if sheet_name else uploaded_file.name
+
+                            if unresolved:
+                                if wb_for_gemini is None:
+                                    wb_for_gemini = load_workbook(BytesIO(uploaded_file.getvalue()), data_only=True)
+                                ws = wb_for_gemini[sheet_name] if sheet_name else wb_for_gemini.active
+                                sheet_rows = extract_spreadsheet_gemini.extract_sheet(
+                                    ws, sheet_label, uploaded_file.name
+                                )
+                                if not sheet_rows:
+                                    st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
+                                else:
+                                    _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
+                                gemini_rows.extend(sheet_rows)
+                            else:
+                                sheet_rows = extract_spreadsheet.build_rows(df, mapping, source_file=sheet_label)
+                                fill_missing_submarket_from_structural_header(sheet_rows, headers, uploaded_file.name)
+                                header_mapped_rows.extend(sheet_rows)
+
+                            rows.extend(sheet_rows)
+
+                        sheet_progress.empty()
                         geocode_rows(rows)
+                        # apply_filename_guess/apply_building_fallback=True
+                        # only for header-mapped rows - a Gemini-extracted
+                        # sheet has already made its own genuine judgment
+                        # call about whether a provider/address genuinely
+                        # exists (same reasoning as PDF/email, see both
+                        # functions' own docstrings), so guessing on top of
+                        # that would risk exactly the "misrepresenting a
+                        # landlord-direct listing as agent-represented"
+                        # problem those docstrings warn about.
+                        fill_missing_provider(header_mapped_rows, uploaded_file.name, apply_filename_guess=True)
+                        fill_missing_address_from_building(header_mapped_rows, apply_building_fallback=True)
                         reused = False
                     else:
                         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -357,31 +466,21 @@ with page_setup.setup_page("upload"):
                             tmp_path = None
 
                         geocode_rows(rows)
+                        # Existing extracted provider/address values are
+                        # never overwritten - see fill_missing_provider's own
+                        # docstring for why PDF/email must never get either
+                        # guess applied on top of Gemini's own judgment call.
+                        fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=False)
+                        fill_missing_address_from_building(rows, apply_building_fallback=False)
                         reused = False
-                    # Both fallbacks below only ever apply to spreadsheet-
-                    # sourced rows, reused or fresh alike (a reused row's
-                    # suffix is still the current re-upload's own suffix,
-                    # since content_hash only matches when the bytes - and
-                    # therefore the file type - are identical). Run AFTER
-                    # geocode_rows() above (already true for every branch:
-                    # the spreadsheet/PDF/email branches call it directly,
-                    # and a reused row was already fully geocoded in a
-                    # prior run) - see fill_missing_address_from_building's
-                    # own docstring for why the ordering matters.
-                    is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
-
-                    # Existing extracted provider values are never
-                    # overwritten - see fill_missing_provider's own
-                    # docstring for why PDF/email must never get this guess.
-                    fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=is_spreadsheet_source)
 
                     # Fixes known spelling/capitalization drift (e.g. Gemini's
                     # own extraction non-determinism on "Workplace Plus" vs
                     # "Workplace+" vs "WORKPLACE+") before these rows ever
                     # reach matching/diffing - see canonicalize_provider_name.
+                    # Unconditional and idempotent, so it's safe to run once
+                    # here regardless of which branch above produced rows.
                     canonicalize_providers(rows)
-
-                    fill_missing_address_from_building(rows, apply_building_fallback=is_spreadsheet_source)
 
                     # Staged immediately, per file (reused or freshly
                     # extracted alike) - so a failure partway through a
