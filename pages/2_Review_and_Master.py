@@ -60,6 +60,86 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
     return approved
 
 
+def _render_merge_field_choice(field_name: str, values: list, labels: list, key: str):
+    """
+    One field's peer-value comparison for the intra-batch duplicate merge UI
+    - same bordered side-by-side visual language as display_utils.
+    render_before_after, generalized from 2 columns to however many pending
+    rows are in the duplicate group, plus a radio to pick which source's
+    value survives into the merged row. Only called when master_merge.
+    merge_field_choice has already established the values genuinely differ
+    - a field where every source agrees never reaches this function at all.
+    """
+    st.markdown(f"**{field_name}**")
+    cols = st.columns(len(values), border=True)
+    for col, label, val in zip(cols, labels, values):
+        with col:
+            st.caption(label.upper())
+            st.write("—" if val in (None, "") else val)
+    default_index = master_merge.default_merge_choice_index(values)
+    choice_index = st.radio(
+        "Keep value from:", range(len(values)), index=default_index,
+        format_func=lambda i: labels[i], key=f"{key}_choice", horizontal=True,
+    )
+    st.divider()
+    return values[choice_index]
+
+
+def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_final: list) -> None:
+    """
+    group: list[master_merge.UnmatchedRow] sharing the same dedup key (see
+    master_merge._dedup_key) - the same real property uploaded more than
+    once in this batch, each copy independently failing to match master.
+    Defaults to treating them as the same property (merge), since that's
+    what a shared match key means by construction - but never silently
+    forces it: an explicit "these are different" escape hatch stays
+    available in case the match key coincidentally collided.
+
+    On merge, every field where the sources agree (see merge_field_choice)
+    carries straight through with no choice needed; a field where they
+    genuinely differ gets its own radio (see _render_merge_field_choice).
+    Confirming produces exactly ONE new ListingRow with a fresh property_id
+    - never two, and never a value silently discarded without the reviewer
+    seeing it was an option.
+    """
+    dicts = [u.new_row.model_dump() for u in group]
+    labels = [d.get("source_file") or f"Row {i + 1}" for i, d in enumerate(dicts)]
+
+    with st.expander(
+        f"⚠️ Possible duplicate — {len(group)} rows look like the same property: "
+        f"{display_utils.row_label(dicts[0])}",
+        key=f"{key_prefix}_expander",
+    ):
+        same_property = st.radio(
+            "Are these the same property?",
+            ["Yes — merge into one property", "No — these are genuinely different properties"],
+            key=f"{key_prefix}_same",
+        )
+
+        if same_property.startswith("Yes"):
+            merged = {}
+            for f in master_merge.DIFF_FIELDS:
+                values = [d.get(f) for d in dicts]
+                needs_choice, resolved = master_merge.merge_field_choice(values)
+                merged[f] = (
+                    _render_merge_field_choice(f, values, labels, f"{key_prefix}_{f}") if needs_choice else resolved
+                )
+
+            confirm_merge = st.checkbox(
+                "Confirm — add as one merged property", value=True, key=f"{key_prefix}_confirm"
+            )
+            if confirm_merge:
+                merged["property_id"] = str(uuid.uuid4())
+                merged["source_file"] = " + ".join(labels)
+                new_rows_final.append(ListingRow(**merged))
+        else:
+            for d in dicts:
+                st.write(display_utils.row_label(d))
+            new_rows_final.extend(
+                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in group
+            )
+
+
 def _render_let_status_decision(m, key_prefix: str) -> str:
     """
     Prominently shown - never inside a collapsed expander like a normal
@@ -582,39 +662,41 @@ def _render_pending_review(pending: list):
         _apply_silent(m)
 
     if plan.unmatched:
-        non_collision_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
-        collision_new = [u for u in plan.unmatched if id(u) in colliding_unmatched_ids]
+        collision_ids = {id(u) for group in plan.unmatched_collisions for u in group}
+        near_miss = [u for u in plan.unmatched if id(u) not in collision_ids and u.suggestions]
+        plain_new = [u for u in plan.unmatched if id(u) not in collision_ids and not u.suggestions]
 
-        if non_collision_new or collision_new:
+        if plain_new or near_miss or plan.unmatched_collisions:
             st.subheader("No match found — will be added as new")
 
-        if non_collision_new:
-            for label in master_merge.new_property_labels([u.new_row for u in non_collision_new]):
+        # Ordinary new properties: no batch duplicate, no near-miss against
+        # master - nothing to decide, so this stays a plain one-line list
+        # (see master_merge.new_property_labels) rather than the detailed
+        # comparison view below, which is reserved for rows that actually
+        # need a decision.
+        if plain_new:
+            for label in master_merge.new_property_labels([u.new_row for u in plain_new]):
                 st.write(label)
             new_rows_final.extend(
-                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in non_collision_new
+                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
             )
 
-        if collision_new:
+        # Near-misses against an EXISTING master property (not a batch
+        # duplicate) - a genuine decision (is this actually that property,
+        # reworded/typo'd?), so it keeps the detailed link-or-confirm UI.
+        if near_miss:
             master_options = {"— add as new —": None}
             for rec in plan.master_records:
                 master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
 
-            for i, u in enumerate(collision_new):
+            for i, u in enumerate(near_miss):
                 row_dict = u.new_row.model_dump()
-                key_prefix = f"unmatched_collision_{i}"
+                key_prefix = f"near_miss_{i}"
                 with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
-                    summary = {
-                        k: v for k, v in row_dict.items()
-                        if k not in ("property_id", "source_file") and v not in (None, "")
-                    }
-                    st.write(summary)
-
-                    if u.suggestions:
-                        st.caption(
-                            "Possible near-misses already in the master: "
-                            + ", ".join(display_utils.row_label(s) for s in u.suggestions)
-                        )
+                    st.caption(
+                        "Possible near-misses already in the master: "
+                        + ", ".join(display_utils.row_label(s) for s in u.suggestions)
+                    )
 
                     choice_label = st.selectbox(
                         "What should happen with this row?",
@@ -651,6 +733,14 @@ def _render_pending_review(pending: list):
                                 entry = updates.setdefault(target_index, {})
                                 entry.update(approved_fields)
                                 entry["source_file"] = u.new_row.source_file
+
+        # Intra-batch duplicates: two or more pending rows independently
+        # failing to match master, but matching EACH OTHER (see
+        # master_merge._dedup_key) - offered a field-level merge into one
+        # property, not a forced choice between "add both" or "add one,
+        # discard the other's data".
+        for i, group in enumerate(plan.unmatched_collisions):
+            _render_intra_batch_duplicate_group(group, f"batch_dup_{i}", new_rows_final)
 
     if plan.matched_unchanged:
         st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")

@@ -554,6 +554,62 @@ def _primary_key(row: dict):
     return _fallback_key(row) + (_normalize_postcode(row.get("postcode")),)
 
 
+def _dedup_key(row: dict):
+    """Grouping key for intra-batch duplicate detection (see
+    unmatched_collisions below) - the same postcode-preferring tiering
+    _primary_key/_fallback_key already use for matching a new row against
+    MASTER, applied instead pairwise among pending rows themselves so two
+    rows that both independently fail to match master can still be
+    recognized as the same property. Prefers the postcode-inclusive key
+    when a row has one: two rows sharing building+provider+floor_unit but
+    with DIFFERENT non-blank postcodes are deliberately never grouped - a
+    postcode difference is real signal against merging, not just missing
+    data, same principle as _primary_key's own postcode requirement."""
+    return _primary_key(row) or _fallback_key(row)
+
+
+def merge_field_choice(values: list) -> tuple:
+    """
+    For one field across a group of intra-batch duplicate rows (see
+    _dedup_key/unmatched_collisions - pages/2_Review_and_Master.py calls
+    this once per field when rendering the merge UI): returns (needs_choice,
+    resolved_value).
+
+    needs_choice is False only when `values` has no real disagreement at
+    all: every value is blank (resolved_value is then None), or every value
+    is the same non-blank value (tolerant-equal - see _values_equal, so
+    "METSPACE" vs "Metspace" counts as agreeing; resolved_value is that
+    shared value). needs_choice is True the moment two values fall into
+    different "classes" - including one source blank and another non-blank,
+    not just two DIFFERENT non-blank values - resolved_value is then None
+    and the caller must ask a human to pick one of `values` itself (see
+    default_merge_choice_index, which is exactly what lets a blank-vs-filled
+    case default to the filled one without hiding the choice entirely - a
+    reviewer can still deliberately pick "blank" if the one value present
+    is actually wrong for the merged property, rather than that ever being
+    silently decided for them).
+    """
+    classes = []  # one representative value per distinct class seen so far
+    for v in values:
+        blank = _is_blank(v)
+        if any(blank == _is_blank(rep) and (blank or _values_equal(v, rep)) for rep in classes):
+            continue
+        classes.append(v)
+    if len(classes) <= 1:
+        return False, (classes[0] if classes else None)
+    return True, None
+
+
+def default_merge_choice_index(values: list) -> int:
+    """Index into `values` to preselect in the merge-choice UI when
+    merge_field_choice says a human must pick - the one non-blank source
+    when exactly one is non-blank, else the first value (arbitrary but
+    predictable; the human sees every actual value in the UI and can always
+    override the preselection)."""
+    non_blank = [i for i, v in enumerate(values) if not _is_blank(v)]
+    return non_blank[0] if len(non_blank) == 1 else 0
+
+
 def row_label(row_dict: dict) -> str:
     parts = [row_dict.get("building") if not _is_blank(row_dict.get("building")) else "(no building)"]
     if not _is_blank(row_dict.get("provider")):
@@ -596,12 +652,30 @@ def new_property_labels(rows: list) -> list:
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
     """Cheap, stdlib-only fuzzy hint for the "no match" review section - not
     part of matching itself, just reduces manual searching when a near-miss
-    (e.g. a slightly different building spelling) is the real cause."""
-    target = normalize_key(new_dict.get("building"))
+    (e.g. a slightly different building spelling) is the real cause.
+
+    Reuses BUILDING_FUZZY_MATCH_THRESHOLD and _building_has_no_digits - the
+    same validated threshold and numbered-address exclusion the real fuzzy-
+    matching tier uses (_fuzzy_building_match) - rather than a separate,
+    untuned cutoff. A lower cutoff here previously suggested completely
+    unrelated buildings: confirmed against real data, "77 Gracechurch
+    Street" spuriously matched "27 Greville Street", "55 Grosvenor Street",
+    and "141 Fenchurch Street (Monument)" at an 0.6 cutoff - any two short
+    "digit + word + Street" addresses cluster in the 0.5-0.65
+    SequenceMatcher range purely from shared generic structure, not real
+    similarity, and a numbered address like that should never be fuzzy-
+    suggested at all (same reasoning _building_has_no_digits documents for
+    the real matching tier). Showing zero suggestions is always preferable
+    to showing irrelevant ones - this only ever reduces manual searching,
+    never replaces it."""
+    target_building = new_dict.get("building")
+    if not _building_has_no_digits(target_building):
+        return []
+    target = normalize_key(target_building)
     if not target:
         return []
     keys = [normalize_key(r.get("building")) for r in master_records]
-    close = set(difflib.get_close_matches(target, keys, n=3, cutoff=0.6))
+    close = set(difflib.get_close_matches(target, keys, n=3, cutoff=BUILDING_FUZZY_MATCH_THRESHOLD))
     seen = set()
     results = []
     for rec, key in zip(master_records, keys):
@@ -712,7 +786,7 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
 
     by_key = {}
     for u in unmatched:
-        by_key.setdefault(_fallback_key(u.new_row.model_dump()), []).append(u)
+        by_key.setdefault(_dedup_key(u.new_row.model_dump()), []).append(u)
     unmatched_collisions = [group for group in by_key.values() if len(group) > 1]
 
     return MergePlan(master_records, matched_changed, matched_unchanged, unmatched, collisions, unmatched_collisions)

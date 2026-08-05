@@ -50,6 +50,146 @@ class NormalizePostcodeTests(unittest.TestCase):
         self.assertEqual(master_merge._normalize_postcode("w1t 4pw"), "w1t4pw")
 
 
+class DedupKeyTests(unittest.TestCase):
+    def test_same_postcode_uses_primary_key(self):
+        a = {"building": "77 Gracechurch Street", "provider": "Workplace Plus",
+             "floor_unit": "6th Floor", "postcode": "EC3V 0AS"}
+        b = dict(a)
+        self.assertEqual(master_merge._dedup_key(a), master_merge._dedup_key(b))
+        self.assertEqual(master_merge._dedup_key(a), master_merge._primary_key(a))
+
+    def test_different_postcode_never_grouped(self):
+        # Same building/provider/floor_unit, genuinely different postcode -
+        # treated as real signal against merging, not missing data.
+        a = {"building": "1 Example Street", "provider": "Test Provider",
+             "floor_unit": "1st Floor", "postcode": "EC1A 1AA"}
+        b = {"building": "1 Example Street", "provider": "Test Provider",
+             "floor_unit": "1st Floor", "postcode": "SW1A 1AA"}
+        self.assertNotEqual(master_merge._dedup_key(a), master_merge._dedup_key(b))
+
+    def test_both_blank_postcode_falls_back_to_three_field_key(self):
+        a = {"building": "1 Example Street", "provider": "Test Provider", "floor_unit": "1st Floor"}
+        b = dict(a)
+        self.assertEqual(master_merge._dedup_key(a), master_merge._dedup_key(b))
+        self.assertEqual(master_merge._dedup_key(a), master_merge._fallback_key(a))
+
+
+class SuggestSimilarTests(unittest.TestCase):
+    def _master_records(self, buildings):
+        return [{"building": b, "provider": "X", "floor_unit": "1st", "postcode": "EC1A 1AA"} for b in buildings]
+
+    def test_numbered_address_never_suggested_anything(self):
+        # Real reported false positives - none share anything meaningful
+        # with "77 Gracechurch Street", all three cleared the old 0.6
+        # cutoff purely from generic "digit + word + Street" structure.
+        master_records = self._master_records(
+            ["27 Greville Street", "55 Grosvenor Street", "141 Fenchurch Street (Monument)"]
+        )
+        new_dict = {"building": "77 Gracechurch Street"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
+
+    def test_genuine_name_only_typo_still_suggested(self):
+        # Same real pair FuzzyBuildingMatchTests validates for the actual
+        # matching tier (0.938) - the raised threshold must not lose this.
+        master_records = self._master_records(["Thirty Lighterman"])
+        new_dict = {"building": "Thirty Lightman"}
+        self.assertEqual(len(master_merge._suggest_similar(new_dict, master_records)), 1)
+
+    def test_unrelated_name_only_pair_not_suggested(self):
+        # Real confirmed false-positive risk for the matching tier (0.762) -
+        # below the 0.85 threshold reused here.
+        master_records = self._master_records(["Orion House"])
+        new_dict = {"building": "York House"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
+
+    def test_blank_building_suggests_nothing(self):
+        self.assertEqual(master_merge._suggest_similar({"building": None}, self._master_records(["Kent House"])), [])
+
+
+class MergeFieldChoiceTests(unittest.TestCase):
+    def test_all_equal_needs_no_choice(self):
+        self.assertEqual(master_merge.merge_field_choice(["Fully Managed", "Fully Managed"]), (False, "Fully Managed"))
+
+    def test_tolerant_equal_needs_no_choice(self):
+        # Case-only difference - same principle as _values_equal elsewhere.
+        self.assertEqual(master_merge.merge_field_choice(["MetSpace", "METSPACE"]), (False, "MetSpace"))
+
+    def test_all_blank_needs_no_choice(self):
+        self.assertEqual(master_merge.merge_field_choice([None, ""]), (False, None))
+
+    def test_one_blank_one_filled_still_needs_a_choice(self):
+        # A blank vs. a real value IS a disagreement worth a reviewer's eyes
+        # (see default_merge_choice_index for the smart default) - the point
+        # is a reviewer can deliberately choose blank if the one value
+        # present is wrong for the merged property, not that this gets
+        # silently decided for them just because only one side has data.
+        needs_choice, resolved = master_merge.merge_field_choice([None, "Fully Managed"])
+        self.assertTrue(needs_choice)
+        self.assertIsNone(resolved)
+
+    def test_genuinely_different_values_need_a_choice(self):
+        needs_choice, resolved = master_merge.merge_field_choice(["Fully Managed", "Fully Fitted"])
+        self.assertTrue(needs_choice)
+        self.assertIsNone(resolved)
+
+
+class DefaultMergeChoiceIndexTests(unittest.TestCase):
+    def test_single_non_blank_is_preselected(self):
+        self.assertEqual(master_merge.default_merge_choice_index([None, "value"]), 1)
+
+    def test_all_non_blank_defaults_to_first(self):
+        self.assertEqual(master_merge.default_merge_choice_index(["a", "b"]), 0)
+
+    def test_all_blank_defaults_to_first(self):
+        self.assertEqual(master_merge.default_merge_choice_index([None, None]), 0)
+
+
+class BuildMergePlanIntraBatchDuplicateTests(unittest.TestCase):
+    """The exact reported scenario: a PDF upload and an email upload of the
+    same real property, neither matching master, must be recognized as
+    duplicates of EACH OTHER - not just checked against master."""
+
+    def test_identical_match_key_rows_are_grouped(self):
+        # Real field values from the 77 Gracechurch Street PDF + email test.
+        pdf_row = ListingRow(
+            building="77 Gracechurch Street", provider="Workplace Plus",
+            floor_unit="6th Floor", postcode="EC3V 0AS", source_file="pdf.pdf",
+        )
+        email_row = ListingRow(
+            building="77 Gracechurch Street", provider="Workplace Plus",
+            floor_unit="6th Floor", postcode="EC3V 0AS", source_file="email.eml",
+        )
+
+        plan = master_merge.build_merge_plan([pdf_row, email_row], _empty_master_df_like(pdf_row))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(len(plan.unmatched_collisions), 1)
+        self.assertEqual(len(plan.unmatched_collisions[0]), 2)
+
+    def test_different_postcode_is_not_grouped(self):
+        row_a = ListingRow(building="1 Example Street", provider="Test Provider",
+                            floor_unit="1st Floor", postcode="EC1A 1AA")
+        row_b = ListingRow(building="1 Example Street", provider="Test Provider",
+                            floor_unit="1st Floor", postcode="SW1A 1AA")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _empty_master_df_like(row_a))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+    def test_a_single_unique_new_row_has_no_collision(self):
+        row = ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st Floor")
+
+        plan = master_merge.build_merge_plan([row], _empty_master_df_like(row))
+
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+
+def _empty_master_df_like(row: ListingRow) -> pd.DataFrame:
+    return pd.DataFrame(columns=list(row.model_dump().keys()))
+
+
 class CanonicalizeProviderNameTests(unittest.TestCase):
     def test_plus_symbol_variant_is_corrected(self):
         self.assertEqual(master_merge.canonicalize_provider_name("Workplace+"), "Workplace Plus")
