@@ -53,6 +53,16 @@ DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "s
 # length/retention check on them would just be noise.
 RISKY_TEXT_FIELDS = ("special_features", "contacts")
 
+# The two fields a leading house number (see _leading_house_number/
+# house_number_changed) can appear in - checked independently of
+# RISKY_TEXT_FIELDS in build_merge_plan's risky_fields computation, since a
+# structural house-number change (master's "18 Copthall Avenue" silently
+# becoming an update's "14-18 Copthall Avenue") is a different concept from
+# RISKY_TEXT_FIELDS' free-text detail-loss/richness-regression checks and
+# would otherwise auto-apply unreviewed unless it happened to also collide
+# with another row in the same batch.
+HOUSE_NUMBER_FIELDS = ("address_1", "building")
+
 # Free-text fields where wording indicating a property is no longer on the
 # market might appear - the two descriptive prose fields, never a matching
 # key or a structured numeric field. Checked against a MATCHED row's DIFF
@@ -608,6 +618,26 @@ def _leading_house_number(building):
     return match.group(1).lower() if match else None
 
 
+def house_number_changed(old_val, new_val) -> bool:
+    """
+    True when old_val and new_val's leading house-number tokens (see
+    _leading_house_number - reused here rather than re-implemented) genuinely
+    differ: a different number entirely ("18" vs "24"), one side having a
+    number and the other not, or a plain number vs. a hyphenated range that
+    happens to share an endpoint ("18" vs "14-18") - still a real change,
+    since the range covers a different, wider set of units than the plain
+    number alone, not the same fact restated. Inherits _leading_house_number's
+    own case/whitespace tolerance for free, so "18" vs " 18 " or "56A" vs
+    "56a" is genuinely the same token and correctly NOT flagged.
+
+    Used by build_merge_plan to flag address_1/building changes as risky
+    (see HOUSE_NUMBER_FIELDS) independent of RISKY_TEXT_FIELDS - a silent
+    house-number change is a structural address concern, not the free-text
+    detail-loss/richness-regression concept RISKY_TEXT_FIELDS exists for.
+    """
+    return _leading_house_number(old_val) != _leading_house_number(new_val)
+
+
 def _address_street_key(building) -> str:
     """
     normalize_key(building) with a leading house number stripped and a
@@ -858,6 +888,9 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             risky_fields = frozenset(
                 f for f in diffs
                 if f in RISKY_TEXT_FIELDS and (is_detail_loss(*diffs[f]) or is_richness_regression(*diffs[f]))
+            ) | frozenset(
+                f for f in diffs
+                if f in HOUSE_NUMBER_FIELDS and house_number_changed(*diffs[f])
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])

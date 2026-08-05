@@ -803,6 +803,106 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
         self.assertIn("address_1", matched.diffs)
         self.assertEqual(matched.risky_fields, frozenset())
 
+    def test_house_number_widened_into_a_range_is_flagged(self):
+        # The reported scenario: master's plain house number silently
+        # becomes an update's hyphenated range sharing that same number as
+        # an endpoint - a real, easy-to-miss change in what the address
+        # actually covers, not a formatting difference.
+        master_df = _master_df([{
+            "building": "1 Example Street",
+            "provider": "Test Provider",
+            "floor_unit": "1st Floor",
+            "postcode": "EC1A 1AA",
+            "address_1": "18 Copthall Avenue",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street",
+            provider="Test Provider",
+            floor_unit="1st Floor",
+            postcode="EC1A 1AA",
+            address_1="14-18 Copthall Avenue",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("address_1", matched.diffs)
+        self.assertIn("address_1", matched.risky_fields)
+
+    def test_house_number_narrowed_from_a_range_is_also_flagged(self):
+        # Same change, opposite direction - a range collapsing down to one
+        # of its own endpoints is just as much a structural change as the
+        # reverse, and must not get a pass just because the reported
+        # direction was widening.
+        master_df = _master_df([{
+            "building": "1 Example Street",
+            "provider": "Test Provider",
+            "floor_unit": "1st Floor",
+            "postcode": "EC1A 1AA",
+            "address_1": "14-18 Copthall Avenue",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street",
+            provider="Test Provider",
+            floor_unit="1st Floor",
+            postcode="EC1A 1AA",
+            address_1="18 Copthall Avenue",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("address_1", matched.diffs)
+        self.assertIn("address_1", matched.risky_fields)
+
+    def test_address_change_that_leaves_house_number_untouched_is_not_flagged(self):
+        # A postcode-fix-flavored correction inside address_1 itself (the
+        # house number at the front is identical) is exactly the ordinary,
+        # safe update this feature must keep auto-applying - only a genuine
+        # house-number change should route to manual review.
+        master_df = _master_df([{
+            "building": "1 Example Street",
+            "provider": "Test Provider",
+            "floor_unit": "1st Floor",
+            "postcode": "EC1A 1AA",
+            "address_1": "18 Copthall Avenue, EC2R 7DJ",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street",
+            provider="Test Provider",
+            floor_unit="1st Floor",
+            postcode="EC1A 1AA",
+            address_1="18 Copthal Avenue, EC2R 7DJ",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("address_1", matched.diffs)
+        self.assertEqual(matched.risky_fields, frozenset())
+
+
+class HouseNumberChangedTests(unittest.TestCase):
+    def test_plain_number_vs_range_sharing_an_endpoint_differs(self):
+        self.assertTrue(master_merge.house_number_changed("18 Copthall Avenue", "14-18 Copthall Avenue"))
+        self.assertTrue(master_merge.house_number_changed("14-18 Copthall Avenue", "18 Copthall Avenue"))
+
+    def test_different_number_entirely_differs(self):
+        self.assertTrue(master_merge.house_number_changed("18 Copthall Avenue", "24 Copthall Avenue"))
+
+    def test_number_appearing_where_there_was_none_differs(self):
+        self.assertTrue(master_merge.house_number_changed("Copthall House", "18 Copthall House"))
+
+    def test_same_number_is_not_flagged(self):
+        self.assertFalse(master_merge.house_number_changed("18 Copthall Avenue", "18 Copthall Avenue"))
+
+    def test_case_and_whitespace_only_differences_are_not_flagged(self):
+        self.assertFalse(master_merge.house_number_changed("18 Copthall Avenue", " 18 copthall avenue"))
+        self.assertFalse(master_merge.house_number_changed("56A Example Street", "56a Example Street"))
+
+    def test_no_leading_number_on_either_side_is_not_flagged(self):
+        self.assertFalse(master_merge.house_number_changed("Copthall House", "Copthall Building"))
+
 
 class CollisionTests(unittest.TestCase):
     def test_two_new_rows_matching_same_master_row_are_a_collision(self):
