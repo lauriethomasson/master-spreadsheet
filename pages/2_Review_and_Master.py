@@ -838,82 +838,99 @@ def _render_pending_review(pending: list):
         near_miss = [u for u in plan.unmatched if id(u) not in collision_ids and u.suggestions]
         plain_new = [u for u in plan.unmatched if id(u) not in collision_ids and not u.suggestions]
 
-        if plain_new or near_miss or plan.unmatched_collisions:
-            st.subheader("No match found — will be added as new")
-
         # Ordinary new properties: no batch duplicate, no near-miss against
         # master - nothing to decide, so this stays a plain one-line list
         # (see master_merge.new_property_labels) rather than the detailed
         # comparison view below, which is reserved for rows that actually
-        # need a decision.
+        # need a decision. Collapsed by default (a real upload can easily
+        # have 15+ of these with nothing to review) so it doesn't push the
+        # rows that DO need a decision below the fold - Streamlit expanders
+        # default to collapsed unless expanded=True is passed, so this
+        # needs no extra session state of its own.
         if plain_new:
-            for label in master_merge.new_property_labels([u.new_row for u in plain_new]):
-                st.write(label)
+            n = len(plain_new)
+            with st.expander(f"📄 {n} new propert{'y' if n == 1 else 'ies'} will be added — click to view"):
+                for label in master_merge.new_property_labels([u.new_row for u in plain_new]):
+                    st.write(label)
             new_rows_final.extend(
                 u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
             )
 
-        # Near-misses against an EXISTING master property (not a batch
-        # duplicate) - a genuine decision (is this actually that property,
-        # reworded/typo'd?), so it keeps the detailed link-or-confirm UI.
-        if near_miss:
-            master_options = {"— add as new —": None}
-            for rec in plan.master_records:
-                master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
+        # near_miss (against an existing master property) and
+        # unmatched_collisions (against another row in this same upload)
+        # both genuinely need a human decision - grouped under one shared,
+        # always-visible heading (never collapsed, unlike plain_new above)
+        # so it's obvious at a glance which rows are just FYI vs. waiting
+        # on an answer.
+        if near_miss or plan.unmatched_collisions:
+            st.subheader("⚠️ Needs a decision")
+            st.caption(
+                "Some of these look similar to a property already in master; others look "
+                "like the same property may have been listed twice in this upload. Open "
+                "each one and decide: is this the same property, or genuinely different?"
+            )
 
-            for i, u in enumerate(near_miss):
-                row_dict = u.new_row.model_dump()
-                key_prefix = f"near_miss_{i}"
-                with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
-                    st.caption(
-                        "Possible near-misses already in the master: "
-                        + ", ".join(display_utils.row_label(s) for s in u.suggestions)
-                    )
+            # Near-misses against an EXISTING master property (not a batch
+            # duplicate) - a genuine decision (is this actually that property,
+            # reworded/typo'd?), so it keeps the detailed link-or-confirm UI.
+            if near_miss:
+                master_options = {"— add as new —": None}
+                for rec in plan.master_records:
+                    master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
 
-                    choice_label = st.selectbox(
-                        "What should happen with this row?",
-                        list(master_options.keys()),
-                        key=f"{key_prefix}_choice",
-                    )
-                    linked_property_id = master_options[choice_label]
-
-                    if linked_property_id is None:
-                        # "— add as new —" is the default selectbox choice, so this is
-                        # already the no-action outcome - no extra checkbox needed to
-                        # confirm it. A reviewer who believes this IS the near-miss
-                        # property says so by picking it from the dropdown above, which
-                        # routes into the `else` branch instead.
-                        new_rows_final.append(
-                            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                for i, u in enumerate(near_miss):
+                    row_dict = u.new_row.model_dump()
+                    key_prefix = f"near_miss_{i}"
+                    with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
+                        st.caption(
+                            "Possible near-misses already in the master: "
+                            + ", ".join(display_utils.row_label(s) for s in u.suggestions)
                         )
-                    else:
-                        target_index = next(
-                            idx for idx, rec in enumerate(plan.master_records)
-                            if rec["property_id"] == linked_property_id
-                        )
-                        old_rec = plan.master_records[target_index]
-                        diffs = master_merge.diff_fields(old_rec, row_dict)
-                        st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
-                        if diffs:
-                            risky_fields = frozenset(
-                                f for f in diffs
-                                if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
-                            )
-                            approved_fields = _render_field_rows(
-                                diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
-                            )
-                            if approved_fields:
-                                entry = updates.setdefault(target_index, {})
-                                entry.update(approved_fields)
-                                entry["source_file"] = u.new_row.source_file
 
-        # Intra-batch duplicates: two or more pending rows independently
-        # failing to match master, but matching EACH OTHER (see
-        # master_merge._dedup_key) - offered a field-level merge into one
-        # property, not a forced choice between "add both" or "add one,
-        # discard the other's data".
-        for i, group in enumerate(plan.unmatched_collisions):
-            _render_intra_batch_duplicate_group(group, f"batch_dup_{i}", new_rows_final)
+                        choice_label = st.selectbox(
+                            "What should happen with this row?",
+                            list(master_options.keys()),
+                            key=f"{key_prefix}_choice",
+                        )
+                        linked_property_id = master_options[choice_label]
+
+                        if linked_property_id is None:
+                            # "— add as new —" is the default selectbox choice, so this is
+                            # already the no-action outcome - no extra checkbox needed to
+                            # confirm it. A reviewer who believes this IS the near-miss
+                            # property says so by picking it from the dropdown above, which
+                            # routes into the `else` branch instead.
+                            new_rows_final.append(
+                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                            )
+                        else:
+                            target_index = next(
+                                idx for idx, rec in enumerate(plan.master_records)
+                                if rec["property_id"] == linked_property_id
+                            )
+                            old_rec = plan.master_records[target_index]
+                            diffs = master_merge.diff_fields(old_rec, row_dict)
+                            st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
+                            if diffs:
+                                risky_fields = frozenset(
+                                    f for f in diffs
+                                    if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
+                                )
+                                approved_fields = _render_field_rows(
+                                    diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
+                                )
+                                if approved_fields:
+                                    entry = updates.setdefault(target_index, {})
+                                    entry.update(approved_fields)
+                                    entry["source_file"] = u.new_row.source_file
+
+            # Intra-batch duplicates: two or more pending rows independently
+            # failing to match master, but matching EACH OTHER (see
+            # master_merge._dedup_key) - offered a field-level merge into one
+            # property, not a forced choice between "add both" or "add one,
+            # discard the other's data".
+            for i, group in enumerate(plan.unmatched_collisions):
+                _render_intra_batch_duplicate_group(group, f"batch_dup_{i}", new_rows_final)
 
     if plan.matched_unchanged:
         st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")
