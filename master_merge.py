@@ -1094,7 +1094,7 @@ def apply_merge(master_records: list, updates: dict, new_rows: list, removed_ind
     return result
 
 
-def build_manual_edit(master_records: list, edited_rows: dict) -> tuple:
+def build_manual_edit(master_records: list, edited_rows: dict, displayed_positions: list = None) -> tuple:
     """
     Turns a data_editor "edited_rows" delta - {row_position: {column: new_value,
     ...}, ...}, straight from the Master default view's direct cell-editing
@@ -1121,6 +1121,18 @@ def build_manual_edit(master_records: list, edited_rows: dict) -> tuple:
     since the caller has no other way to tell "just a checkbox" apart from
     "a real edit" - a row whose only changes are non-ListingRow keys
     contributes nothing to updates/diff_rows/fields_changed.
+
+    displayed_positions, when given, is a list where displayed_positions[i]
+    is the REAL position in master_records of whatever row sat at position i
+    in the (possibly filtered) subset actually passed to data_editor this
+    render - see pages/2_Review_and_Master.py's own text filter on the
+    master table. edited_rows's own keys are always positions within THAT
+    displayed subset, per Streamlit's own data_editor semantics, never
+    directly meaningful against master_records once a filter has narrowed
+    what's shown - e.g. the second VISIBLE row is not necessarily
+    master_records[1] if the first two real rows were filtered out. Omitted
+    (None) is the identity mapping, for the unfiltered case where displayed
+    position and real position are the same thing.
     """
     updates = {}
     diff_rows = []
@@ -1129,6 +1141,8 @@ def build_manual_edit(master_records: list, edited_rows: dict) -> tuple:
         if not real_changes:
             continue
         row_pos = int(row_pos)
+        if displayed_positions is not None:
+            row_pos = displayed_positions[row_pos]
         updates[row_pos] = real_changes
 
         old_rec = master_records[row_pos]
@@ -1142,6 +1156,23 @@ def build_manual_edit(master_records: list, edited_rows: dict) -> tuple:
     fields_changed = sum(len(v) for v in updates.values())
     merged_rows = apply_merge(master_records, updates, [])
     return merged_rows, diff_rows, fields_changed
+
+
+def merge_selected_property_ids(previous_ids: set, visible_ids: set, now_selected_visible_ids: set) -> set:
+    """
+    The new export-selection set (see pages/2_Review_and_Master.py's
+    export_selected_property_ids) after one render of the master table's
+    own (possibly filtered) data_editor.
+
+    previous_ids minus whichever of them are CURRENTLY VISIBLE, unioned
+    with now_selected_visible_ids - a property_id's own checkbox state is
+    only authoritative while its row is actually on screen to check/
+    uncheck; one selected before a text filter narrowed the view stays
+    selected even though its row isn't there to uncheck right now, since a
+    filter narrowing what's DISPLAYED must never silently narrow what's
+    actually SELECTED for removal/export too.
+    """
+    return (previous_ids - visible_ids) | now_selected_visible_ids
 
 
 def pending_status_line(n_uploads: int, plan: MergePlan) -> str:

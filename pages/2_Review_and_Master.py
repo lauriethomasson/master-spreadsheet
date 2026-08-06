@@ -296,6 +296,16 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     stale selection (or edit - see _process_manual_edits) to the wrong row.
     property_id is immune to re-sorting, so it survives that reload intact.
 
+    The text filter below narrows only what's DISPLAYED, never what df/
+    master_records themselves contain - data_editor's own edited_rows
+    positions are always relative to whatever (possibly filtered) subset
+    was actually passed to it this render, so real_positions[i] (the real
+    position in df of whatever row sits at filtered position i) is threaded
+    through to _process_manual_edits/build_manual_edit below, and row
+    selection stays keyed by property_id exactly as it already was for the
+    re-sort case above - a filter is just another way a row's position can
+    shift out from under a stale positional reference.
+
     Returns True if a real field edit was saved this render - the caller
     should st.rerun() so the rest of the page reflects the fresh master
     (download button bytes, write-log caption, Version history) rather than
@@ -310,23 +320,44 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         df["property_id"].isin(selected_ids) if "property_id" in df.columns else False,
     )
 
+    query = st.text_input(
+        "Filter (building, address, provider, or floor/unit)",
+        key=f"{key}_filter",
+    )
+    filtered_df = display_df
+    real_positions = list(range(len(df)))
+    if query.strip():
+        search_cols = [c for c in ("building", "address_1", "provider", "floor_unit") if c in df.columns]
+        mask = pd.Series(False, index=df.index)
+        for c in search_cols:
+            mask = mask | df[c].fillna("").astype(str).str.contains(query.strip(), case=False)
+        filtered_df = display_df[mask]
+        real_positions = [i for i, keep in enumerate(mask) if keep]
+
     edited = st.data_editor(
-        display_df,
+        filtered_df,
         column_config={
-            **display_utils.label_column_config(display_df),
+            **display_utils.label_column_config(filtered_df),
             "Select": st.column_config.CheckboxColumn(required=True),
-            **display_utils.link_column_config(display_df),
-            **display_utils.wide_text_column_config(display_df),
-            **display_utils.numeric_column_config(display_df),
+            **display_utils.link_column_config(filtered_df),
+            **display_utils.wide_text_column_config(filtered_df),
+            **display_utils.numeric_column_config(filtered_df),
         },
         width="stretch",
         height=600,
         key=key,
     )
+    st.caption(f"{len(filtered_df)} of {len(df)} row(s) shown.")
 
     if "property_id" in df.columns:
-        st.session_state["export_selected_property_ids"] = set(df.loc[edited.index[edited["Select"]], "property_id"])
-    selected_positions = edited.index[edited["Select"]].tolist()
+        visible_ids = set(df.loc[filtered_df.index, "property_id"])
+        now_selected_visible = set(df.loc[edited.index[edited["Select"]], "property_id"])
+        st.session_state["export_selected_property_ids"] = master_merge.merge_selected_property_ids(
+            selected_ids, visible_ids, now_selected_visible
+        )
+        selected_positions = df.index[df["property_id"].isin(st.session_state["export_selected_property_ids"])].tolist()
+    else:
+        selected_positions = edited.index[edited["Select"]].tolist()
     st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
 
     with st.container(horizontal=True):
@@ -353,9 +384,18 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         # left behind by a provider-name fix that changed the match key -
         # see master_merge.py's own module docstring on why provider is
         # part of the key at all) - no separate delete mechanism invented.
+        #
+        # Deliberately never `disabled=not selected_positions`: a real-
+        # browser report of this button needing two clicks to register
+        # couldn't be reproduced in AppTest (it can't simulate the DOM-level
+        # timing of a click landing right as a checkbox toggle is still
+        # updating this button's own disabled state) - but leaving it always
+        # clickable side-steps that class of bug entirely, at the cost of a
+        # no-op click needing its own friendly message instead of the button
+        # simply refusing the click.
         remove_clicked = st.button(
             f"Remove {len(selected_positions)} selected row(s)",
-            key=f"{key}_remove_selected", disabled=not selected_positions,
+            key=f"{key}_remove_selected",
         )
 
         # Feedback for this action lives right here, inline in the same row
@@ -363,7 +403,9 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         # a removal is a small, frequent, low-ceremony action (unlike an
         # upload approval's own multi-row diff), so its own confirmation
         # stays equally lightweight rather than pushing the table down.
-        if remove_clicked:
+        if remove_clicked and not selected_positions:
+            st.info("Select at least one row first.")
+        elif remove_clicked:
             with st.spinner("Removing..."):
                 master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
                 removed_indices = frozenset(selected_positions)
@@ -412,15 +454,24 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
                     st.session_state["just_restored"] = last_removal["version_path"]
                     st.rerun()
 
-    return _process_manual_edits(df, key)
+    return _process_manual_edits(df, real_positions, key)
 
 
-def _process_manual_edits(df: pd.DataFrame, key: str) -> bool:
+def _process_manual_edits(df: pd.DataFrame, displayed_positions: list, key: str) -> bool:
     """
     Checks the data_editor's own edit-tracking state (st.session_state[key])
     for real field edits since it was last reset, and if there are any,
     saves them to master.xlsx immediately - see build_manual_edit for how
     the delta becomes a full row list. Returns True iff a save happened.
+
+    displayed_positions[i] is the real position in df of whatever row sat
+    at position i in the (possibly filtered) subset _render_master_table
+    actually passed to data_editor this render - identity (0, 1, 2, ...)
+    when its own filter is empty. edited_rows's own keys are always
+    positions within THAT displayed subset, never directly meaningful
+    against df/master_records once the filter has narrowed what's shown -
+    see build_manual_edit's own handling of this same parameter for the
+    real failure mode it prevents.
 
     Deliberately processes the WHOLE delta in one shot rather than assuming
     "one cell changed" - a multi-cell paste lands as several changed cells
@@ -436,7 +487,9 @@ def _process_manual_edits(df: pd.DataFrame, key: str) -> bool:
         return False
 
     master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
-    merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(master_records, edited_rows)
+    merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(
+        master_records, edited_rows, displayed_positions=displayed_positions
+    )
     if fields_changed == 0:
         return False  # only "Select" checkboxes changed this render - not a data edit
 

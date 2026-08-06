@@ -1209,6 +1209,91 @@ class BuildManualEditTests(unittest.TestCase):
         self.assertEqual(fields_changed, 1)
         self.assertEqual(merged_rows[0].size_sqft, 1200.0)
 
+    def test_displayed_positions_none_behaves_exactly_like_before(self):
+        master_records = self._master_records([
+            {"building": "A", "provider": "P1", "size_sqft": 1000.0},
+            {"building": "B", "provider": "P2", "size_sqft": 2000.0},
+        ])
+        edited_rows = {1: {"size_sqft": 2500.0}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(
+            master_records, edited_rows, displayed_positions=None
+        )
+
+        self.assertEqual(merged_rows[1].size_sqft, 2500.0)
+        self.assertEqual(fields_changed, 1)
+
+    def test_edit_at_a_filtered_position_updates_the_correct_real_row(self):
+        # A text filter on the master table (see pages/2_Review_and_Master.
+        # py's _render_master_table) has narrowed what's displayed down to
+        # real rows 1 and 3 only - the widget itself only ever sees 2 rows,
+        # so data_editor's own edited_rows key "1" means the SECOND VISIBLE
+        # row (real position 3), never real position 1. Without this
+        # translation, a naive int(row_pos) would silently edit Building B
+        # (real position 1) instead of the row the reviewer actually saw
+        # and edited (Building D, real position 3).
+        master_records = self._master_records([
+            {"building": "Building A", "provider": "P1", "size_sqft": 1000.0},
+            {"building": "Building B", "provider": "P1", "size_sqft": 2000.0},
+            {"building": "Building C", "provider": "P1", "size_sqft": 3000.0},
+            {"building": "Building D", "provider": "P1", "size_sqft": 4000.0},
+        ])
+        displayed_positions = [1, 3]  # filtered view shows only real rows 1 and 3, in that order
+        edited_rows = {"1": {"size_sqft": 4500.0}}  # the SECOND visible row was edited
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(
+            master_records, edited_rows, displayed_positions=displayed_positions
+        )
+
+        self.assertEqual(fields_changed, 1)
+        self.assertEqual(merged_rows[3].size_sqft, 4500.0)  # Building D - the real row that was edited
+        self.assertEqual(merged_rows[1].size_sqft, 2000.0)  # Building B - untouched, despite sharing visual position 1
+        self.assertEqual(diff_rows[0]["property"], master_merge.row_label(master_records[3]))
+
+    def test_edit_at_the_first_filtered_position_still_resolves_correctly(self):
+        master_records = self._master_records([
+            {"building": "Building A", "provider": "P1", "size_sqft": 1000.0},
+            {"building": "Building B", "provider": "P1", "size_sqft": 2000.0},
+            {"building": "Building C", "provider": "P1", "size_sqft": 3000.0},
+        ])
+        displayed_positions = [2]  # filter matched only real row 2
+        edited_rows = {"0": {"size_sqft": 3500.0}}
+
+        merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(
+            master_records, edited_rows, displayed_positions=displayed_positions
+        )
+
+        self.assertEqual(merged_rows[2].size_sqft, 3500.0)
+        self.assertEqual(merged_rows[0].size_sqft, 1000.0)
+
+
+class MergeSelectedPropertyIdsTests(unittest.TestCase):
+    """export_selected_property_ids' own update rule across a (possibly
+    filtered) render of the master table - see pages/2_Review_and_Master.
+    py's _render_master_table. A property_id's checkbox state is only
+    authoritative while its row is actually visible; one selected before a
+    filter narrowed the view must survive, not be silently dropped just
+    because it isn't on screen to uncheck right now."""
+
+    def test_visible_selection_is_added(self):
+        result = master_merge.merge_selected_property_ids(set(), {"a", "b"}, {"a"})
+        self.assertEqual(result, {"a"})
+
+    def test_visible_deselection_is_removed(self):
+        result = master_merge.merge_selected_property_ids({"a"}, {"a", "b"}, set())
+        self.assertEqual(result, set())
+
+    def test_selection_outside_the_current_filter_survives(self):
+        # "c" was selected before the filter narrowed the view to just
+        # {"a", "b"} - it must still be selected after this render, even
+        # though its own checkbox isn't on screen to reaffirm it.
+        result = master_merge.merge_selected_property_ids({"c"}, {"a", "b"}, set())
+        self.assertEqual(result, {"c"})
+
+    def test_visible_and_off_filter_selections_combine(self):
+        result = master_merge.merge_selected_property_ids({"c"}, {"a", "b"}, {"a"})
+        self.assertEqual(result, {"a", "c"})
+
 
 class MentionsLetStatusTests(unittest.TestCase):
     """The core detection: does this free-text value's wording suggest the
