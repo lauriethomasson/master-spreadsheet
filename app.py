@@ -369,7 +369,14 @@ with page_setup.setup_page("upload"):
                                     ws, sheet_label, uploaded_file.name
                                 )
                                 if not sheet_rows:
-                                    st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
+                                    text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+                                    if extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text):
+                                        st.info(
+                                            f"{sheet_label}: recognized a building, but nothing currently "
+                                            "available — skipped."
+                                        )
+                                    else:
+                                        st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
                                 else:
                                     _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
                                     _warn_if_units_look_undercounted(sheet_rows, ws, sheet_label)

@@ -355,7 +355,16 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
     return rows
 
 
-def _apparent_data_row_count(raw_text: str, building: str, next_building) -> int:
+def _heading_cell(line: str) -> str:
+    """The first non-blank pipe-separated cell on a rendered line, stripped -
+    a repeating-block sheet's heading/address/data lines all carry an entirely
+    blank leading column on the real files this was confirmed against, so the
+    building name itself lives in the first cell AFTER that blank one, never
+    literally at the start of the line."""
+    return next((c.strip() for c in line.split("|") if c.strip()), "")
+
+
+def _apparent_data_row_count(raw_text: str, building: str) -> int:
     """
     Rough count of how many genuine per-unit data rows a building's own
     block in the raw sheet text appears to contain - a cheap, structural
@@ -370,13 +379,36 @@ def _apparent_data_row_count(raw_text: str, building: str, next_building) -> int
     normal, non-garbled size_sqft/rent_pcm (ruling out app.py's own
     _warn_if_extraction_looks_garbled).
 
-    Locates the building's own block the same way _raw_house_number_for_
-    unit's no-postcode branch does (search for the building name,
-    bounded by the next DIFFERENT building's own heading line or end of
-    text) - substring search, not startswith, since the real file this
-    was confirmed against has an entirely blank leading column on every
-    single row, including the building's own heading row, which a
-    startswith match would silently fail against.
+    Bails to 0 immediately if the raw text has no "download" line
+    anywhere (see PROMPT shape (b)'s own address/link line note) - with
+    no per-building link marker anywhere in the sheet at all, this isn't
+    a repeating-blocks sheet this heuristic was designed for (e.g. a
+    single-consistent-table sheet, PROMPT shape (a)), and guessing a
+    block boundary anyway risks running to the end of the sheet and
+    counting trailing boilerplate/disclaimer rows as if they were this
+    building's own data.
+
+    Locates the building's own heading line by its first non-blank cell
+    (see _heading_cell) STARTING WITH the building name - never a plain
+    substring-anywhere-on-the-line search, which a real file this was
+    confirmed against showed landing inside a completely different,
+    unrelated building's own prose description paragraph that happened to
+    mention this building's name in passing. When more than one line
+    qualifies (e.g. this building's name is itself a prefix of another,
+    different building's longer name, so that OTHER building's own
+    heading also "starts with" this one), the SHORTEST qualifying cell
+    wins - the real heading for this exact building, unlike a different
+    building's heading that merely shares its name as a prefix, has
+    nothing extra appended.
+
+    The block's end is the next "download" line after this building's
+    OWN one (never the next building's heading line, which - confirmed
+    against a real file - can run unbounded straight past an intervening
+    building that was itself "Fully Occupied" and so never produced any
+    surviving unit to anchor a boundary on, silently absorbing that
+    unrelated building's own mini-table header row as if it were an
+    extra data row for THIS building). Falls back to the end of the text
+    if this building has no "download" line of its own, or none follow it.
 
     Within that block, counts lines with at least 3 pipe-separated cells
     - real column count varies row to row (render_sheet_as_text trims
@@ -385,28 +417,33 @@ def _apparent_data_row_count(raw_text: str, building: str, next_building) -> int
     every column is filled; 3 is a low floor that still comfortably
     excludes a single-cell prose paragraph, never a requirement to match
     the table's own header width exactly) - other than the address/link
-    line (identified by containing "download", see PROMPT's own note on
-    "Download Floorplans"/"Download Brochure" link labels). The FIRST
-    such line is treated as the mini-table's own header row (never
-    itself a unit); every one after it, up to the block's end, counts as
-    one apparent data row.
+    line itself (identified by containing "download"). The FIRST such
+    line is treated as the mini-table's own header row (never itself a
+    unit); every one after it, up to the block's end, counts as one
+    apparent data row.
 
     Returns 0 if the building's own heading line can't be found at all -
     "no evidence of undercounting" is the safe default when this cheap
     heuristic can't even locate the block, not a false alarm.
     """
     lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
-    building_key = str(building).strip().lower()
-    start = next((i for i, line in enumerate(lines) if building_key in line.lower()), None)
-    if start is None:
+    if not any("download" in line.lower() for line in lines):
         return 0
 
-    end = len(lines)
-    if next_building and str(next_building).strip().lower() != building_key:
-        next_key = str(next_building).strip().lower()
-        later = [i for i in range(start + 1, len(lines)) if next_key in lines[i].lower()]
-        if later:
-            end = later[0]
+    building_key = str(building).strip().lower()
+    candidates = [i for i, line in enumerate(lines) if _heading_cell(line).lower().startswith(building_key)]
+    if not candidates:
+        return 0
+    start = min(candidates, key=lambda i: (len(_heading_cell(lines[i])), i))
+
+    own_download = next((i for i in range(start + 1, len(lines)) if "download" in lines[i].lower()), None)
+    if own_download is None:
+        end = len(lines)
+    else:
+        next_download = next(
+            (i for i in range(own_download + 1, len(lines)) if "download" in lines[i].lower()), None
+        )
+        end = next_download if next_download is not None else len(lines)
 
     header_seen = False
     data_rows = 0
@@ -422,6 +459,24 @@ def _apparent_data_row_count(raw_text: str, building: str, next_building) -> int
     return data_rows
 
 
+def sheet_shows_fully_occupied_building(raw_text: str) -> bool:
+    """
+    True if the raw sheet text contains at least one "Fully Occupied"
+    marker row (see PROMPT shape (b): "If a data row's first cell just
+    says 'Fully Occupied' ... that building currently has NO available
+    units - do not emit a unit for it"). Distinguishes a sheet where
+    extract_sheet legitimately, correctly returned zero units because a
+    recognized building simply has nothing available right now, from one
+    where no listing data was recognized on the sheet at all (e.g. a
+    portfolio-wide index page) - used only to choose the right
+    skipped-sheet message wording in app.py.
+    """
+    for line in raw_text.splitlines():
+        if _heading_cell(_ROW_PREFIX_RE.sub("", line)).lower() == "fully occupied":
+            return True
+    return False
+
+
 def find_undercounted_buildings(raw_text: str, units: list[dict]) -> list[tuple]:
     """
     Cross-checks every DISTINCT building among `units` (each a dict with
@@ -434,23 +489,13 @@ def find_undercounted_buildings(raw_text: str, units: list[dict]) -> list[tuple]
     own rough count is common (a building with just 1 floor has no
     "extra" rows to miscount) and is not itself suspicious.
 
-    Building block boundaries use EXTRACTION order (the order buildings
-    first appear among `units`), same simplifying assumption
-    _next_distinct_building already makes elsewhere in this file - Gemini
-    has, in every real case observed so far, preserved the sheet's own
-    top-to-bottom row order in its output.
-
     A building entirely missing from `units` (every one of its rows
     dropped, not just some) can't be caught here at all - there's no
-    surviving unit to anchor the block search on, so it can't bound a
-    NEIGHBORING building's own block either (a block with no known
-    building after it searches all the way to the end of the text,
-    which - if some other real building actually follows in the sheet
-    but never made it into `units` at all - can overcount into that
-    unrelated content). This only ever reduces manual checking for a
-    PARTIAL loss, never replaces reading the sheet for a complete one -
-    callers must always pass every unit actually extracted from the
-    WHOLE sheet at once, never a single building's units in isolation.
+    surviving unit to anchor the block search on. This only ever reduces
+    manual checking for a PARTIAL loss, never replaces reading the sheet
+    for a complete one - callers must always pass every unit actually
+    extracted from the WHOLE sheet at once, never a single building's
+    units in isolation.
     """
     buildings = []
     seen = set()
@@ -461,10 +506,9 @@ def find_undercounted_buildings(raw_text: str, units: list[dict]) -> list[tuple]
             buildings.append(b)
 
     mismatches = []
-    for i, building in enumerate(buildings):
-        next_building = buildings[i + 1] if i + 1 < len(buildings) else None
+    for building in buildings:
         actual = sum(1 for u in units if u.get("building") == building)
-        apparent = _apparent_data_row_count(raw_text, building, next_building)
+        apparent = _apparent_data_row_count(raw_text, building)
         if apparent > actual:
             mismatches.append((building, apparent, actual))
     return mismatches

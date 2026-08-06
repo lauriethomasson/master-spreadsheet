@@ -321,7 +321,10 @@ class UndercountedBuildingsTests(unittest.TestCase):
 
     def test_partial_response_is_flagged(self):
         # The exact real failure: only G/LG East (the first, longest-
-        # described row) survived out of Cursitor Street's 3 floors.
+        # described row) survived out of Cursitor Street's 3 floors. Also
+        # the true-positive re-check for the heading-anchor/boundary rework
+        # below - this must still be caught, not just the 3 false positives
+        # it fixes.
         text = extract_spreadsheet_gemini.render_sheet_as_text(self._mid_town_sheet())
         units = [
             {"building": "Charterhouse Street"},
@@ -368,6 +371,131 @@ class UndercountedBuildingsTests(unittest.TestCase):
             "Row 1: unrelated content", [{"building": "Nowhere"}],
         )
         self.assertEqual(mismatches, [])
+
+
+class UndercountedBuildingsFalsePositiveTests(unittest.TestCase):
+    """The first version of find_undercounted_buildings/_apparent_data_row_
+    count had 3 confirmed real false positives against the actual Copthall
+    Estates Availability file's City, Westend Soho, and Portfolio sheets -
+    each reproduced here against the exact shape that triggered it, plus the
+    Mid Town true positive re-checked above in UndercountedBuildingsTests."""
+
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        return ws
+
+    def test_building_name_mentioned_in_another_buildings_description_is_ignored(self):
+        # Real false positive: a plain substring search for a building's
+        # name landed inside a COMPLETELY DIFFERENT building's own prose
+        # description paragraph (which happened to mention it in passing),
+        # rather than that building's own real heading line further down -
+        # here "The Scalpel" is name-dropped inside Moor House's description,
+        # before The Scalpel's own heading and block even appear.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Moor House - Moorgate"],
+            [None, "Just five minutes from The Scalpel and Bank station, this striking building offers "
+                   "24/7 access and a rooftop terrace."],
+            [None, "1 London Wall, EC2Y 5EA", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "2nd Floor", 2200.0, 15000.0, "Now"],
+            [None, "The Scalpel - Leadenhall"],
+            [None, "An instantly recognisable landmark tower with panoramic City views."],
+            [None, "52 Lime Street, EC3M 7AF", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "5th Floor", 3100.0, 21000.0, "Now"],
+            [None, "9th Floor", 2900.0, 19500.0, "1st October 2026"],
+        ]))
+        units = [
+            {"building": "Moor House"},
+            {"building": "The Scalpel"},
+            {"building": "The Scalpel"},
+        ]
+
+        mismatches = extract_spreadsheet_gemini.find_undercounted_buildings(text, units)
+
+        self.assertEqual(mismatches, [])
+
+    def test_fully_occupied_building_with_zero_units_does_not_inflate_neighbor(self):
+        # Real false positive: a building with NO surviving units at all
+        # (correctly, per PROMPT, since its own mini-table just says "Fully
+        # Occupied") never appears in `units`, so it can't bound the
+        # PRECEDING building's own block boundary by its heading line -
+        # the old substring-based boundary ran straight past it to the next
+        # SURVIVING building's heading, silently counting the fully-occupied
+        # building's own mini-table header row as an extra data row for the
+        # building before it.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Bankside House - Southwark"],
+            [None, "A refurbished period building moments from Southwark station."],
+            [None, "10 Bankside, SE1 9EY", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "1st Floor", 1500.0, 12000.0, "Now"],
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "Fully Occupied"],
+            [None, "Skyline Tower - Southwark"],
+            [None, "A striking new-build tower with flexible floorplates."],
+            [None, "20 Skyline Way, SE1 9FA", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+            [None, "4th Floor", 1750.0, 13500.0, "Now"],
+        ]))
+        units = [
+            {"building": "Bankside House"},
+            {"building": "Skyline Tower"},
+            {"building": "Skyline Tower"},
+        ]
+
+        mismatches = extract_spreadsheet_gemini.find_undercounted_buildings(text, units)
+
+        self.assertEqual(mismatches, [])
+
+    def test_single_consistent_table_sheet_is_never_flagged(self):
+        # Real false positive: a single-consistent-table sheet (PROMPT shape
+        # (a) - one sheet-wide header row, building repeated per data row,
+        # no per-building heading/address/download lines at all) isn't the
+        # repeating-blocks shape this heuristic was designed for. With no
+        # per-building end-of-block anchor available, the old code ran the
+        # last building's own block all the way to the end of the sheet,
+        # picking up trailing boilerplate rows as if they were extra units.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Building", "Floor", "Size (sq ft)", "Rent PCM"],
+            [None, "Portfolio Building A", "1st Floor", 1000, 20000],
+            [None, "Portfolio Building A", "2nd Floor", 1200, 24000],
+            [None, "Portfolio Building B", "Ground Floor", 900, 18000],
+            [None, "Terms and Conditions apply", "See website for details", "Not for reliance"],
+            [None, "This document does not constitute an offer or contract", "E&OE", "v2"],
+        ]))
+        units = [
+            {"building": "Portfolio Building A"},
+            {"building": "Portfolio Building A"},
+            {"building": "Portfolio Building B"},
+        ]
+
+        mismatches = extract_spreadsheet_gemini.find_undercounted_buildings(text, units)
+
+        self.assertEqual(mismatches, [])
+
+
+class SheetShowsFullyOccupiedBuildingTests(unittest.TestCase):
+    def test_true_when_a_fully_occupied_row_is_present(self):
+        text = (
+            "Row 1: | Riverside Building - Southwark\n"
+            "Row 2: | A modern glass-fronted office building.\n"
+            "Row 3: | 15 Riverside Walk, SE1 9EZ | | | | Download Floorplans\n"
+            "Row 4: | Office | Sq.Ft | Rent PCM | Available From\n"
+            "Row 5: | Fully Occupied"
+        )
+        self.assertTrue(extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text))
+
+    def test_false_when_no_fully_occupied_row_is_present(self):
+        text = "Row 1: unrelated content\nRow 2: nothing here either"
+        self.assertFalse(extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text))
 
 
 if __name__ == "__main__":
