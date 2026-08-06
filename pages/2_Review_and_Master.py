@@ -706,13 +706,14 @@ def _render_pending_review(pending: list):
                     linked_property_id = master_options[choice_label]
 
                     if linked_property_id is None:
-                        confirm_new = st.checkbox(
-                            "Confirm — add as a new property", value=True, key=f"{key_prefix}_confirm_new"
+                        # "— add as new —" is the default selectbox choice, so this is
+                        # already the no-action outcome - no extra checkbox needed to
+                        # confirm it. A reviewer who believes this IS the near-miss
+                        # property says so by picking it from the dropdown above, which
+                        # routes into the `else` branch instead.
+                        new_rows_final.append(
+                            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
                         )
-                        if confirm_new:
-                            new_rows_final.append(
-                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
-                            )
                     else:
                         target_index = next(
                             idx for idx, rec in enumerate(plan.master_records)
