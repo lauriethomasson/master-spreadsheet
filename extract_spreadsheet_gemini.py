@@ -96,8 +96,14 @@ Then extract EVERY SEPARATE AVAILABLE UNIT:
 - state_of_space: the physical fit-out state ONLY if the text EXPLICITLY states one (e.g. "Fitted",
   "CAT A", "To be fitted out") - never infer or guess this from a description that merely sounds
   furnished/equipped; leave null whenever the source doesn't use an explicit fit-out term.
-- brochure_link: a URL given directly in the sheet content for that specific row/building, if any
-  (see the hyperlink note above); otherwise null.
+- brochure_link: the URL of the link specifically labeled "Brochure" (e.g. "Download Brochure
+  (https://...)") for that specific row/building, if one is given (see the hyperlink note above).
+  A building's own address/link line in shape (b) often carries TWO separate links side by side -
+  e.g. "... | Download Floorplans (https://a) | | | Download Brochure (https://b)" - these are two
+  DIFFERENT assets, not two labels for one link: brochure_link is specifically the "Brochure"-labeled
+  URL, never the "Floorplans" one as a substitute, even when "Brochure" isn't present at all for that
+  building. If no link labeled "Brochure" is given anywhere for that row/building, brochure_link is
+  null - do not fall back to a "Floorplans" (or any other differently-labeled) link.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -364,6 +370,62 @@ def _heading_cell(line: str) -> str:
     return next((c.strip() for c in line.split("|") if c.strip()), "")
 
 
+def _building_block_bounds(lines: list, building: str):
+    """
+    (start, end) bounding a building's own block among already-row-prefix-
+    stripped `lines` (see _apparent_data_row_count/find_undercounted_
+    buildings and find_buildings_missing_brochure_link, which both need the
+    exact same block first) - lines[start] is the building's own heading
+    line itself (never part of the block's own content), lines[start+1:end]
+    is everything belonging to it. Returns None if the raw text doesn't look
+    like the repeating-blocks shape at all (no "download" line anywhere -
+    see PROMPT shape (b)'s own address/link line note; e.g. a single-
+    consistent-table sheet, PROMPT shape (a), guessing a block boundary
+    for which risks running to the end of the sheet and mistaking trailing
+    boilerplate/disclaimer rows for this building's own data), or if this
+    building's own heading line can't be found at all.
+
+    Locates the heading line by its first non-blank cell (see _heading_cell)
+    STARTING WITH the building name - never a plain substring-anywhere-on-
+    the-line search, which a real file this was confirmed against showed
+    landing inside a completely different, unrelated building's own prose
+    description paragraph that happened to mention this building's name in
+    passing. When more than one line qualifies (e.g. this building's name
+    is itself a prefix of another, different building's longer name, so
+    that OTHER building's own heading also "starts with" this one), the
+    SHORTEST qualifying cell wins - the real heading for this exact
+    building, unlike a different building's heading that merely shares its
+    name as a prefix, has nothing extra appended.
+
+    The block's end is the next "download" line after this building's OWN
+    one (never the next building's heading line, which - confirmed against
+    a real file - can run unbounded straight past an intervening building
+    that was itself "Fully Occupied" and so never produced any surviving
+    unit to anchor a boundary on, silently absorbing that unrelated
+    building's own mini-table header row as if it were an extra data row
+    for THIS building). Falls back to the end of the text if this building
+    has no "download" line of its own, or none follow it.
+    """
+    if not any("download" in line.lower() for line in lines):
+        return None
+
+    building_key = str(building).strip().lower()
+    candidates = [i for i, line in enumerate(lines) if _heading_cell(line).lower().startswith(building_key)]
+    if not candidates:
+        return None
+    start = min(candidates, key=lambda i: (len(_heading_cell(lines[i])), i))
+
+    own_download = next((i for i in range(start + 1, len(lines)) if "download" in lines[i].lower()), None)
+    if own_download is None:
+        end = len(lines)
+    else:
+        next_download = next(
+            (i for i in range(own_download + 1, len(lines)) if "download" in lines[i].lower()), None
+        )
+        end = next_download if next_download is not None else len(lines)
+    return start, end
+
+
 def _apparent_data_row_count(raw_text: str, building: str) -> int:
     """
     Rough count of how many genuine per-unit data rows a building's own
@@ -379,71 +441,27 @@ def _apparent_data_row_count(raw_text: str, building: str) -> int:
     normal, non-garbled size_sqft/rent_pcm (ruling out app.py's own
     _warn_if_extraction_looks_garbled).
 
-    Bails to 0 immediately if the raw text has no "download" line
-    anywhere (see PROMPT shape (b)'s own address/link line note) - with
-    no per-building link marker anywhere in the sheet at all, this isn't
-    a repeating-blocks sheet this heuristic was designed for (e.g. a
-    single-consistent-table sheet, PROMPT shape (a)), and guessing a
-    block boundary anyway risks running to the end of the sheet and
-    counting trailing boilerplate/disclaimer rows as if they were this
-    building's own data.
+    Within its own block (see _building_block_bounds), counts lines with
+    at least 3 pipe-separated cells - real column count varies row to row
+    (render_sheet_as_text trims trailing blank cells per row, so a data
+    row missing its last column or two, e.g. no stated Commission, has
+    fewer cells than one where every column is filled; 3 is a low floor
+    that still comfortably excludes a single-cell prose paragraph, never a
+    requirement to match the table's own header width exactly) - other
+    than the address/link line itself (identified by containing
+    "download"). The FIRST such line is treated as the mini-table's own
+    header row (never itself a unit); every one after it, up to the
+    block's end, counts as one apparent data row.
 
-    Locates the building's own heading line by its first non-blank cell
-    (see _heading_cell) STARTING WITH the building name - never a plain
-    substring-anywhere-on-the-line search, which a real file this was
-    confirmed against showed landing inside a completely different,
-    unrelated building's own prose description paragraph that happened to
-    mention this building's name in passing. When more than one line
-    qualifies (e.g. this building's name is itself a prefix of another,
-    different building's longer name, so that OTHER building's own
-    heading also "starts with" this one), the SHORTEST qualifying cell
-    wins - the real heading for this exact building, unlike a different
-    building's heading that merely shares its name as a prefix, has
-    nothing extra appended.
-
-    The block's end is the next "download" line after this building's
-    OWN one (never the next building's heading line, which - confirmed
-    against a real file - can run unbounded straight past an intervening
-    building that was itself "Fully Occupied" and so never produced any
-    surviving unit to anchor a boundary on, silently absorbing that
-    unrelated building's own mini-table header row as if it were an
-    extra data row for THIS building). Falls back to the end of the text
-    if this building has no "download" line of its own, or none follow it.
-
-    Within that block, counts lines with at least 3 pipe-separated cells
-    - real column count varies row to row (render_sheet_as_text trims
-    trailing blank cells per row, so a data row missing its last column
-    or two, e.g. no stated Commission, has fewer cells than one where
-    every column is filled; 3 is a low floor that still comfortably
-    excludes a single-cell prose paragraph, never a requirement to match
-    the table's own header width exactly) - other than the address/link
-    line itself (identified by containing "download"). The FIRST such
-    line is treated as the mini-table's own header row (never itself a
-    unit); every one after it, up to the block's end, counts as one
-    apparent data row.
-
-    Returns 0 if the building's own heading line can't be found at all -
-    "no evidence of undercounting" is the safe default when this cheap
+    Returns 0 if the building's own block can't be found at all - "no
+    evidence of undercounting" is the safe default when this cheap
     heuristic can't even locate the block, not a false alarm.
     """
     lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
-    if not any("download" in line.lower() for line in lines):
+    bounds = _building_block_bounds(lines, building)
+    if bounds is None:
         return 0
-
-    building_key = str(building).strip().lower()
-    candidates = [i for i, line in enumerate(lines) if _heading_cell(line).lower().startswith(building_key)]
-    if not candidates:
-        return 0
-    start = min(candidates, key=lambda i: (len(_heading_cell(lines[i])), i))
-
-    own_download = next((i for i in range(start + 1, len(lines)) if "download" in lines[i].lower()), None)
-    if own_download is None:
-        end = len(lines)
-    else:
-        next_download = next(
-            (i for i in range(own_download + 1, len(lines)) if "download" in lines[i].lower()), None
-        )
-        end = next_download if next_download is not None else len(lines)
+    start, end = bounds
 
     header_seen = False
     data_rows = 0
@@ -512,3 +530,56 @@ def find_undercounted_buildings(raw_text: str, units: list[dict]) -> list[tuple]
         if apparent > actual:
             mismatches.append((building, apparent, actual))
     return mismatches
+
+
+_BROCHURE_HYPERLINK_RE = re.compile(r"brochure.*\(https?://", re.IGNORECASE)
+
+
+def find_buildings_missing_brochure_link(raw_text: str, units: list[dict]) -> list[str]:
+    """
+    Structural safety net matching find_undercounted_buildings' own
+    approach (reuses the exact same block-boundary logic, see
+    _building_block_bounds), for a different real, confirmed failure mode:
+    every building checked in the real Copthall Estates Availability file
+    (across its City, Mid Town, Westend Soho, and Blackfriars sheets) has a
+    real, working "Download Brochure" hyperlink in the source - see
+    PROMPT's own brochure_link field note on picking that one over a
+    separately-labeled "Download Floorplans" link when a row/block has
+    both. This catches whichever of the two Gemini picked wrong (or
+    dropped entirely) at the structural level, without re-deciding which
+    URL is correct itself.
+
+    Cross-checks every DISTINCT building among `units` (each a dict with
+    at least "building" and "brochure_link" keys) - returns the building
+    names whose own block in the raw text contains a "Brochure"-labeled
+    hyperlink (see _BROCHURE_HYPERLINK_RE - a real inlined hyperlink
+    target, per render_sheet_as_text, not just the bare word "brochure"
+    appearing in running prose with no link at all) but where NONE of that
+    building's own extracted units carry a brochure_link.
+
+    Never the reverse: a building with no "Brochure"-labeled link in the
+    source at all is not itself suspicious - not every provider supplies
+    one, and this never invents a requirement that one exist.
+    """
+    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
+    buildings = []
+    seen = set()
+    for u in units:
+        b = u.get("building")
+        if b and b not in seen:
+            seen.add(b)
+            buildings.append(b)
+
+    missing = []
+    for building in buildings:
+        bounds = _building_block_bounds(lines, building)
+        if bounds is None:
+            continue
+        start, end = bounds
+        has_brochure_link_in_source = any(_BROCHURE_HYPERLINK_RE.search(line) for line in lines[start:end])
+        if not has_brochure_link_in_source:
+            continue
+        any_extracted = any(u.get("brochure_link") for u in units if u.get("building") == building)
+        if not any_extracted:
+            missing.append(building)
+    return missing

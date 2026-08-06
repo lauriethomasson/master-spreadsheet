@@ -215,6 +215,33 @@ def _warn_if_units_look_undercounted(rows: list[ListingRow], ws, sheet_label: st
         )
 
 
+def _warn_if_brochure_link_missing(rows: list[ListingRow], ws, sheet_label: str) -> None:
+    """
+    A third, cheap sanity check for Gemini-extracted spreadsheet rows,
+    alongside _warn_if_extraction_looks_garbled/_warn_if_units_look_
+    undercounted - this one flags when a building's own block in the raw
+    sheet text visibly contains a "Download Brochure" hyperlink but none of
+    that building's own extracted units carry a brochure_link (see extract_
+    spreadsheet_gemini.find_buildings_missing_brochure_link's own docstring
+    for the real, confirmed production case this exists to catch - a real
+    source link every one of these buildings genuinely has).
+
+    Re-renders the sheet's raw text (see render_sheet_as_text) rather than
+    threading it through extract_sheet's own return value - same reasoning
+    as _warn_if_units_look_undercounted above.
+    """
+    if not rows:
+        return
+    text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+    units = [{"building": r.building, "brochure_link": r.brochure_link} for r in rows]
+    for building in extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units):
+        st.warning(
+            f"⚠️ {sheet_label}: {building} has a Download Brochure link in the source sheet, but no "
+            "brochure link was extracted for any of its units - please check this building's brochure "
+            "link before approving."
+        )
+
+
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
 
@@ -380,6 +407,7 @@ with page_setup.setup_page("upload"):
                                 else:
                                     _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
                                     _warn_if_units_look_undercounted(sheet_rows, ws, sheet_label)
+                                    _warn_if_brochure_link_missing(sheet_rows, ws, sheet_label)
                                 gemini_rows.extend(sheet_rows)
                             else:
                                 sheet_rows = extract_spreadsheet.build_rows(df, mapping, source_file=sheet_label)

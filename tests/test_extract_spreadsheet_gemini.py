@@ -498,5 +498,146 @@ class SheetShowsFullyOccupiedBuildingTests(unittest.TestCase):
         self.assertFalse(extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text))
 
 
+class BrochureLinkDisambiguationTests(unittest.TestCase):
+    """PROMPT's brochure_link field note - real, confirmed against the
+    actual Copthall Estates Availability file: every building's own
+    address/link line in shape (b) carries TWO separate hyperlinks side by
+    side (e.g. the real City sheet's row 11, 27-30 Lime Street) - a
+    "Download Floorplans" link and a separate "Download Brochure" link,
+    never the same asset twice. Only the "Brochure"-labeled one belongs in
+    brochure_link. Never calls the real Gemini API (see this module's own
+    docstring) - reproduces that real block's raw-text shape for context,
+    and mocks Gemini's own return value as if it had already correctly
+    picked the Brochure link per the strengthened prompt, proving that
+    choice survives end to end into the final ListingRow untouched (not
+    silently swapped for the Floorplans link, or dropped, by anything
+    downstream - e.g. finalize_brochure_link)."""
+
+    def _lime_street_sheet(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "27-30 Lime Street - Fenchurch St / Bank"])
+        ws.append([None, "A striking City tower with a full range of on-site amenities."])
+        ws.append([
+            None, "27-30 Lime Street, EC3M 7AF", None, None, None,
+            "Download Floorplans", None, None, "Download Brochure",
+        ])
+        ws["F3"].hyperlink = "https://lmstern.sharepoint.com/floorplans/27-30-lime-street"
+        ws["I3"].hyperlink = "https://copthallestates.com/brochures/27-30-lime-street.pdf"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "5th Floor", 2400.0, 18000.0, "Now"])
+        return ws
+
+    def test_brochure_labeled_link_is_used_not_the_floorplans_one(self):
+        raw = {
+            "provider": "Copthall Estates",
+            "contacts": None,
+            "units": [{
+                "building": "27-30 Lime Street", "floor_unit": "5th Floor",
+                "size_sqft": 2400, "rent_pcm": 18000,
+                "brochure_link": "https://copthallestates.com/brochures/27-30-lime-street.pdf",
+            }],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(
+                self._lime_street_sheet(), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://copthallestates.com/brochures/27-30-lime-street.pdf")
+        self.assertNotEqual(rows[0].brochure_link, "https://lmstern.sharepoint.com/floorplans/27-30-lime-street")
+
+
+class FindBuildingsMissingBrochureLinkTests(unittest.TestCase):
+    """find_buildings_missing_brochure_link - the structural safety net for
+    a different real, confirmed failure: every building checked in the real
+    Copthall Estates Availability file has a genuine, working Download
+    Brochure link in the source, so a building whose own block clearly has
+    one but whose extracted unit(s) came back with brochure_link=None is
+    worth a warning, exactly like find_undercounted_buildings already does
+    for row counts."""
+
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        return ws
+
+    def test_flags_a_building_with_a_source_brochure_link_but_no_extracted_one(self):
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [
+                None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+                "Download Floorplans (https://a.example.com/floorplans)", None, None,
+                "Download Brochure (https://b.example.com/brochure.pdf)",
+            ],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+        units = [{"building": "Riverside Building", "brochure_link": None}]
+
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units)
+
+        self.assertEqual(missing, ["Riverside Building"])
+
+    def test_not_flagged_when_a_unit_has_the_brochure_link(self):
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [
+                None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+                "Download Brochure (https://b.example.com/brochure.pdf)",
+            ],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+        units = [{"building": "Riverside Building", "brochure_link": "https://b.example.com/brochure.pdf"}]
+
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units)
+
+        self.assertEqual(missing, [])
+
+    def test_not_flagged_when_source_never_had_a_brochure_link_at_all(self):
+        # Not every provider supplies one - a building with none in the
+        # source at all is not itself suspicious.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+        units = [{"building": "Riverside Building", "brochure_link": None}]
+
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units)
+
+        self.assertEqual(missing, [])
+
+    def test_bare_word_brochure_with_no_real_link_is_not_a_false_alarm(self):
+        # "brochure" appearing in running prose with no actual hyperlink
+        # target next to it is not the same thing as a real Download
+        # Brochure link - must not be mistaken for one.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "See our brochure tab for full incentive details."],
+            [None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+        units = [{"building": "Riverside Building", "brochure_link": None}]
+
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units)
+
+        self.assertEqual(missing, [])
+
+    def test_building_block_not_found_returns_no_mismatch(self):
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(
+            "Row 1: unrelated content", [{"building": "Nowhere", "brochure_link": None}],
+        )
+        self.assertEqual(missing, [])
+
+
 if __name__ == "__main__":
     unittest.main()
