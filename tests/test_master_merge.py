@@ -144,6 +144,65 @@ class DefaultMergeChoiceIndexTests(unittest.TestCase):
         self.assertEqual(master_merge.default_merge_choice_index([None, None]), 0)
 
 
+class MatchedCollisionFieldChoiceTests(unittest.TestCase):
+    """Unlike merge_field_choice (used for unmatched_collisions' brand-new-
+    property merge, where a blank source IS a meaningful choice to show -
+    see that class's own test_one_blank_one_filled_still_needs_a_choice),
+    a MATCHED collision always has master's own current value as a
+    fallback, so a colliding row that's silently blank on a field has no
+    opinion on it at all - it must never force a choice just because a
+    sibling row does propose something."""
+
+    def test_all_agree_no_choice_needed(self):
+        self.assertEqual(
+            master_merge.matched_collision_field_choice(["Fitted", "Fitted", "Fitted"]), (False, "Fitted"),
+        )
+
+    def test_tolerant_equal_values_agree(self):
+        self.assertEqual(master_merge.matched_collision_field_choice(["METSPACE", "Metspace"]), (False, "METSPACE"))
+
+    def test_one_non_blank_among_blanks_is_not_a_disagreement(self):
+        # The real point of departure from merge_field_choice: a colliding
+        # row that's blank on this field (silent - no opinion, exactly what
+        # it means for a field to be absent from THAT row's own diffs) must
+        # NOT force a manual choice just because a sibling row DOES propose
+        # a value for it.
+        needs_choice, value = master_merge.matched_collision_field_choice([None, "22 desks", ""])
+        self.assertFalse(needs_choice)
+        self.assertEqual(value, "22 desks")
+
+    def test_genuine_disagreement_needs_choice(self):
+        needs_choice, value = master_merge.matched_collision_field_choice(["Fitted", "CAT A"])
+        self.assertTrue(needs_choice)
+        self.assertIsNone(value)
+
+    def test_all_blank_resolves_to_none_no_choice(self):
+        needs_choice, value = master_merge.matched_collision_field_choice([None, ""])
+        self.assertFalse(needs_choice)
+        self.assertIsNone(value)
+
+
+class CollisionGroupFieldsTests(unittest.TestCase):
+    def test_union_of_diffs_in_diff_fields_order(self):
+        master_df = _master_df([{"building": "A", "provider": "P1", "size_sqft": 1000.0, "state_of_space": "Cat A"}])
+        row_a = ListingRow(building="A", provider="P1", size_sqft=1200.0, state_of_space="Cat A")
+        row_b = ListingRow(building="A", provider="P1", size_sqft=1000.0, state_of_space="Fitted")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], master_df)
+
+        self.assertEqual(len(plan.collisions), 1)
+        self.assertEqual(master_merge.collision_group_fields(plan.collisions[0]), ["size_sqft", "state_of_space"])
+
+    def test_field_no_member_changed_is_not_included(self):
+        master_df = _master_df([{"building": "A", "provider": "P1", "size_sqft": 1000.0}])
+        row_a = ListingRow(building="A", provider="P1", size_sqft=1200.0)
+        row_b = ListingRow(building="A", provider="P1", size_sqft=1200.0)
+
+        plan = master_merge.build_merge_plan([row_a, row_b], master_df)
+
+        self.assertEqual(master_merge.collision_group_fields(plan.collisions[0]), ["size_sqft"])
+
+
 class BuildMergePlanIntraBatchDuplicateTests(unittest.TestCase):
     """The exact reported scenario: a PDF upload and an email upload of the
     same real property, neither matching master, must be recognized as
@@ -362,6 +421,73 @@ class CanonicalizeProvidersTests(unittest.TestCase):
         master_merge.canonicalize_providers(rows)
 
         self.assertEqual([r.provider for r in rows], ["Workplace Plus", "Workplace Plus", "Newco Realty", None])
+
+
+class ProviderPurposeSuffixTests(unittest.TestCase):
+    """Real reported bug: a single uploaded Copthall Estates workbook's
+    per-sheet provider extraction (see extract_spreadsheet_gemini.PROMPT -
+    each sheet's own title/branding text is transcribed verbatim) produced
+    "Copthall Estates" from one sheet and "Copthall Estates Availibility"
+    (that exact misspelling) from another for the SAME real Throgmorton
+    Avenue 2nd Floor unit - two separate "no match found" new-property rows
+    instead of one flagged batch duplicate, because provider is part of
+    every matching/dedup key."""
+
+    def test_strips_availability_and_the_real_misspelling(self):
+        self.assertEqual(
+            master_merge._strip_provider_purpose_suffix("Copthall Estates Availability"), "Copthall Estates",
+        )
+        self.assertEqual(
+            master_merge._strip_provider_purpose_suffix("Copthall Estates Availibility"), "Copthall Estates",
+        )
+
+    def test_bare_suffix_word_alone_is_left_unchanged(self):
+        # Nothing meaningful would be left after stripping - a value this
+        # bare was never a confident provider extraction to begin with.
+        self.assertEqual(master_merge._strip_provider_purpose_suffix("Availability"), "Availability")
+
+    def test_unrelated_word_is_untouched(self):
+        self.assertEqual(master_merge._strip_provider_purpose_suffix("Business Cube"), "Business Cube")
+
+    def test_blank_passes_through_unchanged(self):
+        self.assertIsNone(master_merge._strip_provider_purpose_suffix(None))
+        self.assertEqual(master_merge._strip_provider_purpose_suffix(""), "")
+
+    def test_unrelated_provider_ending_in_a_different_word_is_not_merged(self):
+        # Proves the strip is narrowly scoped to the confirmed sheet-purpose
+        # words only, not a general "strip the trailing word and see if it
+        # matches" heuristic - two genuinely DIFFERENT real providers for
+        # the same unit (e.g. two different agents both listing it) must
+        # never collapse into the same match key just because one string
+        # happens to be a prefix of the other.
+        row_a = ListingRow(
+            building="1 Example Street", provider="Copthall Estates",
+            floor_unit="1st Floor", postcode="EC1A 1AA",
+        )
+        row_b = ListingRow(
+            building="1 Example Street", provider="Copthall Estates Group",
+            floor_unit="1st Floor", postcode="EC1A 1AA",
+        )
+        master_merge.canonicalize_providers([row_a, row_b])
+        self.assertNotEqual(row_a.provider, row_b.provider)
+        plan = master_merge.build_merge_plan([row_a, row_b], _master_df([]))
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+    def test_availability_suffix_variant_recognized_as_same_provider(self):
+        # The actual reported bug: same real Throgmorton Avenue 2nd Floor
+        # unit, one sheet's provider "Copthall Estates", another sheet's
+        # "Copthall Estates Availibility" - must now be flagged as one
+        # batch duplicate instead of two separate "no match" new rows.
+        row_a = ListingRow(building="Throgmorton Avenue", provider="Copthall Estates", floor_unit="2nd Floor")
+        row_b = ListingRow(
+            building="Throgmorton Avenue", provider="Copthall Estates Availibility", floor_unit="2nd Floor",
+        )
+        rows = [row_a, row_b]
+        master_merge.canonicalize_providers(rows)
+        self.assertEqual(row_a.provider, row_b.provider)
+        plan = master_merge.build_merge_plan(rows, _master_df([]))
+        self.assertEqual(len(plan.unmatched_collisions), 1)
+        self.assertEqual(len(plan.unmatched_collisions[0]), 2)
 
 
 class BuildingHasNoDigitsTests(unittest.TestCase):
@@ -921,6 +1047,59 @@ class CollisionTests(unittest.TestCase):
 
         self.assertEqual(len(plan.collisions), 1)
         self.assertEqual(len(plan.collisions[0]), 2)
+
+    def test_byte_identical_collision_all_fields_auto_resolvable(self):
+        # The real reported case: two sheets of the same Copthall Estates
+        # workbook (a portfolio-wide rollup and that provider's own per-
+        # building detail sheet) both extracted "Copthall House" - 4th
+        # Floor - with byte-identical values for every changed field. This
+        # is a genuine plan.collisions entry (write order must never
+        # silently pick a winner), but every field should be auto-
+        # resolvable via matched_collision_field_choice since the two
+        # sources don't actually disagree on anything.
+        master_df = _master_df([{"building": "Copthall House", "provider": "Copthall Estates", "floor_unit": "4th Floor"}])
+        rollup_row = ListingRow(
+            building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor",
+            address_1="1 Copthall Avenue", submarket="City", special_features="Air conditioning; 24hr access",
+            contacts="Jane Doe, jane@example.com", source_file="Copthall.xlsx — Portfolio",
+        )
+        detail_row = ListingRow(
+            building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor",
+            address_1="1 Copthall Avenue", submarket="City", special_features="Air conditioning; 24hr access",
+            contacts="Jane Doe, jane@example.com", source_file="Copthall.xlsx — City Detail",
+        )
+
+        plan = master_merge.build_merge_plan([rollup_row, detail_row], master_df)
+
+        self.assertEqual(len(plan.collisions), 1)
+        group = plan.collisions[0]
+        self.assertEqual(len(group), 2)
+        for f in master_merge.collision_group_fields(group):
+            values = [m.new_row.model_dump()[f] for m in group]
+            needs_choice, _ = master_merge.matched_collision_field_choice(values)
+            self.assertFalse(needs_choice, f"field {f!r} should not need a manual choice")
+
+    def test_collision_with_one_genuine_disagreement_only_that_field_needs_a_choice(self):
+        master_df = _master_df([{"building": "Copthall House", "provider": "Copthall Estates", "floor_unit": "4th Floor"}])
+        row_a = ListingRow(
+            building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor",
+            address_1="1 Copthall Avenue", state_of_space="Cat A",
+        )
+        row_b = ListingRow(
+            building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor",
+            address_1="1 Copthall Avenue", state_of_space="Fitted",
+        )
+
+        plan = master_merge.build_merge_plan([row_a, row_b], master_df)
+        group = plan.collisions[0]
+        fields = master_merge.collision_group_fields(group)
+
+        results = {
+            f: master_merge.matched_collision_field_choice([m.new_row.model_dump()[f] for m in group])
+            for f in fields
+        }
+        self.assertFalse(results["address_1"][0])
+        self.assertTrue(results["state_of_space"][0])
 
 
 class BuildManualEditTests(unittest.TestCase):

@@ -140,6 +140,114 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
             )
 
 
+def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, updates: dict) -> None:
+    """
+    Single-row expander for an ordinary (non-collision, or a collision
+    group that shrank to size 1 after its let-status member was pulled out
+    - see the matched_changed loop below) matched-row diff - factored out
+    of that loop so the rare group-of-one edge case can reuse it instead of
+    duplicating the expander/checkbox rendering.
+    """
+    label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
+    with st.expander(label, key=f"{key_prefix}_expander"):
+        approved_fields = _render_field_rows(
+            m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields
+        )
+    if approved_fields:
+        entry = updates.setdefault(m.master_index, {})
+        entry.update(approved_fields)
+        entry["source_file"] = m.new_row.source_file
+
+
+def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_accept: bool) -> None:
+    """
+    group: list[master_merge.MatchedRow] (len >= 2, non-let-status members
+    only), all sharing one master_index (see master_merge.build_merge_
+    plan's plan.collisions) - multiple rows in THIS SAME upload
+    independently matched the same existing master property. Real reported
+    case this replaces: two sheets of the same Copthall Estates workbook
+    both extracting "Copthall House" - 4th Floor, with byte-identical
+    values for all 6 changed fields - rendered as two separate, fully-
+    expanded diff blocks, forcing the same 6 fields to be reviewed and
+    approved twice.
+
+    Compares the group's own proposed values against EACH OTHER first (see
+    master_merge.matched_collision_field_choice) rather than diffing each
+    member against master independently: a field every member agrees on
+    (or where only one member has an opinion at all) is treated exactly
+    like an ordinary non-colliding matched-row change - no manual click
+    needed, silently auto-applied when auto_accept and nothing else about
+    this group forces a look. Only a field where colliding sources
+    genuinely disagree gets its own single decision, reusing the same
+    merge-choice UI already built for unmatched_collisions' brand-new-
+    property merge (see _render_merge_field_choice) - never one decision
+    per field per member.
+
+    A field is still flagged risky (see master_merge.is_detail_loss/
+    is_richness_regression/house_number_changed) if ANY member's own diff
+    triggered it - agreeing on a value doesn't make a detail-loss pattern
+    any less worth a human's attention.
+    """
+    master_index = group[0].master_index
+    old_rec = plan.master_records[master_index]
+    dicts = [m.new_row.model_dump() for m in group]
+    labels = [d.get("source_file") or f"Row {i + 1}" for i, d in enumerate(dicts)]
+    risky_fields = frozenset().union(*(m.risky_fields for m in group))
+
+    agree_diffs = {}    # {field: (old_val, resolved_val)} - agree, or only one has an opinion
+    choice_fields = []  # [(field, values)] - genuine disagreement, needs a human pick
+    for f in master_merge.collision_group_fields(group):
+        values = [d.get(f) for d in dicts]
+        needs_choice, resolved = master_merge.matched_collision_field_choice(values)
+        if needs_choice:
+            choice_fields.append((f, values))
+        else:
+            agree_diffs[f] = (old_rec.get(f), resolved)
+
+    if auto_accept and not choice_fields and not risky_fields:
+        entry = updates.setdefault(master_index, {})
+        entry.update({f: v for f, (_, v) in agree_diffs.items()})
+        entry["source_file"] = " + ".join(labels)
+        return
+
+    total_fields = len(agree_diffs) + len(choice_fields)
+    label = f"⚠️ {display_utils.row_label(old_rec)} — {total_fields} field(s) changed ({len(group)} sources)"
+    key_prefix = f"collision_{idx}_{master_index}"
+    approved = {}
+    with st.expander(label, key=f"{key_prefix}_expander"):
+        if choice_fields:
+            st.caption(
+                f"{len(group)} rows in this upload matched this same existing property. "
+                f"{len(choice_fields)} field(s) disagree between sources — pick which value is correct below; "
+                "the rest already agree and are shown below that."
+            )
+            for f, values in choice_fields:
+                old_val = old_rec.get(f)
+                st.caption(f"Current master value: {'—' if old_val in (None, '') else old_val}")
+                value = _render_merge_field_choice(f, values, labels, f"{key_prefix}_{f}")
+                is_risky = f in risky_fields
+                apply_field = st.checkbox(
+                    "Apply this change", value=not is_risky, key=f"{key_prefix}_{f}_apply",
+                )
+                if is_risky:
+                    st.caption(
+                        "⚠️ This update looks like it may be missing information from the current record — "
+                        "review carefully before applying."
+                    )
+                if apply_field:
+                    approved[f] = value
+                st.divider()
+        if agree_diffs:
+            approved.update(
+                _render_field_rows(agree_diffs, f"{key_prefix}_agree", default_checked=True, risky_fields=risky_fields)
+            )
+
+    if approved:
+        entry = updates.setdefault(master_index, {})
+        entry.update(approved)
+        entry["source_file"] = " + ".join(labels)
+
+
 def _render_let_status_decision(m, key_prefix: str) -> str:
     """
     Prominently shown - never inside a collapsed expander like a normal
@@ -619,6 +727,8 @@ def _render_pending_review(pending: list):
     if plan.matched_changed:
         if not auto_accept or colliding_changed_ids or risky_changed_ids or let_status_ids:
             st.subheader("Matched — changes detected")
+        collision_groups_by_index = {group[0].master_index: group for group in plan.collisions}
+        rendered_collision_indices = set()
         for i, m in enumerate(plan.matched_changed):
             is_collision = id(m) in colliding_changed_ids
             is_risky = id(m) in risky_changed_ids
@@ -636,27 +746,33 @@ def _render_pending_review(pending: list):
                     entry["source_file"] = m.new_row.source_file
                 continue
 
-            if auto_accept and not is_collision and not is_risky:
+            if is_collision:
+                if m.master_index in rendered_collision_indices:
+                    continue  # this group's peer already rendered the whole group below
+                rendered_collision_indices.add(m.master_index)
+                # A collision group's own let-status members (if any) were
+                # already pulled out above, individually, before this loop
+                # ever reaches them - only the remaining, non-let-status
+                # members are compared against each other here.
+                group = [g for g in collision_groups_by_index[m.master_index] if id(g) not in let_status_ids]
+                if len(group) < 2:
+                    # Nothing left to compare against as a group (a sibling
+                    # was pulled into its own let-status decision above) -
+                    # fall through to the ordinary single-row rendering,
+                    # still flagged ⚠️ since it did collide with something.
+                    if group:
+                        _render_matched_row(group[0], f"matched_{i}_{group[0].property_id}", "⚠️ ", False, updates)
+                    continue
+                _render_collision_group(group, i, plan, updates, auto_accept)
+                continue
+
+            if auto_accept and not is_risky:
                 entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
                 entry["source_file"] = m.new_row.source_file
                 updates[m.master_index] = entry
                 continue
 
-            prefix = "⚠️ " if (is_collision or is_risky) else ""
-            label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
-            key_prefix = f"matched_{i}_{m.property_id}"
-            # Two colliding rows both targeting the same master property share
-            # the exact same label text (that's what makes them a collision) -
-            # an explicit, per-iteration key is required here, or Streamlit
-            # can't tell the two expanders apart and silently renders only one.
-            with st.expander(label, key=f"{key_prefix}_expander"):
-                approved_fields = _render_field_rows(
-                    m.diffs, key_prefix, default_checked=not is_collision, risky_fields=m.risky_fields
-                )
-            if approved_fields:
-                entry = updates.setdefault(m.master_index, {})
-                entry.update(approved_fields)
-                entry["source_file"] = m.new_row.source_file
+            _render_matched_row(m, f"matched_{i}_{m.property_id}", "⚠️ " if is_risky else "", True, updates)
 
     for m in plan.matched_unchanged:
         _apply_silent(m)

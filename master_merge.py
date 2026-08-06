@@ -215,15 +215,68 @@ def canonicalize_provider_name(value):
     return _CANONICAL_PROVIDER_BY_KEY.get(_canonical_provider_key(value), value)
 
 
+# Sheet-title-derived provider text can carry a trailing word describing the
+# SHEET's purpose/content rather than who the provider actually is - real,
+# confirmed case: a single uploaded Copthall Estates workbook where one
+# sheet's own title/branding text is literally "Copthall Estates" (a
+# portfolio-wide rollup) and another sheet's is "Copthall Estates
+# Availibility" (that exact misspelling, not "Availability" - confirmed
+# against the real reported bug) for a per-area detail sheet.
+# extract_spreadsheet_gemini.py's PROMPT correctly instructs verbatim
+# transcription of each sheet's own title, so Gemini reporting these as two
+# different literal provider strings is itself correct extraction, not a
+# bug there - but left uncorrected, provider is part of every matching key
+# (_fallback_key/_primary_key/_dedup_key/_fuzzy_anchor_key below), so the
+# exact same real units extracted from each sheet never recognize each
+# other as the same provider. Confirmed real symptom: the same Throgmorton
+# Avenue 2nd Floor unit appearing twice as two separate "no match found -
+# will be added as new" rows, one under each spelling, instead of one
+# flagged batch duplicate. A small, explicit, hand-maintained set of
+# confirmed sheet-purpose words - same "conservative, human catches it"
+# philosophy as KNOWN_PROVIDERS/_STREET_SUFFIX_EXPANSIONS/LET_STATUS_
+# KEYWORDS in this same file - not a general "strip anything that looks
+# like a suffix" heuristic, so a provider whose real name genuinely ends
+# in some other word is never touched.
+_PROVIDER_PURPOSE_SUFFIXES = ("availability", "availibility")
+
+
+def _strip_provider_purpose_suffix(value):
+    """
+    Drops a trailing sheet-purpose word (see _PROVIDER_PURPOSE_SUFFIXES)
+    from value's own last word, if present - e.g. "Copthall Estates
+    Availability" / "Copthall Estates Availibility" both -> "Copthall
+    Estates". Applies to ANY provider string, not just ones already on
+    KNOWN_PROVIDERS - unlike canonicalize_provider_name, this isn't
+    correcting toward an already-confirmed spelling, it's removing a word
+    that was never part of the provider's name at all, and that's true
+    whether or not this project has seen this particular provider before.
+
+    Returns value completely unchanged when its last word isn't one of
+    these, OR when the value is nothing BUT that one word (e.g. a bare
+    "Availability" with no provider name at all) - stripping every word
+    would leave nothing meaningful, and a value this bare was never a
+    confident provider extraction to begin with, so there's nothing safe
+    to correct it toward.
+    """
+    if _is_blank(value):
+        return value
+    words = str(value).split()
+    if len(words) > 1 and words[-1].lower() in _PROVIDER_PURPOSE_SUFFIXES:
+        return " ".join(words[:-1])
+    return value
+
+
 def canonicalize_providers(rows: list[ListingRow]) -> None:
-    """Applies canonicalize_provider_name to every row's provider in place -
-    the list[ListingRow]-mutating counterpart to app.py's fill_missing_
-    provider/fill_missing_address_from_building, meant to run right
-    alongside them: after extraction/mapping (Gemini or spreadsheet) has
-    produced a provider value, before that row is ever used for matching or
-    diffing."""
+    """Applies _strip_provider_purpose_suffix then canonicalize_provider_name
+    to every row's provider in place - the list[ListingRow]-mutating
+    counterpart to app.py's fill_missing_provider/fill_missing_address_from_
+    building, meant to run right alongside them: after extraction/mapping
+    (Gemini or spreadsheet) has produced a provider value, before that row
+    is ever used for matching or diffing. Suffix-stripping runs first since
+    it can turn an otherwise-unrecognized "X Availability" into the bare "X"
+    that KNOWN_PROVIDERS might then separately recognize."""
     for row in rows:
-        row.provider = canonicalize_provider_name(row.provider)
+        row.provider = canonicalize_provider_name(_strip_provider_purpose_suffix(row.provider))
 
 
 def field_kind(field_name: str) -> str:
@@ -810,6 +863,56 @@ class MergePlan:
     unmatched: list                # list[UnmatchedRow]
     collisions: list               # list[list[MatchedRow]] - multiple incoming rows targeting the same master row
     unmatched_collisions: list     # list[list[UnmatchedRow]] - multiple incoming rows matching each other, no master row
+
+
+def collision_group_fields(group: list) -> list:
+    """
+    Union of every field that appears in ANY member's diffs, in DIFF_FIELDS
+    order (a stable, predictable render order rather than dict/set
+    insertion order) - see matched_collision_field_choice for how each
+    field's proposed values across the group get resolved. A field none of
+    the group's members changed relative to master isn't included at all -
+    there's nothing to resolve for it, same as it wouldn't appear in a
+    single non-colliding matched row's own diff either.
+    """
+    fields_with_diffs = {f for m in group for f in m.diffs}
+    return [f for f in DIFF_FIELDS if f in fields_with_diffs]
+
+
+def matched_collision_field_choice(values: list) -> tuple:
+    """
+    Like merge_field_choice, but for one field's PROPOSED values across a
+    matched-collision group (see collision_group_fields) rather than
+    merge_field_choice's own brand-new-property case (unmatched_collisions,
+    no master row to fall back to at all). Blank vs non-blank is
+    deliberately NOT treated as a disagreement here, unlike
+    merge_field_choice: a colliding row that's blank (or simply unchanged
+    from master, so this field never even reached ITS OWN diffs) on a field
+    has no opinion on it, exactly as it would in an ordinary, non-colliding
+    matched-row diff (diff_fields itself already treats "no data this
+    time" as nothing to review, never a value to choose between) - there
+    IS a master fallback here, so unlike merge_field_choice's brand-new-
+    property case, a silent source isn't losing its only chance to state
+    this field.
+
+    needs_choice is True only when two or more colliding rows propose
+    genuinely different non-blank values (tolerant-equal, see _values_equal)
+    for this field - resolved_value is then None and the caller must ask a
+    human to pick one (see _render_merge_field_choice). Otherwise - every
+    value blank, or exactly one distinct non-blank value regardless of how
+    many rows propose it - auto-resolves to that value with no manual
+    click, same as this field would need in a non-colliding matched row.
+    """
+    classes = []
+    for v in values:
+        if _is_blank(v):
+            continue
+        if any(_values_equal(v, rep) for rep in classes):
+            continue
+        classes.append(v)
+    if len(classes) <= 1:
+        return False, (classes[0] if classes else None)
+    return True, None
 
 
 def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
