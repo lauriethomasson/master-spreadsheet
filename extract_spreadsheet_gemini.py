@@ -353,3 +353,118 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
             )
         )
     return rows
+
+
+def _apparent_data_row_count(raw_text: str, building: str, next_building) -> int:
+    """
+    Rough count of how many genuine per-unit data rows a building's own
+    block in the raw sheet text appears to contain - a cheap, structural
+    cross-check against how many units extract_sheet actually returned
+    for that building (see app.py's _warn_if_units_look_undercounted),
+    never a replacement for reading the sheet. Real, confirmed production
+    case this exists to catch: a real Copthall Estates "11 Cursitor
+    Street" mini-table with 3 floor rows (G/LG East, 1st Floor, 4th
+    Floor) came back from a live Gemini call with only 1 unit - a
+    silent, validly-parsed but short JSON response that no existing
+    check catches, since the one row that DID survive had a completely
+    normal, non-garbled size_sqft/rent_pcm (ruling out app.py's own
+    _warn_if_extraction_looks_garbled).
+
+    Locates the building's own block the same way _raw_house_number_for_
+    unit's no-postcode branch does (search for the building name,
+    bounded by the next DIFFERENT building's own heading line or end of
+    text) - substring search, not startswith, since the real file this
+    was confirmed against has an entirely blank leading column on every
+    single row, including the building's own heading row, which a
+    startswith match would silently fail against.
+
+    Within that block, counts lines with at least 3 pipe-separated cells
+    - real column count varies row to row (render_sheet_as_text trims
+    trailing blank cells per row, so a data row missing its last column
+    or two, e.g. no stated Commission, has fewer cells than one where
+    every column is filled; 3 is a low floor that still comfortably
+    excludes a single-cell prose paragraph, never a requirement to match
+    the table's own header width exactly) - other than the address/link
+    line (identified by containing "download", see PROMPT's own note on
+    "Download Floorplans"/"Download Brochure" link labels). The FIRST
+    such line is treated as the mini-table's own header row (never
+    itself a unit); every one after it, up to the block's end, counts as
+    one apparent data row.
+
+    Returns 0 if the building's own heading line can't be found at all -
+    "no evidence of undercounting" is the safe default when this cheap
+    heuristic can't even locate the block, not a false alarm.
+    """
+    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
+    building_key = str(building).strip().lower()
+    start = next((i for i, line in enumerate(lines) if building_key in line.lower()), None)
+    if start is None:
+        return 0
+
+    end = len(lines)
+    if next_building and str(next_building).strip().lower() != building_key:
+        next_key = str(next_building).strip().lower()
+        later = [i for i in range(start + 1, len(lines)) if next_key in lines[i].lower()]
+        if later:
+            end = later[0]
+
+    header_seen = False
+    data_rows = 0
+    for line in lines[start + 1:end]:
+        if "download" in line.lower():
+            continue
+        if len(line.split("|")) < 3:
+            continue
+        if not header_seen:
+            header_seen = True
+            continue
+        data_rows += 1
+    return data_rows
+
+
+def find_undercounted_buildings(raw_text: str, units: list[dict]) -> list[tuple]:
+    """
+    Cross-checks every DISTINCT building among `units` (each a dict with
+    at least a "building" key - the shape extract_sheet's own raw units
+    have before becoming ListingRows, and what app.py adapts its final
+    rows into) against _apparent_data_row_count - returns [(building,
+    apparent_count, actual_count), ...] for every building where the raw
+    text appears to have MORE rows than were actually extracted for it.
+    Never the reverse: genuinely fewer real rows than this heuristic's
+    own rough count is common (a building with just 1 floor has no
+    "extra" rows to miscount) and is not itself suspicious.
+
+    Building block boundaries use EXTRACTION order (the order buildings
+    first appear among `units`), same simplifying assumption
+    _next_distinct_building already makes elsewhere in this file - Gemini
+    has, in every real case observed so far, preserved the sheet's own
+    top-to-bottom row order in its output.
+
+    A building entirely missing from `units` (every one of its rows
+    dropped, not just some) can't be caught here at all - there's no
+    surviving unit to anchor the block search on, so it can't bound a
+    NEIGHBORING building's own block either (a block with no known
+    building after it searches all the way to the end of the text,
+    which - if some other real building actually follows in the sheet
+    but never made it into `units` at all - can overcount into that
+    unrelated content). This only ever reduces manual checking for a
+    PARTIAL loss, never replaces reading the sheet for a complete one -
+    callers must always pass every unit actually extracted from the
+    WHOLE sheet at once, never a single building's units in isolation.
+    """
+    buildings = []
+    seen = set()
+    for u in units:
+        b = u.get("building")
+        if b and b not in seen:
+            seen.add(b)
+            buildings.append(b)
+
+    mismatches = []
+    for i, building in enumerate(buildings):
+        next_building = buildings[i + 1] if i + 1 < len(buildings) else None
+        actual = sum(1 for u in units if u.get("building") == building)
+        apparent = _apparent_data_row_count(raw_text, building, next_building)
+        if apparent > actual:
+            mismatches.append((building, apparent, actual))
+    return mismatches

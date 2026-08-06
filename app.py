@@ -187,6 +187,34 @@ def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) 
         )
 
 
+def _warn_if_units_look_undercounted(rows: list[ListingRow], ws, sheet_label: str) -> None:
+    """
+    A second, cheap sanity check for Gemini-extracted spreadsheet rows,
+    alongside _warn_if_extraction_looks_garbled - that one flags a row
+    whose OWN content looks garbled; this one flags when a building's own
+    block in the raw sheet text visibly contains MORE data rows than were
+    actually extracted for it, a failure row-level content checks can't
+    see at all (see extract_spreadsheet_gemini.find_undercounted_
+    buildings's own docstring for the real, confirmed production case
+    this exists to catch).
+
+    Re-renders the sheet's raw text (see render_sheet_as_text) rather
+    than threading it through extract_sheet's own return value - a
+    second, cheap, pure-function call, not worth widening extract_sheet's
+    return type (and every existing caller/test of it) just to avoid it.
+    """
+    if not rows:
+        return
+    text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+    units = [{"building": r.building} for r in rows]
+    for building, apparent, actual in extract_spreadsheet_gemini.find_undercounted_buildings(text, units):
+        st.warning(
+            f"⚠️ {sheet_label}: {building} looks like it may have {apparent} unit(s) in the "
+            f"source sheet, but only {actual} were extracted - please check this building "
+            "carefully before approving."
+        )
+
+
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
 
@@ -344,6 +372,7 @@ with page_setup.setup_page("upload"):
                                     st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
                                 else:
                                     _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
+                                    _warn_if_units_look_undercounted(sheet_rows, ws, sheet_label)
                                 gemini_rows.extend(sheet_rows)
                             else:
                                 sheet_rows = extract_spreadsheet.build_rows(df, mapping, source_file=sheet_label)

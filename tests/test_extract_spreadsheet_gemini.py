@@ -259,5 +259,116 @@ class AddressHouseNumberVerificationTests(unittest.TestCase):
         self.assertEqual(rows[2].address_1, "1 New Bond Street")
 
 
+class UndercountedBuildingsTests(unittest.TestCase):
+    """Real production case: a live Gemini call against the real Copthall
+    Estates "Mid Town" sheet's Cursitor Street mini-table (G/LG East, 1st
+    Floor, 4th Floor) returned only 1 unit - a silent, validly-parsed but
+    short response no existing check catches, since the one row that DID
+    survive (G/LG East) had a completely normal size_sqft/rent_pcm. This
+    reproduces that exact sheet's shape - confirmed against the real file:
+    a blank leading column on every row, including each building's own
+    heading line, two building blocks separated by a prose amenities
+    paragraph and an address/download-link line."""
+
+    def _mid_town_sheet(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Charterhouse Street - Farringdon / Barbican"])
+        ws.append([None, "Nestled in the vibrant Farringdon/Smithfield quarter, this stylish workspace features high-speed fibre."])
+        ws.append([None, "89 Charterhouse Street, EC1M 6PE", None, None, None, "Download Floorplans"])
+        ws.append([
+            None, "Office", "Sq.Ft", "Price Per Sq.Ft", "Monthly List Price",
+            "Office Description", "Minimum Term", "Available From", "Commission",
+        ])
+        ws.append([
+            None, "3rd Floor", 1960.0, 175.0, 28583.0,
+            "Currently set up with 24 desks, 1 large boardroom, 1 meeting room, 1 chat room, 1 phone booths "
+            "and separate breakout/kitchen",
+            "24 Months", "Now", "Up to 15% - See incentives tab",
+        ])
+        ws.append([None, "Cursitor Street - Chancery Lane"])
+        ws.append([
+            None, "Cursitor Street offers fully furnished, self-contained office spaces with meeting rooms, "
+            "kitchens, high-speed internet, air-conditioning, showers, bike storage, a passenger lift, and "
+            "24/7 access.",
+        ])
+        ws.append([None, "11 Cursitor Street, EC4A 1LL", None, None, None, "Download Floorplans"])
+        ws.append([
+            None, "Office", "Sq.Ft", "Price Per Sq.Ft", "Monthly List Price",
+            "Office Description", "Minimum Term", "Available From", "Commission",
+        ])
+        ws.append([
+            None, "G/LG East", 1800.0, 143.0, 21379.0,
+            "24+ desks on the ground floor and a dedicated kitchen, and a breakout area in the LG floor. "
+            "The layout also provides the option for a private meeting room on the ground floor, with its "
+            "location to be determined by the tenant",
+            "24 Months", "Now",
+            "10% on the first 12 months, 2% commission on months 13-24 for any deals with a lease term of "
+            "36 months or longer. Payable when the deal enters year 3.  Bonus Available for 4th and G/LG "
+            "East Floors **See incentives tab",
+        ])
+        ws.append([
+            None, "1st Floor", 1696.0, 160.0, 22614.0,
+            "18 desks, 1 exec office, 10 person boardroom, dedicated kitchen and breakout space",
+            "24 Months", "1st October 2026",
+        ])
+        ws.append([
+            None, "4th Floor", 706.0, 160.0, 9413.0,
+            "12 desks, dedicated kitchen, dedicated 8 person boardroom",
+            "24 Months", "Now",
+        ])
+        return ws
+
+    def test_partial_response_is_flagged(self):
+        # The exact real failure: only G/LG East (the first, longest-
+        # described row) survived out of Cursitor Street's 3 floors.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._mid_town_sheet())
+        units = [
+            {"building": "Charterhouse Street"},
+            {"building": "Cursitor Street"},
+        ]
+
+        mismatches = extract_spreadsheet_gemini.find_undercounted_buildings(text, units)
+
+        self.assertEqual(mismatches, [("Cursitor Street", 3, 1)])
+
+    def test_correct_extraction_has_no_mismatch(self):
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._mid_town_sheet())
+        units = [
+            {"building": "Charterhouse Street"},
+            {"building": "Cursitor Street"},
+            {"building": "Cursitor Street"},
+            {"building": "Cursitor Street"},
+        ]
+
+        self.assertEqual(extract_spreadsheet_gemini.find_undercounted_buildings(text, units), [])
+
+    def test_single_floor_building_has_no_false_positive(self):
+        # Charterhouse's own 1-floor block must never be flagged just
+        # because its address/header lines are also multi-column - checked
+        # alongside Cursitor Street's full, correct 3-unit extraction (the
+        # real calling convention: app.py always passes every unit
+        # extracted from the WHOLE sheet at once, never a single
+        # building's units in isolation - block boundaries are only
+        # anchored against buildings that actually appear in `units`, so a
+        # building missing entirely from that list can't bound anything
+        # after it).
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._mid_town_sheet())
+        units = [
+            {"building": "Charterhouse Street"},
+            {"building": "Cursitor Street"},
+            {"building": "Cursitor Street"},
+            {"building": "Cursitor Street"},
+        ]
+
+        self.assertEqual(extract_spreadsheet_gemini.find_undercounted_buildings(text, units), [])
+
+    def test_building_not_found_in_text_returns_no_mismatch(self):
+        mismatches = extract_spreadsheet_gemini.find_undercounted_buildings(
+            "Row 1: unrelated content", [{"building": "Nowhere"}],
+        )
+        self.assertEqual(mismatches, [])
+
+
 if __name__ == "__main__":
     unittest.main()
