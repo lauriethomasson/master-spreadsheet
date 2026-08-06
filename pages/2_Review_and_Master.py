@@ -633,6 +633,61 @@ def _render_discard_pending(pending: list, new_rows: list):
     st.divider()
 
 
+def _render_master_lookup(master_df: pd.DataFrame) -> None:
+    """
+    Read-only, filterable view of the CURRENT master spreadsheet, rendered
+    inside the pending-review screen itself - several of that screen's own
+    decisions (the "possible near-miss" link-or-new choice, in particular)
+    require comparing an incoming row against an existing master record,
+    but _render_pending_review replaces _render_full_master_view entirely
+    while anything is pending, so there was previously no way to look at
+    master at all until the batch was approved or discarded.
+
+    st.dataframe, never st.data_editor - genuinely read-only, no possible
+    edit can reach master.xlsx through this view - under its own widget
+    key namespace (pending_master_lookup_*) so it can never collide with
+    _render_master_table's own data_editor state (key=
+    "master_table_default_view") on a later, nothing-pending visit. Takes
+    the SAME master_df _render_pending_review already loaded for
+    build_merge_plan - no second load - and reads/writes no session state
+    of its own beyond the filter text box, so this can never affect
+    updates/new_rows_final/removed_indices or trigger master_writer.
+    write_master().
+    """
+    with st.expander("🔍 View current master", expanded=False):
+        if not master_writer.master_exists():
+            st.info("No master spreadsheet yet — approve an upload to create one.")
+            return
+
+        query = st.text_input(
+            "Filter (building, address, provider, or floor/unit)",
+            key="pending_master_lookup_filter",
+        )
+
+        df = display_utils.sort_by_provider(master_df)
+        if query.strip():
+            search_cols = [c for c in ("building", "address_1", "provider", "floor_unit") if c in df.columns]
+            mask = pd.Series(False, index=df.index)
+            for c in search_cols:
+                mask = mask | df[c].fillna("").astype(str).str.contains(query.strip(), case=False)
+            df = df[mask]
+
+        visible = display_utils.visible_columns(df)
+        display_df = df[visible]
+        st.dataframe(
+            display_df,
+            width="stretch",
+            column_config={
+                **display_utils.label_column_config(display_df),
+                **display_utils.link_column_config(display_df),
+                **display_utils.wide_text_column_config(display_df),
+                **display_utils.numeric_column_config(display_df),
+            },
+            key="pending_master_lookup_table",
+        )
+        st.caption(f"{len(df)} of {len(master_df)} row(s) shown.")
+
+
 def _render_pending_review(pending: list):
     with st.spinner("Loading..."):
         combined_df = display_utils.sort_by_provider(pd.concat(
@@ -643,6 +698,7 @@ def _render_pending_review(pending: list):
         plan = master_merge.build_merge_plan(new_rows, master_df)
 
     st.caption(master_merge.pending_status_line(len(pending), plan))
+    _render_master_lookup(master_df)
 
     colliding_changed_ids = {id(m) for group in plan.collisions for m in group}
     colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}
