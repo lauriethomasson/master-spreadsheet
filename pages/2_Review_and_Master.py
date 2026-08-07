@@ -301,6 +301,30 @@ def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix:
     return "remove" if choice.startswith("Remove") else "keep"
 
 
+# Search fields for the MAIN editable table's own search bar - unchanged
+# from before this section had a name of its own (see _search_mask).
+_MASTER_SEARCH_COLUMNS = ("building", "address_1", "provider", "floor_unit")
+
+# Search fields for the Remove-rows expander's OWN, separate search bar -
+# adds postcode on top of the master search's own fields, per real request:
+# a duplicate-row cleanup is often easier to spot by postcode than by
+# address text alone.
+_REMOVAL_SEARCH_COLUMNS = ("provider", "building", "address_1", "floor_unit", "postcode")
+
+
+def _search_mask(df: pd.DataFrame, query: str, columns: tuple) -> pd.Series:
+    """Boolean mask, aligned to df's own index, of every row where ANY of
+    `columns` contains `query` case-insensitively - shared by the Remove-
+    rows and master-table search bars so the two stay behaviorally
+    identical (same case-insensitive substring semantics) despite searching
+    different field sets and feeding two completely independent widgets."""
+    search_cols = [c for c in columns if c in df.columns]
+    mask = pd.Series(False, index=df.index)
+    for c in search_cols:
+        mask = mask | df[c].fillna("").astype(str).str.contains(query.strip(), case=False)
+    return mask
+
+
 def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     """
     Full master, browsable, directly editable, and row-selectable (for the
@@ -320,15 +344,28 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     (or edit - see _process_manual_edits) to the wrong row. property_id is
     immune to re-sorting, so it survives that reload intact.
 
-    The text filter below narrows only what's DISPLAYED, never what df/
-    master_records themselves contain - both widgets' own positional state
+    Removal (inside its own collapsed-by-default "Remove rows" expander) and
+    editing (the main table below it) each have their OWN search bar, over
+    their OWN widget key - deliberately never shared, so searching to find
+    a row to remove can never narrow what the main table shows, or vice
+    versa (a real request: the two are different tasks a person does at
+    different times, and conflating their search state was confusing). Both
+    still narrow only what's DISPLAYED to their own widget, never what df/
+    master_records themselves contain - each widget's own positional state
     is always relative to whatever (possibly filtered) subset was actually
-    passed to them this render, so real_positions[i] (the real position in
-    df of whatever row sits at filtered position i) is threaded through to
-    _process_manual_edits/build_manual_edit below, and row selection stays
-    keyed by property_id exactly as it already was for the re-sort case
-    above - a filter is just another way a row's position can shift out
-    from under a stale positional reference.
+    passed to IT this render, so real_positions[i] (the real position in df
+    of whatever row sits at the MASTER table's filtered position i) is
+    threaded through to _process_manual_edits/build_manual_edit below, and
+    row selection stays keyed by property_id exactly as it already was for
+    the re-sort case above - a filter is just another way a row's position
+    can shift out from under a stale positional reference.
+
+    st.expander's own contents run on every rerun regardless of whether the
+    user currently has it open or collapsed on screen (collapsing is a
+    purely client-side visual toggle, not a conditional Python branch) - so
+    nothing about the Remove-rows section (its own search text, tracked
+    selection, or the master table/write log below it) is created, reset,
+    or skipped differently depending on that toggle.
 
     Returns True if a real field edit was saved this render - the caller
     should st.rerun() so the rest of the page reflects the fresh master
@@ -338,23 +375,23 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     visible = display_utils.visible_columns(df)
     display_df = df[visible].copy()
 
-    query = st.text_input(
-        "Filter (building, address, provider, or floor/unit)",
-        key=f"{key}_filter",
-    )
+    with st.expander("Remove rows", expanded=False):
+        removal_query = st.text_input("Search rows to remove", key=f"{key}_removal_filter")
+        removal_filtered_df = display_df
+        if removal_query.strip():
+            removal_filtered_df = display_df[_search_mask(df, removal_query, _REMOVAL_SEARCH_COLUMNS)]
+
+        selected_positions = _render_row_selector(df, removal_filtered_df, key)
+        st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
+        _render_selection_actions(df, selected_positions, key)
+
+    query = st.text_input("Search master spreadsheet", key=f"{key}_filter")
     filtered_df = display_df
     real_positions = list(range(len(df)))
     if query.strip():
-        search_cols = [c for c in ("building", "address_1", "provider", "floor_unit") if c in df.columns]
-        mask = pd.Series(False, index=df.index)
-        for c in search_cols:
-            mask = mask | df[c].fillna("").astype(str).str.contains(query.strip(), case=False)
+        mask = _search_mask(df, query, _MASTER_SEARCH_COLUMNS)
         filtered_df = display_df[mask]
         real_positions = [i for i, keep in enumerate(mask) if keep]
-
-    selected_positions = _render_row_selector(df, filtered_df, key)
-    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
-    _render_selection_actions(df, selected_positions, key)
 
     edited_df = st.data_editor(
         filtered_df,
@@ -385,10 +422,10 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
     Renders a compact, READ-ONLY, natively row-selectable table (st.
     dataframe's own on_select/selection_mode, added specifically for this
     "select rows, then act on the selection" pattern) and returns
-    selected_positions - real positions in df (immune to the text filter
-    above narrowing what's shown - see _render_master_table's own
-    docstring), kept in session_state["export_selected_property_ids"] by
-    property_id exactly as before.
+    selected_positions - real positions in df (immune to the Remove-rows
+    expander's OWN search bar narrowing what filtered_df contains here -
+    see _render_master_table's own docstring), kept in session_state[
+    "export_selected_property_ids"] by property_id exactly as before.
 
     A real-browser report confirmed the "Remove N selected row(s)" button
     (see _render_selection_actions) sometimes needed two clicks to

@@ -62,7 +62,12 @@ class MasterTableSearchFilterTests(unittest.TestCase):
         return next(t for t in at.text_input if t.key == "master_table_default_view_filter")
 
     def _table_value(self, at):
-        return at.dataframe[0].value
+        # Keyed lookup, not at.dataframe[0] - the Remove-rows expander's own
+        # read-only row-selector (see pages/2_Review_and_Master.py's
+        # _render_row_selector) is now ALSO a real st.dataframe rendered
+        # before this one, so index 0 no longer reliably means "the main
+        # editable table."
+        return next(d for d in at.dataframe if d.key == "master_table_default_view").value
 
     def test_unfiltered_view_shows_every_row(self):
         self._seed_master()

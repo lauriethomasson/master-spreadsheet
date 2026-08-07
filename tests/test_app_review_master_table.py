@@ -191,11 +191,15 @@ class OneClickRemovalTests(unittest.TestCase):
         # and the UNDERLYING position of a DIFFERENT, non-Kitt's row don't
         # coincide - use a provider that is not first alphabetically/by
         # sort so a naive positional removal would hit the wrong row.
+        #
+        # Uses the Remove-rows expander's OWN search bar (_removal_filter),
+        # not the master table's _filter - the two are independent widgets
+        # now, and only the removal one narrows what the row-selector shows.
         self._write_three_rows()
         at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
         at.run()
 
-        filter_input = next(t for t in at.text_input if t.key == f"{KEY}_filter")
+        filter_input = next(t for t in at.text_input if t.key == f"{KEY}_removal_filter")
         filter_input.set_value("Fleet Place").run()
 
         self._select_rows(at, [0])  # the only row visible in the filtered selector
