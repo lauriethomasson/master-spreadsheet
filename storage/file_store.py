@@ -48,7 +48,10 @@ def _write_meta(xlsx_path: str, meta: dict) -> None:
     blob_store.write_bytes(_meta_path(xlsx_path), json.dumps(meta, indent=2).encode("utf-8"))
 
 
-def save_staging_file(rows: list[ListingRow], original_filename: str, content_hash: str = None) -> str:
+def save_staging_file(
+    rows: list[ListingRow], original_filename: str, content_hash: str = None,
+    fully_occupied_buildings: list = None,
+) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     stem = Path(original_filename).stem
     staging_path = f"{STAGING_PREFIX}/{timestamp}_{stem}.xlsx"
@@ -64,9 +67,29 @@ def save_staging_file(rows: list[ListingRow], original_filename: str, content_ha
             "status": "pending_review",
             "n_rows": len(rows),
             "content_hash": content_hash,
+            # {"provider", "building"} dicts (see extract_spreadsheet_gemini.
+            # extract_sheet_with_metadata) - buildings this upload's own
+            # source text explicitly states have zero current availability.
+            # Never present in a row (a fully-occupied building has none),
+            # so this is the only place that signal survives past upload
+            # time for master_merge.find_stale_candidates to use at review
+            # time. Always a list, never None, so a caller can iterate it
+            # unconditionally regardless of upload source type.
+            "fully_occupied_buildings": fully_occupied_buildings or [],
         },
     )
     return staging_path
+
+
+def get_staging_fully_occupied_buildings(path: str) -> list:
+    """
+    The {"provider", "building"} dicts persisted for this staging file (see
+    save_staging_file) - [] for a file staged before this existed (plain
+    .get() default, same "old entries just don't have it" tolerance as
+    content_hash above) or for any non-Gemini-extracted upload, which never
+    has any to begin with.
+    """
+    return _read_meta(path).get("fully_occupied_buildings", [])
 
 
 def find_previous_upload_by_hash(content_hash: str) -> str:

@@ -20,6 +20,7 @@ so there's no separate vision-extraction mechanism to build here.
 
 import re
 import sys
+from datetime import date
 
 from brochure_link_resolver import finalize_brochure_link
 from gemini_client import call_gemini, compute_rent, get_client
@@ -57,7 +58,8 @@ content, don't assume either:
     text itself unless a URL is given, see above), then THIS BUILDING'S OWN mini-table header row,
     then one or more data rows under it - each one a separate unit in that building. If a data row's
     first cell just says "Fully Occupied" (no real numbers), that building currently has NO available
-    units - do not emit a unit for it.
+    units - do not emit a unit for it, and add its name to fully_occupied_buildings instead (see
+    below).
 
 Boilerplate to ignore entirely everywhere (never emit a unit or a contact from these): legal
 disclaimers, terms and conditions notices, and a repeated generic company-wide enquiry email/phone
@@ -72,6 +74,11 @@ Extract file-level information:
   paraphrase or substitute a spelling you recognize from general knowledge of the brand.
 - contacts: every NAMED individual contact person listed, each as "Name, email, phone" (omit
   whichever of email/phone isn't given). Join multiple with "; ".
+- fully_occupied_buildings: the exact name (as you'd give it in a unit's own "building" field) of
+  every building on THIS sheet whose own mini-table states it has zero current availability (shape
+  (b)'s "Fully Occupied" marker row - see below) rather than real unit rows. Do not include a
+  building just because it happens to have few units right now - only one whose own block
+  explicitly states this. Empty list if none, or if this sheet is shape (a).
 
 Then extract EVERY SEPARATE AVAILABLE UNIT:
 - building: the building name. Never leave this null - inherit from the most recent row/column that
@@ -110,6 +117,7 @@ Return your answer as a single JSON object with this exact structure:
 {
   "provider": "..." or null,
   "contacts": "..." or null,
+  "fully_occupied_buildings": ["...", ...],
   "units": [
     {
       "building": "...",
@@ -297,8 +305,137 @@ def _verify_address_house_numbers(units: list[dict], raw_text: str, sheet_label:
             unit["address_1"] = _splice_leading_house_number(address_1, raw_token)
 
 
-def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
+def _brochure_url_from_cell_text(cell_text: str):
+    """The URL inlined (see render_sheet_as_text) in `cell_text` if that cell's
+    OWN display text mentions "brochure" - i.e. this is a real Excel hyperlink
+    behind a "Download Brochure"-labeled cell, not just the word "brochure"
+    appearing somewhere in unrelated prose with no link at all. Returns None
+    for a "Download Floorplans" cell even when it sits right next to a
+    Brochure cell on the exact same rendered line - checked against this ONE
+    cell's own text only, never the whole line, which is what makes this safe
+    to use even when a line has more than one inlined hyperlink."""
+    if "brochure" not in cell_text.lower():
+        return None
+    match = re.search(r"\((https?://[^)]+)\)\s*$", cell_text)
+    return match.group(1) if match else None
+
+
+def _brochure_urls_in_block(lines: list, start: int, end: int) -> list:
+    """Every DISTINCT URL found via _brochure_url_from_cell_text across every
+    cell in lines[start:end] (see _building_block_bounds - start is the
+    heading line itself, included since it's never the source of a
+    "download" cell in practice but costs nothing to also check), in the
+    order first seen."""
+    urls = []
+    for line in lines[start:end]:
+        for cell_text in line.split("|"):
+            url = _brochure_url_from_cell_text(cell_text.strip())
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def deterministic_brochure_link_for_building(raw_text: str, building: str):
     """
+    The single, unambiguous brochure URL for `building`'s own block in the
+    raw sheet text (see _building_block_bounds) - read straight from the
+    real Excel hyperlink behind that building's own "Download Brochure"
+    cell (render_sheet_as_text already inlines a cell's real hyperlink
+    target after its display text), bypassing Gemini's own free-form
+    reading of that same rendered text entirely. Confirmed against the real
+    Copthall Estates Availability.xlsx: every building's address/link row
+    carries the Floorplans and Brochure links as two separate cells with
+    two distinct real URLs, so the source of truth for which is which is
+    the cell's own hyperlink object, not any judgment call about wording.
+
+    Returns None - deliberately never a guess - whenever this building's
+    own block can't be found at all, has no Brochure-labeled hyperlink in
+    it, or has more than one DIFFERENT such link (a real conflict, not
+    resolvable from the block alone). A caller finding None here has learned
+    nothing about whether Gemini's own value (if any) is right or wrong -
+    it just means this specific safety net can't independently confirm it
+    either way, so Gemini's own extraction is left as the best available
+    answer.
+    """
+    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
+    bounds = _building_block_bounds(lines, building)
+    if bounds is None:
+        return None
+    start, end = bounds
+    urls = _brochure_urls_in_block(lines, start, end)
+    return urls[0] if len(urls) == 1 else None
+
+
+def _apply_deterministic_brochure_links(units: list[dict], raw_text: str) -> None:
+    """
+    Overrides each unit's own brochure_link in place with its building's
+    deterministic value (see deterministic_brochure_link_for_building)
+    whenever one can be confidently identified - this takes priority over
+    whatever Gemini itself read out of the free-form text, since the real
+    target URL is already known with certainty straight from the source
+    cell, for BOTH directions: recovers a brochure_link Gemini dropped
+    entirely, and corrects one Gemini picked wrong (e.g. the neighboring
+    Floorplans link) - a real conflict between the two never happens here,
+    since a confident deterministic value always wins outright rather than
+    being weighed against Gemini's own answer.
+
+    Leaves a unit's brochure_link completely untouched - whatever Gemini
+    itself returned, blank or not - whenever its building's own block has
+    no such link at all, or has more than one conflicting one: Gemini's own
+    read is the best available signal in that case, not something to
+    second-guess further with a guess of our own. Never invents a link for
+    a building with no real Brochure hyperlink in the source.
+
+    One deterministic_brochure_link_for_building call per DISTINCT building
+    (cached in `cache`), not per unit - several units legitimately share one
+    building block (its own several available floors), and each one gets
+    that building's own single answer.
+    """
+    cache = {}
+    for unit in units:
+        building = unit.get("building")
+        if not building:
+            continue
+        if building not in cache:
+            cache[building] = deterministic_brochure_link_for_building(raw_text, building)
+        deterministic_url = cache[building]
+        if deterministic_url:
+            unit["brochure_link"] = deterministic_url
+
+
+def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
+    """Thin wrapper over extract_sheet_with_metadata for every caller that
+    only needs the rows themselves (the overwhelming majority - see that
+    function's own docstring for why fully_occupied_buildings needs a
+    second return value at all)."""
+    rows, _fully_occupied_buildings = extract_sheet_with_metadata(ws, sheet_label, filename)
+    return rows
+
+
+def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
+    """
+    Same extraction as extract_sheet, returning (rows, fully_occupied_
+    buildings) - the second element is a list of {"provider", "building"}
+    dicts (provider exactly as this sheet's own raw Gemini response gave it,
+    unnormalized - callers needing the canonical spelling apply master_merge.
+    canonicalize_provider_name themselves, same as every other raw provider
+    value) naming each building this sheet's own text explicitly states has
+    zero current availability (see PROMPT's own fully_occupied_buildings
+    field). Unlike find_undercounted_buildings/find_buildings_missing_
+    brochure_link, this genuinely can't be cheaply re-derived later from a
+    fresh render_sheet_as_text call the way those are (see e.g. app.py's
+    _warn_if_units_look_undercounted) - a fully-occupied building produces no
+    surviving unit at all, so there's no building name in the final rows to
+    anchor a later, pure-code re-check on; recognizing "Fully Occupied"
+    belongs to a specific building heading (as opposed to just noticing the
+    marker exists somewhere on the sheet, see sheet_shows_fully_occupied_
+    building) is exactly the free-form structural judgment call Gemini is
+    already making to correctly skip emitting a unit for it, so this simply
+    asks it to also name what it recognized. provider is bundled in here
+    (rather than left for the caller to infer from this same sheet's other
+    rows) because a sheet whose ENTIRE content is one fully-occupied
+    building has no surviving row at all to read a provider off of.
+
     ws: an openpyxl worksheet (already loaded by the caller - see app.py,
     which needs the same workbook open for other sheets in the same file
     too, so loading happens once at the call site rather than per sheet
@@ -312,7 +449,7 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
     """
     text = render_sheet_as_text(ws)
     if not text.strip():
-        return []
+        return [], []
     client = get_client()
     raw = call_gemini(client, PROMPT, [text])
 
@@ -342,6 +479,13 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
     # a block's boundary, not just the ones that restated their own.
     _verify_address_house_numbers(units, text, sheet_label)
 
+    # Deterministic Excel-hyperlink override takes priority over Gemini's own
+    # free-form reading of the same rendered text - see _apply_deterministic_
+    # brochure_links's own docstring. Must run before finalize_brochure_link
+    # below so a recovered/corrected link still goes through the same admin-
+    # link/generic-link/landing-page handling every other brochure_link does.
+    _apply_deterministic_brochure_links(units, text)
+
     rows = []
     for unit in units:
         unit["brochure_link"] = finalize_brochure_link(
@@ -358,7 +502,13 @@ def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
                 source_file=sheet_label,
             )
         )
-    return rows
+
+    fully_occupied_buildings = [
+        {"provider": raw.get("provider"), "building": b}
+        for b in (raw.get("fully_occupied_buildings", []) or [])
+        if b
+    ]
+    return rows, fully_occupied_buildings
 
 
 def _heading_cell(line: str) -> str:
@@ -475,6 +625,216 @@ def _apparent_data_row_count(raw_text: str, building: str) -> int:
             continue
         data_rows += 1
     return data_rows
+
+
+def is_non_authoritative_rollup_sheet(ws, raw_text: str) -> bool:
+    """
+    True when a Gemini-fallback-eligible sheet is confirmed non-authoritative
+    - a stale/legacy rollup rather than a genuine source of current per-
+    building availability - and should be skipped from extraction entirely,
+    rather than risk producing duplicate/stale rows alongside its sibling
+    sheets' own genuinely current data.
+
+    Confirmed against the real Copthall Estates Availability.xlsx: its
+    "Portfolio" sheet (a single flat Area/Station/Building/Office/... table,
+    titled "Copthall Estates Availibility - Updated 05/08/25" - about a year
+    stale compared to its sibling sheets' own "Updated 03/08/2026") is a
+    hidden sheet in the actual workbook, while every genuinely current sheet
+    (City, Mid Town, Westend Soho, Blackfriars) is visible - an explicit,
+    deliberate signal from the workbook's own author that this specific
+    sheet isn't meant to be seen or used, not a guess derived from its name
+    or content alone.
+
+    Requires BOTH of:
+    - ws.sheet_state is "hidden" or "veryHidden" (openpyxl reads this
+      straight from the workbook's own <sheet state="..."> attribute - the
+      same thing Excel itself uses to decide whether to show a tab);
+    - raw_text has NO "download" line anywhere at all (see
+      _building_block_bounds) - i.e. this sheet could never contain even ONE
+      genuine shape (b) building block, since a repeating per-building block
+      always carries its own hyperlink-bearing Floorplans/Brochure address
+      line (see PROMPT).
+
+    Deliberately requires BOTH, never either alone:
+    - hidden alone would risk skipping a hidden HELPER/lookup sheet that
+      happens to also carry real per-building hyperlinked blocks (unlikely,
+      but not something to assume away) - "skip every hidden sheet" is
+      exactly the global rule this must never become;
+    - "no download line" alone would risk skipping a genuinely current, but
+      hyperlink-less, free-form sheet from some other provider - the risk
+      already documented on find_buildings_missing_brochure_link's own
+      "not every provider supplies one" note.
+    Only the intersection - deliberately tucked away by the workbook's own
+    author AND structurally incapable of holding genuine per-building
+    availability data - is what's actually confirmed safe to skip.
+    """
+    if ws.sheet_state not in ("hidden", "veryHidden"):
+        return False
+    return not any("download" in line.lower() for line in raw_text.splitlines())
+
+
+# Sheet names known, in general, to describe a rollup/index/summary rather
+# than a building's own current listings - a small, explicit, hand-
+# maintained list (same "conservative, human catches it" philosophy as
+# master_merge.KNOWN_PROVIDERS/COMPLETE_SNAPSHOT_PROVIDERS), matched only
+# against the sheet's OWN full name (case-insensitive, trimmed), never a
+# substring-anywhere check. Deliberately never used alone to auto-skip - see
+# classify_sheet_for_extraction's own docstring: a sheet literally named
+# "Portfolio" is common enough, and legitimate enough in principle, that
+# this is only ever ONE contributing signal toward "ambiguous", not a
+# decision by itself.
+SUSPICIOUS_SHEET_NAMES = ("portfolio", "summary", "archive", "index", "overview")
+
+# How many days older than the newest sibling sheet's own "Updated" date
+# (see extract_update_date) counts as "significantly older" for the
+# staleness signal below - deliberately generous (roughly 4 months): the
+# real Copthall sibling sheets' own dates differ by a few weeks against each
+# other (a normal, unremarkable per-area update cadence), while the real
+# stale Portfolio sheet is about a YEAR behind them. This threshold is
+# comfortably below that real gap while comfortably above the real sibling-
+# to-sibling variation, so it doesn't fire on ordinary staggered updates.
+STALE_UPDATE_DATE_THRESHOLD_DAYS = 120
+
+_UPDATED_DATE_RE = re.compile(r"updated\s+(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", re.IGNORECASE)
+
+
+def extract_update_date(raw_text: str):
+    """
+    The date parsed from an "Updated DD/MM/YY(YY)" phrase in this sheet's
+    own title text, if one is present - checked only against the first few
+    lines (a title line is always at or near the top of a real sheet, per
+    every real example confirmed so far: "Copthall Estates City
+    Availability - Updated 03/08/2026", "Copthall Estates Availibility -
+    Updated 05/08/25") - or None if no such phrase is found there, or if one
+    is found but isn't a real calendar date (never raises). A 2-digit year
+    is read as 20XX - every real example seen uses either a 4-digit year or
+    a 2-digit one clearly meaning 20XX, never a genuinely ambiguous century.
+    """
+    for line in raw_text.splitlines()[:5]:
+        match = _UPDATED_DATE_RE.search(line)
+        if not match:
+            continue
+        day, month, year = (int(g) for g in match.groups())
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_numeric_cell(text: str) -> bool:
+    try:
+        float(text.replace(",", "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _looks_like_flat_data_table(raw_text: str) -> bool:
+    """
+    True if raw_text contains several rows shaped like genuine tabular
+    per-property data - at least 5 pipe-separated cells AND at least 2 of
+    them numeric-looking (a size/price/rent-shaped column) - repeated across
+    at least 5 rows anywhere in the sheet. Confirmed against the real
+    Copthall Portfolio sheet (an Area/Station/Building/Office/Sq.Ft/Price
+    Per Sq.Ft/... table, ~20 such rows) versus the real Incentives sheet
+    (mostly single-cell prose/commission-structure paragraphs and a
+    name/phone-number column far to the right of mostly-blank cells - wide
+    after render_sheet_as_text's own trailing-blank trim, but never with 2+
+    genuinely numeric cells on the same row).
+
+    This exists ONLY to tell apart "a sheet that's at least trying to state
+    per-property data in a flat table, just not one the header-mapping
+    column-name matching recognizes" from "a sheet with no per-unit
+    availability data at all" (PROMPT's own commission/incentive-
+    explanation case) - the latter must never be flagged ambiguous just for
+    lacking hyperlinks, since it was never a listings sheet to begin with.
+    """
+    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
+    wide_numeric_rows = 0
+    for line in lines:
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 5:
+            continue
+        if sum(1 for c in cells if _is_numeric_cell(c)) >= 2:
+            wide_numeric_rows += 1
+    return wide_numeric_rows >= 5
+
+
+def classify_sheet_for_extraction(ws, raw_text: str, sibling_dates: dict = None) -> dict:
+    """
+    Classifies a Gemini-fallback-eligible sheet (one header-mapping has
+    already failed to resolve - see app.py) into exactly one of three
+    outcomes - never a numeric score, and never decided from a single
+    signal alone:
+
+    - "auto_skip": confidently non-authoritative - is_non_authoritative_
+      rollup_sheet's own two-signal intersection (hidden/veryHidden AND no
+      real hyperlink/"download" line anywhere), UNCHANGED by this function -
+      still the only rule strong enough to decide without asking a human.
+    - "ambiguous": at least one independent, meaningful piece of evidence
+      this sheet MIGHT be non-authoritative, but not the confident
+      intersection above - a human must decide (see app.py's upload-time
+      decision UI). The individual signals, NONE of which trigger this
+      alone (see reasons below and each helper's own docstring):
+        - hidden/veryHidden, even though real hyperlinked blocks ARE
+          present (a hidden sheet is always at least worth asking about -
+          why would a genuinely current listings sheet be hidden? - even
+          when it isn't confidently skippable on structure alone);
+        - no "download" line anywhere, but ONLY when the sheet also looks
+          like it's at least trying to state flat per-property data (see
+          _looks_like_flat_data_table) - never for a sheet with no per-unit
+          data at all (e.g. a commission/incentive explanation), which was
+          never a listings candidate to begin with;
+        - its own name is one of SUSPICIOUS_SHEET_NAMES;
+        - its own "Updated" date (see extract_update_date) is
+          STALE_UPDATE_DATE_THRESHOLD_DAYS+ older than the newest sibling
+          sheet's own date in the same upload (sibling_dates) - never
+          guessed from a single data point, so this never fires without at
+          least one comparably-dated sibling.
+    - "authoritative": none of the above - process automatically, exactly
+      as every sheet did before this function existed.
+
+    sibling_dates: {other_sheet_name: date} for every OTHER sheet in the
+    SAME uploaded file that also needed classifying - omit or pass {} when
+    there are none yet; that signal then simply never fires.
+
+    Returns {"outcome": "auto_skip"|"ambiguous"|"authoritative",
+    "reasons": [...], "sheet_state": ws.sheet_state} - reasons is always []
+    for "authoritative", a single confirmed reason for "auto_skip", and one
+    entry per contributing signal for "ambiguous" (a reviewer-facing
+    explanation, not machine-parsed anywhere).
+    """
+    if is_non_authoritative_rollup_sheet(ws, raw_text):
+        return {
+            "outcome": "auto_skip",
+            "reasons": ["hidden_with_no_download_lines"],
+            "sheet_state": ws.sheet_state,
+        }
+
+    hidden = ws.sheet_state in ("hidden", "veryHidden")
+    has_download_lines = any("download" in line.lower() for line in raw_text.splitlines())
+    name_key = str(ws.title or "").strip().lower()
+
+    reasons = []
+    if hidden:
+        reasons.append("hidden")
+    if not has_download_lines and _looks_like_flat_data_table(raw_text):
+        reasons.append("flat_summary_table_with_no_brochure_links")
+    if name_key in SUSPICIOUS_SHEET_NAMES:
+        reasons.append("suspicious_sheet_name")
+
+    own_date = extract_update_date(raw_text)
+    if own_date and sibling_dates:
+        newest_sibling_date = max(sibling_dates.values())
+        if (newest_sibling_date - own_date).days > STALE_UPDATE_DATE_THRESHOLD_DAYS:
+            reasons.append("stale_update_date_vs_siblings")
+
+    if reasons:
+        return {"outcome": "ambiguous", "reasons": reasons, "sheet_state": ws.sheet_state}
+    return {"outcome": "authoritative", "reasons": [], "sheet_state": ws.sheet_state}
 
 
 def sheet_shows_fully_occupied_building(raw_text: str) -> bool:

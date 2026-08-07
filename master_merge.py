@@ -279,6 +279,105 @@ def canonicalize_providers(rows: list[ListingRow]) -> None:
         row.provider = canonicalize_provider_name(_strip_provider_purpose_suffix(row.provider))
 
 
+# Providers whose spreadsheet upload always represents that provider's ENTIRE
+# current portfolio, never a partial one-area/one-building export - a small,
+# explicit, hand-maintained allow-list, same "conservative, human catches it"
+# philosophy as KNOWN_PROVIDERS. find_stale_candidates is scoped to these
+# providers ONLY: for any other provider, a property genuinely absent from
+# the latest upload says nothing about whether it's still on the market (a
+# partial export covering just one area/building is common and expected -
+# see that function's own docstring), so treating absence as evidence of
+# staleness there would be unsafe. Confirmed against the real Copthall
+# Estates Availability.xlsx: every upload is that provider's full City/Mid
+# Town/Westend Soho/Blackfriars portfolio, sheet-per-area, never a subset.
+COMPLETE_SNAPSHOT_PROVIDERS = ("Copthall Estates",)
+
+
+def _is_complete_snapshot_provider(provider) -> bool:
+    if _is_blank(provider):
+        return False
+    return canonicalize_provider_name(_strip_provider_purpose_suffix(provider)) in COMPLETE_SNAPSHOT_PROVIDERS
+
+
+def find_stale_candidates(
+    new_rows: list, master_records: list, matched_master_indices: set, fully_occupied_buildings: list = None,
+) -> list:
+    """
+    master_index values (into master_records) for existing master rows this
+    upload batch gives strong, narrowly-scoped evidence are no longer
+    available - never a blanket "missing from this upload" check (see
+    COMPLETE_SNAPSHOT_PROVIDERS' own docstring for why that would be unsafe
+    for most providers/uploads).
+
+    A master row is a stale candidate only when ALL of:
+    - its own provider (canonicalized) is on COMPLETE_SNAPSHOT_PROVIDERS;
+    - its master_index isn't already in matched_master_indices - a row this
+      exact batch matched (with or without a diff) obviously still exists,
+      whatever else is true below;
+    - this upload has real evidence about its own building specifically -
+      either another row in new_rows shares that same provider+building
+      (normalize_key-equal - the building WAS covered by this upload, just
+      not this exact floor/unit), or that building's own name appears in
+      fully_occupied_buildings for the same provider (the source sheet
+      explicitly states zero current availability for it - see extract_
+      spreadsheet_gemini.extract_sheet_with_metadata). A building this
+      upload never mentions AT ALL is not evidence of anything - exactly
+      the "this upload only covers one area/building" case that must never
+      be punished, and the real reason this is safe to scope by provider
+      alone rather than needing to separately confirm the WHOLE FILE is a
+      complete snapshot: a partial upload from an allow-listed provider
+      still only ever flags floors within buildings it actually mentions.
+    - and, when the building wasn't marked fully-occupied specifically,
+      no row in new_rows for that same provider+building shares this
+      master row's own floor_unit (normalize_key-equal) - i.e. this exact
+      unit has no counterpart in the fresh data either.
+
+    Returns master_index values only - never mutates master_records or
+    decides removal itself. pages/2_Review_and_Master.py surfaces these for
+    an explicit human keep/remove decision and feeds a "remove" choice into
+    apply_merge's existing removed_indices parameter - the exact same
+    mechanism mentions_let_status already uses (see _render_let_status_
+    decision), reused here rather than duplicated.
+    """
+    fully_occupied_keys = {
+        (canonicalize_provider_name(_strip_provider_purpose_suffix(fo.get("provider"))), normalize_key(fo.get("building")))
+        for fo in (fully_occupied_buildings or [])
+        if not _is_blank(fo.get("building"))
+    }
+
+    covered_buildings = set()  # (provider_key, building_key) mentioned anywhere in new_rows
+    covered_units = {}  # (provider_key, building_key) -> set of floor_unit_key mentioned in new_rows
+    for row in new_rows:
+        if not _is_complete_snapshot_provider(row.provider):
+            continue
+        combo = (canonicalize_provider_name(_strip_provider_purpose_suffix(row.provider)), normalize_key(row.building))
+        covered_buildings.add(combo)
+        covered_units.setdefault(combo, set()).add(normalize_key(row.floor_unit))
+
+    stale = []
+    for i, rec in enumerate(master_records):
+        if i in matched_master_indices:
+            continue
+        if not _is_complete_snapshot_provider(rec.get("provider")):
+            continue
+        combo = (
+            canonicalize_provider_name(_strip_provider_purpose_suffix(rec.get("provider"))),
+            normalize_key(rec.get("building")),
+        )
+
+        if combo in fully_occupied_keys:
+            stale.append(i)
+            continue
+
+        if combo not in covered_buildings:
+            continue  # this upload never mentioned this building at all - no evidence either way
+
+        if normalize_key(rec.get("floor_unit")) not in covered_units.get(combo, set()):
+            stale.append(i)
+
+    return stale
+
+
 def field_kind(field_name: str) -> str:
     """"int" | "float" | "str" - derived from ListingRow's own type hints
     (via typing.get_args on the Optional[...] annotation) rather than a

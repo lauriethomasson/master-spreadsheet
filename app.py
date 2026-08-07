@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import tempfile
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from storage.file_store import (
     dataframe_to_listing_rows,
     find_previous_upload_by_hash,
     get_saved_critical_field_rescue,
+    get_staging_fully_occupied_buildings,
     load_staging_as_dataframe,
     save_original_pdf,
     save_staging_file,
@@ -56,6 +58,19 @@ EXTRACTION_VERSION = "3"
 _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
     Path(extract_spreadsheet.__file__).read_bytes() + Path(extract_spreadsheet_gemini.__file__).read_bytes()
 ).hexdigest()
+
+# The neutral, un-decided option in an ambiguous-sheet decision radio (see
+# _render_ambiguous_sheet_decision) - deliberately never pre-selecting
+# either real choice, so _pending_sheet_decisions can tell "hasn't been
+# looked at yet" apart from a real decision.
+SHEET_DECISION_PLACEHOLDER = "— Please choose —"
+SHEET_DECISION_SKIP = "Skip this sheet"
+SHEET_DECISION_INCLUDE = "Include this sheet"
+
+HIDDEN_SHEET_EXPLAINER = (
+    "Excel workbooks can contain hidden sheets. Hidden sheets may not appear as tabs in Excel, "
+    "but they are still part of the workbook and can contain data."
+)
 
 
 def fill_missing_provider(rows: list[ListingRow], filename: str, apply_filename_guess: bool) -> None:
@@ -242,6 +257,142 @@ def _warn_if_brochure_link_missing(rows: list[ListingRow], ws, sheet_label: str)
         )
 
 
+def _resolve_sheet_mapping(file_bytes: bytes, suffix: str, filename: str, sheet_name):
+    """
+    (df, headers, mapping, unresolved) for one sheet - the exact header-
+    mapping resolution the Extract-time sheet loop has always done,
+    factored out so the SAME logic backs both that loop and the upload-time
+    ambiguous-sheet scan (_scan_spreadsheet_sheets) - the two can never
+    independently disagree about which sheets even reach classification.
+    """
+    df = extract_spreadsheet.read_spreadsheet(file_bytes, suffix, sheet_name=sheet_name)
+    headers = list(df.columns)
+    h_hash = extract_spreadsheet.header_hash(headers)
+    mapping = extract_spreadsheet.suggest_mapping(headers)
+    mapping = extract_spreadsheet.apply_provider_structural_fallback(mapping, headers, filename)
+    saved_rescue = get_saved_critical_field_rescue(h_hash)
+    rescue = saved_rescue["assignments"] if saved_rescue else {}
+    mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
+    unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
+    return df, headers, mapping, unresolved
+
+
+def _scan_spreadsheet_sheets(file_bytes: bytes, suffix: str, filename: str) -> list:
+    """
+    One entry per sheet in this spreadsheet file, in original order:
+    {"sheet_name", "df", "headers", "mapping", "unresolved", "ws", "text",
+    "classification"}. ws/text/classification stay None for a sheet
+    header-mapping already resolved - a header-mapped sheet (Kitt's/UNION-
+    style) never needed the Gemini fallback at all, so it's never a rollup/
+    ambiguity candidate either (see extract_spreadsheet_gemini.
+    is_non_authoritative_rollup_sheet's own scope).
+
+    Computed once per uploaded file and reused for BOTH the upload-time
+    ambiguous-sheet decision UI (rendered before Extract is even clickable)
+    and the real Extract-time sheet loop - a single source of truth, so the
+    two can never disagree about what any sheet classifies as.
+    """
+    sheet_names = extract_spreadsheet.list_sheet_names(file_bytes, suffix)
+    wb = None
+    plans = []
+    for sheet_name in sheet_names:
+        df, headers, mapping, unresolved = _resolve_sheet_mapping(file_bytes, suffix, filename, sheet_name)
+        ws = None
+        if unresolved:
+            if wb is None:
+                wb = load_workbook(BytesIO(file_bytes), data_only=True)
+            ws = wb[sheet_name] if sheet_name else wb.active
+        plans.append({
+            "sheet_name": sheet_name, "df": df, "headers": headers, "mapping": mapping,
+            "unresolved": unresolved, "ws": ws, "text": None, "classification": None,
+        })
+
+    # Cross-sheet "Updated" date comparison (see extract_spreadsheet_gemini.
+    # classify_sheet_for_extraction's own sibling_dates note) needs every
+    # unresolved sheet's own date known before classifying ANY of them.
+    dates = {}
+    for plan in plans:
+        if plan["ws"] is None:
+            continue
+        plan["text"] = extract_spreadsheet_gemini.render_sheet_as_text(plan["ws"])
+        d = extract_spreadsheet_gemini.extract_update_date(plan["text"])
+        if d:
+            dates[plan["sheet_name"]] = d
+
+    for plan in plans:
+        if plan["ws"] is None:
+            continue
+        sibling_dates = {name: d for name, d in dates.items() if name != plan["sheet_name"]}
+        plan["classification"] = extract_spreadsheet_gemini.classify_sheet_for_extraction(
+            plan["ws"], plan["text"], sibling_dates=sibling_dates,
+        )
+    return plans
+
+
+def _sheet_decision_key(file_hash: str, sheet_name) -> str:
+    return f"sheet_decision_{file_hash}_{sheet_name}"
+
+
+def _spreadsheet_content_hash(file_bytes: bytes, decisions: dict) -> str:
+    """
+    content_hash for a spreadsheet upload - _SPREADSHEET_LOGIC_FINGERPRINT +
+    file_bytes exactly as before, PLUS a canonical (sorted-keys) JSON
+    serialization of this file's own ambiguous-sheet Include/Skip decisions
+    (see classify_sheet_for_extraction's "ambiguous" outcome) folded in - so
+    the exact same bytes with a DIFFERENT decision for even one sheet never
+    collides with an already-cached result computed under a different
+    choice (see find_previous_upload_by_hash). decisions: {sheet_name:
+    SHEET_DECISION_SKIP|SHEET_DECISION_INCLUDE, ...} - empty for a file with
+    no ambiguous sheet at all, in which case this is exactly the pre-
+    existing formula (nothing to fold in, nothing changes for it).
+    """
+    decisions_repr = json.dumps(decisions, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(
+        _SPREADSHEET_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes + b"\0" + decisions_repr
+    ).hexdigest()
+
+
+def _render_ambiguous_sheet_decision(filename: str, plan: dict, file_hash: str) -> None:
+    """
+    Renders the required decision control + explanatory copy for one
+    ambiguous sheet (see extract_spreadsheet_gemini.classify_sheet_for_
+    extraction) - a radio defaulting to the neutral SHEET_DECISION_
+    PLACEHOLDER (never pre-selecting Skip or Include), so _pending_sheet_
+    decisions can tell "not yet decided" apart from a real choice.
+
+    The widget's own key IS the decision's storage (Streamlit persists a
+    widget's value in st.session_state under its key across reruns) - keyed
+    by file_hash (the exact uploaded bytes, see _sheet_decision_key), never
+    by filename or sheet name alone, so the choice is scoped to exactly
+    this uploaded file for this session only: a different file (even one
+    with the same name) or a new session starts with no decision recorded,
+    and nothing here is ever written to disk.
+    """
+    sheet_name = plan["sheet_name"]
+    hidden = plan["classification"]["sheet_state"] in ("hidden", "veryHidden")
+    key = _sheet_decision_key(file_hash, sheet_name)
+
+    with st.container(border=True):
+        st.markdown(f"**Possible summary or old sheet detected: {sheet_name}**")
+        st.write(
+            f"This workbook (**{filename}**) contains a sheet named `{sheet_name}` that may be a "
+            "summary, older rollup, or non-authoritative source, rather than genuine current "
+            "availability."
+        )
+        st.caption(f"ℹ️ {HIDDEN_SHEET_EXPLAINER}")
+        st.caption(f"Sheet visibility: **{'Hidden' if hidden else 'Visible'}**")
+
+        st.radio(
+            f'What should we do with "{sheet_name}"?',
+            [SHEET_DECISION_PLACEHOLDER, SHEET_DECISION_SKIP, SHEET_DECISION_INCLUDE],
+            key=key,
+        )
+        st.caption(
+            f"**{SHEET_DECISION_SKIP}** — recommended if it's an old summary/rollup. "
+            f"**{SHEET_DECISION_INCLUDE}** — use if it contains genuine current availability."
+        )
+
+
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
 
@@ -268,7 +419,70 @@ with page_setup.setup_page("upload"):
     # get_saved_critical_field_rescue) - only creating a NEW one via a human
     # prompt is gone, not the ability to honor an existing one.
 
-    if uploaded_files and st.button("Extract"):
+    # A DIFFERENT decision from the column-mapping rescue above: whether a
+    # whole SHEET (one that already needed the Gemini fallback) is even a
+    # genuine source of current availability at all - see extract_
+    # spreadsheet_gemini.classify_sheet_for_extraction. Scanned here, before
+    # Extract is even clickable, so an ambiguous sheet's decision is made
+    # BEFORE extraction the same way any other required pre-extraction
+    # choice would be - never silently decided one way or the other.
+    # Content-keyed (sha256 of the raw bytes alone, not filename/sheet name)
+    # so two uploads that happen to share a filename are never confused with
+    # each other, and re-scanning the exact same bytes within one session
+    # (e.g. after an unrelated widget interaction triggers a rerun) reuses
+    # the same scan rather than recomputing it under a different identity.
+    scanned_files = {}  # file_hash -> (filename, [plan, ...])
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            suffix = Path(uploaded_file.name).suffix.lower()
+            if suffix not in SPREADSHEET_SUFFIXES:
+                continue
+            file_bytes = uploaded_file.getvalue()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            if file_hash not in scanned_files:
+                scanned_files[file_hash] = (
+                    uploaded_file.name, _scan_spreadsheet_sheets(file_bytes, suffix, uploaded_file.name),
+                )
+
+    any_hidden_sheet_mentioned = False
+    pending_decision_labels = []
+    for file_hash, (filename, plans) in scanned_files.items():
+        for plan in plans:
+            classification = plan["classification"]
+            if not classification:
+                continue
+
+            if classification["outcome"] == "auto_skip":
+                any_hidden_sheet_mentioned = any_hidden_sheet_mentioned or classification["sheet_state"] in (
+                    "hidden", "veryHidden",
+                )
+                st.info(f"Skipped hidden non-authoritative sheet: {plan['sheet_name']} ({filename})")
+                with st.expander(f"Why was {plan['sheet_name']!r} skipped?"):
+                    st.caption(HIDDEN_SHEET_EXPLAINER)
+                    st.caption(
+                        f"This sheet is {'hidden' if classification['sheet_state'] in ('hidden', 'veryHidden') else 'visible'} "
+                        "in the workbook and does not contain the normal availability/download "
+                        "structure, so it was not treated as current availability."
+                    )
+
+            elif classification["outcome"] == "ambiguous":
+                any_hidden_sheet_mentioned = True
+                _render_ambiguous_sheet_decision(filename, plan, file_hash)
+                decision = st.session_state.get(_sheet_decision_key(file_hash, plan["sheet_name"]))
+                if decision in (None, SHEET_DECISION_PLACEHOLDER):
+                    pending_decision_labels.append(f"{filename} — {plan['sheet_name']}")
+
+    if any_hidden_sheet_mentioned:
+        st.caption(f"ℹ️ {HIDDEN_SHEET_EXPLAINER}")
+
+    extract_disabled = bool(pending_decision_labels)
+    if pending_decision_labels:
+        st.warning(
+            "Please decide what to do with the following sheet(s) before extracting: "
+            + ", ".join(pending_decision_labels)
+        )
+
+    if uploaded_files and st.button("Extract", disabled=extract_disabled):
         total = len(uploaded_files)
         succeeded = 0
         tmp_path = None
@@ -304,10 +518,22 @@ with page_setup.setup_page("upload"):
                     # extract_spreadsheet.py's own source - automatic,
                     # nothing to remember to bump).
                     file_bytes = uploaded_file.getvalue()
+                    sheet_plans = None
+                    decisions_for_this_file = {}
                     if suffix in SPREADSHEET_SUFFIXES:
-                        content_hash = hashlib.sha256(
-                            _SPREADSHEET_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes
-                        ).hexdigest()
+                        file_hash = hashlib.sha256(file_bytes).hexdigest()
+                        _, sheet_plans = scanned_files[file_hash]
+                        # Folded into content_hash below - see _spreadsheet_
+                        # content_hash's own docstring for why the exact same
+                        # bytes with a different ambiguous-sheet decision must
+                        # never collide with a result cached under a
+                        # different choice.
+                        decisions_for_this_file = {
+                            p["sheet_name"]: st.session_state.get(_sheet_decision_key(file_hash, p["sheet_name"]))
+                            for p in sheet_plans
+                            if p["classification"] and p["classification"]["outcome"] == "ambiguous"
+                        }
+                        content_hash = _spreadsheet_content_hash(file_bytes, decisions_for_this_file)
                     else:
                         versioned_content = (
                             EXTRACTION_VERSION.encode("utf-8")
@@ -317,10 +543,19 @@ with page_setup.setup_page("upload"):
                         content_hash = hashlib.sha256(versioned_content).hexdigest()
 
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
+                    fully_occupied_buildings = []
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
                         reused = True
+                        # A reused result's own fully_occupied_buildings (see
+                        # extract_spreadsheet_gemini.extract_sheet_with_
+                        # metadata) lives in the ORIGINAL staging run's own
+                        # meta.json, not recoverable from its rows - carried
+                        # forward here so a byte-identical re-upload doesn't
+                        # silently lose the signal that let it through the
+                        # first time.
+                        fully_occupied_buildings = get_staging_fully_occupied_buildings(previous_staging_path)
                         # Preserves the exact pre-existing behavior for a
                         # cached result: origin (header-mapped vs Gemini-
                         # extracted) isn't recoverable from a reloaded
@@ -353,8 +588,12 @@ with page_setup.setup_page("upload"):
                         rows = []
                         header_mapped_rows = []
                         gemini_rows = []
-                        wb_for_gemini = None  # lazily opened - most files never need it
-                        sheet_names = extract_spreadsheet.list_sheet_names(uploaded_file.getvalue(), suffix)
+                        # sheet_plans (see _scan_spreadsheet_sheets) was
+                        # already computed above, before Extract was even
+                        # clickable, for the ambiguous-sheet decision UI - the
+                        # SAME plans (mapping/unresolved/ws/classification)
+                        # are reused here rather than recomputed, so this loop
+                        # can never disagree with what the decision UI showed.
                         # A multi-sheet file where every sheet needs the
                         # Gemini fallback (confirmed against the real
                         # Copthall Estates file: 6 sheets, ~150s total) gives
@@ -362,52 +601,59 @@ with page_setup.setup_page("upload"):
                         # the outer st.spinner's own text is fixed for the
                         # whole file, not updated per sheet.
                         sheet_progress = st.empty()
-                        for sheet_idx, sheet_name in enumerate(sheet_names, start=1):
-                            if len(sheet_names) > 1:
+                        for sheet_idx, plan in enumerate(sheet_plans, start=1):
+                            sheet_name = plan["sheet_name"]
+                            if len(sheet_plans) > 1:
                                 sheet_progress.caption(
-                                    f"Reading sheet {sheet_idx} of {len(sheet_names)}: {sheet_name}..."
+                                    f"Reading sheet {sheet_idx} of {len(sheet_plans)}: {sheet_name}..."
                                 )
-                            df = extract_spreadsheet.read_spreadsheet(
-                                uploaded_file.getvalue(), suffix, sheet_name=sheet_name
-                            )
-                            headers = list(df.columns)
-                            h_hash = extract_spreadsheet.header_hash(headers)
-                            mapping = extract_spreadsheet.suggest_mapping(headers)
-                            # Same fallback applied at upload time above (see
-                            # its comment there) - must run here too, or a
-                            # format that fallback resolves (suppressing the
-                            # rescue prompt) would still fall back to Gemini
-                            # unnecessarily the moment Extract is clicked.
-                            mapping = extract_spreadsheet.apply_provider_structural_fallback(
-                                mapping, headers, uploaded_file.name
-                            )
-                            saved_rescue = get_saved_critical_field_rescue(h_hash)
-                            rescue = saved_rescue["assignments"] if saved_rescue else {}
-                            mapping = extract_spreadsheet.apply_critical_field_rescue(mapping, rescue)
-                            unresolved = extract_spreadsheet.unresolved_critical_fields(mapping, rescue)
-
+                            df, headers, mapping, unresolved = plan["df"], plan["headers"], plan["mapping"], plan["unresolved"]
                             sheet_label = f"{uploaded_file.name} — {sheet_name}" if sheet_name else uploaded_file.name
 
                             if unresolved:
-                                if wb_for_gemini is None:
-                                    wb_for_gemini = load_workbook(BytesIO(uploaded_file.getvalue()), data_only=True)
-                                ws = wb_for_gemini[sheet_name] if sheet_name else wb_for_gemini.active
-                                sheet_rows = extract_spreadsheet_gemini.extract_sheet(
-                                    ws, sheet_label, uploaded_file.name
-                                )
-                                if not sheet_rows:
-                                    text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
-                                    if extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text):
-                                        st.info(
-                                            f"{sheet_label}: recognized a building, but nothing currently "
-                                            "available — skipped."
-                                        )
-                                    else:
-                                        st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
+                                ws = plan["ws"]
+                                classification = plan["classification"]
+                                decision = decisions_for_this_file.get(sheet_name)
+
+                                # Checked BEFORE ever calling Gemini. Two ways a
+                                # sheet never reaches extraction: confidently
+                                # non-authoritative on its own (see is_non_
+                                # authoritative_rollup_sheet, e.g. the real
+                                # Copthall Estates Availability.xlsx's hidden
+                                # "Portfolio" sheet - UNCHANGED from before this
+                                # classification existed), or ambiguous with an
+                                # explicit human "skip" decision recorded for
+                                # it (see classify_sheet_for_extraction). Either
+                                # way the sheet contributes nothing at all - no
+                                # rows, no fully_occupied signal - so it can
+                                # never produce a duplicate/stale row alongside
+                                # its sibling sheets' own genuinely current data.
+                                if classification["outcome"] == "auto_skip":
+                                    st.info(
+                                        f"{sheet_label}: hidden, non-authoritative rollup sheet — skipped."
+                                    )
+                                    sheet_rows = []
+                                elif classification["outcome"] == "ambiguous" and decision == SHEET_DECISION_SKIP:
+                                    st.info(f"{sheet_label}: skipped per your decision for this sheet.")
+                                    sheet_rows = []
                                 else:
-                                    _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
-                                    _warn_if_units_look_undercounted(sheet_rows, ws, sheet_label)
-                                    _warn_if_brochure_link_missing(sheet_rows, ws, sheet_label)
+                                    sheet_rows, sheet_fully_occupied = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                                        ws, sheet_label, uploaded_file.name
+                                    )
+                                    fully_occupied_buildings.extend(sheet_fully_occupied)
+                                    if not sheet_rows:
+                                        text = plan["text"]
+                                        if extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text):
+                                            st.info(
+                                                f"{sheet_label}: recognized a building, but nothing currently "
+                                                "available — skipped."
+                                            )
+                                        else:
+                                            st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
+                                    else:
+                                        _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
+                                        _warn_if_units_look_undercounted(sheet_rows, ws, sheet_label)
+                                        _warn_if_brochure_link_missing(sheet_rows, ws, sheet_label)
                                 gemini_rows.extend(sheet_rows)
                             else:
                                 sheet_rows = extract_spreadsheet.build_rows(df, mapping, source_file=sheet_label)
@@ -482,7 +728,10 @@ with page_setup.setup_page("upload"):
                     # save_staging_file() was called once at the very end -
                     # meaning an interruption at any point lost everything,
                     # even files that had already been fully processed.
-                    staging_path = save_staging_file(rows, uploaded_file.name, content_hash=content_hash)
+                    staging_path = save_staging_file(
+                        rows, uploaded_file.name, content_hash=content_hash,
+                        fully_occupied_buildings=fully_occupied_buildings,
+                    )
                     succeeded += 1
 
                     st.session_state["recent_uploads"].insert(

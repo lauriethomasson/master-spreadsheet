@@ -14,6 +14,7 @@ from storage.file_store import (
     clean_value,
     dataframe_to_listing_rows,
     discard_pending_staging_files,
+    get_staging_fully_occupied_buildings,
     list_pending_staging_files,
     load_staging_as_dataframe,
     mark_as_approved,
@@ -275,6 +276,27 @@ def _render_let_status_decision(m, key_prefix: str) -> str:
         "What should happen to this property?",
         ["Keep in master — apply this update", "Remove this property from master entirely"],
         key=f"{key_prefix}_let_decision",
+    )
+    return "remove" if choice.startswith("Remove") else "keep"
+
+
+def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix: str) -> str:
+    """
+    Like _render_let_status_decision, for a different signal - see
+    master_merge.find_stale_candidates - a master row this upload's own
+    provider gave real, scoped evidence is no longer available, rather than
+    a matched row whose own wording says so. Defaults to "keep" (the
+    non-destructive option) exactly like that function - a review trigger
+    forcing a human to look, never a trap that silently deletes anything.
+    """
+    st.warning(
+        f"🕳️ **{display_utils.row_label(rec)}** — no longer present in the latest "
+        f"{provider_label} availability."
+    )
+    choice = st.radio(
+        "What should happen to this property?",
+        ["Keep in master", "Remove this property from master entirely"],
+        key=f"{key_prefix}_stale_decision",
     )
     return "remove" if choice.startswith("Remove") else "keep"
 
@@ -749,6 +771,9 @@ def _render_pending_review(pending: list):
         new_rows = dataframe_to_listing_rows(combined_df)
         master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
         plan = master_merge.build_merge_plan(new_rows, master_df)
+        fully_occupied_buildings = [
+            fo for path in pending for fo in get_staging_fully_occupied_buildings(path)
+        ]
 
     st.caption(master_merge.pending_status_line(len(pending), plan))
     _render_master_lookup(master_df)
@@ -984,6 +1009,27 @@ def _render_pending_review(pending: list):
             # discard the other's data".
             for i, group in enumerate(plan.unmatched_collisions):
                 _render_intra_batch_duplicate_group(group, f"batch_dup_{i}", new_rows_final)
+
+    matched_master_indices = {m.master_index for m in plan.matched_changed} | {
+        m.master_index for m in plan.matched_unchanged
+    }
+    stale_indices = master_merge.find_stale_candidates(
+        new_rows, plan.master_records, matched_master_indices, fully_occupied_buildings=fully_occupied_buildings,
+    )
+    if stale_indices:
+        st.subheader("🕳️ No longer present in latest availability")
+        st.caption(
+            "These existing master properties weren't matched by anything in this upload, but their "
+            "own building was covered by it — meaning the latest availability data no longer mentions "
+            "them. Review each one: keep it if it's still genuinely available, or remove it if it's "
+            "no longer offered."
+        )
+        for idx in stale_indices:
+            rec = plan.master_records[idx]
+            provider_label = rec.get("provider") or "this provider's"
+            decision = _render_stale_candidate_decision(rec, provider_label, f"stale_{idx}")
+            if decision == "remove":
+                removed_indices.add(idx)
 
     if plan.matched_unchanged:
         st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")

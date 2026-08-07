@@ -1462,5 +1462,132 @@ class BuildApprovalSummaryRemovalTests(unittest.TestCase):
         self.assertEqual(removed_labels, [])
 
 
+class FindStaleCandidatesTests(unittest.TestCase):
+    """master_merge.find_stale_candidates - surfaces existing master rows a
+    complete-snapshot provider's own upload gives real, scoped evidence are
+    no longer available, without ever punishing a partial (one-area/one-
+    building) upload from any provider - see COMPLETE_SNAPSHOT_PROVIDERS'
+    own docstring."""
+
+    def _master_records(self, rows: list[dict]) -> list[dict]:
+        return [ListingRow(**r).model_dump() for r in rows]
+
+    def test_stale_unit_from_a_complete_snapshot_is_surfaced(self):
+        # The real example given: latest file has 50 Gresham Street - 2nd
+        # Floor; master still has an older 50 Gresham Street - 3rd Floor.
+        master_records = self._master_records([
+            {"building": "50 Gresham Street", "provider": "Copthall Estates", "floor_unit": "2nd Floor"},
+            {"building": "50 Gresham Street", "provider": "Copthall Estates", "floor_unit": "3rd Floor"},
+        ])
+        new_rows = [
+            ListingRow(building="50 Gresham Street", provider="Copthall Estates", floor_unit="2nd Floor"),
+        ]
+
+        stale = master_merge.find_stale_candidates(new_rows, master_records, matched_master_indices={0})
+
+        self.assertEqual(stale, [1])
+
+    def test_current_unit_is_not_marked_stale(self):
+        master_records = self._master_records([
+            {"building": "50 Gresham Street", "provider": "Copthall Estates", "floor_unit": "2nd Floor"},
+        ])
+        new_rows = [
+            ListingRow(building="50 Gresham Street", provider="Copthall Estates", floor_unit="2nd Floor"),
+        ]
+
+        stale = master_merge.find_stale_candidates(new_rows, master_records, matched_master_indices={0})
+
+        self.assertEqual(stale, [])
+
+    def test_already_matched_master_row_is_never_flagged(self):
+        # Even if it would otherwise qualify (different floor_unit reported
+        # this time, say) - a row this exact batch matched obviously still
+        # exists; matched_master_indices always wins.
+        master_records = self._master_records([
+            {"building": "50 Gresham Street", "provider": "Copthall Estates", "floor_unit": "3rd Floor"},
+        ])
+        new_rows = [
+            ListingRow(building="50 Gresham Street", provider="Copthall Estates", floor_unit="2nd Floor"),
+        ]
+
+        stale = master_merge.find_stale_candidates(new_rows, master_records, matched_master_indices={0})
+
+        self.assertEqual(stale, [])
+
+    def test_building_never_mentioned_by_this_upload_is_not_flagged(self):
+        # The critical safety case: this upload only covers ONE building for
+        # Copthall (a partial upload even from an allow-listed provider) -
+        # a completely different building's existing floor must never be
+        # treated as evidence of anything.
+        master_records = self._master_records([
+            {"building": "11 Cursitor Street", "provider": "Copthall Estates", "floor_unit": "Ground Floor"},
+        ])
+        new_rows = [
+            ListingRow(building="50 Gresham Street", provider="Copthall Estates", floor_unit="2nd Floor"),
+        ]
+
+        stale = master_merge.find_stale_candidates(new_rows, master_records, matched_master_indices=set())
+
+        self.assertEqual(stale, [])
+
+    def test_other_providers_partial_upload_never_flags_anything(self):
+        # A provider not on COMPLETE_SNAPSHOT_PROVIDERS uploading a subset
+        # of their portfolio must never have absent rows treated as stale,
+        # even when the building IS mentioned in this batch.
+        master_records = self._master_records([
+            {"building": "16 Dufour's Place", "provider": "GPE", "floor_unit": "3rd Floor"},
+        ])
+        new_rows = [
+            ListingRow(building="16 Dufour's Place", provider="GPE", floor_unit="2nd Floor"),
+        ]
+
+        stale = master_merge.find_stale_candidates(new_rows, master_records, matched_master_indices=set())
+
+        self.assertEqual(stale, [])
+
+    def test_fully_occupied_building_flags_every_existing_floor(self):
+        # A building marked Fully Occupied produces zero ListingRows, so
+        # covered_buildings/covered_units alone would never catch it - this
+        # is exactly what fully_occupied_buildings exists for.
+        master_records = self._master_records([
+            {"building": "27 Lime Street", "provider": "Copthall Estates", "floor_unit": "Ground Floor"},
+            {"building": "27 Lime Street", "provider": "Copthall Estates", "floor_unit": "1st Floor"},
+        ])
+        fully_occupied = [{"provider": "Copthall Estates", "building": "27 Lime Street"}]
+
+        stale = master_merge.find_stale_candidates(
+            [], master_records, matched_master_indices=set(), fully_occupied_buildings=fully_occupied,
+        )
+
+        self.assertEqual(stale, [0, 1])
+
+    def test_fully_occupied_building_for_a_different_provider_is_not_flagged(self):
+        master_records = self._master_records([
+            {"building": "27 Lime Street", "provider": "GPE", "floor_unit": "Ground Floor"},
+        ])
+        fully_occupied = [{"provider": "Copthall Estates", "building": "27 Lime Street"}]
+
+        stale = master_merge.find_stale_candidates(
+            [], master_records, matched_master_indices=set(), fully_occupied_buildings=fully_occupied,
+        )
+
+        self.assertEqual(stale, [])
+
+    def test_provider_name_variants_still_match_via_canonicalization(self):
+        # "Copthall Estates Availability" (a real sheet-title-derived
+        # provider string, see _strip_provider_purpose_suffix) must still be
+        # recognized as the same allow-listed provider.
+        master_records = self._master_records([
+            {"building": "50 Gresham Street", "provider": "Copthall Estates", "floor_unit": "3rd Floor"},
+        ])
+        new_rows = [
+            ListingRow(building="50 Gresham Street", provider="Copthall Estates Availability", floor_unit="2nd Floor"),
+        ]
+
+        stale = master_merge.find_stale_candidates(new_rows, master_records, matched_master_indices=set())
+
+        self.assertEqual(stale, [0])
+
+
 if __name__ == "__main__":
     unittest.main()

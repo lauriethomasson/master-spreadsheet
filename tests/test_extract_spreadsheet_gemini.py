@@ -15,6 +15,7 @@ import contextlib
 import io
 import sys
 import unittest
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -637,6 +638,617 @@ class FindBuildingsMissingBrochureLinkTests(unittest.TestCase):
             "Row 1: unrelated content", [{"building": "Nowhere", "brochure_link": None}],
         )
         self.assertEqual(missing, [])
+
+
+class DeterministicBrochureLinkForBuildingTests(unittest.TestCase):
+    """deterministic_brochure_link_for_building - reads the real Excel
+    hyperlink behind a building's own "Download Brochure" cell directly,
+    bypassing Gemini's own free-form reading of the same rendered text
+    entirely. Confirmed against the real Copthall Estates Availability.xlsx:
+    every building's address/link row carries Floorplans and Brochure as two
+    separate cells, each with its own distinct real URL."""
+
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        return ws
+
+    def _riverside_block(self, ws):
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([
+            None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+            "Download Floorplans", None, None, "Download Brochure",
+        ])
+        ws["F3"].hyperlink = "https://a.example.com/floorplans"
+        ws["I3"].hyperlink = "https://b.example.com/brochure.pdf"
+
+    def test_recovers_the_single_unambiguous_brochure_link(self):
+        ws = self._sheet([])
+        self._riverside_block(ws)
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(text, "Riverside Building")
+
+        self.assertEqual(url, "https://b.example.com/brochure.pdf")
+
+    def test_never_returns_the_floorplans_link(self):
+        ws = self._sheet([])
+        self._riverside_block(ws)
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(text, "Riverside Building")
+
+        self.assertNotEqual(url, "https://a.example.com/floorplans")
+
+    def test_no_brochure_link_in_source_returns_none(self):
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+
+        url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(text, "Riverside Building")
+
+        self.assertIsNone(url)
+
+    def test_two_conflicting_brochure_links_returns_none(self):
+        ws = self._sheet([])
+        self._riverside_block(ws)
+        ws.append([None, "Old Brochure (superseded)"])
+        ws["B4"].hyperlink = "https://c.example.com/old-brochure.pdf"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(text, "Riverside Building")
+
+        self.assertIsNone(url)
+
+    def test_building_block_not_found_returns_none(self):
+        url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(
+            "Row 1: unrelated content", "Nowhere",
+        )
+        self.assertIsNone(url)
+
+
+class ApplyDeterministicBrochureLinksEndToEndTests(unittest.TestCase):
+    """Same real, confirmed shape as DeterministicBrochureLinkForBuildingTests,
+    exercised through extract_sheet end to end (Gemini mocked) - proves the
+    override actually reaches the final ListingRow.brochure_link, survives
+    finalize_brochure_link's own downstream handling, and correctly leaves
+    every OTHER case (multiple floors, no source link, conflicting links)
+    exactly as Gemini itself extracted."""
+
+    def _riverside_block(self, ws):
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([
+            None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+            "Download Floorplans", None, None, "Download Brochure",
+        ])
+        ws["F3"].hyperlink = "https://a.example.com/floorplans"
+        ws["I3"].hyperlink = "https://b.example.com/brochure.pdf"
+
+    def _sheet_with_floors(self, floor_rows):
+        wb = Workbook()
+        ws = wb.active
+        self._riverside_block(ws)
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        for floor in floor_rows:
+            ws.append([None, floor, 1800.0, 14000.0, "Now"])
+        return ws
+
+    def test_one_building_one_brochure_one_floor(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000, "brochure_link": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(
+                self._sheet_with_floors(["3rd Floor"]), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://b.example.com/brochure.pdf")
+
+    def test_one_building_one_brochure_multiple_floors_all_inherit_it(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000, "brochure_link": None},
+                {"building": "Riverside Building", "floor_unit": "4th Floor",
+                 "size_sqft": 1900, "rent_pcm": 15000, "brochure_link": None},
+                {"building": "Riverside Building", "floor_unit": "5th Floor",
+                 "size_sqft": 2000, "rent_pcm": 16000, "brochure_link": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(
+                self._sheet_with_floors(["3rd Floor", "4th Floor", "5th Floor"]), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(row.brochure_link, "https://b.example.com/brochure.pdf")
+
+    def test_gemini_returns_none_but_excel_has_explicit_brochure_link(self):
+        # The real, confirmed failure mode this whole mechanism exists for:
+        # Gemini drops brochure_link entirely despite the source having one.
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000, "brochure_link": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(
+                self._sheet_with_floors(["3rd Floor"]), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://b.example.com/brochure.pdf")
+
+    def test_gemini_returns_the_floorplan_url_but_excel_clearly_differs(self):
+        # Gemini picked the wrong (Floorplans) link - the deterministic
+        # value must win outright, not merely fill a gap.
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000,
+                 "brochure_link": "https://a.example.com/floorplans"},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(
+                self._sheet_with_floors(["3rd Floor"]), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://b.example.com/brochure.pdf")
+        self.assertNotEqual(rows[0].brochure_link, "https://a.example.com/floorplans")
+
+    def test_no_source_brochure_link_never_fabricates_one(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Floorplans"])
+        ws["F3"].hyperlink = "https://a.example.com/floorplans"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000, "brochure_link": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — City", "file.xlsx")
+
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_conflicting_brochure_links_are_never_guessed(self):
+        wb = Workbook()
+        ws = wb.active
+        self._riverside_block(ws)
+        ws.append([None, "Old Brochure (superseded)"])
+        ws["B4"].hyperlink = "https://c.example.com/old-brochure.pdf"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000, "brochure_link": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — City", "file.xlsx")
+
+        # Never guessed at from the conflicting pair - left exactly as Gemini
+        # (the best available signal here) extracted it, which in this case
+        # was nothing.
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_does_not_replace_an_already_valid_link_with_a_wrong_neighbor(self):
+        # A single-consistent-table sheet (shape (a)) has no "download" line
+        # at all, so _building_block_bounds returns None and the override is
+        # a complete no-op - Gemini's own extraction is untouched either way.
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Building", "Floor", "Size (sq ft)", "Rent PCM"])
+        ws.append([None, "Portfolio Building A", "1st Floor", 1000, 20000])
+        raw = {
+            "provider": "Some Provider", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Portfolio Building A", "floor_unit": "1st Floor",
+                 "size_sqft": 1000, "rent_pcm": 20000,
+                 "brochure_link": "https://provider.example.com/brochure.pdf"},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertEqual(rows[0].brochure_link, "https://provider.example.com/brochure.pdf")
+
+
+class ExtractSheetWithMetadataTests(unittest.TestCase):
+    """extract_sheet_with_metadata's second return value - the {"provider",
+    "building"} dicts Gemini names as explicitly fully-occupied (see PROMPT's
+    own fully_occupied_buildings field) - and extract_sheet's own backward-
+    compatible wrapper around it."""
+
+    def _sheet(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "Office"
+        ws["A2"] = "4th Floor"
+        return ws
+
+    def test_returns_fully_occupied_buildings_alongside_rows(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": None,
+            "fully_occupied_buildings": ["50 Wells Street"],
+            "units": [
+                {"building": "28 Lime Street", "floor_unit": "4th Floor",
+                 "size_sqft": 1358, "rent_pcm": 19805},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows, fully_occupied = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._sheet(), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(fully_occupied, [{"provider": "Copthall Estates", "building": "50 Wells Street"}])
+
+    def test_no_fully_occupied_buildings_returns_empty_list(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [{"building": "28 Lime Street", "floor_unit": "4th Floor"}],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            _rows, fully_occupied = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._sheet(), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(fully_occupied, [])
+
+    def test_missing_field_in_raw_response_defaults_to_empty_list(self):
+        # Older/looser Gemini responses without this new field at all must
+        # never crash - .get() with a default, not a required key.
+        raw = {"provider": "Copthall Estates", "contacts": None, "units": []}
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows, fully_occupied = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._sheet(), "file.xlsx — City", "file.xlsx"
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(fully_occupied, [])
+
+    def test_extract_sheet_wrapper_drops_the_metadata_and_returns_rows_only(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": None,
+            "fully_occupied_buildings": ["Some Building"],
+            "units": [{"building": "28 Lime Street", "floor_unit": "4th Floor"}],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — City", "file.xlsx")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "28 Lime Street")
+
+
+class IsNonAuthoritativeRollupSheetTests(unittest.TestCase):
+    """is_non_authoritative_rollup_sheet - confirmed against the real
+    Copthall Estates Availability.xlsx: its "Portfolio" sheet is a hidden,
+    flat Area/Station/Building/Office/... table with zero real hyperlinks
+    anywhere, roughly a year stale compared to its visible sibling sheets.
+    Requires BOTH hidden-state AND "no download line anywhere" - see the
+    function's own docstring for why either alone is unsafe."""
+
+    def _sheet(self, rows, state="visible"):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        ws.sheet_state = state
+        return ws
+
+    def _portfolio_like_rows(self):
+        return [
+            [None, "Area", "Station", "Building", "Office", "Sq.Ft"],
+            [None, "City", "Liverpool St", "50 Gresham", "3rd Floor", 973],
+        ]
+
+    def _riverside_block_rows(self):
+        # A genuine shape (b) repeating block WITH a real "download" line -
+        # what a genuinely authoritative sheet always has somewhere.
+        return [
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]
+
+    def test_hidden_with_no_download_lines_is_non_authoritative(self):
+        # The real, confirmed Copthall Portfolio shape.
+        ws = self._sheet(self._portfolio_like_rows(), state="hidden")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        self.assertTrue(extract_spreadsheet_gemini.is_non_authoritative_rollup_sheet(ws, text))
+
+    def test_very_hidden_with_no_download_lines_is_non_authoritative(self):
+        ws = self._sheet(self._portfolio_like_rows(), state="veryHidden")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        self.assertTrue(extract_spreadsheet_gemini.is_non_authoritative_rollup_sheet(ws, text))
+
+    def test_visible_with_no_download_lines_is_not_flagged(self):
+        # A different provider's genuinely current, but hyperlink-less,
+        # free-form sheet - visible, so never touched by this rule at all.
+        ws = self._sheet(self._portfolio_like_rows(), state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        self.assertFalse(extract_spreadsheet_gemini.is_non_authoritative_rollup_sheet(ws, text))
+
+    def test_hidden_but_with_real_download_lines_is_not_flagged(self):
+        # A hidden sheet that DOES carry a genuine per-building hyperlinked
+        # block must never be skipped just because it's hidden - "skip
+        # every hidden sheet" is exactly the global rule this must avoid.
+        ws = self._sheet(self._riverside_block_rows(), state="hidden")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        self.assertFalse(extract_spreadsheet_gemini.is_non_authoritative_rollup_sheet(ws, text))
+
+    def test_visible_with_real_download_lines_is_not_flagged(self):
+        ws = self._sheet(self._riverside_block_rows(), state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        self.assertFalse(extract_spreadsheet_gemini.is_non_authoritative_rollup_sheet(ws, text))
+
+
+class ExtractUpdateDateTests(unittest.TestCase):
+    def test_parses_four_digit_year(self):
+        d = extract_spreadsheet_gemini.extract_update_date(
+            "Row 1: Copthall Estates City Availability - Updated 03/08/2026"
+        )
+        self.assertEqual(d, date(2026, 8, 3))
+
+    def test_parses_two_digit_year_as_20xx(self):
+        d = extract_spreadsheet_gemini.extract_update_date(
+            "Row 1: Copthall Estates Availibility - Updated 05/08/25"
+        )
+        self.assertEqual(d, date(2025, 8, 5))
+
+    def test_no_updated_phrase_returns_none(self):
+        self.assertIsNone(extract_spreadsheet_gemini.extract_update_date("Row 1: Some Provider Availability"))
+
+    def test_invalid_date_is_ignored_not_raised(self):
+        self.assertIsNone(extract_spreadsheet_gemini.extract_update_date("Row 1: Updated 32/13/2026"))
+
+    def test_only_checks_the_first_few_lines(self):
+        text = "\n".join([f"Row {i}: filler" for i in range(1, 20)] + ["Row 20: Updated 01/01/2020"])
+        self.assertIsNone(extract_spreadsheet_gemini.extract_update_date(text))
+
+
+class LooksLikeFlatDataTableTests(unittest.TestCase):
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        return ws
+
+    def test_real_portfolio_shape_is_a_flat_table(self):
+        rows = [[None, "Area", "Station", "Building", "Office", "Sq.Ft", "Price Per Sq.Ft", "Monthly List Price"]]
+        for i in range(10):
+            rows.append([None, "City", "Bank", f"Building {i}", "3rd Floor", 1000 + i, 150, 12000])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet(rows))
+
+        self.assertTrue(extract_spreadsheet_gemini._looks_like_flat_data_table(text))
+
+    def test_real_incentives_shape_is_not_a_flat_table(self):
+        # Mostly prose/commission-structure paragraphs plus a name/phone
+        # column far to the right of otherwise-blank cells - wide after
+        # trailing-blank trimming, but never 2+ numeric cells on one row.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Copthall Estates Incentives - Updated 03/08/26", None, None, None, None, None, None, None, None,
+             None, "To register a lead or discuss an enquiry, contact:"],
+            [None, "Standard Commission", None, None, None, None, None, None, None, None, None,
+             "Enquiry@copthallestates.com  0203 002 2503"],
+            [None, "10% on the first 12 months, 2% on months 13-24 for any deals with a lease term of 36 months "
+                   "or longer. Payable when the deal enters year 3.", None, None, None, None, None, None, None,
+             None, None, "Kiri Norton-Brennan - 0795 811 8382"],
+            [None, None, None, None, None, None, None, None, None, None, None, "Megan Copsey - 0794 393 2852"],
+            [None, "89 Charterhouse Street - Enhanced Incentive"],
+            [None, "Achieved Year 1 Rent: Enhanced Commission Rate Achieved +1.5% of Year 1 rent"],
+            [None, "11 Cursitor Street - Viewing Incentive"],
+        ]))
+
+        self.assertFalse(extract_spreadsheet_gemini._looks_like_flat_data_table(text))
+
+    def test_few_numeric_rows_is_not_a_flat_table(self):
+        rows = [[None, "Area", "Station", "Building", "Office", "Sq.Ft"]]
+        rows.append([None, "City", "Bank", "50 Gresham", "3rd Floor", 973])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet(rows))
+
+        self.assertFalse(extract_spreadsheet_gemini._looks_like_flat_data_table(text))
+
+
+class ClassifySheetForExtractionTests(unittest.TestCase):
+    """classify_sheet_for_extraction - the three-outcome classification
+    (auto_skip / ambiguous / authoritative) app.py's upload-time decision UI
+    and Extract-time sheet loop both rely on. Confirmed against the real
+    Copthall Estates Availability.xlsx's own real shapes throughout."""
+
+    def _sheet(self, rows, title="Sheet1", state="visible"):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = title
+        for row in rows:
+            ws.append(row)
+        ws.sheet_state = state
+        return ws
+
+    def _portfolio_rows(self):
+        rows = [[None, "Copthall Estates Availibility - Updated 05/08/25"],
+                [None, "Area", "Station", "Building", "Office", "Sq.Ft", "Price Per Sq.Ft"]]
+        for i in range(10):
+            rows.append([None, "City", "Bank", f"Building {i}", "3rd Floor", 1000 + i, 150])
+        return rows
+
+    def _city_block_rows(self, updated="03/08/2026"):
+        return [
+            [None, f"Copthall Estates City Availability - Updated {updated}"],
+            [None, "28 Lime Street - Fenchurch St / Bank"],
+            [None, "A striking City tower with amenities."],
+            [None, "27-30 Lime Street, EC3M 7AF", None, None, None, "Download Floorplans"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "5th Floor", 2400.0, 18000.0, "Now"],
+        ]
+
+    def _incentives_rows(self):
+        return [
+            [None, "Copthall Estates Incentives - Updated 03/08/26", None, None, None, None, None, None, None,
+             None, None, "To register a lead or discuss an enquiry, contact:"],
+            [None, "Standard Commission", None, None, None, None, None, None, None, None, None,
+             "Enquiry@copthallestates.com  0203 002 2503"],
+            [None, "10% on the first 12 months, 2% on months 13-24.", None, None, None, None, None, None, None,
+             None, None, "Kiri Norton-Brennan - 0795 811 8382"],
+            [None, "89 Charterhouse Street - Enhanced Incentive"],
+        ]
+
+    def test_hidden_and_no_download_lines_is_auto_skipped_unchanged(self):
+        # The real, confirmed Copthall Portfolio shape - auto_skip must
+        # survive exactly as it did before this classification existed.
+        ws = self._sheet(self._portfolio_rows(), title="Portfolio", state="hidden")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertEqual(result["outcome"], "auto_skip")
+
+    def test_ordinary_authoritative_sheet_has_no_reasons(self):
+        ws = self._sheet(self._city_block_rows(), title="City", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertEqual(result["outcome"], "authoritative")
+        self.assertEqual(result["reasons"], [])
+
+    def test_incentives_shaped_sheet_is_authoritative_not_ambiguous(self):
+        # Must never be flagged just for lacking hyperlinks - it was never
+        # trying to be a listings table in the first place (see
+        # _looks_like_flat_data_table's own docstring).
+        ws = self._sheet(self._incentives_rows(), title="Incentives", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertEqual(result["outcome"], "authoritative")
+
+    def test_visible_portfolio_named_flat_table_is_ambiguous(self):
+        ws = self._sheet(self._portfolio_rows(), title="Portfolio", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertEqual(result["outcome"], "ambiguous")
+        self.assertIn("suspicious_sheet_name", result["reasons"])
+
+    def test_hidden_sheet_with_real_download_lines_is_ambiguous_not_authoritative(self):
+        ws = self._sheet(self._city_block_rows(), title="City", state="hidden")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertEqual(result["outcome"], "ambiguous")
+        self.assertIn("hidden", result["reasons"])
+
+    def test_suspicious_name_alone_never_reaches_auto_skip(self):
+        ws = self._sheet(self._city_block_rows(), title="Summary", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertNotEqual(result["outcome"], "auto_skip")
+
+    def test_hidden_state_alone_never_reaches_auto_skip(self):
+        ws = self._sheet(self._city_block_rows(), title="City", state="hidden")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertNotEqual(result["outcome"], "auto_skip")
+
+    def test_no_download_links_alone_never_reaches_auto_skip(self):
+        # Visible + no download lines + a flat-table shape (so the
+        # ambiguity signal itself CAN fire) - still must never auto-skip
+        # without the hidden/veryHidden half of the confident pair.
+        ws = self._sheet(self._portfolio_rows(), title="Portfolio", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text)
+
+        self.assertNotEqual(result["outcome"], "auto_skip")
+
+    def test_stale_date_versus_siblings_is_ambiguous(self):
+        ws = self._sheet(self._city_block_rows(updated="05/08/25"), title="City", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(
+            ws, text, sibling_dates={"Mid Town": date(2026, 8, 3)},
+        )
+
+        self.assertEqual(result["outcome"], "ambiguous")
+        self.assertIn("stale_update_date_vs_siblings", result["reasons"])
+
+    def test_small_date_gap_versus_siblings_is_not_flagged(self):
+        # Real Blackfriars vs City gap (~1 month) - a normal per-area
+        # update cadence difference, never staleness.
+        ws = self._sheet(self._city_block_rows(updated="01/07/2026"), title="Blackfriars", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(
+            ws, text, sibling_dates={"City": date(2026, 8, 3)},
+        )
+
+        self.assertEqual(result["outcome"], "authoritative")
+
+    def test_no_sibling_dates_never_guesses_staleness(self):
+        ws = self._sheet(self._city_block_rows(updated="05/08/25"), title="City", state="visible")
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text, sibling_dates={})
+
+        self.assertEqual(result["outcome"], "authoritative")
 
 
 if __name__ == "__main__":

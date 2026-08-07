@@ -299,5 +299,37 @@ class CriticalFieldRescuePersistenceTests(IsolatedCwdTestCase):
         self.assertIsNone(saved["assignments"]["building"])
 
 
+class FullyOccupiedBuildingsMetadataTests(IsolatedCwdTestCase):
+    """save_staging_file/get_staging_fully_occupied_buildings - the sidecar
+    meta.json field carrying extract_spreadsheet_gemini's fully_occupied_
+    buildings signal from upload time through to review time (see master_
+    merge.find_stale_candidates)."""
+
+    def test_round_trips_through_the_sidecar(self):
+        fully_occupied = [{"provider": "Copthall Estates", "building": "27 Lime Street"}]
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A", provider="Copthall Estates")], "copthall.xlsx",
+            fully_occupied_buildings=fully_occupied,
+        )
+
+        self.assertEqual(file_store.get_staging_fully_occupied_buildings(staging_path), fully_occupied)
+
+    def test_omitted_defaults_to_empty_list_not_none(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A", provider="P1")], "a.pdf")
+
+        self.assertEqual(file_store.get_staging_fully_occupied_buildings(staging_path), [])
+
+    def test_pre_existing_entry_with_no_such_key_at_all_defaults_to_empty_list(self):
+        # A staging file written before this field existed has no key for it
+        # at all in its meta.json - must not KeyError, same "old entries
+        # just don't have it" tolerance as content_hash.
+        staging_path = file_store.save_staging_file([ListingRow(building="A", provider="P1")], "a.pdf")
+        meta = file_store._read_meta(staging_path)
+        del meta["fully_occupied_buildings"]
+        file_store._write_meta(staging_path, meta)
+
+        self.assertEqual(file_store.get_staging_fully_occupied_buildings(staging_path), [])
+
+
 if __name__ == "__main__":
     unittest.main()
