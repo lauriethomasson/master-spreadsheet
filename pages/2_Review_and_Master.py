@@ -304,29 +304,31 @@ def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix:
 def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     """
     Full master, browsable, directly editable, and row-selectable (for the
-    export step). Every visible column is a real edit target except Select,
-    which is a UI-only checkbox never itself a ListingRow field (see
-    master_merge.build_manual_edit) - hidden columns (property_id,
-    source_file) are simply absent from display_df, so they can't be edited
-    through this UI at all, same as before.
+    export step and for bulk removal).
 
-    Row selection is tracked by property_id in session_state, not by the
-    data_editor's own positional widget state - a saved edit reloads the
-    master (freshly re-sorted; see sort_by_provider), which can shift a
-    row's position, and Streamlit's data_editor state is keyed by position.
-    Trusting that position across a reload risks silently reapplying a
-    stale selection (or edit - see _process_manual_edits) to the wrong row.
-    property_id is immune to re-sorting, so it survives that reload intact.
+    Selection and editing are TWO INDEPENDENT WIDGETS, not one - see
+    _render_row_selector below for why. Every column data_editor shows is a
+    real edit target - hidden columns (property_id, source_file) are simply
+    absent from display_df, so they can't be edited through this UI at all,
+    same as before.
+
+    Row selection is tracked by property_id in session_state, not by either
+    widget's own positional state - a saved edit reloads the master (freshly
+    re-sorted; see sort_by_provider), which can shift a row's position, and
+    Streamlit's own widget state is keyed by position. Trusting that
+    position across a reload risks silently reapplying a stale selection
+    (or edit - see _process_manual_edits) to the wrong row. property_id is
+    immune to re-sorting, so it survives that reload intact.
 
     The text filter below narrows only what's DISPLAYED, never what df/
-    master_records themselves contain - data_editor's own edited_rows
-    positions are always relative to whatever (possibly filtered) subset
-    was actually passed to it this render, so real_positions[i] (the real
-    position in df of whatever row sits at filtered position i) is threaded
-    through to _process_manual_edits/build_manual_edit below, and row
-    selection stays keyed by property_id exactly as it already was for the
-    re-sort case above - a filter is just another way a row's position can
-    shift out from under a stale positional reference.
+    master_records themselves contain - both widgets' own positional state
+    is always relative to whatever (possibly filtered) subset was actually
+    passed to them this render, so real_positions[i] (the real position in
+    df of whatever row sits at filtered position i) is threaded through to
+    _process_manual_edits/build_manual_edit below, and row selection stays
+    keyed by property_id exactly as it already was for the re-sort case
+    above - a filter is just another way a row's position can shift out
+    from under a stale positional reference.
 
     Returns True if a real field edit was saved this render - the caller
     should st.rerun() so the rest of the page reflects the fresh master
@@ -335,12 +337,6 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     """
     visible = display_utils.visible_columns(df)
     display_df = df[visible].copy()
-
-    selected_ids = st.session_state.get("export_selected_property_ids", set())
-    display_df.insert(
-        0, "Select",
-        df["property_id"].isin(selected_ids) if "property_id" in df.columns else False,
-    )
 
     query = st.text_input(
         "Filter (building, address, provider, or floor/unit)",
@@ -356,11 +352,14 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         filtered_df = display_df[mask]
         real_positions = [i for i, keep in enumerate(mask) if keep]
 
-    edited = st.data_editor(
+    selected_positions = _render_row_selector(df, filtered_df, key)
+    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
+    _render_selection_actions(df, selected_positions, key)
+
+    edited_df = st.data_editor(
         filtered_df,
         column_config={
             **display_utils.label_column_config(filtered_df),
-            "Select": st.column_config.CheckboxColumn(required=True),
             **display_utils.link_column_config(filtered_df),
             **display_utils.wide_text_column_config(filtered_df),
             **display_utils.numeric_column_config(filtered_df),
@@ -369,33 +368,107 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         height=600,
         key=key,
     )
-    st.caption(f"{len(filtered_df)} of {len(df)} row(s) shown.")
+    st.caption(f"{len(edited_df)} of {len(df)} row(s) shown.")
+
+    return _process_manual_edits(df, real_positions, key)
+
+
+# The narrow, identifying column set _render_row_selector shows - enough to
+# tell rows apart for a bulk-removal decision without duplicating the full
+# editable table's own width. Deliberately not configurable per call site -
+# every caller of _render_master_table wants the same at-a-glance identity.
+_SELECTOR_COLUMNS = ("provider", "building", "floor_unit", "address_1")
+
+
+def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> list:
+    """
+    Renders a compact, READ-ONLY, natively row-selectable table (st.
+    dataframe's own on_select/selection_mode, added specifically for this
+    "select rows, then act on the selection" pattern) and returns
+    selected_positions - real positions in df (immune to the text filter
+    above narrowing what's shown - see _render_master_table's own
+    docstring), kept in session_state["export_selected_property_ids"] by
+    property_id exactly as before.
+
+    A real-browser report confirmed the "Remove N selected row(s)" button
+    (see _render_selection_actions) sometimes needed two clicks to
+    register. That was rigorously proven (via direct session_state
+    manipulation reproducing both a single combined rerun and two genuinely
+    sequential ones, in both the unfiltered AND filtered case) to NOT be a
+    stale-state bug anywhere in this file's own logic - every scenario
+    tested computed the correct selection given synchronized widget state.
+    The remaining, unfixable-in-pure-Python explanation is a browser-level
+    commit-timing race specific to an EDITABLE grid cell (the previous
+    design: a manually-added "Select" CheckboxColumn living inside the SAME
+    st.data_editor as real field edits) committing its own value to
+    Streamlit's backend while racing against a separate st.button's click -
+    something no amount of restructuring which session_state key gets read
+    can fix, since the value genuinely hasn't arrived yet at the moment
+    the race is lost. st.form() would fix this outright (it forces the
+    browser to flush every contained widget atomically with the submit
+    click) but wrapping the WHOLE data_editor in one would also defer
+    ordinary field edits until an explicit submit, breaking today's
+    auto-save-without-a-click behavior for those - not something this
+    change may do.
+
+    Splitting selection into its own widget, backed by a fundamentally
+    different interaction (native row selection, never an in-grid EDIT at
+    all) removes it from that specific race entirely, while leaving the
+    real editable data_editor (and its auto-save behavior) completely
+    untouched - the two widgets never share one commit pathway again.
+    """
+    selector_columns = [c for c in _SELECTOR_COLUMNS if c in filtered_df.columns]
+    selector_df = filtered_df[selector_columns] if selector_columns else filtered_df
+
+    selected_ids = st.session_state.get("export_selected_property_ids", set())
+    default_rows = []
+    if "property_id" in df.columns and selected_ids:
+        filtered_property_ids = df.loc[filtered_df.index, "property_id"]
+        default_rows = [i for i, pid in enumerate(filtered_property_ids) if pid in selected_ids]
+
+    st.caption("Select rows to remove:")
+    selection = st.dataframe(
+        selector_df,
+        column_config=display_utils.label_column_config(selector_df),
+        width="stretch",
+        height=200,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="multi-row",
+        selection_default={"selection": {"rows": default_rows}},
+        key=f"{key}_selector",
+    )
+    selected_row_positions = selection["selection"]["rows"]
 
     if "property_id" in df.columns:
         visible_ids = set(df.loc[filtered_df.index, "property_id"])
-        now_selected_visible = set(df.loc[edited.index[edited["Select"]], "property_id"])
+        now_selected_visible = set(df.loc[filtered_df.index[selected_row_positions], "property_id"])
         st.session_state["export_selected_property_ids"] = master_merge.merge_selected_property_ids(
             selected_ids, visible_ids, now_selected_visible
         )
-        selected_positions = df.index[df["property_id"].isin(st.session_state["export_selected_property_ids"])].tolist()
-    else:
-        selected_positions = edited.index[edited["Select"]].tolist()
-    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
+        return df.index[df["property_id"].isin(st.session_state["export_selected_property_ids"])].tolist()
+    return filtered_df.index[selected_row_positions].tolist()
 
+
+def _clear_row_selection(df: pd.DataFrame, key: str) -> None:
+    """Shared by "Clear selection" and a successful removal - resets the
+    tracked selection AND the selector widget's own stale state (otherwise
+    its cached selection from before this click would just reapply itself
+    on the next render, on top of the now-empty export_selected_property_
+    ids, leaving rows looking still selected despite the tracked set
+    genuinely being empty)."""
+    st.session_state["export_selected_property_ids"] = set()
+    st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
+    selector_key = f"{key}_selector"
+    if selector_key in st.session_state:
+        del st.session_state[selector_key]
+
+
+def _render_selection_actions(df: pd.DataFrame, selected_positions: list, key: str) -> None:
     with st.container(horizontal=True):
         st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
         if st.button("Clear selection", key=f"{key}_clear_selection", disabled=not selected_positions):
-            st.session_state["export_selected_property_ids"] = set()
-            st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
-            # Also resets the data_editor's OWN widget state (same reasoning
-            # as _process_manual_edits below) - otherwise its cached
-            # per-checkbox overrides from before this click would just
-            # reapply themselves on the next render, on top of the freshly
-            # all-unchecked Select column this seeds from the now-empty
-            # export_selected_property_ids, leaving every box looking still
-            # checked despite the tracked set genuinely being empty.
-            if key in st.session_state:
-                del st.session_state[key]
+            _clear_row_selection(df, key)
             st.rerun()
 
         # Reuses the exact same apply_merge/write_master path a let-status
@@ -406,15 +479,6 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
         # left behind by a provider-name fix that changed the match key -
         # see master_merge.py's own module docstring on why provider is
         # part of the key at all) - no separate delete mechanism invented.
-        #
-        # Deliberately never `disabled=not selected_positions`: a real-
-        # browser report of this button needing two clicks to register
-        # couldn't be reproduced in AppTest (it can't simulate the DOM-level
-        # timing of a click landing right as a checkbox toggle is still
-        # updating this button's own disabled state) - but leaving it always
-        # clickable side-steps that class of bug entirely, at the cost of a
-        # no-op click needing its own friendly message instead of the button
-        # simply refusing the click.
         remove_clicked = st.button(
             f"Remove {len(selected_positions)} selected row(s)",
             key=f"{key}_remove_selected",
@@ -451,32 +515,35 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
             if write_failed:
                 st.error(f"Removal failed, master was not changed: {write_failed}")
             else:
-                st.session_state["export_selected_property_ids"] = set()
-                st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
-                if key in st.session_state:
-                    del st.session_state[key]
+                _clear_row_selection(df, key)
                 st.session_state["last_removal"] = {
                     "count": len(removed_indices),
                     "version_path": previous_version_path,
                 }
                 st.rerun()
         else:
-            # Popped, not just read - shown once right on the rerun
-            # immediately after the removal above, then gone, rather than
-            # persisting in (page-wide, cross-navigation) session state
-            # until someone happens to click Undo - see the equivalent fix
-            # for last_approval/last_manual_edit in _render_full_master_view.
-            last_removal = st.session_state.pop("last_removal", None)
+            # Deliberately read, not popped: popping here would consume
+            # last_removal on the very rerun that clicking "Undo" itself
+            # triggers - by the time that rerun's script runs, last_removal
+            # would already be gone, so the "if last_removal:" guard below
+            # would be False, st.button("Undo", ...) would never even be
+            # called THIS run, and the click landing on it would be
+            # silently dropped (confirmed with a minimal repro - a button
+            # whose own visibility depends on a pop()'d value can never be
+            # clicked, since the pop already fired on the render that first
+            # displayed it, one render before the click can land). Cleared
+            # explicitly (not via pop-into-a-throwaway-local) only once
+            # Undo has actually run, immediately below.
+            last_removal = st.session_state.get("last_removal")
             if last_removal:
                 n = last_removal["count"]
                 st.markdown(f":red[✓ {n} row{'s' if n != 1 else ''} removed]")
                 if last_removal.get("version_path") and st.button("Undo", key=f"{key}_undo_manual_removal"):
                     with st.spinner("Undoing..."):
                         master_writer.restore_version(last_removal["version_path"])
+                    del st.session_state["last_removal"]
                     st.session_state["just_restored"] = last_removal["version_path"]
                     st.rerun()
-
-    return _process_manual_edits(df, real_positions, key)
 
 
 def _process_manual_edits(df: pd.DataFrame, displayed_positions: list, key: str) -> bool:
