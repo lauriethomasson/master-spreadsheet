@@ -444,33 +444,26 @@ with page_setup.setup_page("upload"):
                     uploaded_file.name, _scan_spreadsheet_sheets(file_bytes, suffix, uploaded_file.name),
                 )
 
+    # auto_skip sheets (see extract_spreadsheet_gemini.is_non_authoritative_
+    # rollup_sheet) are intentionally silent here - confidently non-
+    # authoritative, so nothing to ask or even mention before Extract; the
+    # existing Extract-time "hidden, non-authoritative rollup sheet —
+    # skipped" info message (see the sheet loop below) is the only surfacing
+    # they get. Only genuinely ambiguous sheets need a human's attention
+    # here at all.
     any_hidden_sheet_mentioned = False
     pending_decision_labels = []
     for file_hash, (filename, plans) in scanned_files.items():
         for plan in plans:
             classification = plan["classification"]
-            if not classification:
+            if not classification or classification["outcome"] != "ambiguous":
                 continue
 
-            if classification["outcome"] == "auto_skip":
-                any_hidden_sheet_mentioned = any_hidden_sheet_mentioned or classification["sheet_state"] in (
-                    "hidden", "veryHidden",
-                )
-                st.info(f"Skipped hidden non-authoritative sheet: {plan['sheet_name']} ({filename})")
-                with st.expander(f"Why was {plan['sheet_name']!r} skipped?"):
-                    st.caption(HIDDEN_SHEET_EXPLAINER)
-                    st.caption(
-                        f"This sheet is {'hidden' if classification['sheet_state'] in ('hidden', 'veryHidden') else 'visible'} "
-                        "in the workbook and does not contain the normal availability/download "
-                        "structure, so it was not treated as current availability."
-                    )
-
-            elif classification["outcome"] == "ambiguous":
-                any_hidden_sheet_mentioned = True
-                _render_ambiguous_sheet_decision(filename, plan, file_hash)
-                decision = st.session_state.get(_sheet_decision_key(file_hash, plan["sheet_name"]))
-                if decision in (None, SHEET_DECISION_PLACEHOLDER):
-                    pending_decision_labels.append(f"{filename} — {plan['sheet_name']}")
+            any_hidden_sheet_mentioned = True
+            _render_ambiguous_sheet_decision(filename, plan, file_hash)
+            decision = st.session_state.get(_sheet_decision_key(file_hash, plan["sheet_name"]))
+            if decision in (None, SHEET_DECISION_PLACEHOLDER):
+                pending_decision_labels.append(f"{filename} — {plan['sheet_name']}")
 
     if any_hidden_sheet_mentioned:
         st.caption(f"ℹ️ {HIDDEN_SHEET_EXPLAINER}")

@@ -222,11 +222,15 @@ class AmbiguousSheetPromptTests(unittest.TestCase):
             all_text = "".join(c.value for c in at.caption) + "".join(m.value for m in at.markdown)
             self.assertIn("hidden sheets", all_text.lower())
 
-    def test_auto_skipped_hidden_sheet_is_surfaced_informationally(self):
+    def test_auto_skipped_hidden_sheet_produces_no_upload_time_message(self):
         # A confidently non-authoritative sheet (real Copthall Portfolio
-        # shape: hidden + zero download lines) is never a prompt - but the
-        # user still sees an informational message naming it, so looking in
-        # Excel and not finding "Portfolio" as a tab makes sense.
+        # shape: hidden + zero download lines) is never a prompt, and - per
+        # explicit request - no longer gets any upload-time informational
+        # message either: it's silently skipped, exactly like any other
+        # fully-automatic decision. The Extract-time "hidden, non-
+        # authoritative rollup sheet — skipped" message (unchanged, shown
+        # only once Extract actually runs) is covered separately by
+        # test_app_upload_hidden_portfolio_sheet.py.
         file_bytes = _build_workbook({
             "City": (_city_block, "visible"),
             "Portfolio": (_flat_rollup_table, "hidden"),
@@ -241,8 +245,10 @@ class AmbiguousSheetPromptTests(unittest.TestCase):
             self.assertFalse(at.exception)
             self.assertEqual(len(at.radio), 0)  # never a prompt for this one
             info_text = "".join(i.value for i in at.info)
-            self.assertIn("Portfolio", info_text)
-            self.assertIn("hidden", info_text.lower())
+            self.assertNotIn("Portfolio", info_text)
+
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            self.assertFalse(extract_buttons[0].disabled)
 
     def test_another_providers_legitimate_visible_portfolio_sheet_is_not_auto_skipped(self):
         file_bytes = _build_workbook({"Portfolio": (_city_block, "visible")})
