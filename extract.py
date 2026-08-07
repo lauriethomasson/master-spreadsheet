@@ -420,6 +420,28 @@ def render_pages(pdf_path: Path) -> list[types.Part]:
     return parts
 
 
+def extract_raw_units(pdf_path: Path) -> dict:
+    """
+    The raw Gemini JSON ({"provider", "contacts", "units": [...]}) for one
+    PDF - one page-image render + one Gemini vision call against PROMPT,
+    before per-row PDF-hyperlink attachment (_attach_per_row_pdf_links,
+    page-index-dependent - only meaningful for a PDF Gemini has just been
+    shown page images from) or ListingRow conversion. The shared core both
+    extract() (below - the uploaded-PDF path, behavior-identical to before
+    this was factored out) and brochure_enrichment.py build on, so there is
+    only ONE PDF-vision extraction pipeline for both an uploaded brochure
+    that becomes ListingRows directly and a linked brochure fetched purely
+    to enrich a row from a different source (e.g. a spreadsheet row's own
+    brochure_link) - never a second, independently-drifting implementation.
+    """
+    client = get_client()
+    images = render_pages(pdf_path)
+    raw = call_gemini(client, PROMPT, images)
+    del images
+    gc.collect()
+    return raw
+
+
 def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = None) -> list[ListingRow]:
     """
     original_filename is the name the user actually uploaded — pdf_path itself
@@ -439,11 +461,7 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
     filename = original_filename or pdf_path.name
     pdf_fallback_link = brochure_url or filename
 
-    client = get_client()
-    images = render_pages(pdf_path)
-    raw = call_gemini(client, PROMPT, images)
-    del images
-    gc.collect()
+    raw = extract_raw_units(pdf_path)
 
     # Runs BEFORE finalize_brochure_link below, and mutates page_index out of
     # each unit dict as it goes - so a unit that gets a genuine per-row link

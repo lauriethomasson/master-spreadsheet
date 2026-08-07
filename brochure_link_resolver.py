@@ -84,7 +84,15 @@ def is_generic_link(url: str) -> bool:
     regardless of path - see KNOWN_NON_BROCHURE_DOMAINS.
     """
     parsed = urlparse(_normalize_url(url))
-    if any(parsed.netloc.endswith(d) for d in KNOWN_NON_BROCHURE_DOMAINS):
+    # netloc == d (exact) or netloc.endswith("." + d) (a real subdomain) -
+    # NEVER a bare .endswith(d) substring check, which is a real, confirmed
+    # false positive: "app.box.com".endswith("x.com") is True purely because
+    # "box.com" happens to end in the same 5 characters as "x.com", wrongly
+    # rejecting every real UNION brochure link (Box-hosted) as if it were a
+    # Twitter/X profile. A domain is only ever "the same site or a subdomain
+    # of it", never "any domain whose name happens to end with the same
+    # letters".
+    if any(parsed.netloc == d or parsed.netloc.endswith(f".{d}") for d in KNOWN_NON_BROCHURE_DOMAINS):
         return True
     path = parsed.path.rstrip("/")
     return not path and not parsed.query

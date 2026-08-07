@@ -9,6 +9,7 @@ from pathlib import Path
 import streamlit as st
 from openpyxl import load_workbook
 
+import brochure_enrichment
 import extract
 import extract_email
 import extract_spreadsheet
@@ -55,8 +56,15 @@ EXTRACTION_VERSION = "3"
 # change there must invalidate a cached result exactly like a mapping-logic
 # change does, for the same reason, even though a fresh (non-cached) call to
 # that module was never guaranteed byte-identical to begin with.
+# brochure_enrichment.py is included for the exact same reason: it also runs
+# unconditionally on every fresh spreadsheet extraction (see the spreadsheet
+# branch below), so a change to its matching/field rules must invalidate an
+# already-staged result too, not silently keep serving rows enriched (or not
+# enriched) under the OLD logic.
 _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
-    Path(extract_spreadsheet.__file__).read_bytes() + Path(extract_spreadsheet_gemini.__file__).read_bytes()
+    Path(extract_spreadsheet.__file__).read_bytes()
+    + Path(extract_spreadsheet_gemini.__file__).read_bytes()
+    + Path(brochure_enrichment.__file__).read_bytes()
 ).hexdigest()
 
 # The neutral, un-decided option in an ambiguous-sheet decision radio (see
@@ -668,6 +676,31 @@ with page_setup.setup_page("upload"):
                         # problem those docstrings warn about.
                         fill_missing_provider(header_mapped_rows, uploaded_file.name, apply_filename_guess=True)
                         fill_missing_address_from_building(header_mapped_rows, apply_building_fallback=True)
+
+                        # Secondary enrichment ONLY - spreadsheet rows are
+                        # always the source of truth (see brochure_
+                        # enrichment.py's own module docstring); this only
+                        # ever fills special_features/state_of_space when
+                        # BOTH are already blank AND the row's own brochure_
+                        # link confidently matches a brochure unit. Every
+                        # row for which nothing happened comes back
+                        # byte-identical - a fetch/Gemini failure on one
+                        # row's brochure never affects any other row or the
+                        # rest of this upload. Scoped to spreadsheet rows
+                        # only (both header-mapped and Gemini free-form) -
+                        # never PDF/email, see that module's own docstring
+                        # for why.
+                        rows, enrichment_log = brochure_enrichment.enrich_rows(rows)
+                        if enrichment_log:
+                            st.info(
+                                f"Enriched {len(enrichment_log)} row(s) from their linked brochure: "
+                                + ", ".join(
+                                    f"{entry['building']} ({entry['floor_unit'] or 'n/a'}) — "
+                                    f"{', '.join(entry['fields'])}"
+                                    for entry in enrichment_log
+                                )
+                            )
+
                         reused = False
                     else:
                         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:

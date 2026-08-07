@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brochure_link_resolver import finalize_brochure_link
+from brochure_link_resolver import finalize_brochure_link, is_generic_link
 from storage import blob_store, file_store
 
 
@@ -155,6 +155,39 @@ class SaveOriginalPdfTests(unittest.TestCase):
         _, kwargs = blob.upload_from_string.call_args
         self.assertEqual(kwargs.get("predefined_acl"), "publicRead")
         self.assertEqual(kwargs.get("content_type"), "application/pdf")
+
+
+class IsGenericLinkDomainMatchingTests(unittest.TestCase):
+    """The real, confirmed bug found verifying brochure_enrichment.py against
+    the real UNION Availability files: is_generic_link used a bare
+    netloc.endswith(d) check against KNOWN_NON_BROCHURE_DOMAINS, which is a
+    SUBSTRING match, not a same-site-or-subdomain check - "app.box.com"
+    (UNION's real brochure host on every one of its real files) ends in the
+    same five characters as "x.com" purely by coincidence ("bo-X.COM"),
+    so every single real UNION brochure link was silently rejected as if it
+    were a Twitter/X profile before this fix."""
+
+    def test_box_com_is_not_mistaken_for_x_com(self):
+        self.assertFalse(is_generic_link("https://app.box.com/s/whntw3tqip6cnjeu88d055o3rfbdr019"))
+
+    def test_other_coincidental_x_com_suffix_domains_are_not_mistaken_either(self):
+        self.assertFalse(is_generic_link("https://www.netflix.com/watch/12345"))
+        self.assertFalse(is_generic_link("https://www.fedex.com/track/12345"))
+
+    def test_real_x_com_profile_is_still_rejected(self):
+        self.assertTrue(is_generic_link("https://x.com/somecompany"))
+
+    def test_real_twitter_subdomain_is_still_rejected(self):
+        self.assertTrue(is_generic_link("https://mobile.twitter.com/somecompany"))
+
+    def test_bare_box_com_homepage_with_no_path_is_still_generic(self):
+        # Not via the domain list at all - via the OTHER is_generic_link rule
+        # (empty path, no query) - a real Box share link always has a /s/...
+        # path, so this never conflicts with the fix above.
+        self.assertTrue(is_generic_link("https://box.com"))
+
+    def test_real_linkedin_company_page_is_still_rejected(self):
+        self.assertTrue(is_generic_link("https://www.linkedin.com/company/example"))
 
 
 if __name__ == "__main__":
