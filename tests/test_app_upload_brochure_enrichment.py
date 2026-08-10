@@ -1,9 +1,14 @@
 """
-App-level regression tests for wiring brochure_enrichment.py into app.py's
-spreadsheet upload path - confirms the feature actually reaches staged
-rows end to end, is scoped to spreadsheet uploads only, and that the
-existing content-hash cache-busting fingerprint mechanism now also covers
-brochure_enrichment.py's own source.
+App-level regression tests for AUTOMATIC brochure enrichment on spreadsheet
+Extract (see app.py's _run_automatic_brochure_enrichment and brochure_
+enrichment.py's own module docstring) - enrichment now runs on its own,
+immediately after a fresh spreadsheet upload's base rows are staged, with
+no separate "Enrich from brochures" button anywhere. Confirms: it only
+fires when there's genuinely something to enrich, the base rows are staged
+BEFORE any brochure/Gemini call happens, a broken brochure never fails the
+whole upload, and the fingerprint invalidation this depends on is correct
+again now that brochure_enrichment.py runs unconditionally during
+extraction (see app.py's own _SPREADSHEET_LOGIC_FINGERPRINT comment).
 
 Runs the real app.py end-to-end via Streamlit's AppTest, with httpx and
 extract.extract_raw_units mocked - never touches the real network or the
@@ -26,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app
 import brochure_enrichment
-from storage.file_store import list_pending_staging_files, load_staging_as_dataframe
+from storage.file_store import get_staging_enrichment_summary, list_pending_staging_files, load_staging_as_dataframe
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -37,15 +42,24 @@ def _clear_pending():
         (BASE / p).with_suffix(".meta.json").unlink(missing_ok=True)
 
 
-def _union_style_workbook() -> bytes:
-    # Real documented UNION "by-area" header wording (see extract_
-    # spreadsheet.py's own EXTRA_SYNONYMS comment) - a plain single-table
-    # sheet, resolved entirely by header-mapping, no Gemini call at all.
+def _union_style_workbook(n_rows=1) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "Availability"
     ws.append(["Building", "Floor/Unit", "Size (sq ft)", "Monthly Rate", "Brochure"])
-    ws.append(["16 Dufour's Place", "3rd Floor", 1200, 15000, "https://example.com/brochure.pdf"])
+    for i in range(n_rows):
+        ws.append([f"Building {i}", f"{i}th Floor", 1200, 15000, "https://example.com/brochure.pdf"])
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _no_brochure_workbook() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Availability"
+    ws.append(["Building", "Floor/Unit", "Size (sq ft)", "Monthly Rate"])
+    ws.append(["40 New Bond Street", "3rd Floor", 2000, 15000])
     buffer = BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
@@ -60,7 +74,7 @@ def _pdf_response():
     return resp
 
 
-class BrochureEnrichmentUploadTests(unittest.TestCase):
+class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
     def setUp(self):
         _clear_pending()
         brochure_enrichment._extract_brochure_units.cache_clear()
@@ -69,13 +83,11 @@ class BrochureEnrichmentUploadTests(unittest.TestCase):
         _clear_pending()
         brochure_enrichment._extract_brochure_units.cache_clear()
 
-    def test_union_style_row_gets_enriched_from_its_linked_brochure(self):
-        raw_units = {
-            "units": [{
-                "building": "16 Dufour's Place", "floor_unit": "3rd Floor",
-                "special_features": "Private terrace; showers; cycle storage",
-            }],
-        }
+    def test_eligible_upload_triggers_automatic_enrichment_with_no_button(self):
+        raw_units = {"units": [{
+            "building": "Building 0", "floor_unit": "0th Floor",
+            "special_features": "Private terrace; showers; cycle storage",
+        }]}
         with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()) as mock_get, \
              patch("brochure_enrichment.extract.extract_raw_units", return_value=raw_units) as mock_extract:
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
@@ -85,69 +97,128 @@ class BrochureEnrichmentUploadTests(unittest.TestCase):
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             at.run()
-
             extract_buttons = [b for b in at.button if b.label == "Extract"]
             extract_buttons[0].click().run()
             self.assertFalse(at.exception)
 
-        # geocode.py ALSO calls httpx.get (same shared module-level
-        # attribute), so mock_get's own call count isn't specific to
-        # brochure fetching - filter to calls actually targeting the
-        # brochure URL instead.
+        # No button anywhere asks the user to trigger this themselves.
+        self.assertEqual([b.label for b in at.button if "nrich" in (b.label or "")], [])
+
         brochure_calls = [c for c in mock_get.call_args_list if c.args and c.args[0] == "https://example.com/brochure.pdf"]
         self.assertEqual(len(brochure_calls), 1)
         mock_extract.assert_called_once()
 
-        info_text = "".join(i.value for i in at.info)
-        self.assertIn("Enriched", info_text)
-        self.assertIn("16 Dufour's Place", info_text)
-
         pending = list_pending_staging_files()
         df = load_staging_as_dataframe(pending[0])
         self.assertEqual(df.iloc[0]["special_features"], "Private terrace; showers; cycle storage")
-        # The structured fields the spreadsheet already provided must
-        # survive completely untouched.
-        self.assertEqual(df.iloc[0]["size_sqft"], 1200)
-        self.assertEqual(df.iloc[0]["rent_pcm"], 15000)
+        self.assertEqual(df.iloc[0]["size_sqft"], 1200)  # primary source untouched
 
-    def test_row_with_no_brochure_link_never_touches_the_network(self):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Availability"
-        ws.append(["Building", "Floor/Unit", "Size (sq ft)", "Monthly Rate"])
-        ws.append(["40 New Bond Street", "3rd Floor", 2000, 15000])
-        buffer = BytesIO()
-        wb.save(buffer)
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("Brochure enrichment complete", caption_text)
 
-        with patch("brochure_enrichment.extract.extract_raw_units") as mock_extract:
+    def test_no_eligible_rows_means_no_brochure_calls_at_all(self):
+        with patch("brochure_enrichment.httpx.get") as mock_get, \
+             patch("brochure_enrichment.extract.extract_raw_units") as mock_extract:
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at.run()
             at.file_uploader[0].upload(
-                "Kitts.xlsx", buffer.getvalue(),
+                "Kitts.xlsx", _no_brochure_workbook(),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             at.run()
-
             extract_buttons = [b for b in at.button if b.label == "Extract"]
             extract_buttons[0].click().run()
             self.assertFalse(at.exception)
 
-        # No brochure_link at all on this row - _is_eligible_brochure_url
-        # rejects it before any fetch/Gemini attempt, regardless of
-        # needs_enrichment (special_features is also blank here).
+        brochure_calls = [c for c in mock_get.call_args_list if c.args and "brochure" in str(c.args[0])]
+        self.assertEqual(brochure_calls, [])
         mock_extract.assert_not_called()
-        info_text = "".join(i.value for i in at.info)
-        self.assertNotIn("Enriched", info_text)
+        self.assertIsNone(get_staging_enrichment_summary(list_pending_staging_files()[0]))
+
+    def test_base_rows_are_staged_before_any_brochure_call_is_made(self):
+        staged_already = {}
+
+        def _check_and_return(*a, **kw):
+            staged_already["yes"] = bool(list_pending_staging_files())
+            return {"units": []}
+
+        with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
+             patch("brochure_enrichment.extract.extract_raw_units", side_effect=_check_and_return):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", _union_style_workbook(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        self.assertEqual(staged_already, {"yes": True})
+
+    def test_ten_rows_sharing_one_brochure_costs_exactly_one_gemini_call(self):
+        raw_units = {"units": [
+            {"building": f"Building {i}", "floor_unit": f"{i}th Floor", "special_features": f"Feature {i}"}
+            for i in range(10)
+        ]}
+        with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
+             patch("brochure_enrichment.extract.extract_raw_units", return_value=raw_units) as mock_extract:
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", _union_style_workbook(n_rows=10),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        mock_extract.assert_called_once()
+        pending = list_pending_staging_files()
+        df = load_staging_as_dataframe(pending[0])
+        self.assertEqual(len(df), 10)
+        self.assertTrue(all(df["special_features"].notna()))
+
+    def test_a_broken_brochure_does_not_fail_the_whole_upload(self):
+        # Patched at _extract_brochure_units, not httpx.get - that
+        # attribute is shared with geocode.py's own, unrelated Google
+        # Geocoding calls (see test_extract_never_fetches_or_sends_the_
+        # linked_brochure_to_gemini's own comment on this same sharing),
+        # and geocode.py has no exception handling of its own around it; a
+        # raising httpx.get here would break geocoding, not just the thing
+        # actually under test.
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=RuntimeError("network down")):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", _union_style_workbook(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        success_text = "".join(s.value for s in at.success)
+        self.assertIn("Extracted and staged", success_text)
+        pending = list_pending_staging_files()
+        self.assertEqual(len(pending), 1)
+        df = load_staging_as_dataframe(pending[0])
+        self.assertEqual(df.iloc[0]["building"], "Building 0")
 
 
-class FingerprintIncludesBrochureEnrichmentTests(unittest.TestCase):
-    def test_fingerprint_matches_recomputation_including_brochure_enrichment(self):
-        # A change to brochure_enrichment.py's own logic must invalidate an
-        # already-staged spreadsheet result exactly like a change to
-        # extract_spreadsheet(_gemini).py already does - see app.py's own
-        # _SPREADSHEET_LOGIC_FINGERPRINT comment. Recomputes the exact same
-        # formula independently and compares, so a future refactor that
-        # forgets to fold brochure_enrichment.py back in fails this test.
+class FingerprintIncludesBrochureEnrichmentAgainTests(unittest.TestCase):
+    def test_fingerprint_includes_brochure_enrichment_again(self):
+        # brochure_enrichment.py runs unconditionally during extraction
+        # again now (automatically, right after staging - see app.py's own
+        # _SPREADSHEET_LOGIC_FINGERPRINT comment), so a change to its
+        # matching/field rules must invalidate an already-staged result
+        # exactly like a change to extract_spreadsheet(_gemini).py already
+        # does. Recomputes the exact same formula independently and
+        # compares, so a future refactor that forgets to fold it back in
+        # fails this test.
         import hashlib
 
         import extract_spreadsheet

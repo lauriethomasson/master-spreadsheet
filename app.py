@@ -29,6 +29,8 @@ from storage.file_store import (
     load_staging_as_dataframe,
     save_original_pdf,
     save_staging_file,
+    set_staging_enrichment_summary,
+    update_staging_rows,
 )
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
@@ -56,11 +58,12 @@ EXTRACTION_VERSION = "3"
 # change there must invalidate a cached result exactly like a mapping-logic
 # change does, for the same reason, even though a fresh (non-cached) call to
 # that module was never guaranteed byte-identical to begin with.
-# brochure_enrichment.py is included for the exact same reason: it also runs
-# unconditionally on every fresh spreadsheet extraction (see the spreadsheet
-# branch below), so a change to its matching/field rules must invalidate an
-# already-staged result too, not silently keep serving rows enriched (or not
-# enriched) under the OLD logic.
+# brochure_enrichment.py is included for the exact same reason: it now runs
+# automatically, unconditionally, right after a fresh spreadsheet
+# extraction (see _run_automatic_brochure_enrichment/the spreadsheet branch
+# below), so a change to its matching/field rules must invalidate an
+# already-staged result too, not silently keep serving rows enriched (or
+# not enriched) under the OLD logic.
 _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
     Path(extract_spreadsheet.__file__).read_bytes()
     + Path(extract_spreadsheet_gemini.__file__).read_bytes()
@@ -181,6 +184,77 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
             continue
         if row.building and _ADDRESS_LIKE_RE.search(row.building):
             row.address_1 = row.building
+
+
+def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str) -> list[ListingRow]:
+    """
+    Runs immediately after a FRESH spreadsheet upload's base rows are
+    already staged at staging_path (see save_staging_file, called by the
+    caller strictly BEFORE this) - automatic, not a separate action the
+    user has to remember to trigger. That ordering is what keeps the base
+    extraction safe even if this crashes, times out, or is interrupted (see
+    brochure_enrichment.py's own module docstring): the rows already exist
+    on disk, byte-identical to what was just extracted, before this ever
+    downloads or sends a single brochure to Gemini.
+
+    A no-op, with no UI at all, when nothing is eligible (see
+    brochure_enrichment.eligible_rows_and_brochures) - the common case for a
+    provider whose spreadsheet already states everything ENRICHABLE_FIELDS
+    covers, and the ONLY case that should ever feel instant; the point of
+    showing real progress below is precisely for the case where it isn't.
+
+    Persists partial progress incrementally (checkpoint_callback, see
+    enrich_rows_grouped's own docstring) and the final result via
+    update_staging_rows - so an interruption partway through loses at most
+    a handful of brochures' worth of work, never the base extraction, which
+    was already durably staged before this function was even called.
+
+    Returns the (possibly enriched) rows so the caller can reassign its own
+    `rows` variable to the final state - enrichment never changes row
+    COUNT, only field values, but keeping the caller's own variable
+    accurate is one less place a future change could accidentally read the
+    stale pre-enrichment list.
+    """
+    eligible, unique_urls = brochure_enrichment.eligible_rows_and_brochures(rows)
+    if not unique_urls:
+        return rows
+
+    st.caption(
+        f"{len(eligible)} row(s) have missing descriptive information — "
+        f"checking {len(unique_urls)} unique brochure(s) for it. "
+        "Your extracted spreadsheet data has already been saved — this step only adds extra detail."
+    )
+    progress_slot = st.empty()
+    bar = progress_slot.progress(0.0, text=f"Enriching from brochures — 0 / {len(unique_urls)}")
+
+    def on_progress(done, total, label):
+        if not total:
+            return
+        text = f"Enriching from brochures — {done} / {total}"
+        if label:
+            text += f" ({label})"
+        bar.progress(done / total, text=text)
+
+    def on_checkpoint(rows_so_far):
+        update_staging_rows(staging_path, rows_so_far)
+
+    enriched_rows, _log, stats = brochure_enrichment.enrich_rows_grouped(
+        rows, progress_callback=on_progress, checkpoint_callback=on_checkpoint,
+    )
+    progress_slot.empty()
+
+    update_staging_rows(staging_path, enriched_rows)
+    set_staging_enrichment_summary(staging_path, stats)
+
+    summary = (
+        f"{stats['unique_brochures_considered']} unique brochure(s) considered, "
+        f"{stats['brochures_read_ok']} read successfully, {stats['rows_enriched']} row(s) enriched."
+    )
+    if stats["brochures_unavailable"]:
+        summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
+    st.caption(f"Brochure enrichment complete: {summary}")
+
+    return enriched_rows
 
 
 def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) -> None:
@@ -491,6 +565,12 @@ with page_setup.setup_page("upload"):
             for i, uploaded_file in enumerate(uploaded_files, start=1):
                 with st.spinner(f"Processing {i} of {total}: {uploaded_file.name}..."):
                     suffix = Path(uploaded_file.name).suffix.lower()
+                    # Computed once per file, up here, rather than separately
+                    # inside the reused-vs-fresh branches below - both the
+                    # reused branch's fill_missing_*/apply_*_fallback calls
+                    # AND automatic brochure enrichment (fresh extraction
+                    # only, see below) need to know this.
+                    is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
 
                     # Hashed before anything else, from the bytes already in
                     # memory - a byte-identical re-upload (same content, any
@@ -568,7 +648,6 @@ with page_setup.setup_page("upload"):
                         # this a no-op in the overwhelmingly common case
                         # (both functions only ever fill an actually-blank
                         # value).
-                        is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
                         fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=is_spreadsheet_source)
                         fill_missing_address_from_building(rows, apply_building_fallback=is_spreadsheet_source)
                     elif suffix in SPREADSHEET_SUFFIXES:
@@ -677,30 +756,21 @@ with page_setup.setup_page("upload"):
                         fill_missing_provider(header_mapped_rows, uploaded_file.name, apply_filename_guess=True)
                         fill_missing_address_from_building(header_mapped_rows, apply_building_fallback=True)
 
-                        # Secondary enrichment ONLY - spreadsheet rows are
-                        # always the source of truth (see brochure_
-                        # enrichment.py's own module docstring); this only
-                        # ever fills special_features/state_of_space when
-                        # BOTH are already blank AND the row's own brochure_
-                        # link confidently matches a brochure unit. Every
-                        # row for which nothing happened comes back
-                        # byte-identical - a fetch/Gemini failure on one
-                        # row's brochure never affects any other row or the
-                        # rest of this upload. Scoped to spreadsheet rows
-                        # only (both header-mapped and Gemini free-form) -
-                        # never PDF/email, see that module's own docstring
-                        # for why.
-                        rows, enrichment_log = brochure_enrichment.enrich_rows(rows)
-                        if enrichment_log:
-                            st.info(
-                                f"Enriched {len(enrichment_log)} row(s) from their linked brochure: "
-                                + ", ".join(
-                                    f"{entry['building']} ({entry['floor_unit'] or 'n/a'}) — "
-                                    f"{', '.join(entry['fields'])}"
-                                    for entry in enrichment_log
-                                )
-                            )
-
+                        # Brochure enrichment deliberately does NOT run here
+                        # any more - it used to (synchronously, per row),
+                        # which meant a real UNION file's 100+ unique
+                        # brochures blocked this ENTIRE upload behind
+                        # sequential Box-fetch-then-Gemini-vision calls, with
+                        # the rows below not yet staged anywhere - an
+                        # interruption mid-enrichment lost the whole
+                        # extraction, not just the enrichment. Extraction now
+                        # stages its rows immediately (see save_staging_file
+                        # below) with no brochure/Gemini call at all;
+                        # enrichment is a separate, explicit, later action
+                        # (see pages/2_Review_and_Master.py and brochure_
+                        # enrichment.enrich_rows_grouped) that reads these
+                        # already-staged rows back and writes the enriched
+                        # result to the same staging file.
                         reused = False
                     else:
                         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -758,6 +828,37 @@ with page_setup.setup_page("upload"):
                         rows, uploaded_file.name, content_hash=content_hash,
                         fully_occupied_buildings=fully_occupied_buildings,
                     )
+
+                    # Shown for every spreadsheet upload, whether or not
+                    # anything below turns out to be eligible for
+                    # enrichment - the point is confirming, immediately,
+                    # that the row count above is already real and saved,
+                    # before any further (potentially slow) step runs.
+                    if is_spreadsheet_source and not reused:
+                        st.caption(f"Spreadsheet extracted — {len(rows)} row(s) saved.")
+
+                    # Automatic, fresh-spreadsheet-extraction only - never
+                    # for a reused (byte-identical previous upload) result,
+                    # which already carries forward whatever its own
+                    # original run's enrichment did or didn't accomplish,
+                    # and never for PDF/email (see brochure_enrichment.py's
+                    # own module docstring on why those are out of scope).
+                    # Wrapped in its own try/except, on top of enrich_rows_
+                    # grouped's own internal per-brochure exception handling
+                    # - the base extraction above is ALREADY staged by this
+                    # point, so an unexpected bug here must never surface as
+                    # "extraction failed" for a file whose real extraction
+                    # genuinely succeeded.
+                    if is_spreadsheet_source and not reused:
+                        try:
+                            rows = _run_automatic_brochure_enrichment(rows, staging_path)
+                        except Exception as e:
+                            st.warning(
+                                f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
+                                f"({e}) and was skipped for this file — the extraction above is "
+                                "unaffected and already staged."
+                            )
+
                     succeeded += 1
 
                     st.session_state["recent_uploads"].insert(

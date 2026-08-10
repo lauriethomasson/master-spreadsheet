@@ -14,6 +14,8 @@ from storage.file_store import (
     clean_value,
     dataframe_to_listing_rows,
     discard_pending_staging_files,
+    get_staging_enrichment_summary,
+    get_staging_filename,
     get_staging_fully_occupied_buildings,
     list_pending_staging_files,
     load_staging_as_dataframe,
@@ -867,6 +869,37 @@ def _render_master_lookup(master_df: pd.DataFrame) -> None:
         st.caption(f"{len(df)} of {len(master_df)} row(s) shown.")
 
 
+def _render_brochure_enrichment_summary(pending: list) -> None:
+    """
+    Read-only "brochure enrichment: N rows enriched" caption per pending
+    file that actually went through it - purely informational, no button,
+    no action a user could forget to take. Enrichment itself now runs
+    automatically, immediately after a fresh spreadsheet upload's base rows
+    are staged (see app.py's _run_automatic_brochure_enrichment) - by the
+    time a file is even visible here, its own enrichment (if any was
+    eligible) has already run and already been folded into the very rows
+    combined_df reads below; there is nothing left here to trigger.
+
+    get_staging_enrichment_summary returns None for a file enrichment never
+    touched at all (no eligible rows, or an upload predating this feature) -
+    silently skipped, not shown as "0 processed", so this section is simply
+    absent for the common case where a provider's spreadsheet already had
+    everything ENRICHABLE_FIELDS covers.
+    """
+    for path in pending:
+        stats = get_staging_enrichment_summary(path)
+        if not stats:
+            continue
+        filename = get_staging_filename(path)
+        summary = (
+            f"Brochure enrichment — {filename}: {stats['unique_brochures_considered']} unique brochure(s) "
+            f"considered, {stats['rows_enriched']} row(s) enriched."
+        )
+        if stats["brochures_unavailable"]:
+            summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
+        st.caption(summary)
+
+
 def _render_pending_review(pending: list):
     with st.spinner("Loading..."):
         combined_df = display_utils.sort_by_provider(pd.concat(
@@ -881,6 +914,7 @@ def _render_pending_review(pending: list):
 
     st.caption(master_merge.pending_status_line(len(pending), plan))
     _render_master_lookup(master_df)
+    _render_brochure_enrichment_summary(pending)
 
     colliding_changed_ids = {id(m) for group in plan.collisions for m in group}
     colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}

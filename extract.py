@@ -2,6 +2,7 @@ import gc
 import json
 import re
 import sys
+import threading
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -13,6 +14,17 @@ from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
 RENDER_DPI = 72
+
+# Guards every call to render_pages (see extract_raw_units) - PyMuPDF/MuPDF's
+# page-rendering keeps process-wide, not per-Document, internal state (see
+# render_pages' own comment on fitz.TOOLS.store_shrink), so two threads
+# rendering different PDFs at the same instant risk corrupting that shared
+# state, not just running slowly. Only the render step is serialized - the
+# actual Gemini network call (call_gemini, below) happens OUTSIDE this lock,
+# so concurrent callers (see brochure_enrichment.enrich_rows_grouped's own
+# bounded worker pool) still genuinely overlap on the by far more expensive
+# part (a real vision-model API round trip), just never on rendering itself.
+_RENDER_LOCK = threading.Lock()
 
 # --- Per-row PDF hyperlink extraction ---
 #
@@ -433,9 +445,17 @@ def extract_raw_units(pdf_path: Path) -> dict:
     that becomes ListingRows directly and a linked brochure fetched purely
     to enrich a row from a different source (e.g. a spreadsheet row's own
     brochure_link) - never a second, independently-drifting implementation.
+
+    Safe to call from multiple threads concurrently (see brochure_
+    enrichment.enrich_rows_grouped's own bounded worker pool) - get_client()
+    makes a fresh genai.Client per call (never a shared, mutable one across
+    threads), and render_pages' own process-wide MuPDF state is serialized
+    via _RENDER_LOCK, above - only the actual Gemini network call is ever
+    allowed to genuinely overlap between threads.
     """
     client = get_client()
-    images = render_pages(pdf_path)
+    with _RENDER_LOCK:
+        images = render_pages(pdf_path)
     raw = call_gemini(client, PROMPT, images)
     del images
     gc.collect()

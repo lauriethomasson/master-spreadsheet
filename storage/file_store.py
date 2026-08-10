@@ -81,6 +81,69 @@ def save_staging_file(
     return staging_path
 
 
+def get_staging_filename(path: str) -> str:
+    """The original uploaded filename for a staging path (see save_staging_
+    file) - for a UI label (e.g. pages/2_Review_and_Master.py's own per-file
+    "Enrich from brochures" section) that needs to name a pending file
+    without exposing its internal staging path."""
+    return _read_meta(path).get("filename", path)
+
+
+def update_staging_rows(path: str, rows: list[ListingRow]) -> None:
+    """
+    Overwrites an already-staged file's OWN rows in place at the same path -
+    used by brochure enrichment (see pages/2_Review_and_Master.py and
+    brochure_enrichment.enrich_rows_grouped) to persist an enriched result
+    back to the exact staging file it read from, as a separate, later step
+    from the original extraction that created it.
+
+    Only the .xlsx blob is rewritten - the .meta.json sidecar (status,
+    content_hash, filename, fully_occupied_buildings) is untouched, since
+    none of those describe the ROWS themselves: status/content_hash exist to
+    recognize a future re-upload of the same raw bytes (unaffected by this
+    file's own rows changing after the fact), and filename/
+    fully_occupied_buildings are provenance about the original upload, not
+    about whatever enrichment has since filled in.
+
+    load_staging_as_dataframe's own cache is keyed on this blob's mtime (see
+    its own docstring), so a caller reads the freshly-enriched rows back on
+    its very next call with no separate cache-clear needed.
+    """
+    buffer = BytesIO()
+    write_rows_to_xlsx(rows, buffer)
+    blob_store.write_bytes(path, buffer.getvalue())
+
+
+def set_staging_enrichment_summary(path: str, stats: dict) -> None:
+    """
+    Persists brochure enrichment's own summary stats (see brochure_
+    enrichment.enrich_rows_grouped's own return value) into this staging
+    file's meta.json - so Review & Master can show a read-only "brochure
+    enrichment: N rows enriched" caption for a file that's already been
+    through automatic enrichment (see app.py's own _run_automatic_brochure_
+    enrichment), durably, without needing anything in session_state that a
+    fresh browser session/server restart would lose.
+
+    Absent entirely for a file where enrichment never ran at all (no
+    eligible rows in the first place, or an upload predating this feature) -
+    a caller should treat a missing key as "nothing to show", not as "zero
+    rows enriched" (see get_staging_enrichment_summary).
+    """
+    meta = _read_meta(path)
+    meta["brochure_enrichment"] = stats
+    _write_meta(path, meta)
+
+
+def get_staging_enrichment_summary(path: str) -> dict:
+    """
+    The stats dict set_staging_enrichment_summary last wrote for this
+    staging file, or None if brochure enrichment never ran for it at all
+    (see that function's own docstring on why this is None, not a
+    zero-valued dict, in that case).
+    """
+    return _read_meta(path).get("brochure_enrichment")
+
+
 def get_staging_fully_occupied_buildings(path: str) -> list:
     """
     The {"provider", "building"} dicts persisted for this staging file (see

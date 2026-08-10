@@ -10,6 +10,8 @@ Run with:
 """
 
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -624,6 +626,400 @@ class EnrichRowsBatchTests(EnrichmentTestCase):
         self.assertIsNone(enriched[0].special_features)
         self.assertEqual(enriched[1].special_features, "Good features")
         self.assertEqual(len(log), 1)
+
+
+class EligibleRowsAndBrochuresTests(unittest.TestCase):
+    def test_returns_eligible_rows_and_unique_urls_in_first_encounter_order(self):
+        rows = [
+            ListingRow(building="A", floor_unit="1st", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="A", floor_unit="2nd", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="B", floor_unit="1st", brochure_link="https://example.com/b.pdf", special_features="Already there", state_of_space="Cat A"),
+            ListingRow(building="C", floor_unit="1st", brochure_link=None, special_features=None),
+        ]
+        eligible, urls = brochure_enrichment.eligible_rows_and_brochures(rows)
+        self.assertEqual(len(eligible), 2)
+        self.assertEqual(urls, ["https://example.com/a.pdf"])
+
+    def test_no_eligible_rows_returns_empty(self):
+        rows = [ListingRow(building="A", special_features="x", state_of_space="y")]
+        eligible, urls = brochure_enrichment.eligible_rows_and_brochures(rows)
+        self.assertEqual(eligible, [])
+        self.assertEqual(urls, [])
+
+
+class EnrichRowsGroupedTests(EnrichmentTestCase):
+    def test_ten_rows_sharing_one_brochure_extract_exactly_once(self):
+        rows = [
+            ListingRow(
+                building="28 Lime Street", floor_unit=f"{i}th Floor",
+                brochure_link="https://example.com/shared.pdf", special_features=None,
+            )
+            for i in range(10)
+        ]
+        units = [{"building": "28 Lime Street", "floor_unit": None, "special_features": "Shared feature"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units) as mock_units:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_units.assert_called_once_with("https://example.com/shared.pdf")
+        self.assertEqual(len(log), 10)
+        self.assertTrue(all(r.special_features == "Shared feature" for r in enriched))
+        self.assertEqual(stats["unique_brochures_considered"], 1)
+        self.assertEqual(stats["rows_enriched"], 10)
+
+    def test_more_than_64_unique_brochures_still_one_extraction_each(self):
+        # Directly exercises the real confirmed bug: the module-level
+        # lru_cache(maxsize=64) alone would evict and re-call past the 64th
+        # distinct URL. enrich_rows_grouped's own per-run worklist (the
+        # FULL deduplicated URL list, built up front - see its own
+        # docstring) must not depend on that cache surviving.
+        n = 80
+        rows = [
+            ListingRow(
+                building=f"Building {i}", floor_unit="1st",
+                brochure_link=f"https://example.com/{i}.pdf", special_features=None,
+            )
+            for i in range(n)
+        ]
+        call_log = []
+
+        def _fake_extract(url):
+            call_log.append(url)
+            idx = url.split("/")[-1].split(".")[0]
+            return [{"building": f"Building {idx}", "floor_unit": None, "special_features": f"Feature {idx}"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake_extract):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(len(call_log), n)
+        self.assertEqual(len(set(call_log)), n)
+        self.assertEqual(stats["unique_brochures_considered"], n)
+        self.assertEqual(len(log), n)
+
+    def test_cache_eviction_cannot_create_a_duplicate_call_within_one_run(self):
+        # Simulates the real confirmed 200 Aldersgate scenario: the SAME
+        # brochure link referenced by two rows, more than 64 OTHER unique
+        # links apart. The real functools.lru_cache(maxsize=64) underneath
+        # _extract_brochure_units would itself evict and re-call for the
+        # second reference; enrich_rows_grouped must not, since it only
+        # ever calls _extract_brochure_units once per distinct URL in its
+        # own per-run worklist regardless of what the cache does.
+        shared_url = "https://example.com/shared.pdf"
+        rows = [ListingRow(building="Shared Building", floor_unit="1st", brochure_link=shared_url, special_features=None)]
+        for i in range(70):
+            rows.append(ListingRow(
+                building=f"Building {i}", floor_unit="1st",
+                brochure_link=f"https://example.com/{i}.pdf", special_features=None,
+            ))
+        rows.append(ListingRow(building="Shared Building", floor_unit="2nd", brochure_link=shared_url, special_features=None))
+
+        call_count = {}
+
+        def _fake_fetch(url):
+            call_count[url] = call_count.get(url, 0) + 1
+            if url == shared_url:
+                return [{"building": "Shared Building", "floor_unit": None, "special_features": "Shared"}]
+            return [{"building": url, "floor_unit": None, "special_features": "X"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake_fetch):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(call_count[shared_url], 1)
+        self.assertEqual(enriched[0].special_features, "Shared")
+        self.assertEqual(enriched[-1].special_features, "Shared")
+
+    def test_different_brochures_remain_separate(self):
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            if "a.pdf" in url:
+                return [{"building": "A", "floor_unit": None, "special_features": "A-only"}]
+            return [{"building": "B", "floor_unit": None, "special_features": "B-only"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "A-only")
+        self.assertEqual(enriched[1].special_features, "B-only")
+
+    def test_broken_brochure_does_not_fail_the_batch(self):
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/broken.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/good.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            return None if "broken" in url else [{"building": "B", "floor_unit": None, "special_features": "Good"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[1].special_features, "Good")
+        self.assertEqual(stats["brochures_unavailable"], 1)
+        self.assertEqual(stats["brochures_read_ok"], 1)
+
+    def test_unexpected_exception_in_one_brochure_does_not_fail_the_batch(self):
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/raises.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/good.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            if "raises" in url:
+                raise RuntimeError("boom")
+            return [{"building": "B", "floor_unit": None, "special_features": "Good"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[1].special_features, "Good")
+
+    def test_no_confident_match_leaves_row_unchanged(self):
+        rows = [ListingRow(building="A", floor_unit="Suite Z", brochure_link="https://example.com/x.pdf", special_features=None)]
+        units = [
+            {"building": "A", "floor_unit": "1st Floor", "special_features": "One"},
+            {"building": "A", "floor_unit": "2nd Floor", "special_features": "Two"},
+        ]
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(log, [])
+
+    def test_progress_callback_called_once_per_unique_brochure(self):
+        # done starts at 1 (not 0) here - unlike the old sequential version,
+        # every unique brochure's work is dispatched to the worker pool up
+        # front (see enrich_rows_grouped's own docstring), so there's no
+        # single well-defined "about to start #1" moment to report a 0
+        # against; the first callback IS the first completion.
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
+        ]
+        calls = []
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[]):
+            brochure_enrichment.enrich_rows_grouped(rows, progress_callback=lambda d, t, l: calls.append((d, t)))
+
+        self.assertEqual(sorted(calls), [(1, 2), (2, 2)])
+
+    def test_progress_count_is_based_on_unique_brochures_not_rows(self):
+        rows = [
+            ListingRow(
+                building="A", floor_unit=str(i), brochure_link="https://example.com/shared.pdf", special_features=None,
+            )
+            for i in range(5)
+        ]
+        totals = set()
+        with patch(
+            "brochure_enrichment._extract_brochure_units",
+            return_value=[{"building": "A", "floor_unit": None, "special_features": "F"}],
+        ):
+            brochure_enrichment.enrich_rows_grouped(rows, progress_callback=lambda d, t, l: totals.add(t))
+
+        self.assertEqual(totals, {1})
+
+    def test_checkpoint_callback_fires_on_the_final_brochure_even_below_the_interval(self):
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+        checkpoints = []
+        with patch(
+            "brochure_enrichment._extract_brochure_units",
+            return_value=[{"building": "A", "floor_unit": None, "special_features": "F"}],
+        ):
+            brochure_enrichment.enrich_rows_grouped(rows, checkpoint_callback=checkpoints.append)
+
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0][0].special_features, "F")
+
+    def test_rows_with_nothing_missing_are_excluded_from_the_run(self):
+        rows = [ListingRow(
+            building="A", brochure_link="https://example.com/a.pdf", special_features="Done", state_of_space="Cat A",
+        )]
+        with patch("brochure_enrichment._extract_brochure_units") as mock_units:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_units.assert_not_called()
+        self.assertEqual(stats["unique_brochures_considered"], 0)
+        self.assertEqual(stats["rows_eligible"], 0)
+
+    def test_summary_stats_are_accurate(self):
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
+            ListingRow(building="C", brochure_link="https://example.com/c.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            if "a.pdf" in url:
+                return [{"building": "A", "floor_unit": None, "special_features": "A feature"}]
+            if "b.pdf" in url:
+                return [{"building": "NoMatchHere", "floor_unit": None, "special_features": "irrelevant"}]
+            return None  # c.pdf unavailable
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["unique_brochures_considered"], 3)
+        self.assertEqual(stats["brochures_read_ok"], 2)
+        self.assertEqual(stats["brochures_unavailable"], 1)
+        self.assertEqual(stats["rows_eligible"], 3)
+        self.assertEqual(stats["rows_enriched"], 1)
+
+
+class EnrichRowsGroupedConcurrencyTests(EnrichmentTestCase):
+    def test_never_exceeds_the_configured_worker_limit(self):
+        max_workers = 3
+        lock = threading.Lock()
+        state = {"current": 0, "max_seen": 0}
+
+        rows = [
+            ListingRow(building=f"B{i}", brochure_link=f"https://example.com/{i}.pdf", special_features=None)
+            for i in range(12)
+        ]
+
+        def _fake(url):
+            with lock:
+                state["current"] += 1
+                state["max_seen"] = max(state["max_seen"], state["current"])
+            time.sleep(0.05)
+            with lock:
+                state["current"] -= 1
+            return [{"building": url, "floor_unit": None, "special_features": "x"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            brochure_enrichment.enrich_rows_grouped(rows, max_workers=max_workers)
+
+        self.assertLessEqual(state["max_seen"], max_workers)
+        # Also confirms real overlap actually happened (not accidentally
+        # serialized down to 1) - otherwise this test would pass for the
+        # wrong reason.
+        self.assertGreater(state["max_seen"], 1)
+
+    def test_progress_and_checkpoint_callbacks_never_run_on_a_worker_thread(self):
+        # Streamlit's own APIs (what a real caller's progress_callback/
+        # checkpoint_callback would call - see app.py) are documented as
+        # unsafe to call off the main script thread. Every callback must
+        # therefore run in the SAME thread that called enrich_rows_grouped,
+        # never inside a worker (see that function's own docstring on why
+        # this holds by construction).
+        main_thread = threading.current_thread()
+        seen_threads = []
+
+        rows = [
+            ListingRow(building=f"B{i}", brochure_link=f"https://example.com/{i}.pdf", special_features=None)
+            for i in range(8)
+        ]
+
+        def _fake(url):
+            return [{"building": url, "floor_unit": None, "special_features": "x"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            brochure_enrichment.enrich_rows_grouped(
+                rows,
+                progress_callback=lambda d, t, l: seen_threads.append(threading.current_thread()),
+                checkpoint_callback=lambda r: seen_threads.append(threading.current_thread()),
+                max_workers=3,
+            )
+
+        self.assertTrue(seen_threads)
+        self.assertTrue(all(t is main_thread for t in seen_threads))
+
+    def test_results_apply_correctly_regardless_of_completion_order(self):
+        # Fake fetch sleeps different amounts per URL so real completion
+        # order is deliberately scrambled relative to submission order -
+        # per-row result correctness must never depend on which finishes
+        # first (see enrich_rows_grouped's own docstring on why checkpoint/
+        # result application follows completion order, not unique_urls'
+        # own order).
+        rows = [
+            ListingRow(building="Slow", brochure_link="https://example.com/slow.pdf", special_features=None),
+            ListingRow(building="Fast", brochure_link="https://example.com/fast.pdf", special_features=None),
+            ListingRow(building="Medium", brochure_link="https://example.com/medium.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            if "slow" in url:
+                time.sleep(0.15)
+                return [{"building": "Slow", "floor_unit": None, "special_features": "Slow feature"}]
+            if "fast" in url:
+                return [{"building": "Fast", "floor_unit": None, "special_features": "Fast feature"}]
+            time.sleep(0.05)
+            return [{"building": "Medium", "floor_unit": None, "special_features": "Medium feature"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, max_workers=3)
+
+        result_map = {r.building: r.special_features for r in enriched}
+        self.assertEqual(result_map, {"Slow": "Slow feature", "Fast": "Fast feature", "Medium": "Medium feature"})
+
+    def test_progress_reaches_total_even_when_some_brochures_fail(self):
+        rows = [
+            ListingRow(building=f"B{i}", brochure_link=f"https://example.com/{i}.pdf", special_features=None)
+            for i in range(5)
+        ]
+
+        def _fake(url):
+            if "2.pdf" in url or "3.pdf" in url:
+                return None
+            return [{"building": url, "floor_unit": None, "special_features": "x"}]
+
+        calls = []
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            brochure_enrichment.enrich_rows_grouped(rows, progress_callback=lambda d, t, l: calls.append((d, t)))
+
+        self.assertIn((5, 5), calls)  # reached total despite 2 real failures
+
+    def test_checkpoints_reflect_a_consistent_partial_state_under_concurrency(self):
+        # Every checkpoint snapshot must be a fully self-consistent
+        # rows list (any row whose brochure has completed already
+        # reflects that; anything not yet completed is still the
+        # original row) - never a half-written/torn state, which is
+        # exactly what the "only the consumer thread ever mutates
+        # `current`" design (see enrich_rows_grouped's own docstring)
+        # is meant to guarantee.
+        rows = [
+            ListingRow(building=f"B{i}", brochure_link=f"https://example.com/{i}.pdf", special_features=None)
+            for i in range(12)
+        ]
+
+        def _fake(url):
+            return [{"building": url, "floor_unit": None, "special_features": "filled"}]
+
+        snapshots = []
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            brochure_enrichment.enrich_rows_grouped(
+                rows, checkpoint_callback=lambda r: snapshots.append(list(r)), max_workers=3,
+            )
+
+        self.assertTrue(snapshots)
+        for snap in snapshots:
+            for row in snap:
+                self.assertIn(row.special_features, (None, "filled"))
+
+    def test_worker_count_of_one_is_still_correct(self):
+        # max_workers is a performance knob, never a correctness one -
+        # confirms the degenerate case (effectively sequential) produces
+        # the exact same result as any other worker count.
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            name = "A" if "a.pdf" in url else "B"
+            return [{"building": name, "floor_unit": None, "special_features": f"{name} feature"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, max_workers=1)
+
+        self.assertEqual(enriched[0].special_features, "A feature")
+        self.assertEqual(enriched[1].special_features, "B feature")
+        self.assertEqual(stats["unique_brochures_considered"], 2)
 
 
 if __name__ == "__main__":
