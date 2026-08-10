@@ -98,12 +98,21 @@ CRITICAL_FIELDS = ("building",)
 # would reopen exactly those false positives, not just add safe coverage.
 # An unrecognized header simply gets no guess (mapped to None, dropped)
 # rather than a forced fuzzy pick.
+#
+# "size" and "price per sq ft" (bare, no punctuation) were added once
+# confirmed against a real UNION by-area file's OTHER own sheet naming
+# convention ("Aldgate & Whitechapel") - the same by-area format's City-
+# style sheets spell these "Size sq.ft"/"Price p/sq.ft" (already covered:
+# "Size sq.ft" normalizes to "size sqft", matching size_sqft's own title-
+# case-label synonym; "Price p/sq.ft" normalizes to "price psqft", already
+# present below) - confirming UNION genuinely varies this wording sheet-to-
+# sheet within the SAME workbook, not just file-to-file.
 EXTRA_SYNONYMS = {
     "floor_unit": ("floorunit", "floor"),
-    "size_sqft": ("size sq ft", "sq ft"),
+    "size_sqft": ("size sq ft", "sq ft", "size"),
     "desks_max": ("desks",),
     "rent_pcm": ("marketing price based on min term pcm", "monthly rate"),
-    "rent_psf": ("marketing price based on min term psf", "price psqft"),
+    "rent_psf": ("marketing price based on min term psf", "price psqft", "price per sq ft"),
     "brochure_link": (
         "brochure pdf", "link to file", "link to brochure", "brochure link", "link to brochure pdf", "brochure",
     ),
@@ -131,6 +140,75 @@ def _build_field_synonyms() -> dict:
 
 
 FIELD_SYNONYMS = _build_field_synonyms()
+
+
+# The fields whose header text is virtually never anything BUT a genuine
+# availability-table column label, together - "Floor", a Size column, a
+# Monthly Rate column, a Price-per-sq.ft column, and "Brochure" are never
+# something a spreadsheet's own DATA cells (or a title/prose line) would
+# independently happen to say in the same row, so requiring a recognizable
+# synonym (see FIELD_SYNONYMS) for every one of these five, together, in a
+# single row is strong enough structural evidence to trust unconditionally
+# for ANY provider - see _find_header_row. Deliberately five fields, not
+# fewer: "building" is excluded on purpose - UNION's own by-area export
+# convention headers that column with the area's own name (see
+# _PROVIDER_BUILDING_FALLBACK_RUNS), which this detector must recognize as
+# a genuine header row too, before that column's real meaning is even
+# resolved.
+_HEADER_ROW_EVIDENCE_FIELDS = ("floor_unit", "size_sqft", "rent_pcm", "rent_psf", "brochure_link")
+
+# How many rows from the top to consider as a candidate header row at all -
+# generous enough for a real UNION by-area sheet (confirmed against a real
+# file: rows 1 and 3 blank, row 2 introductory prose, the real header at
+# row 4) without risking mistaking an early DATA row on some other,
+# unrelated sheet shape for a header this deep into the sheet.
+_MAX_HEADER_SCAN_ROWS = 10
+
+
+def _looks_like_header_row(cells: list) -> bool:
+    """
+    True when `cells` (one row's raw values, in column order) carries
+    _HEADER_ROW_EVIDENCE_FIELDS' own strong structural evidence of being a
+    genuine availability-table header row - a recognizable synonym for
+    EVERY one of those five fields, each in its own cell (not necessarily
+    adjacent, and never more than one field claiming the same cell - a
+    header row's columns are already distinct by construction, so no
+    used-fields bookkeeping is needed the way suggest_mapping's own two
+    passes need it against reused headers).
+    """
+    normalized = {normalize_key(c) for c in cells if c is not None and str(c).strip()}
+    return all(
+        any(option in normalized for option in FIELD_SYNONYMS[field])
+        for field in _HEADER_ROW_EVIDENCE_FIELDS
+    )
+
+
+def _find_header_row(ws) -> int:
+    """
+    The 1-based row number to treat as `ws`'s real header row - almost
+    always row 1 (the overwhelming majority of real provider exports:
+    returned immediately the first time it qualifies, so this changes
+    nothing for any format already working today), but scans up to
+    _MAX_HEADER_SCAN_ROWS for the first row that clears _looks_like_
+    header_row's own strong-evidence bar when row 1 itself doesn't.
+
+    Confirmed necessary against a real UNION by-area export ("City"): its
+    row 1 is entirely blank and row 2 is introductory prose, with the real
+    header at row 4.
+
+    Falls back to row 1 (the previous, unconditional assumption) if no row
+    within the scan window clears the bar at all - never guesses a row with
+    only partial evidence, so any format whose header doesn't happen to
+    carry this exact five-field combination (most of them - a sheet with no
+    Brochure column, say) is completely unaffected by this function
+    existing at all.
+    """
+    last_row = min(ws.max_row, _MAX_HEADER_SCAN_ROWS)
+    for row_num in range(1, last_row + 1):
+        cells = [cell.value for cell in ws[row_num]]
+        if _looks_like_header_row(cells):
+            return row_num
+    return 1
 
 
 # Matches the exact shape of a Google Sheets/IMPORTRANGE .xlsx export's
@@ -208,14 +286,24 @@ def read_spreadsheet(data: bytes, suffix: str, sheet_name: str = None) -> pd.Dat
     Reads an uploaded provider spreadsheet's raw headers/rows exactly as the
     provider wrote them - unlike storage.file_store.read_xlsx_with_hyperlinks
     (which assumes OUR OWN header format, written by staging_writer.
-    write_rows_to_xlsx), headers here are whatever text is actually in row 1;
-    which one means what is decided later by suggest_mapping/the confirm-
-    mapping UI, never assumed from position or a fixed label set.
+    write_rows_to_xlsx), headers here are whatever text is actually in the
+    sheet's own header row; which one means what is decided later by
+    suggest_mapping/the confirm-mapping UI, never assumed from position or a
+    fixed label set.
+
+    The header row itself is usually row 1, but not assumed to be - see
+    _find_header_row, which scans a few rows down for one with strong
+    structural header evidence when row 1 doesn't have it. Confirmed
+    necessary against a real UNION by-area export ("City"): row 1 is blank,
+    row 2 is introductory prose, and the real header is on row 4.
 
     sheet_name selects a specific sheet in a multi-sheet .xlsx (see
     list_sheet_names) - defaults to the workbook's active sheet, preserving
     prior single-sheet-file behavior for every existing caller. Ignored for
-    .csv, which has only one sheet by construction.
+    .csv, which has only one sheet by construction (and whose header-row
+    detection is unchanged - pandas' own row 1 assumption - since a CSV
+    export has never been seen with this problem; only a real multi-sheet
+    .xlsx with actual title/prose rows above its header has).
 
     Every .xlsx cell carrying a real hyperlink target uses that target
     instead of its displayed text (e.g. a "Brochure PDF" column showing just
@@ -239,11 +327,15 @@ def read_spreadsheet(data: bytes, suffix: str, sheet_name: str = None) -> pd.Dat
     wb_formulas = load_workbook(BytesIO(data), data_only=False)
     ws_formulas = wb_formulas[sheet_name] if sheet_name else wb_formulas.active
 
+    header_row = _find_header_row(ws_values)
     headers = [
-        _resolve_cell_value(vcell, fcell) for vcell, fcell in zip(ws_values[1], ws_formulas[1])
+        _resolve_cell_value(vcell, fcell)
+        for vcell, fcell in zip(ws_values[header_row], ws_formulas[header_row])
     ]
     records = []
-    for value_row, formula_row in zip(ws_values.iter_rows(min_row=2), ws_formulas.iter_rows(min_row=2)):
+    for value_row, formula_row in zip(
+        ws_values.iter_rows(min_row=header_row + 1), ws_formulas.iter_rows(min_row=header_row + 1)
+    ):
         record = {}
         for col_idx, (vcell, fcell) in enumerate(zip(value_row, formula_row)):
             header = headers[col_idx]
@@ -400,28 +492,33 @@ def unresolved_critical_fields(mapping: dict, rescue: dict) -> list:
 # area's own name instead of a recognizable field name - confirmed against
 # every real by-area file seen so far ("Clerkenwell & Farringdon",
 # "Fitzrovia & Marylebone", "Soho / Covent Garden", "Mayfair / St James",
-# "Midtown", "London Bridge / Southbank"): always the column immediately
-# BEFORE this exact fixed run of headers - Floor, "Current spec" or
-# "Category", Size sq.ft, Minimum Term, Monthly Rate, Price p/sq.ft,
-# Brochure. Matched as a contiguous run rather than fixed absolute column
-# indices, since a real file sometimes has a genuinely blank column before
-# the area-name one and sometimes doesn't - "immediately before this run"
-# holds either way, "always column N" doesn't. Deliberately keyed on the
-# WHOLE surrounding run, not "this one column is unmapped" alone, and only
-# ever consulted for a filename already recognized as a specific known
-# provider (see _leading_known_provider) - a coincidental run match on some
-# other provider's genuinely different layout must never misfire into
-# treating an unrelated column as Building. UNION's OTHER real export
-# format (the current full Shoreditch-style one) already has a real
-# "Building" header and maps automatically without ever reaching this.
+# "Midtown", "London Bridge / Southbank", "City", "Aldgate & Whitechapel"):
+# always the column immediately BEFORE this exact fixed run of headers -
+# Floor, "Current spec" or "Category", a Size column, a lease-term column,
+# Monthly Rate, a Price-per-sq.ft column, Brochure. Matched as a contiguous
+# run rather than fixed absolute column indices, since a real file
+# sometimes has a genuinely blank column before the area-name one and
+# sometimes doesn't - "immediately before this run" holds either way,
+# "always column N" doesn't. Each position tolerates the wording variants
+# actually confirmed across different sheets of the SAME real workbook -
+# e.g. "Size sq.ft" on one sheet, bare "Size" on another; "Minimum Term" vs
+# bare "Term"; "Price p/sq.ft" vs "Price per sq ft" - never a single fixed
+# string per position. Deliberately keyed on the WHOLE surrounding run, not
+# "this one column is unmapped" alone, and only ever consulted for a
+# filename already recognized as a specific known provider (see
+# _leading_known_provider) - a coincidental run match on some other
+# provider's genuinely different layout must never misfire into treating an
+# unrelated column as Building. UNION's OTHER real export format (the
+# current full Shoreditch-style one) already has a real "Building" header
+# and maps automatically without ever reaching this.
 _PROVIDER_BUILDING_FALLBACK_RUNS = {
     "UNION": (
         ("floor",),
         ("current spec", "category"),
-        ("size sqft",),
-        ("minimum term",),
+        ("size sqft", "size"),
+        ("minimum term", "term"),
         ("monthly rate",),
-        ("price psqft",),
+        ("price psqft", "price per sq ft"),
         ("brochure",),
     ),
 }
