@@ -85,10 +85,17 @@ class EligibleBrochureUrlTests(unittest.TestCase):
 
 
 class FetchAndExtractTests(EnrichmentTestCase):
+    # render_pages/render_and_extract, not extract_raw_units - _extract_
+    # brochure_units renders directly from the fetched bytes now (see its
+    # own docstring on why: no temp file at all), so the fake PDF content
+    # _response() returns is never actually valid enough for fitz to parse
+    # as a real PDF - these mock the two split steps instead, exactly as
+    # production code now calls them.
     def test_direct_pdf_url_skips_landing_page_resolution(self):
         with patch("brochure_enrichment.resolve_brochure_link") as mock_resolve, \
              patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value={"units": []}):
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value={"units": []}):
             brochure_enrichment._extract_brochure_units("https://example.com/brochure.pdf")
 
         mock_resolve.assert_not_called()
@@ -97,7 +104,8 @@ class FetchAndExtractTests(EnrichmentTestCase):
     def test_landing_page_is_resolved_before_fetching(self):
         with patch("brochure_enrichment.resolve_brochure_link", return_value="https://example.com/real.pdf") as mock_resolve, \
              patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value={"units": []}):
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value={"units": []}):
             brochure_enrichment._extract_brochure_units("https://example.com/preview")
 
         mock_resolve.assert_called_once_with("https://example.com/preview")
@@ -127,20 +135,48 @@ class FetchAndExtractTests(EnrichmentTestCase):
 
     def test_gemini_extraction_failure_returns_none(self):
         with patch("brochure_enrichment.httpx.get", return_value=_response()), \
-             patch("brochure_enrichment.extract.extract_raw_units", side_effect=RuntimeError("bad json")):
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", side_effect=RuntimeError("bad json")):
             result = brochure_enrichment._extract_brochure_units("https://example.com/x.pdf")
 
         self.assertIsNone(result)
 
+    def test_a_render_failure_also_returns_none_not_raise(self):
+        # A malformed/corrupt PDF - render_pages itself is what raises here,
+        # never reaching render_and_extract at all.
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", side_effect=RuntimeError("corrupt PDF")) as mock_render, \
+             patch("brochure_enrichment.extract.render_and_extract") as mock_extract:
+            result = brochure_enrichment._extract_brochure_units("https://example.com/x.pdf")
+
+        self.assertIsNone(result)
+        mock_render.assert_called_once()
+        mock_extract.assert_not_called()
+
     def test_same_url_only_fetched_once(self):
         with patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value={"units": []}) as mock_extract:
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value={"units": []}) as mock_extract:
             brochure_enrichment._extract_brochure_units("https://example.com/shared.pdf")
             brochure_enrichment._extract_brochure_units("https://example.com/shared.pdf")
             brochure_enrichment._extract_brochure_units("https://example.com/shared.pdf")
 
         mock_get.assert_called_once()
         mock_extract.assert_called_once()
+
+    def test_raw_pdf_bytes_are_never_written_to_a_temp_file(self):
+        # The whole point of rendering directly from bytes (see extract.
+        # render_pages' own docstring) - confirms no tempfile.* call is
+        # made anywhere in this path at all.
+        import tempfile as tempfile_module
+
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value={"units": []}), \
+             patch.object(tempfile_module, "NamedTemporaryFile") as mock_tmp:
+            brochure_enrichment._extract_brochure_units("https://example.com/brochure.pdf")
+
+        mock_tmp.assert_not_called()
 
 
 def _box_share_html(shared_name="abc123", extension="pdf", can_download=True, name="16 Dufour's Place Brochure.pdf"):
@@ -550,7 +586,8 @@ class EnrichRowsBatchTests(EnrichmentTestCase):
         ]
 
         with patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value={"units": units}) as mock_extract:
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value={"units": units}) as mock_extract:
             enriched, log = brochure_enrichment.enrich_rows(rows)
 
         mock_get.assert_called_once()

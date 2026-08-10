@@ -150,7 +150,8 @@ class MasterUntouchedBeforeApprovalTests(unittest.TestCase):
             "building": "16 Dufour's Place", "floor_unit": "3rd Floor", "special_features": "Roof terrace",
         }]}
         with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value=raw_units):
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw_units):
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at.run()
             at.file_uploader[0].upload(

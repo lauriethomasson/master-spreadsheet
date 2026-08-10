@@ -417,19 +417,61 @@ Return ONLY this JSON object. No preamble, no explanation, no markdown code fenc
 """
 
 
-def render_pages(pdf_path: Path) -> list[types.Part]:
-    doc = fitz.open(pdf_path)
-    parts = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=RENDER_DPI)
-        parts.append(types.Part.from_bytes(data=pix.tobytes("png"), mime_type="image/png"))
-    doc.close()
-    # MuPDF's internal object store (decoded pixmaps/glyphs/images) is process-wide,
-    # not tied to this Document - closing it above doesn't touch that cache. Every
-    # upload here is a one-off brochure that's never re-rendered, so the cache is
-    # pure dead weight that otherwise accumulates ~20MB per call, forever.
-    fitz.TOOLS.store_shrink(100)
-    return parts
+def render_pages(pdf_source) -> list[types.Part]:
+    """
+    pdf_source is either a Path (existing on-disk file - the uploaded-PDF
+    path, extract() below) or raw bytes (a brochure fetched purely in
+    memory - see brochure_enrichment.py, which deliberately never writes a
+    linked brochure to a temp file at all: on a container filesystem backed
+    by tmpfs, e.g. Cloud Run's default /tmp, a temp file's bytes count
+    against the SAME memory budget as an in-memory bytes object, so writing
+    one would just be a second, redundant copy of a PDF that can be up to
+    ~32MB, held for no benefit).
+
+    doc.close()/store_shrink run in a finally, not just at the end of the
+    happy path - a page that fails partway through rendering (a malformed
+    PDF) must not leak this Document or skip shrinking the process-wide
+    store below just because an exception is about to propagate.
+    """
+    if isinstance(pdf_source, (bytes, bytearray)):
+        doc = fitz.open(stream=pdf_source, filetype="pdf")
+    else:
+        doc = fitz.open(pdf_source)
+    try:
+        parts = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=RENDER_DPI)
+            parts.append(types.Part.from_bytes(data=pix.tobytes("png"), mime_type="image/png"))
+            del pix
+        return parts
+    finally:
+        doc.close()
+        # MuPDF's internal object store (decoded pixmaps/glyphs/images) is process-wide,
+        # not tied to this Document - closing it above doesn't touch that cache. Every
+        # upload here is a one-off brochure that's never re-rendered, so the cache is
+        # pure dead weight that otherwise accumulates ~20MB per call, forever.
+        fitz.TOOLS.store_shrink(100)
+
+
+def render_and_extract(images: list, client=None) -> dict:
+    """
+    The second half of extract_raw_units, split out on its own so a caller
+    that rendered from an in-memory bytes source (see render_pages) can
+    drop that source's own reference BETWEEN rendering and this call,
+    rather than being forced to hold it alive for the full, much slower
+    Gemini round trip too (see brochure_enrichment._extract_brochure_units,
+    the one caller that actually needs this split - extract_raw_units below
+    remains the single call every other caller should keep using).
+
+    client defaults to a fresh get_client() call if not given - accepting
+    one explicitly only lets extract_raw_units reuse the SAME client it
+    already made for this call, never a shared one across separate calls.
+    """
+    client = client or get_client()
+    raw = call_gemini(client, PROMPT, images)
+    del images
+    gc.collect()
+    return raw
 
 
 def extract_raw_units(pdf_path: Path) -> dict:
@@ -445,6 +487,9 @@ def extract_raw_units(pdf_path: Path) -> dict:
     that becomes ListingRows directly and a linked brochure fetched purely
     to enrich a row from a different source (e.g. a spreadsheet row's own
     brochure_link) - never a second, independently-drifting implementation.
+    Unchanged for this (Path-based, single-call) caller - see render_pages/
+    render_and_extract's own docstrings for the one place that now calls
+    those two steps separately instead of through here.
 
     Safe to call from multiple threads concurrently (see brochure_
     enrichment.enrich_rows_grouped's own bounded worker pool) - get_client()
@@ -456,10 +501,7 @@ def extract_raw_units(pdf_path: Path) -> dict:
     client = get_client()
     with _RENDER_LOCK:
         images = render_pages(pdf_path)
-    raw = call_gemini(client, PROMPT, images)
-    del images
-    gc.collect()
-    return raw
+    return render_and_extract(images, client=client)
 
 
 def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = None) -> list[ListingRow]:

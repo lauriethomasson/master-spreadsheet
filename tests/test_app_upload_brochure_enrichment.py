@@ -89,7 +89,8 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
             "special_features": "Private terrace; showers; cycle storage",
         }]}
         with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()) as mock_get, \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value=raw_units) as mock_extract:
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw_units) as mock_extract:
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at.run()
             at.file_uploader[0].upload(
@@ -118,7 +119,7 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
 
     def test_no_eligible_rows_means_no_brochure_calls_at_all(self):
         with patch("brochure_enrichment.httpx.get") as mock_get, \
-             patch("brochure_enrichment.extract.extract_raw_units") as mock_extract:
+             patch("brochure_enrichment.extract.render_and_extract") as mock_extract:
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at.run()
             at.file_uploader[0].upload(
@@ -143,7 +144,8 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
             return {"units": []}
 
         with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
-             patch("brochure_enrichment.extract.extract_raw_units", side_effect=_check_and_return):
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", side_effect=_check_and_return):
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at.run()
             at.file_uploader[0].upload(
@@ -163,7 +165,8 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
             for i in range(10)
         ]}
         with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
-             patch("brochure_enrichment.extract.extract_raw_units", return_value=raw_units) as mock_extract:
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw_units) as mock_extract:
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at.run()
             at.file_uploader[0].upload(

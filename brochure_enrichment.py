@@ -62,8 +62,6 @@ import concurrent.futures
 import functools
 import re
 import sys
-import tempfile
-from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -385,21 +383,29 @@ def _extract_brochure_units(url: str):
     if data is None:
         return None
 
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(data)
-            tmp_path = Path(tmp.name)
-        raw = extract.extract_raw_units(tmp_path)
+        # Rendered directly from the in-memory bytes - never written to a
+        # temp file at all (see render_pages' own docstring on why: a
+        # tmpfs-backed container /tmp, e.g. Cloud Run's default, would
+        # count that file's bytes against the SAME memory budget as `data`
+        # itself, a real doubling of a payload that can be up to ~32MB).
+        with extract._RENDER_LOCK:
+            images = extract.render_pages(data)
+        # Dropped HERE, between the two calls - not in a finally at the end
+        # of this function - specifically so it's freed BEFORE the slower
+        # Gemini call below runs, not merely before this function returns.
+        # A caller-side reference to an argument stays alive for a callee's
+        # entire execution regardless of what that callee does internally,
+        # so this only works because the render step and the Gemini call
+        # are two SEPARATE calls with this line in between, not one.
+        data = None
+        raw = extract.render_and_extract(images)
     except Exception as e:
         print(
             f"[brochure_enrichment] Could not read {url!r} as a brochure ({e!r}) — skipping enrichment.",
             file=sys.stderr,
         )
         return None
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
     return raw.get("units", [])
 
 
