@@ -65,12 +65,16 @@ class PlainNewSectionTests(IsolatedCwdTestCase):
         self.assertFalse(plain_new_expanders[0].proto.expanded)
 
     def test_no_plain_new_section_when_there_are_no_plain_new_rows(self):
-        # Everything in this batch is a genuine duplicate of everything
-        # else - no plain_new rows at all.
+        # A genuinely CONFLICTING duplicate pair (different size_sqft for
+        # what's otherwise the same unit) - still needs a manual decision
+        # (see master_merge.consolidate_unmatched_duplicates), so this is
+        # NOT auto-merged into a plain_new row, unlike a trivial duplicate
+        # would be (see test_trivial_duplicates_never_reach_plain_new_or_
+        # needs_a_decision in test_app_review_duplicate_consolidation.py).
         save_staging_file(
             [
-                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st"),
-                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st"),
+                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st", size_sqft=1000.0),
+                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st", size_sqft=5000.0),
             ],
             "dupes.xlsx", content_hash="no-plain-new-hash",
         )
@@ -119,11 +123,15 @@ class NeedsADecisionHeadingTests(IsolatedCwdTestCase):
     def test_heading_and_explainer_for_batch_duplicate(self):
         # No master at all - both rows fail to match master, but match
         # EACH OTHER (see master_merge._dedup_key), landing in
-        # unmatched_collisions rather than near_miss.
+        # unmatched_collisions rather than near_miss. A genuine size
+        # conflict keeps this one from auto-merging (see master_merge.
+        # consolidate_unmatched_duplicates) - a trivially-identical
+        # duplicate no longer reaches this heading at all (see
+        # test_app_review_duplicate_consolidation.py).
         save_staging_file(
             [
-                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st"),
-                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st"),
+                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st", size_sqft=1000.0),
+                ListingRow(building="1 Example Street", provider="Test Provider", floor_unit="1st", size_sqft=5000.0),
             ],
             "dupes.xlsx", content_hash="dupe-heading-hash",
         )

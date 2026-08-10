@@ -181,6 +181,257 @@ class MatchedCollisionFieldChoiceTests(unittest.TestCase):
         self.assertFalse(needs_choice)
         self.assertIsNone(value)
 
+    def test_field_name_not_passed_keeps_prior_behavior_for_text_fields(self):
+        # Backward compatibility: an existing caller that doesn't pass
+        # field_name gets the exact prior behavior (always a real choice
+        # on any textual disagreement, even a reworded-but-compatible one)
+        # - the new RISKY_TEXT_FIELDS tolerance is opt-in per call site.
+        needs_choice, value = master_merge.matched_collision_field_choice(
+            ["Fully fitted, meeting rooms, kitchen", "Meeting rooms and a kitchen"],
+        )
+        self.assertTrue(needs_choice)
+        self.assertIsNone(value)
+
+    def test_reworded_but_compatible_special_features_auto_resolves_to_richest(self):
+        # Real scenario this exists for: the SAME real brochure enriched
+        # independently across separate uploads/runs, where Gemini's own
+        # extraction non-determinism can reword the same fact slightly -
+        # never a genuine conflict, so this must not force a click.
+        needs_choice, value = master_merge.matched_collision_field_choice(
+            ["Fully fitted, meeting rooms, kitchen", "Meeting rooms and a kitchen"], "special_features",
+        )
+        self.assertFalse(needs_choice)
+        self.assertEqual(value, "Fully fitted, meeting rooms, kitchen")
+
+    def test_genuinely_conflicting_special_features_still_needs_a_choice(self):
+        # Real content disagreement (not just rewording) - is_detail_loss
+        # correctly sees an item on each side missing from the other.
+        needs_choice, value = master_merge.matched_collision_field_choice(
+            ["Meeting rooms; kitchen", "Gym; roof terrace"], "special_features",
+        )
+        self.assertTrue(needs_choice)
+        self.assertIsNone(value)
+
+    def test_tolerance_is_scoped_to_risky_text_fields_only(self):
+        # The same reworded-looking pair on a NON-risky field (e.g.
+        # provider) must still be treated as a genuine disagreement - the
+        # tolerance is specifically about detail-loss on free-text lists,
+        # never a general "these look similar" fuzzy match.
+        needs_choice, value = master_merge.matched_collision_field_choice(["UNION", "Union Ltd"], "provider")
+        self.assertTrue(needs_choice)
+        self.assertIsNone(value)
+
+
+class GroupHasGenuineConflictTests(unittest.TestCase):
+    def test_identical_rows_have_no_conflict(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_complementary_blank_and_filled_special_features_has_no_conflict(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "special_features": None},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "special_features": "Roof terrace"},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_conflicting_size_is_a_genuine_conflict(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 5000.0},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_conflicting_rent_is_a_genuine_conflict(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_pcm": 10000.0},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_pcm": 15000.0},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_conflicting_state_of_space_is_a_genuine_conflict(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "state_of_space": "Cat A"},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "state_of_space": "Shell & Core"},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_reworded_compatible_special_features_across_three_copies_has_no_conflict(self):
+        # The real "same brochure enriched 3 times" pattern - three
+        # slightly different phrasings of the same underlying fact.
+        dicts = [
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th", "special_features": "Fully fitted, meeting rooms, kitchen"},
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th", "special_features": "Meeting rooms and a kitchen"},
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th", "special_features": None},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+
+class MergeUnmatchedGroupTests(unittest.TestCase):
+    def _group(self, rows):
+        return [master_merge.UnmatchedRow(r) for r in rows]
+
+    def test_three_identical_copies_merge_into_one_row_with_no_data_loss(self):
+        rows = [
+            ListingRow(
+                building="107 Cannon Street", provider="UNION", floor_unit="4th", size_sqft=4500.0,
+                source_file=f"upload_{i}.xlsx",
+            )
+            for i in range(3)
+        ]
+        merged = master_merge._merge_unmatched_group(self._group(rows))
+        self.assertEqual(merged.building, "107 Cannon Street")
+        self.assertEqual(merged.floor_unit, "4th")
+        self.assertEqual(merged.size_sqft, 4500.0)
+        self.assertIn("upload_0.xlsx", merged.source_file)
+        self.assertIn("upload_1.xlsx", merged.source_file)
+        self.assertIn("upload_2.xlsx", merged.source_file)
+
+    def test_complementary_information_is_combined_not_lost(self):
+        rows = [
+            ListingRow(
+                building="107 Cannon Street", provider="UNION", floor_unit="4th", size_sqft=4500.0,
+                special_features=None, brochure_link="https://example.com/b.pdf", source_file="a.xlsx",
+            ),
+            ListingRow(
+                building="107 Cannon Street", provider="UNION", floor_unit="4th", size_sqft=4500.0,
+                special_features="Fully fitted, meeting rooms", brochure_link="https://example.com/b.pdf",
+                source_file="b.xlsx",
+            ),
+        ]
+        merged = master_merge._merge_unmatched_group(self._group(rows))
+        self.assertEqual(merged.special_features, "Fully fitted, meeting rooms")
+        self.assertEqual(merged.size_sqft, 4500.0)
+        self.assertEqual(merged.brochure_link, "https://example.com/b.pdf")
+
+    def test_gets_a_fresh_property_id_distinct_from_any_source_row(self):
+        rows = [
+            ListingRow(building="A", provider="UNION", floor_unit="1st", property_id="orig-1"),
+            ListingRow(building="A", provider="UNION", floor_unit="1st", property_id="orig-2"),
+        ]
+        merged = master_merge._merge_unmatched_group(self._group(rows))
+        self.assertNotIn(merged.property_id, ("orig-1", "orig-2"))
+
+
+class ConsolidateUnmatchedDuplicatesTests(unittest.TestCase):
+    def _plan_with_unmatched(self, rows, master_records=None):
+        unmatched = [master_merge.UnmatchedRow(r) for r in rows]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        return master_merge.MergePlan(master_records or [], [], [], unmatched, [], groups)
+
+    def test_three_identical_copies_become_one_unmatched_row_no_review_needed(self):
+        rows = [
+            ListingRow(building="107 Cannon Street", provider="UNION", floor_unit="4th", size_sqft=4500.0)
+            for _ in range(3)
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+    def test_six_identical_copies_become_one_unmatched_row(self):
+        rows = [
+            ListingRow(building="4 Moorgate", provider="UNION", floor_unit="5th", size_sqft=2000.0)
+            for _ in range(6)
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+    def test_conflicting_group_stays_in_unmatched_collisions_and_in_unmatched(self):
+        rows = [
+            ListingRow(building="A", provider="UNION", floor_unit="1st", size_sqft=1000.0),
+            ListingRow(building="A", provider="UNION", floor_unit="1st", size_sqft=5000.0),
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched_collisions), 1)
+        self.assertEqual(len(consolidated.unmatched_collisions[0]), 2)
+        # Original members remain present in `unmatched` too - the existing
+        # pages-layer id() tracking excludes them from near_miss/plain_new,
+        # not a removal from this list (see consolidate_unmatched_
+        # duplicates' own docstring).
+        self.assertEqual(len(consolidated.unmatched), 2)
+
+    def test_same_floor_different_units_never_merged(self):
+        rows = [
+            ListingRow(building="A Building", provider="UNION", floor_unit="2nd Unit 1"),
+            ListingRow(building="A Building", provider="UNION", floor_unit="2nd Unit 2"),
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        # Never grouped at all - different floor_unit keys - so both stay
+        # as independent, standalone unmatched rows.
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        self.assertEqual(len(consolidated.unmatched), 2)
+
+    def test_north_south_never_merged(self):
+        rows = [
+            ListingRow(building="A Building", provider="UNION", floor_unit="5th (North)"),
+            ListingRow(building="A Building", provider="UNION", floor_unit="5th (South)"),
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        self.assertEqual(len(consolidated.unmatched), 2)
+
+    def test_front_rear_entire_never_merged(self):
+        rows = [
+            ListingRow(building="A Building", provider="UNION", floor_unit="3rd (Front)"),
+            ListingRow(building="A Building", provider="UNION", floor_unit="3rd (Rear)"),
+            ListingRow(building="A Building", provider="UNION", floor_unit="3rd (Entire)"),
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        self.assertEqual(len(consolidated.unmatched), 3)
+
+    def test_different_floors_never_merged(self):
+        rows = [
+            ListingRow(building="A Building", provider="UNION", floor_unit="4th"),
+            ListingRow(building="A Building", provider="UNION", floor_unit="5th"),
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        self.assertEqual(len(consolidated.unmatched), 2)
+
+    def test_near_miss_suggestions_survive_onto_the_merged_row(self):
+        master_rec = {"building": "Similar Building", "provider": "UNION", "floor_unit": "1st", "property_id": "m1"}
+        rows = [
+            ListingRow(building="107 Cannon Street", provider="UNION", floor_unit="4th"),
+            ListingRow(building="107 Cannon Street", provider="UNION", floor_unit="4th"),
+        ]
+        unmatched = [master_merge.UnmatchedRow(r, suggestions=[master_rec]) for r in rows]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        plan = master_merge.MergePlan([master_rec], [], [], unmatched, [], groups)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched[0].suggestions, [master_rec])
+
+    def test_other_providers_unaffected(self):
+        rows = [
+            ListingRow(building="33 Cavendish Square", provider="Kitt's", floor_unit="2nd Floor", desks_max=20),
+            ListingRow(building="33 Cavendish Square", provider="Kitt's", floor_unit="2nd Floor", desks_max=20),
+            ListingRow(building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor"),
+        ]
+        plan = self._plan_with_unmatched(rows)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 2)  # the Kitt's pair merged; Copthall row untouched
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
 
 class CollisionGroupFieldsTests(unittest.TestCase):
     def test_union_of_diffs_in_diff_fields_order(self):

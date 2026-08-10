@@ -201,7 +201,7 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
     choice_fields = []  # [(field, values)] - genuine disagreement, needs a human pick
     for f in master_merge.collision_group_fields(group):
         values = [d.get(f) for d in dicts]
-        needs_choice, resolved = master_merge.matched_collision_field_choice(values)
+        needs_choice, resolved = master_merge.matched_collision_field_choice(values, f)
         if needs_choice:
             choice_fields.append((f, values))
         else:
@@ -908,11 +908,29 @@ def _render_pending_review(pending: list):
         new_rows = dataframe_to_listing_rows(combined_df)
         master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
         plan = master_merge.build_merge_plan(new_rows, master_df)
+        # Intra-batch duplicates (see build_merge_plan's own unmatched_
+        # collisions) are auto-merged here, BEFORE any of the rendering
+        # below - manual review becomes the exception (a genuine field
+        # conflict, see master_merge.consolidate_unmatched_duplicates's own
+        # docstring), not the default just because a property happened to
+        # be extracted more than once. total_unmatched_before is captured
+        # for the summary line below, since plan.unmatched itself shrinks
+        # once safe groups collapse into one row each.
+        total_unmatched_before = len(plan.unmatched)
+        plan = master_merge.consolidate_unmatched_duplicates(plan)
         fully_occupied_buildings = [
             fo for path in pending for fo in get_staging_fully_occupied_buildings(path)
         ]
 
     st.caption(master_merge.pending_status_line(len(pending), plan))
+    auto_consolidated_rows = total_unmatched_before - len(plan.unmatched)
+    if auto_consolidated_rows or plan.unmatched_collisions:
+        st.caption(
+            f"{total_unmatched_before} extracted row(s) with no existing master match — "
+            f"{auto_consolidated_rows} duplicate row(s) automatically consolidated, "
+            f"{len(plan.unmatched_collisions)} conflict(s) need your review, "
+            f"{len(plan.unmatched)} unique row(s) ready."
+        )
     _render_master_lookup(master_df)
     _render_brochure_enrichment_summary(pending)
 

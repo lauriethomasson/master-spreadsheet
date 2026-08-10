@@ -978,29 +978,66 @@ def collision_group_fields(group: list) -> list:
     return [f for f in DIFF_FIELDS if f in fields_with_diffs]
 
 
-def matched_collision_field_choice(values: list) -> tuple:
+def _text_variants_compatible(values: list) -> bool:
+    """
+    True if no value in `values` is missing an item another value has (see
+    is_detail_loss, checked pairwise in BOTH directions) - i.e. these look
+    like the same underlying fact/list at different levels of completeness
+    or rewording (e.g. two independent Gemini extractions of the SAME real
+    brochure, which real extraction non-determinism confirms can come back
+    with slightly different phrasing for the same fact), never a genuine
+    conflict. Only meaningful for RISKY_TEXT_FIELDS - see
+    matched_collision_field_choice, the only caller - reusing the exact
+    same item-similarity tolerance already trusted for an old-vs-new master
+    diff, applied here peer-vs-peer instead.
+    """
+    return not any(
+        is_detail_loss(values[i], values[j]) or is_detail_loss(values[j], values[i])
+        for i in range(len(values)) for j in range(i + 1, len(values))
+    )
+
+
+def _richest_text_value(values: list) -> str:
+    """The most complete of a set of already-confirmed-compatible text
+    variants (see _text_variants_compatible) - most itemizable content
+    (see _detail_items) wins; ties broken by raw length. Never called on
+    genuinely conflicting values."""
+    return max(values, key=lambda v: (len(_detail_items(str(v))), len(str(v))))
+
+
+def matched_collision_field_choice(values: list, field_name: str = None) -> tuple:
     """
     Like merge_field_choice, but for one field's PROPOSED values across a
-    matched-collision group (see collision_group_fields) rather than
-    merge_field_choice's own brand-new-property case (unmatched_collisions,
-    no master row to fall back to at all). Blank vs non-blank is
-    deliberately NOT treated as a disagreement here, unlike
-    merge_field_choice: a colliding row that's blank (or simply unchanged
-    from master, so this field never even reached ITS OWN diffs) on a field
-    has no opinion on it, exactly as it would in an ordinary, non-colliding
+    collision group of PEER rows (rows that all independently propose a
+    value for the same identity, with no inherent priority order between
+    them) rather than merge_field_choice's own brand-new-property case
+    (unmatched_collisions, no master row to fall back to at all... except
+    unmatched_collisions now calls THIS function too - see
+    consolidate_unmatched_duplicates - since the same "peer rows, resolve
+    or flag" shape applies whether or not a master row happens to exist).
+    Blank vs non-blank is deliberately NOT treated as a disagreement here,
+    unlike merge_field_choice: a colliding row that's blank on a field has
+    no opinion on it, exactly as it would in an ordinary, non-colliding
     matched-row diff (diff_fields itself already treats "no data this
-    time" as nothing to review, never a value to choose between) - there
-    IS a master fallback here, so unlike merge_field_choice's brand-new-
-    property case, a silent source isn't losing its only chance to state
-    this field.
+    time" as nothing to review, never a value to choose between).
 
     needs_choice is True only when two or more colliding rows propose
     genuinely different non-blank values (tolerant-equal, see _values_equal)
     for this field - resolved_value is then None and the caller must ask a
-    human to pick one (see _render_merge_field_choice). Otherwise - every
-    value blank, or exactly one distinct non-blank value regardless of how
-    many rows propose it - auto-resolves to that value with no manual
-    click, same as this field would need in a non-colliding matched row.
+    human to pick one (see _render_merge_field_choice) - UNLESS field_name
+    is one of RISKY_TEXT_FIELDS and every differing value is confirmed
+    compatible (see _text_variants_compatible), in which case this still
+    auto-resolves, to the richest variant, rather than forcing a click over
+    what's really just reworded/differently-complete phrasing of the same
+    fact. field_name is optional (existing callers that don't pass it keep
+    the exact prior behavior for text fields - always a real choice on any
+    textual disagreement) precisely so this tolerance is opt-in per call
+    site, not a silent behavior change for every existing caller.
+
+    Otherwise - every value blank, or exactly one distinct non-blank value
+    regardless of how many rows propose it - auto-resolves to that value
+    with no manual click, same as this field would need in a non-colliding
+    matched row.
     """
     classes = []
     for v in values:
@@ -1011,7 +1048,112 @@ def matched_collision_field_choice(values: list) -> tuple:
         classes.append(v)
     if len(classes) <= 1:
         return False, (classes[0] if classes else None)
+    if field_name in RISKY_TEXT_FIELDS and _text_variants_compatible(classes):
+        return False, _richest_text_value(classes)
     return True, None
+
+
+def _group_has_genuine_conflict(dicts: list) -> bool:
+    """
+    True if any DIFF_FIELD has 2+ genuinely different non-blank values
+    across `dicts` (see matched_collision_field_choice, called with the
+    field name so RISKY_TEXT_FIELDS gets its own reworded-but-compatible
+    tolerance) - the single generic rule this module uses to decide
+    whether a group of rows claiming to be the same property/unit can be
+    safely auto-merged (see consolidate_unmatched_duplicates) or must be
+    left for a human: automatically combining them would only ever change
+    the DATA'S MEANING if some field genuinely disagrees, never merely
+    because there happen to be several source rows.
+    """
+    return any(
+        matched_collision_field_choice([d.get(f) for d in dicts], f)[0]
+        for f in DIFF_FIELDS
+    )
+
+
+def _merge_unmatched_group(group: list) -> ListingRow:
+    """
+    Consolidates a group of UnmatchedRow objects (see
+    _group_unmatched_duplicates) that _group_has_genuine_conflict has
+    already confirmed has NO genuine field conflict into a single
+    ListingRow - every field resolved via matched_collision_field_choice
+    (a blank source contributes nothing; multiple agreeing/compatible
+    sources resolve to one shared or richest value - the exact same
+    source-priority-agnostic resolution _render_collision_group already
+    trusts for the analogous matched-against-master case, never a second,
+    differently-behaved merge system). Never called on a group with a
+    genuine conflict - see consolidate_unmatched_duplicates.
+
+    source_file becomes every contributing row's own source_file joined
+    with " + " (falling back to a positional "Row N" label for whichever
+    lack one) - the same provenance convention _render_intra_batch_
+    duplicate_group's manual merge path already uses, so debugging which
+    original upload(s) fed a consolidated row works identically whether
+    that consolidation happened automatically or via a manual click.
+    """
+    dicts = [u.new_row.model_dump() for u in group]
+    merged = {}
+    for f in DIFF_FIELDS:
+        _, resolved = matched_collision_field_choice([d.get(f) for d in dicts], f)
+        merged[f] = resolved
+    labels = [d.get("source_file") or f"Row {i + 1}" for i, d in enumerate(dicts)]
+    merged["property_id"] = str(uuid.uuid4())
+    merged["source_file"] = " + ".join(labels)
+    return ListingRow(**merged)
+
+
+def consolidate_unmatched_duplicates(plan: MergePlan) -> MergePlan:
+    """
+    Auto-merges every intra-batch duplicate group (see build_merge_plan's
+    own unmatched_collisions) that has no genuine field conflict (see
+    _group_has_genuine_conflict) into a single UnmatchedRow, carrying
+    forward the union of the group's own near-miss suggestions - so a
+    duplicated property that ALSO looks like an existing master property
+    still gets the normal link-or-add-new decision downstream, exactly as
+    a single non-duplicated near-miss row already would (auto-merging
+    duplicates first, then letting it flow through the SAME near-miss
+    check every other unmatched row goes through, rather than bypassing
+    that check just because it started out as several rows).
+
+    Only a group with a genuine conflict is left in unmatched_collisions,
+    for the existing manual-duplicate-review UI to handle exactly as
+    before - manual review becomes the exception (a real conflict), not
+    the default (any group size > 1).
+
+    Returns a NEW MergePlan (never mutates the one passed in) -
+    master_records/matched_changed/matched_unchanged/collisions are
+    identical references; only unmatched/unmatched_collisions differ.
+    Members of a group still needing review are left exactly where
+    build_merge_plan already put them (present in BOTH plan.unmatched and
+    plan.unmatched_collisions) - the existing pages-layer id() tracking
+    that excludes collision members from near_miss/plain_new already
+    handles that correctly and needs no change.
+    """
+    still_needs_review = []
+    safe_groups = []
+    for group in plan.unmatched_collisions:
+        dicts = [u.new_row.model_dump() for u in group]
+        (still_needs_review if _group_has_genuine_conflict(dicts) else safe_groups).append(group)
+
+    safe_member_ids = {id(u) for group in safe_groups for u in group}
+
+    merged_rows = []
+    for group in safe_groups:
+        merged_row = _merge_unmatched_group(group)
+        suggestions, seen_ids = [], set()
+        for u in group:
+            for s in u.suggestions:
+                if id(s) not in seen_ids:
+                    seen_ids.add(id(s))
+                    suggestions.append(s)
+        merged_rows.append(UnmatchedRow(merged_row, suggestions))
+
+    new_unmatched = [u for u in plan.unmatched if id(u) not in safe_member_ids] + merged_rows
+
+    return MergePlan(
+        plan.master_records, plan.matched_changed, plan.matched_unchanged,
+        new_unmatched, plan.collisions, still_needs_review,
+    )
 
 
 def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
