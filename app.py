@@ -29,9 +29,6 @@ from storage.file_store import (
     load_staging_as_dataframe,
     save_original_pdf,
     save_staging_file,
-    set_staging_enrichment_progress,
-    set_staging_enrichment_summary,
-    update_staging_rows,
 )
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
@@ -204,11 +201,13 @@ def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str
     covers, and the ONLY case that should ever feel instant; the point of
     showing real progress below is precisely for the case where it isn't.
 
-    Persists partial progress incrementally (checkpoint_callback, see
-    enrich_rows_grouped's own docstring) and the final result via
-    update_staging_rows - so an interruption partway through loses at most
-    a handful of brochures' worth of work, never the base extraction, which
-    was already durably staged before this function was even called.
+    Persists partial progress incrementally and the final result (see
+    brochure_enrichment.run_brochure_enrichment, the shared Streamlit-aware
+    orchestration this delegates to - also used by pages/2_Review_and_
+    Master.py's own "Continue enrichment" action to resume an interrupted
+    run) - so an interruption partway through loses at most a handful of
+    brochures' worth of work, never the base extraction, which was already
+    durably staged before this function was even called.
 
     Returns the (possibly enriched) rows so the caller can reassign its own
     `rows` variable to the final state - enrichment never changes row
@@ -225,48 +224,12 @@ def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str
         f"checking {len(unique_urls)} unique brochure(s) for it. "
         "Your extracted spreadsheet data has already been saved — this step only adds extra detail."
     )
-    progress_slot = st.empty()
-    bar = progress_slot.progress(0.0, text=f"Enriching from brochures — 0 / {len(unique_urls)}")
-
-    # Written BEFORE the run starts (not just at checkpoints) so even an
-    # interruption in the first few seconds - before a single brochure has
-    # completed, let alone reached CHECKPOINT_EVERY - still leaves an
-    # "in_progress" record in meta.json rather than none at all (see
-    # set_staging_enrichment_progress's own docstring on why a missing
-    # record is otherwise indistinguishable from "nothing was eligible").
-    set_staging_enrichment_progress(staging_path, 0, len(unique_urls))
-    latest_progress = {"done": 0, "total": len(unique_urls)}
-
-    def on_progress(done, total, label):
-        latest_progress["done"], latest_progress["total"] = done, total
-        if not total:
-            return
-        text = f"Enriching from brochures — {done} / {total}"
-        if label:
-            text += f" ({label})"
-        bar.progress(done / total, text=text)
-
-    def on_checkpoint(rows_so_far):
-        update_staging_rows(staging_path, rows_so_far)
-        set_staging_enrichment_progress(staging_path, latest_progress["done"], latest_progress["total"])
-
-    enriched_rows, _log, stats = brochure_enrichment.enrich_rows_grouped(
-        rows, progress_callback=on_progress, checkpoint_callback=on_checkpoint,
-    )
-    progress_slot.empty()
-
-    update_staging_rows(staging_path, enriched_rows)
-    set_staging_enrichment_summary(staging_path, stats)
-
-    summary = (
-        f"{stats['unique_brochures_considered']} unique brochure(s) considered, "
-        f"{stats['brochures_read_ok']} read successfully, {stats['rows_enriched']} row(s) enriched."
-    )
-    if stats["brochures_unavailable"]:
-        summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
-    st.caption(f"Brochure enrichment complete: {summary}")
-
-    return enriched_rows
+    # already_processed is always {} here - a FRESH upload's staging file
+    # has no prior enrichment attempt to resume from at all (see pages/
+    # 2_Review_and_Master.py's own "Continue enrichment" action for the
+    # ONLY other caller of run_brochure_enrichment, which passes whatever
+    # a previous, interrupted attempt already recorded).
+    return brochure_enrichment.run_brochure_enrichment(rows, staging_path, already_processed={})
 
 
 def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) -> None:

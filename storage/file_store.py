@@ -114,39 +114,81 @@ def update_staging_rows(path: str, rows: list[ListingRow]) -> None:
     blob_store.write_bytes(path, buffer.getvalue())
 
 
-def set_staging_enrichment_summary(path: str, stats: dict) -> None:
+def _derive_enrichment_counts(processed_urls: dict, unique_brochures_considered: int) -> dict:
     """
-    Persists brochure enrichment's own FINAL summary stats (see brochure_
-    enrichment.enrich_rows_grouped's own return value) into this staging
-    file's meta.json, tagged status="complete" - so Review & Master can show
-    a read-only "brochure enrichment: N rows enriched" caption for a file
-    that's already been through automatic enrichment (see app.py's own
-    _run_automatic_brochure_enrichment), durably, without needing anything
-    in session_state that a fresh browser session/server restart would lose.
+    brochures_done/brochures_read_ok/brochures_unavailable, all derived from
+    processed_urls ({url: "ok" | "unavailable"}) rather than tracked as
+    separate counters passed in alongside it - one source of truth for
+    "what's been attempted so far" (across possibly several resumed runs),
+    never two numbers that could quietly drift apart.
+    """
+    return {
+        "unique_brochures_considered": unique_brochures_considered,
+        "brochures_done": len(processed_urls),
+        "brochures_read_ok": sum(1 for v in processed_urls.values() if v == "ok"),
+        "brochures_unavailable": sum(1 for v in processed_urls.values() if v == "unavailable"),
+    }
 
-    Called only once enrich_rows_grouped has fully returned - see
-    set_staging_enrichment_progress for the interim marker written before
-    and during the run, which this overwrites. Absent entirely (both this
-    and the interim marker) for a file where enrichment never ran at all (no
-    eligible rows in the first place, or an upload predating this feature) -
-    a caller should treat a missing key as "nothing to show", not as "zero
-    rows enriched" (see get_staging_enrichment_summary).
+
+def set_staging_enrichment_summary(path: str, stats: dict, processed_urls: dict) -> None:
+    """
+    Persists brochure enrichment's own FINAL summary stats into this
+    staging file's meta.json, tagged status="complete" - so Review & Master
+    can show a read-only "brochure enrichment: N rows enriched" caption for
+    a file that's already been through automatic enrichment (see app.py's
+    own _run_automatic_brochure_enrichment), durably, without needing
+    anything in session_state that a fresh browser session/server restart
+    would lose.
+
+    processed_urls is the FULL CUMULATIVE {url: "ok" | "unavailable"} map
+    across every attempt this staging file has ever gone through (a fresh
+    run's own outcomes merged with whatever an earlier, resumed attempt had
+    already recorded - see enrich_rows_grouped's own already_processed
+    param) - stats["rows_eligible"]/["rows_enriched"] still come from the
+    caller's own stats dict (see enrich_rows_grouped's return value; not
+    derivable from processed_urls alone), but unique_brochures_considered/
+    brochures_done/brochures_read_ok/brochures_unavailable are recomputed
+    from processed_urls here (see _derive_enrichment_counts) so the FINAL
+    persisted record can never disagree with what's actually in
+    processed_urls, regardless of what the caller's own stats dict says.
+
+    Called only once enrich_rows_grouped has fully processed every
+    remaining brochure - see set_staging_enrichment_progress for the
+    interim marker written before and during a run, which this overwrites.
+    Absent entirely (both this and the interim marker) for a file where
+    enrichment never ran at all (no eligible rows in the first place, or an
+    upload predating this feature) - a caller should treat a missing key as
+    "nothing to show", not as "zero rows enriched" (see
+    get_staging_enrichment_summary).
     """
     meta = _read_meta(path)
-    meta["brochure_enrichment"] = {**stats, "status": "complete"}
+    meta["brochure_enrichment"] = {
+        "status": "complete",
+        "rows_eligible": stats["rows_eligible"],
+        "rows_enriched": stats["rows_enriched"],
+        "processed_urls": dict(processed_urls),
+        **_derive_enrichment_counts(processed_urls, stats["unique_brochures_considered"]),
+    }
     _write_meta(path, meta)
 
 
-def set_staging_enrichment_progress(path: str, brochures_done: int, unique_brochures_considered: int) -> None:
+def set_staging_enrichment_progress(path: str, processed_urls: dict, unique_brochures_considered: int) -> None:
     """
     Persists an INTERIM brochure-enrichment marker - status="in_progress"
-    plus how many of the run's own unique brochures have completed so far -
-    written before enrich_rows_grouped starts (brochures_done=0) and again
-    at each of its own checkpoints (see app.py's _run_automatic_brochure_
-    enrichment), specifically so an interruption (a killed process, a
-    crashed Cloud Run instance, a cancelled Streamlit rerun) that stops the
-    run before set_staging_enrichment_summary's own final call is ever
-    reached still leaves SOME record in meta.json, rather than none at all.
+    plus the FULL CUMULATIVE per-URL outcome map so far (see
+    set_staging_enrichment_summary's own docstring on why this is the
+    cumulative map, not just this run's own increment) - written before
+    enrich_rows_grouped starts (processed_urls={} on a fresh run, or
+    whatever a prior interrupted attempt already recorded on a resume) and
+    again at each of its own checkpoints (see app.py's
+    _run_automatic_brochure_enrichment and pages/2_Review_and_Master.py's
+    own "Continue enrichment" action), specifically so an interruption (a
+    killed process, a crashed Cloud Run instance, a cancelled Streamlit
+    rerun) that stops the run before set_staging_enrichment_summary's own
+    final call is ever reached still leaves SOME record in meta.json,
+    rather than none at all - AND so a SUBSEQUENT resume knows exactly
+    which brochures to skip (see enrich_rows_grouped's own already_processed
+    param), never just "how many", which alone can't identify WHICH ones.
 
     Without this, an interrupted run's staging rows end up a genuine mix of
     enriched and never-attempted rows (see enrich_rows_grouped's own
@@ -163,8 +205,8 @@ def set_staging_enrichment_progress(path: str, brochures_done: int, unique_broch
     meta = _read_meta(path)
     meta["brochure_enrichment"] = {
         "status": "in_progress",
-        "brochures_done": brochures_done,
-        "unique_brochures_considered": unique_brochures_considered,
+        "processed_urls": dict(processed_urls),
+        **_derive_enrichment_counts(processed_urls, unique_brochures_considered),
     }
     _write_meta(path, meta)
 
@@ -178,7 +220,10 @@ def get_staging_enrichment_summary(path: str) -> dict:
     docstrings on why this is None, not a zero-valued dict, in that case).
     Callers must check stats["status"] before treating this as a finished
     result - see pages/2_Review_and_Master.py's own _render_brochure_
-    enrichment_summary.
+    enrichment_summary. stats["processed_urls"] is present on every entry
+    written by the current version of either setter - absent (plain
+    .get() default needed by a caller) only for a staging file whose
+    enrichment ran before this field existed.
     """
     return _read_meta(path).get("brochure_enrichment")
 

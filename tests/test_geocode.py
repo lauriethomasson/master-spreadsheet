@@ -245,5 +245,180 @@ class CompoundBuildingGeocodingTests(unittest.TestCase):
         self.assertEqual(row.postcode, "W1T 2RG")
 
 
+class GeocodeRowsGroupingTests(unittest.TestCase):
+    """
+    geocode_rows (the batch entry point, distinct from geocode_row) groups
+    rows sharing a (building, provider) identity and geocodes each group
+    ONCE, copying the result into every member's own blank fields - see its
+    own docstring for the real Nexus Place case this exists for (the same
+    physical building, listed as two intentionally SEPARATE source rows
+    under two different submarkets - see master_merge.py's own source-row-
+    identity handling - getting two DIFFERENT postcodes purely because each
+    row's own submarket biased its Tier 2 Places query differently).
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_same_building_and_provider_geocoded_only_once(self):
+        row_a = ListingRow(building="Nexus Place", provider="UNION", submarket="City")
+        row_b = ListingRow(building="Nexus Place", provider="UNION", submarket="Clerkenwell")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.52, "lng": -0.1, "address_components": []},
+        ) as mock_places:
+            geocode.geocode_rows([row_a, row_b])
+
+        mock_places.assert_called_once()
+        self.assertEqual(row_a.lat, 51.52)
+        self.assertEqual(row_b.lat, 51.52)
+        self.assertEqual(row_a.lng, -0.1)
+        self.assertEqual(row_b.lng, -0.1)
+
+    def test_submarket_is_never_copied_across_the_group(self):
+        # The whole point: two rows can share a physical location while
+        # keeping their own, genuinely different, source-stated submarket -
+        # location consistency must never homogenize that field.
+        row_a = ListingRow(building="Nexus Place", provider="UNION", submarket="City")
+        row_b = ListingRow(building="Nexus Place", provider="UNION", submarket="Clerkenwell & Farringdon")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.52, "lng": -0.1, "address_components": []},
+        ):
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertEqual(row_a.submarket, "City")
+        self.assertEqual(row_b.submarket, "Clerkenwell & Farringdon")
+
+    def test_address_1_and_postcode_are_also_shared(self):
+        row_a = ListingRow(building="Nexus Place", provider="UNION", submarket="City")
+        row_b = ListingRow(building="Nexus Place", provider="UNION", submarket="Clerkenwell")
+        components = [
+            {"longText": "25", "types": ["street_number"]},
+            {"longText": "Farringdon Street", "types": ["route"]},
+            {"longText": "EC4M 4AB", "types": ["postal_code"]},
+        ]
+
+        with patch("geocode.call_places_text_search", return_value={
+            "status": "OK", "lat": 51.52, "lng": -0.1, "address_components": components,
+        }):
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertEqual(row_a.address_1, "25 Farringdon Street")
+        self.assertEqual(row_b.address_1, "25 Farringdon Street")
+        self.assertEqual(row_a.postcode, "EC4M 4AB")
+        self.assertEqual(row_b.postcode, "EC4M 4AB")
+
+    def test_a_row_with_its_own_stated_address_becomes_the_group_representative(self):
+        # Tier 1 (deterministic, from a genuinely stated address) is
+        # preferred over ever running the hint-biased Tier 2 Places search
+        # at all for this group.
+        row_a = ListingRow(building="Nexus Place", provider="UNION", submarket="City")
+        row_b = ListingRow(
+            building="Nexus Place", provider="UNION", submarket="Clerkenwell",
+            address_1="25 Farringdon Street", postcode="EC4M 4AB",
+        )
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.52, "lng": -0.1},
+        ) as mock_geocoding, patch("geocode.call_places_text_search") as mock_places:
+            geocode.geocode_rows([row_a, row_b])
+
+        mock_geocoding.assert_called_once()
+        mock_places.assert_not_called()
+        self.assertEqual(row_a.address_1, "25 Farringdon Street")
+        self.assertEqual(row_a.postcode, "EC4M 4AB")
+        self.assertEqual(row_a.lat, 51.52)
+
+    def test_a_row_with_existing_lat_lng_becomes_the_shared_answer_with_no_api_call(self):
+        row_a = ListingRow(building="Nexus Place", provider="UNION", lat=51.52, lng=-0.1, submarket="City")
+        row_b = ListingRow(building="Nexus Place", provider="UNION", submarket="Clerkenwell")
+
+        with patch("geocode.call_geocoding_api") as mock_geocoding, \
+             patch("geocode.call_places_text_search") as mock_places, \
+             patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_rows([row_a, row_b])
+
+        mock_geocoding.assert_not_called()
+        mock_places.assert_not_called()
+        self.assertEqual(row_b.lat, 51.52)
+        self.assertEqual(row_b.lng, -0.1)
+
+    def test_representative_failure_falls_back_to_independent_attempts(self):
+        # The group's one shared attempt found nothing - rather than
+        # silently failing the whole group, each OTHER member still gets
+        # its own independent try (the pre-grouping behavior), and one of
+        # them succeeding must not be lost.
+        row_a = ListingRow(building="Nexus Place", provider="UNION", submarket="City")
+        row_b = ListingRow(building="Nexus Place", provider="UNION", submarket="Clerkenwell")
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertEqual(mock_places.call_count, 2)
+        self.assertIsNone(row_a.lat)
+        self.assertIsNone(row_b.lat)
+
+    def test_different_buildings_remain_independent_groups(self):
+        row_a = ListingRow(building="Nexus Place", provider="UNION")
+        row_b = ListingRow(building="Totally Different Building", provider="UNION")
+
+        def fake_places(query):
+            if "Nexus" in query:
+                return {"status": "OK", "lat": 51.52, "lng": -0.1, "address_components": []}
+            return {"status": "OK", "lat": 51.50, "lng": -0.2, "address_components": []}
+
+        with patch("geocode.call_places_text_search", side_effect=fake_places) as mock_places:
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertEqual(mock_places.call_count, 2)
+        self.assertEqual(row_a.lat, 51.52)
+        self.assertEqual(row_b.lat, 51.50)
+
+    def test_different_providers_for_the_same_building_name_remain_independent_groups(self):
+        # Same precedent master_merge.py's own _fallback_key already trusts
+        # elsewhere - building alone is never enough identity evidence
+        # without provider too.
+        row_a = ListingRow(building="Kent House", provider="UNION")
+        row_b = ListingRow(building="Kent House", provider="Some Other Agent")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.52, "lng": -0.1, "address_components": []},
+        ) as mock_places:
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertEqual(mock_places.call_count, 2)
+
+    def test_a_rows_own_stated_field_is_never_overwritten_by_the_group(self):
+        row_a = ListingRow(
+            building="Nexus Place", provider="UNION", submarket="City",
+            address_1="Row A's own stated address", postcode="AA1 1AA",
+        )
+        row_b = ListingRow(building="Nexus Place", provider="UNION", submarket="Clerkenwell")
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.1, "lng": -0.05},
+        ):
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertEqual(row_a.address_1, "Row A's own stated address")
+        self.assertEqual(row_a.postcode, "AA1 1AA")
+
+    def test_blank_building_rows_are_never_grouped_with_anything(self):
+        row_a = ListingRow(building="", provider="UNION")
+        row_b = ListingRow(building="", provider="UNION")
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            geocode.geocode_rows([row_a, row_b])
+
+        # Blank building means geocode_row's own Tier 2 branch never even
+        # runs (see geocode_row's own "if row.building:" guard) - confirms
+        # this grouping wrapper doesn't change that for either row.
+        mock_places.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

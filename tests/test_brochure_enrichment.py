@@ -1183,5 +1183,138 @@ class EnrichRowsGroupedConcurrencyTests(EnrichmentTestCase):
         self.assertEqual(stats["unique_brochures_considered"], 2)
 
 
+class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
+    """
+    already_processed/stats["processed_urls"]/url_checkpoint_callback -
+    lets a caller resume an interrupted run without re-fetching (and
+    re-billing Gemini for) a brochure already successfully checked. See
+    enrich_rows_grouped's own docstring: a blank special_features value can
+    never itself prove a brochure was never checked, so this is tracked by
+    explicit per-URL state, never inferred from row content.
+    """
+
+    def _rows(self, n, prefix="B"):
+        return [
+            ListingRow(building=f"{prefix}{i}", brochure_link=f"https://example.com/{prefix}{i}.pdf", special_features=None)
+            for i in range(n)
+        ]
+
+    def test_urls_already_marked_ok_are_never_refetched(self):
+        rows = self._rows(3)
+        already_processed = {"https://example.com/B0.pdf": "ok", "https://example.com/B1.pdf": "ok"}
+
+        def _fake(url):
+            return [{"building": url, "floor_unit": None, "special_features": "checked"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake) as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+
+        mock_extract.assert_called_once_with("https://example.com/B2.pdf")
+        self.assertEqual(stats["processed_urls"], {"https://example.com/B2.pdf": "ok"})
+
+    def test_skipped_rows_are_left_completely_unchanged(self):
+        rows = self._rows(2)
+        rows[0] = rows[0].model_copy(update={"special_features": "Already checked, genuinely nothing more"})
+        already_processed = {"https://example.com/B0.pdf": "ok"}
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[
+            {"building": "B1", "floor_unit": None, "special_features": "New"},
+        ]):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+
+        self.assertIs(enriched[0], rows[0])
+        self.assertEqual(enriched[0].special_features, "Already checked, genuinely nothing more")
+        self.assertEqual(enriched[1].special_features, "New")
+
+    def test_checked_with_no_applicable_features_is_still_recorded_as_ok(self):
+        # An empty units list (or one with nothing matching) is still a
+        # SUCCESSFUL check - never "unavailable" - see _extract_brochure_
+        # units' own None-vs-[] distinction.
+        rows = self._rows(1)
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[]):
+            _, _, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["processed_urls"], {"https://example.com/B0.pdf": "ok"})
+
+    def test_failed_brochure_is_recorded_as_unavailable_not_ok(self):
+        rows = self._rows(1)
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=None):
+            _, _, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["processed_urls"], {"https://example.com/B0.pdf": "unavailable"})
+
+    def test_previously_unavailable_url_is_retried_not_skipped(self):
+        rows = self._rows(1)
+        already_processed = {"https://example.com/B0.pdf": "unavailable"}
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[
+            {"building": "B0", "floor_unit": None, "special_features": "Recovered"},
+        ]) as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+
+        mock_extract.assert_called_once()
+        self.assertEqual(enriched[0].special_features, "Recovered")
+        self.assertEqual(stats["processed_urls"], {"https://example.com/B0.pdf": "ok"})
+
+    def test_url_checkpoint_callback_fires_with_cumulative_state(self):
+        rows = self._rows(1)
+        already_processed = {"https://example.com/other.pdf": "ok"}
+        seen = []
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[
+            {"building": "B0", "floor_unit": None, "special_features": "x"},
+        ]):
+            brochure_enrichment.enrich_rows_grouped(
+                rows, already_processed=already_processed, url_checkpoint_callback=seen.append,
+            )
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0], {"https://example.com/other.pdf": "ok", "https://example.com/B0.pdf": "ok"})
+
+    def test_url_checkpoint_callback_does_not_break_callers_using_only_checkpoint_callback(self):
+        rows = self._rows(1)
+        row_checkpoints = []
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[
+            {"building": "B0", "floor_unit": None, "special_features": "x"},
+        ]):
+            brochure_enrichment.enrich_rows_grouped(rows, checkpoint_callback=lambda r: row_checkpoints.append(list(r)))
+
+        self.assertTrue(row_checkpoints)
+
+    def test_everything_already_ok_is_a_no_op_with_correct_totals(self):
+        rows = self._rows(2)
+        already_processed = {r.brochure_link: "ok" for r in rows}
+
+        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+
+        mock_extract.assert_not_called()
+        self.assertEqual(stats["unique_brochures_considered"], 2)
+        self.assertEqual(stats["processed_urls"], {})
+        self.assertEqual(log, [])
+
+    def test_resume_after_interruption_processes_only_the_remaining_brochures(self):
+        # Simulates the exact reported scenario: 30 of 126 already checked,
+        # a resume must only touch the other 96 - proven here at smaller
+        # scale (2 of 5 already done).
+        rows = self._rows(5)
+        already_processed = {
+            "https://example.com/B0.pdf": "ok", "https://example.com/B1.pdf": "ok",
+        }
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[
+            {"building": "x", "floor_unit": None, "special_features": "f"},
+        ]) as mock_extract:
+            _, _, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+
+        self.assertEqual(mock_extract.call_count, 3)
+        called_urls = {c.args[0] for c in mock_extract.call_args_list}
+        self.assertEqual(called_urls, {"https://example.com/B2.pdf", "https://example.com/B3.pdf", "https://example.com/B4.pdf"})
+        self.assertEqual(len(stats["processed_urls"]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

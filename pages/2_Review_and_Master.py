@@ -4,6 +4,7 @@ import uuid
 import pandas as pd
 import streamlit as st
 
+import brochure_enrichment
 import display_utils
 import master_merge
 import master_writer
@@ -943,13 +944,14 @@ def _render_master_lookup(master_df: pd.DataFrame) -> None:
 def _render_brochure_enrichment_summary(pending: list) -> None:
     """
     Read-only "brochure enrichment: N rows enriched" caption per pending
-    file that actually went through it - purely informational, no button,
-    no action a user could forget to take. Enrichment itself now runs
-    automatically, immediately after a fresh spreadsheet upload's base rows
-    are staged (see app.py's _run_automatic_brochure_enrichment) - by the
-    time a file is even visible here, its own enrichment (if any was
+    file that actually went through it - purely informational for a file
+    that finished normally, no button, nothing to forget. Enrichment itself
+    runs automatically, immediately after a fresh spreadsheet upload's base
+    rows are staged (see app.py's _run_automatic_brochure_enrichment) - by
+    the time a file is even visible here, its own enrichment (if any was
     eligible) has already run and already been folded into the very rows
-    combined_df reads below; there is nothing left here to trigger.
+    combined_df reads below; there is nothing left here to trigger for a
+    file that completed.
 
     get_staging_enrichment_summary returns None for a file enrichment never
     touched at all (no eligible rows, or an upload predating this feature) -
@@ -961,11 +963,20 @@ def _render_brochure_enrichment_summary(pending: list) -> None:
     reached its own final set_staging_enrichment_summary call - an
     interruption (killed process, crashed Cloud Run instance, cancelled
     Streamlit rerun) partway through (see set_staging_enrichment_progress's
-    own docstring). Surfaced as an explicit warning, never folded into the
-    same "complete" caption below: this file's rows are a genuine mix of
-    enriched and never-attempted, and a blank special_features/state_of_
-    space cell here is NOT confirmation the brochure had nothing - it may
-    simply not have been checked yet.
+    own docstring). Surfaced as a prominent warning PLUS a "Continue
+    enrichment" button, never the same quiet caption a finished run gets:
+    this file's rows are a genuine mix of enriched and never-attempted, and
+    a blank special_features/state_of_space cell here is NOT confirmation
+    the brochure had nothing - it may simply not have been checked yet.
+    Clicking Continue resumes brochure_enrichment.run_brochure_enrichment
+    with already_processed=stats["processed_urls"] (see enrich_rows_
+    grouped's own docstring) - already-"ok" brochures are never re-fetched/
+    re-sent to Gemini, so this is genuinely a resume, not a restart. Not an
+    automatic retry loop: it only ever runs again when this exact button is
+    clicked, exactly once per click. Re-uploading the identical file
+    instead would NOT help (see app.py's own content-hash dedup - an
+    unchanged file's bytes are reused as-is), so Continue is the only real
+    recovery action offered.
     """
     for path in pending:
         stats = get_staging_enrichment_summary(path)
@@ -973,14 +984,20 @@ def _render_brochure_enrichment_summary(pending: list) -> None:
             continue
         filename = get_staging_filename(path)
         if stats.get("status") == "in_progress":
+            remaining = stats["unique_brochures_considered"] - stats["brochures_done"]
             st.warning(
-                f"Brochure enrichment — {filename}: only {stats['brochures_done']} of "
-                f"{stats['unique_brochures_considered']} unique brochure(s) were checked before this run "
-                "stopped (the app was likely interrupted or restarted mid-run). Blank descriptive fields on "
-                "this file's rows may simply be unchecked, not confirmed blank. Re-uploading the exact same "
-                "file again will NOT retry it (an unchanged file is reused as-is, enrichment included) — "
-                "discard this pending upload below first, then re-upload it to run enrichment from scratch."
+                f"⚠️ Brochure enrichment incomplete — {filename}: {stats['brochures_done']}/"
+                f"{stats['unique_brochures_considered']} unique brochure(s) checked before this run stopped "
+                "(the app was likely interrupted or restarted mid-run). Blank descriptive fields on this "
+                f"file's rows may simply be unchecked, not confirmed blank. {remaining} brochure(s) remain."
             )
+            if st.button(f"Continue enrichment ({remaining} remaining)", key=f"continue_enrichment_{path}"):
+                rows = dataframe_to_listing_rows(load_staging_as_dataframe(path))
+                with st.spinner("Resuming brochure enrichment..."):
+                    brochure_enrichment.run_brochure_enrichment(
+                        rows, path, already_processed=stats["processed_urls"],
+                    )
+                st.rerun()
             continue
         summary = (
             f"Brochure enrichment — {filename}: {stats['unique_brochures_considered']} unique brochure(s) "

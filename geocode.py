@@ -47,6 +47,7 @@ import sys
 import httpx
 
 from env_utils import load_dotenv
+from master_merge import normalize_key
 from schema import ListingRow
 
 load_dotenv()
@@ -383,9 +384,117 @@ def geocode_row(row: ListingRow) -> ListingRow:
     return row
 
 
+def _physical_identity_key(row: ListingRow):
+    """
+    (building, provider) as an exact, normalize_key-tolerant tuple, or None
+    if building is blank - the SAME identity tuple master_merge.py's own
+    _fallback_key already trusts elsewhere in this pipeline as sufficient
+    evidence two rows describe the same real building (never a fuzzy/
+    similarity match - see master_merge.BUILDING_FUZZY_MATCH_THRESHOLD's
+    own docstring on why a numbered address is never fuzzy-matched at all).
+    Reused here, not a new/looser trust level, specifically so a physical
+    location fact (lat/lng/address_1/postcode - which is true of the whole
+    BUILDING, never just one floor of it) is resolved once per building
+    rather than once per row.
+    """
+    building_key = normalize_key(row.building)
+    if not building_key:
+        return None
+    return building_key, normalize_key(row.provider)
+
+
 def geocode_rows(rows: list) -> list:
+    """
+    Resolves lat/lng (and backfills address_1/postcode/submarket where
+    blank) for every row, grouping rows that share the same (building,
+    provider) identity (see _physical_identity_key) so the group is
+    geocoded ONCE and every member's own blank location fields copy that
+    ONE result, rather than each row independently calling geocode_row and
+    risking a different answer for the same real building.
+
+    This exists because geocode_row's own Tier 2 Places query includes
+    row.submarket as a disambiguation hint (see its own docstring) - two
+    rows for the exact same building, listed under two different genuine
+    source areas/submarkets (see master_merge._group_unmatched_duplicates'
+    own source-row-identity handling - those two rows are deliberately kept
+    as separate master rows, never merged, since that's a question of
+    listing identity, not physical identity), can each bias the SAME
+    Places query differently and come back with two different addresses/
+    postcodes/coordinates for one real building (the confirmed real Nexus
+    Place case: EC4M 4AB vs EC1M 3HA). Grouping first makes the two
+    questions independent: which/how-many LISTING rows exist is decided
+    entirely by source-row identity (submarket included), while WHERE that
+    building actually is gets one consistent, correctly-resolved answer
+    shared by every row naming it - never two rows silently disagreeing
+    about their own physical location metadata.
+
+    Only ever fills a row's OWN blank fields (identical guarantee to
+    geocode_row's own field-by-field rule) - a row that already has its own
+    lat/lng, or its own address_1+postcode, is never touched by another
+    group member's result; if one IS already fully resolved, its result
+    becomes the group's shared answer instead of a fresh API call. The
+    representative actually sent through geocode_row is whichever member
+    has the most identifying information already (address_1+postcode, else
+    just address_1, else neither), preferring an existing head start over
+    an arbitrary first-in-batch pick - submarket is deliberately excluded
+    from that preference and never touched by this copy-down at all, since
+    it's the one field this whole grouping exists to keep row-specific.
+    """
+    groups = {}
+    ungrouped = []
     for row in rows:
+        key = _physical_identity_key(row)
+        if key is None:
+            ungrouped.append(row)
+        else:
+            groups.setdefault(key, []).append(row)
+
+    for row in ungrouped:
         geocode_row(row)
+
+    def _completeness(row):
+        if row.address_1 and row.postcode:
+            return 2
+        if row.address_1:
+            return 1
+        return 0
+
+    for members in groups.values():
+        if len(members) == 1:
+            geocode_row(members[0])
+            continue
+
+        already_resolved = next((r for r in members if r.lat is not None and r.lng is not None), None)
+        representative = already_resolved or max(members, key=_completeness)
+        geocode_row(representative)
+
+        if representative.lat is None or representative.lng is None:
+            # The group's one shared attempt found nothing - falls back to
+            # each OTHER member trying independently (the pre-grouping
+            # behavior) rather than letting one failed lookup silently fail
+            # the whole group; a different member's own address/building
+            # text is a genuinely different query that might still resolve
+            # even though the representative's own didn't.
+            for row in members:
+                if row is not representative:
+                    geocode_row(row)
+            continue
+
+        for row in members:
+            if row is representative:
+                continue
+            if row.lat is None and row.lng is None:
+                row.lat = representative.lat
+                row.lng = representative.lng
+            if not row.address_1 and representative.address_1:
+                row.address_1 = representative.address_1
+            if not row.postcode and representative.postcode:
+                row.postcode = representative.postcode
+            # submarket is NEVER copied here - see this function's own
+            # docstring on why that field alone stays row-specific.
+            if row.lat is not None and row.lng is not None:
+                _backfill_submarket_from_coords(row, row.lat, row.lng)
+
     return rows
 
 

@@ -1291,6 +1291,56 @@ def _brochure_link_identity_override(dicts: list) -> bool:
     return len(links) == 1
 
 
+def _partition_by_source_submarket(indices: list, unmatched: list) -> list:
+    """
+    Splits `indices` (candidate duplicates already sharing an identity key -
+    see _group_unmatched_duplicates) into sub-groups such that two rows with
+    a genuinely different, BOTH non-blank submarket/area value are NEVER
+    placed in the same sub-group - the signal that a provider's own source
+    workbook intentionally lists the same building/floor more than once
+    under a different area/submarket context (a real UNION file lists the
+    same physical unit once per area sheet it's marketed under) rather than
+    one listing accidentally duplicated by this pipeline. A blank submarket
+    on either side is never treated as evidence of anything - see test #3's
+    own "one area/submarket blank -> use existing identity evidence" rule -
+    a row with no stated submarket simply joins whichever sub-group it's
+    compatible with under this same tolerant rule, exactly as if this
+    function didn't exist for it.
+
+    Deliberately provider-agnostic and format-agnostic: this reads only
+    ListingRow's own submarket field, never a provider name, a sheet name,
+    or any hardcoded area string - it applies identically to any current or
+    future spreadsheet format that states a per-row area/submarket, and is
+    a pure no-op (single sub-group, unchanged behavior) for one that
+    doesn't.
+
+    A single sub-group (the whole of `indices`, in order) whenever every
+    member's submarket is blank or they all agree - the overwhelmingly
+    common case, and exactly the previous no-submarket-guard behavior.
+    Greedy first-fit, not a fully general conflict-graph partition: two
+    non-blank, DIFFERING submarket values are always split; a blank value
+    joins the first sub-group it's compatible with (which may itself have
+    started blank and since adopted a non-blank identity from an earlier
+    member) - correct for every realistic shape seen in practice (a
+    handful of distinct areas, or none), though a contrived, unordered mix
+    of several blanks and several conflicting non-blank values could
+    theoretically cluster differently under a different member order.
+    """
+    clusters = []  # each: [submarket_or_None, [indices...]]
+    for i in indices:
+        submarket_i = normalize_key(unmatched[i].new_row.submarket)
+        for cluster in clusters:
+            rep_submarket = cluster[0]
+            if not submarket_i or not rep_submarket or submarket_i == rep_submarket:
+                cluster[1].append(i)
+                if not rep_submarket and submarket_i:
+                    cluster[0] = submarket_i
+                break
+        else:
+            clusters.append([submarket_i, [i]])
+    return [members for _, members in clusters]
+
+
 def _group_unmatched_duplicates(unmatched: list) -> list:
     """
     Groups pending rows that both independently failed to match master but
@@ -1326,6 +1376,20 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
        genuinely strong evidence (an identical, provider-issued brochure
        document link) never even consulted.
 
+    BOTH passes are further split by _partition_by_source_submarket BEFORE
+    either one ever unions anything - a genuinely different, non-blank
+    submarket/area between two otherwise-identical candidates means the
+    ORIGINAL provider workbook intentionally represented them as separate
+    listings (see that function's own docstring), which must never be
+    collapsed into a merge OR a manual duplicate prompt merely because
+    building/provider/floor/postcode/brochure_link happen to agree - source-
+    listing identity and physical-property identity are two different
+    questions, and this function only ever answers the first. A shared
+    brochure_link is real evidence the same PHYSICAL property is involved,
+    but it is not evidence the provider intended one listing row, so it
+    never overrides a genuine submarket split, unlike the narrower
+    postcode-only override above.
+
     Returns groups of size > 1 only, exactly like the single-pass version
     this replaces.
     """
@@ -1346,8 +1410,9 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
     for i, u in enumerate(unmatched):
         by_key.setdefault(_dedup_key(u.new_row.model_dump()), []).append(i)
     for indices in by_key.values():
-        for i in indices[1:]:
-            union(indices[0], i)
+        for cluster in _partition_by_source_submarket(indices, unmatched):
+            for i in cluster[1:]:
+                union(cluster[0], i)
 
     address_groups = {}
     for i, u in enumerate(unmatched):
@@ -1361,34 +1426,38 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
     for indices in address_groups.values():
         if len(indices) < 2:
             continue
-        buildings = [unmatched[i].new_row.building for i in indices]
-        numbers = {n for n in (_leading_house_number(b) for b in buildings) if n is not None}
-        if len(numbers) > 1:
-            continue  # genuinely different numbered units on the same street
-        postcodes = {
-            _normalize_postcode(unmatched[i].new_row.postcode)
-            for i in indices
-            if not _is_blank(unmatched[i].new_row.postcode)
-        }
-        if len(postcodes) > 1:
-            # A real postcode disagreement is normally strong signal
-            # against merging (see this function's own docstring) - EXCEPT
-            # when every member of this SAME provider+floor_unit+street
-            # group also agrees on one identical, non-blank brochure_link
-            # (see _brochure_link_identity_override) - a provider-issued
-            # document tied to one specific property is stronger, less
-            # error-prone identity evidence than a geocoded postcode
-            # (which this pipeline derives via an API call biased by each
-            # sheet's own submarket text, not sourced from the provider's
-            # own spreadsheet at all - see the confirmed real Nexus Place
-            # case above). Never overrides the house-number check above,
-            # which comes straight from the provider's own text, not from
-            # geocoding.
-            group_dicts = [unmatched[i].new_row.model_dump() for i in indices]
-            if not _brochure_link_identity_override(group_dicts):
+        for cluster in _partition_by_source_submarket(indices, unmatched):
+            if len(cluster) < 2:
                 continue
-        for i in indices[1:]:
-            union(indices[0], i)
+            buildings = [unmatched[i].new_row.building for i in cluster]
+            numbers = {n for n in (_leading_house_number(b) for b in buildings) if n is not None}
+            if len(numbers) > 1:
+                continue  # genuinely different numbered units on the same street
+            postcodes = {
+                _normalize_postcode(unmatched[i].new_row.postcode)
+                for i in cluster
+                if not _is_blank(unmatched[i].new_row.postcode)
+            }
+            if len(postcodes) > 1:
+                # A real postcode disagreement is normally strong signal
+                # against merging (see this function's own docstring) - EXCEPT
+                # when every member of this SAME provider+floor_unit+street
+                # (+submarket, per the partition above) group also agrees on
+                # one identical, non-blank brochure_link (see
+                # _brochure_link_identity_override) - a provider-issued
+                # document tied to one specific property is stronger, less
+                # error-prone identity evidence than a geocoded postcode
+                # (which this pipeline derives via an API call biased by each
+                # sheet's own submarket text, not sourced from the provider's
+                # own spreadsheet at all - see the confirmed real Nexus Place
+                # case above). Never overrides the house-number check above,
+                # which comes straight from the provider's own text, not from
+                # geocoding.
+                group_dicts = [unmatched[i].new_row.model_dump() for i in cluster]
+                if not _brochure_link_identity_override(group_dicts):
+                    continue
+            for i in cluster[1:]:
+                union(cluster[0], i)
 
     components = {}
     for i in range(len(unmatched)):

@@ -701,6 +701,247 @@ class BrochureLinkOverridesPostcodeConflictTests(unittest.TestCase):
         self.assertEqual(consolidated.unmatched_collisions, [])
 
 
+class SourceRowIdentityPreservedTests(unittest.TestCase):
+    """
+    A provider's own source workbook can intentionally list the SAME
+    building/floor more than once under a different area/submarket context
+    (a real UNION file lists the same physical unit once per area sheet
+    it's marketed under) - that is a decision about how many LISTING rows
+    exist, entirely separate from whether two rows describe the same
+    PHYSICAL property (see _brochure_link_identity_override's own,
+    narrower postcode-only concern). _partition_by_source_submarket must
+    keep such rows apart - never merged, never even offered as a manual
+    duplicate decision - while still letting every other existing
+    duplicate/conflict rule apply normally whenever submarket doesn't
+    distinguish them. Deliberately provider-agnostic: every scenario here
+    uses invented buildings/providers, proving the rule from ListingRow's
+    own submarket field alone, never a hardcoded provider name or area.
+    """
+
+    def _plan_with_unmatched(self, rows):
+        unmatched = [master_merge.UnmatchedRow(r) for r in rows]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        return master_merge.MergePlan([], [], [], unmatched, [], groups)
+
+    # 1. Different, meaningful, non-blank submarket -> two rows, no manual
+    # duplicate decision at all.
+    def test_different_meaningful_submarket_keeps_rows_separate_with_no_prompt(self):
+        row_a = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=2000.0,
+        )
+        row_b = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="South District", size_sqft=2000.0,
+        )
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        self.assertEqual(groups, [])
+
+        plan = self._plan_with_unmatched([row_a, row_b])
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+        self.assertEqual(len(consolidated.unmatched), 2)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+    # 2. Same building/provider/floor AND same submarket -> existing
+    # duplicate logic applies (safe auto-consolidation).
+    def test_same_submarket_still_auto_consolidates_as_before(self):
+        row_a = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=2000.0,
+        )
+        row_b = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=2000.0,
+        )
+        plan = self._plan_with_unmatched([row_a, row_b])
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+    # 3. One submarket blank -> do not assume distinct; fall back to
+    # existing identity evidence (here, a genuine size conflict still
+    # forces manual review exactly as it would with no submarket at all).
+    def test_one_blank_submarket_does_not_assume_distinctness(self):
+        row_a = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=2000.0,
+        )
+        row_b = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket=None, size_sqft=5000.0,
+        )
+        plan = self._plan_with_unmatched([row_a, row_b])
+
+        groups = master_merge._group_unmatched_duplicates(
+            [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        )
+        self.assertEqual(len(groups), 1)  # still treated as ONE candidate-duplicate group
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+        self.assertEqual(len(consolidated.unmatched), 2)  # left for manual review
+        self.assertEqual(len(consolidated.unmatched_collisions), 1)
+
+    # 6. A pipeline-generated duplicate of one source row (identical
+    # submarket, identical everything) still consolidates even in a batch
+    # that ALSO contains a genuinely distinct-submarket row for the same
+    # building/floor - the distinct row must not block the OTHER, genuinely
+    # safe consolidation.
+    def test_accidental_duplicate_still_consolidates_alongside_a_distinct_submarket_row(self):
+        row_a = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=2000.0,
+        )
+        row_a_dupe = row_a.model_copy(update={"property_id": None})
+        row_b = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="South District", size_sqft=2000.0,
+        )
+        plan = self._plan_with_unmatched([row_a, row_a_dupe, row_b])
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 2)  # merged North pair + separate South row
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        submarkets = sorted(r.new_row.submarket for r in consolidated.unmatched)
+        self.assertEqual(submarkets, ["North District", "South District"])
+
+    # 7. A genuine source-data conflict (unrelated to submarket) still
+    # requires manual review even when submarket also happens to differ -
+    # a submarket difference isn't a blanket excuse for every OTHER field
+    # to be flagged instead of resolved; it only ever governs whether rows
+    # are grouped as duplicate candidates AT ALL. Here they aren't (this
+    # covers the "genuinely conflicting duplicate" case at the row-pair
+    # level - a group that never forms produces no prompt, which is
+    # covered by test 1 above; this test instead confirms a SAME-submarket
+    # conflict still gets manual review, unaffected by this feature).
+    def test_genuine_conflict_with_same_submarket_still_needs_manual_review(self):
+        row_a = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=2000.0,
+        )
+        row_b = ListingRow(
+            building="Example Tower", provider="Acme Estates", floor_unit="5th",
+            submarket="North District", size_sqft=9999.0,
+        )
+        plan = self._plan_with_unmatched([row_a, row_b])
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 2)
+        self.assertEqual(len(consolidated.unmatched_collisions), 1)
+
+    # 8. A different provider entirely is unaffected by this rule existing.
+    def test_unrelated_provider_batch_is_unaffected(self):
+        row_a = ListingRow(building="Some Building", provider="Other Provider", floor_unit="2nd", size_sqft=800.0)
+        row_b = ListingRow(building="Some Building", provider="Other Provider", floor_unit="2nd", size_sqft=800.0)
+        plan = self._plan_with_unmatched([row_a, row_b])
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+    # Non-UNION regression proving the rule is fully generic - a different
+    # invented provider/format, same mechanism.
+    def test_generic_non_union_provider_with_area_distinction(self):
+        row_a = ListingRow(
+            building="Riverside House", provider="Meridian Workspace", floor_unit="3rd",
+            submarket="Riverside", size_sqft=1500.0,
+        )
+        row_b = ListingRow(
+            building="Riverside House", provider="Meridian Workspace", floor_unit="3rd",
+            submarket="Docklands", size_sqft=1500.0,
+        )
+        plan = self._plan_with_unmatched([row_a, row_b])
+
+        groups = master_merge._group_unmatched_duplicates(
+            [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        )
+        self.assertEqual(groups, [])
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+        self.assertEqual(len(consolidated.unmatched), 2)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+
+class NexusPlaceSourceRowVsPhysicalIdentityTests(unittest.TestCase):
+    """
+    The required Nexus Place regression test (see this module's own
+    _partition_by_source_submarket/_group_unmatched_duplicates docstrings):
+    the SAME real UNION listing intentionally appears under two different
+    submarkets in the original workbook (City / Clerkenwell & Farringdon) -
+    genuinely two source rows, not a pipeline duplicate - while also being
+    the exact real case _brochure_link_identity_override exists for (a
+    shared brochure_link overriding a geocoding-artifact postcode
+    disagreement). Both protections must hold at once: 2 rows out, 0
+    manual-merge prompts, submarkets preserved, shared brochure_link never
+    used to collapse them into one - proving source-listing identity and
+    physical-property identity are governed independently.
+    """
+
+    def _rows(self):
+        row_a = ListingRow(
+            submarket="City", building="Nexus Place - 25 Farringdon Place", floor_unit="5th",
+            postcode="EC4M 4AB", address_1="25 Farringdon Street",
+            brochure_link="https://app.box.com/s/cktz4q797wgzo5dgoi1flvrcf2d70ae2",
+            source_file="UNION.xlsx — City",
+        )
+        row_b = ListingRow(
+            submarket="Clerkenwell & Farringdon", building="Nexus Place - 25 Farringdon Place", floor_unit="5th",
+            postcode="EC1M 3HA", address_1="25-27 Farringdon Road",
+            brochure_link=row_a.brochure_link,
+            source_file="UNION.xlsx — Clerkenwell & Farringdon",
+        )
+        return row_a, row_b
+
+    def test_nexus_place_yields_two_rows_with_no_manual_merge_decision(self):
+        row_a, row_b = self._rows()
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        self.assertEqual(groups, [])
+
+        plan = master_merge.MergePlan([], [], [], unmatched, [], groups)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 2)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        submarkets = sorted(r.new_row.submarket for r in consolidated.unmatched)
+        self.assertEqual(submarkets, ["City", "Clerkenwell & Farringdon"])
+
+    def test_shared_brochure_link_does_not_collapse_the_two_submarkets(self):
+        # Explicit safety check: the exact identity evidence that WOULD
+        # merge two rows lacking a submarket distinction (see
+        # BrochureLinkOverridesPostcodeConflictTests) must never override a
+        # genuine submarket split.
+        row_a, row_b = self._rows()
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        self.assertTrue(master_merge._brochure_link_identity_override(
+            [row_a.model_dump(), row_b.model_dump()]
+        ))  # the override condition genuinely holds here...
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        self.assertEqual(groups, [])  # ...but still never merges them.
+
+    def test_does_not_prevent_a_genuine_accidental_duplicate_in_the_same_submarket(self):
+        # A THIRD row - an accidental re-extraction of row_a itself (same
+        # submarket, same everything) - must still safely auto-consolidate
+        # with row_a, without being dragged into row_b's separate identity.
+        row_a, row_b = self._rows()
+        row_a_dupe = row_a.model_copy(update={"source_file": "UNION.xlsx — City (re-run)"})
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_a_dupe), master_merge.UnmatchedRow(row_b)]
+        plan = master_merge.MergePlan([], [], [], unmatched, [], master_merge._group_unmatched_duplicates(unmatched))
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 2)  # merged City pair + separate Clerkenwell row
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+
 class CollisionGroupFieldsTests(unittest.TestCase):
     def test_union_of_diffs_in_diff_fields_order(self):
         master_df = _master_df([{"building": "A", "provider": "P1", "size_sqft": 1000.0, "state_of_space": "Cat A"}])

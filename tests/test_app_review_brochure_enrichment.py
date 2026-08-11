@@ -1,10 +1,13 @@
 """
-Streamlit-level regression tests for the READ-ONLY brochure-enrichment
-summary on pages/2_Review_and_Master.py's pending-review screen (see
-_render_brochure_enrichment_summary) - enrichment itself now runs
-automatically during Extract (see test_app_upload_brochure_enrichment.py),
-never from a button here. This page only ever shows a caption reporting
-what already happened.
+Streamlit-level regression tests for the brochure-enrichment summary on
+pages/2_Review_and_Master.py's pending-review screen (see
+_render_brochure_enrichment_summary) - purely a read-only caption for a
+file that finished normally (enrichment itself runs automatically during
+Extract, see test_app_upload_brochure_enrichment.py, never from a button
+for that case), but a "Continue enrichment" button DOES appear for a file
+whose enrichment was interrupted partway through - the one and only
+action this page offers, and only ever to recover from that specific
+situation, never to make ordinary enrichment optional.
 
 Runs from an isolated temporary working directory (never the real repo),
 same approach as test_app_review_master_lookup.py.
@@ -28,7 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import master_writer
 from schema import ListingRow
-from storage.file_store import save_staging_file, set_staging_enrichment_progress, set_staging_enrichment_summary
+from storage.file_store import (
+    get_staging_enrichment_summary,
+    load_staging_as_dataframe,
+    save_staging_file,
+    set_staging_enrichment_progress,
+    set_staging_enrichment_summary,
+)
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -43,7 +52,13 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
         os.chdir(self._original_cwd)
         self._tmp.cleanup()
 
-    def test_no_manual_enrich_button_exists_anywhere_on_the_page(self):
+    def test_no_enrich_button_for_a_file_with_no_interrupted_run(self):
+        # No enrichment ever ran for this file at all (get_staging_
+        # enrichment_summary returns None) - "Continue enrichment" only
+        # ever appears for a file whose OWN interim marker says
+        # status="in_progress" (see test_interrupted_run_offers_a_
+        # continue_button_with_the_remaining_count), never as a general
+        # optional trigger.
         save_staging_file(
             [ListingRow(
                 building="16 Dufour's Place", floor_unit="3rd Floor",
@@ -67,10 +82,10 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
             )],
             "Union.xlsx", content_hash="hash-2",
         )
-        set_staging_enrichment_summary(path, {
-            "unique_brochures_considered": 1, "brochures_read_ok": 1,
-            "brochures_unavailable": 0, "rows_eligible": 1, "rows_enriched": 1,
-        })
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 1},
+            {"https://example.com/brochure.pdf": "ok"},
+        )
 
         at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
         at.run()
@@ -98,10 +113,10 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
             [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features="x")],
             "Union.xlsx", content_hash="hash-4",
         )
-        set_staging_enrichment_summary(path, {
-            "unique_brochures_considered": 5, "brochures_read_ok": 3,
-            "brochures_unavailable": 2, "rows_eligible": 5, "rows_enriched": 3,
-        })
+        processed = {f"https://example.com/{i}.pdf": ("ok" if i < 3 else "unavailable") for i in range(5)}
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 5, "rows_eligible": 5, "rows_enriched": 3}, processed,
+        )
 
         at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
         at.run()
@@ -121,36 +136,60 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
             [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)],
             "Union.xlsx", content_hash="hash-interrupted",
         )
-        set_staging_enrichment_progress(path, 4, 10)
+        processed = {f"https://example.com/{i}.pdf": "ok" for i in range(4)}
+        set_staging_enrichment_progress(path, processed, 10)
 
         at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
         at.run()
         self.assertFalse(at.exception)
 
         warning_text = "".join(w.value for w in at.warning)
-        self.assertIn("4 of 10", warning_text)
+        self.assertIn("4/10", warning_text)
         self.assertIn("stopped", warning_text)
         caption_text = "".join(c.value for c in at.caption)
         self.assertNotIn("Brochure enrichment", caption_text)
 
-    def test_interrupted_run_warning_correctly_advises_discard_then_reupload(self):
-        # A byte-identical re-upload is REUSED as-is (see app.py's own
-        # content-hash dedup), never re-triggering enrichment - so the
-        # advice here must be to discard first, never just "re-upload",
-        # which would silently do nothing.
+    def test_interrupted_run_offers_a_continue_button_with_the_remaining_count(self):
         path = save_staging_file(
             [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)],
             "Union.xlsx", content_hash="hash-interrupted-2",
         )
-        set_staging_enrichment_progress(path, 0, 3)
+        processed = {f"https://example.com/{i}.pdf": "ok" for i in range(4)}
+        set_staging_enrichment_progress(path, processed, 10)
 
         at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
         at.run()
         self.assertFalse(at.exception)
 
-        warning_text = "".join(w.value for w in at.warning).lower()
-        self.assertIn("discard", warning_text)
-        self.assertIn("will not retry", warning_text)
+        continue_buttons = [b for b in at.button if "Continue enrichment" in (b.label or "")]
+        self.assertEqual(len(continue_buttons), 1)
+        self.assertIn("6 remaining", continue_buttons[0].label)
+
+    def test_clicking_continue_resumes_only_the_remaining_brochures(self):
+        path = save_staging_file(
+            [
+                ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+                ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
+            ],
+            "Union.xlsx", content_hash="hash-interrupted-3",
+        )
+        set_staging_enrichment_progress(path, {"https://example.com/a.pdf": "ok"}, 2)
+
+        with patch(
+            "brochure_enrichment._extract_brochure_units",
+            return_value=[{"building": "B", "floor_unit": None, "special_features": "Recovered"}],
+        ) as mock_extract:
+            at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+            at.run()
+            continue_button = next(b for b in at.button if "Continue enrichment" in (b.label or ""))
+            continue_button.click().run()
+            self.assertFalse(at.exception)
+
+        mock_extract.assert_called_once_with("https://example.com/b.pdf")
+        df = load_staging_as_dataframe(path)
+        self.assertEqual(df.loc[df["building"] == "B", "special_features"].iloc[0], "Recovered")
+        stats = get_staging_enrichment_summary(path)
+        self.assertEqual(stats["status"], "complete")
 
 
 def _pdf_response():

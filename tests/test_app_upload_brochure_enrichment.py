@@ -245,6 +245,95 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         self.assertEqual(df.iloc[0]["building"], "Building 0")
 
 
+class ReuploadWhileIncompleteTests(unittest.TestCase):
+    """
+    Content-hash dedup (see app.py's own find_previous_upload_by_hash)
+    reuses an already-extracted result for a byte-identical re-upload
+    rather than re-extracting/re-enriching (see app.py's own "if
+    is_spreadsheet_source and not reused:" guard around _run_automatic_
+    brochure_enrichment - pre-existing, unchanged behavior) - an incomplete
+    prior result (a run interrupted partway through - see
+    set_staging_enrichment_progress) must never be silently treated as
+    done just because the file was uploaded again.
+
+    Each upload event still stages its OWN file (see save_staging_file's
+    own docstring - "reused or freshly extracted alike", a pre-existing,
+    unrelated design choice for multi-file-batch durability), so a
+    re-upload genuinely produces a SECOND pending entry; this is not a
+    duplication this feature introduces or is meant to fix, and the
+    ORIGINAL (first) file's own incomplete status/rows are what must
+    survive the reuse untouched - checked here, not "only one file exists"
+    (see this module's own docstring on this known, pre-existing
+    limitation for the "Continue enrichment" story: a user should ideally
+    reach for it on the same pending file rather than re-uploading at all).
+    """
+
+    def setUp(self):
+        _clear_pending()
+        brochure_enrichment._extract_brochure_units.cache_clear()
+        # This class deletes/rewrites staging files directly (not just
+        # through the app's own API, unlike a real upload) - clearing
+        # these caches too avoids a stale cross-test cached listing/lookup
+        # within the same process (other test classes in this same file
+        # share the real repo's staging/ directory, never an isolated cwd).
+        from storage import file_store as _file_store
+        _file_store._list_pending_staging_files_cached.clear()
+        _file_store._find_previous_upload_by_hash_cached.clear()
+        _file_store._load_staging_as_dataframe_cached.clear()
+
+    def tearDown(self):
+        _clear_pending()
+        brochure_enrichment._extract_brochure_units.cache_clear()
+
+    def test_reuploading_the_same_file_while_incomplete_does_not_mark_it_complete(self):
+        file_bytes = _union_style_workbook()
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=RuntimeError("interrupted")):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        pending = list_pending_staging_files()
+        self.assertEqual(len(pending), 1)
+        original_path = pending[0]
+        # A genuine crash-mid-run leaves an "in_progress" marker (see
+        # run_brochure_enrichment) - simulated directly here since a
+        # RuntimeError from _extract_brochure_units is caught and recorded
+        # as "unavailable", not an uncaught crash; this test is about the
+        # RE-UPLOAD behavior, not reproducing the crash itself (see
+        # test_app_review_brochure_enrichment.py for that).
+        from storage.file_store import set_staging_enrichment_progress
+        set_staging_enrichment_progress(original_path, {}, 1)
+
+        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+            at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at2.run()
+            at2.file_uploader[0].upload(
+                "Union.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at2.run()
+            extract_buttons = [b for b in at2.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at2.exception)
+
+        # Reused, not re-extracted or re-enriched - no new brochure call at
+        # all for the re-upload event itself (the content-hash match skips
+        # _run_automatic_brochure_enrichment entirely - see app.py's own
+        # "not reused" guard).
+        mock_extract.assert_not_called()
+        # The ORIGINAL file's own incomplete status survives untouched -
+        # never silently promoted to "complete" just because the file was
+        # uploaded again elsewhere.
+        stats = get_staging_enrichment_summary(original_path)
+        self.assertEqual(stats["status"], "in_progress")
+
+
 class FingerprintIncludesBrochureEnrichmentAgainTests(unittest.TestCase):
     def test_fingerprint_includes_brochure_enrichment_again(self):
         # brochure_enrichment.py runs unconditionally during extraction

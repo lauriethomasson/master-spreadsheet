@@ -65,11 +65,13 @@ import sys
 from urllib.parse import urlparse
 
 import httpx
+import streamlit as st
 
 import extract
 from brochure_link_resolver import REQUEST_TIMEOUT, USER_AGENT, is_generic_link, resolve_brochure_link
 from master_merge import normalize_key
 from schema import ListingRow
+from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
 
 # The only fields enrich_row ever assigns to, and only when the row's own
 # value is blank - see the module docstring for why this list alone is the
@@ -658,7 +660,10 @@ CHECKPOINT_EVERY = 10
 DEFAULT_MAX_WORKERS = 5
 
 
-def enrich_rows_grouped(rows: list, progress_callback=None, checkpoint_callback=None, max_workers: int = DEFAULT_MAX_WORKERS):
+def enrich_rows_grouped(
+    rows: list, progress_callback=None, checkpoint_callback=None, max_workers: int = DEFAULT_MAX_WORKERS,
+    already_processed: dict = None, url_checkpoint_callback=None,
+):
     """
     (rows, log, stats) - like enrich_rows, but processes each DISTINCT
     eligible brochure_link (see eligible_rows_and_brochures) exactly ONCE
@@ -727,9 +732,41 @@ def enrich_rows_grouped(rows: list, progress_callback=None, checkpoint_callback=
     be able to abort an entire upload over one bad brochure, so it stays
     defensive even though every currently-known failure mode is already
     handled one level down).
+
+    already_processed ({url: "ok" | "unavailable"}, from a PRIOR call of
+    this same function against this same staging file - see storage.
+    file_store's own processed_urls persistence) lets a caller RESUME an
+    interrupted run: a URL already marked "ok" here is skipped entirely -
+    never re-fetched, never re-sent to Gemini, full stop - since "blank
+    special_features" alone can never tell a caller whether a brochure was
+    already successfully checked and genuinely had nothing to contribute,
+    or was never checked at all (see this module's own ENRICHABLE_FIELDS
+    docstring on why a blank value is never itself evidence of anything).
+    A URL marked "unavailable" is NOT skipped - retried exactly like a
+    never-seen URL, since a fetch/Gemini failure may well have been
+    transient; this is bounded by the caller only ever resuming in
+    response to an explicit action (see pages/2_Review_and_Master.py's own
+    "Continue enrichment"), never an automatic unbounded retry loop.
+    Defaults to {} (nothing previously processed - identical to every
+    prior behavior before this parameter existed).
+
+    stats["processed_urls"] ({url: "ok" | "unavailable"}) reports the
+    outcome for every URL actually FETCHED during THIS call only (never
+    includes a URL skipped via already_processed) - the caller merges this
+    into its own persisted cumulative record; deliberately not merged with
+    already_processed internally, so a caller can always tell "what did
+    THIS call itself just learn" apart from "what was already known
+    coming in". url_checkpoint_callback(processed_urls_so_far), if given,
+    fires at the exact same points as checkpoint_callback (see its own
+    docstring) with the CUMULATIVE dict (already_processed merged with
+    every outcome learned so far this call) - a separate callback, not a
+    second argument added to checkpoint_callback, so every existing caller
+    that only ever passes checkpoint_callback is completely unaffected.
     """
     progress_callback = progress_callback or (lambda done, total, label: None)
+    already_processed = already_processed or {}
     eligible, unique_urls = eligible_rows_and_brochures(rows)
+    urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
 
     first_label = {}
     indices_by_url = {}
@@ -742,12 +779,14 @@ def enrich_rows_grouped(rows: list, progress_callback=None, checkpoint_callback=
     log = []
     brochures_read_ok = 0
     brochures_unavailable = 0
+    processed_urls = {}
 
-    if not unique_urls:
+    if not unique_urls or not urls_to_fetch:
         progress_callback(0, 0, None)
         return current, log, {
-            "unique_brochures_considered": 0, "brochures_read_ok": 0,
+            "unique_brochures_considered": len(unique_urls), "brochures_read_ok": 0,
             "brochures_unavailable": 0, "rows_eligible": len(eligible), "rows_enriched": 0,
+            "processed_urls": processed_urls,
         }
 
     def _fetch_one(url):
@@ -762,14 +801,27 @@ def enrich_rows_grouped(rows: list, progress_callback=None, checkpoint_callback=
 
     since_checkpoint = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        futures = [executor.submit(_fetch_one, url) for url in unique_urls]
+        futures = [executor.submit(_fetch_one, url) for url in urls_to_fetch]
         for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
             url, units = future.result()
 
-            if units:
+            # is not None, not plain truthiness - _extract_brochure_units
+            # returns [] (falsy) for a brochure that was successfully
+            # fetched and read but genuinely has no units in it, which is
+            # a real "checked, nothing there" outcome, never the same as
+            # None's "couldn't read this at all" (see that function's own
+            # docstring). Conflating the two here would wrongly mark a
+            # perfectly good, already-checked brochure "unavailable" -
+            # exactly the ambiguity per-URL status tracking exists to
+            # avoid (a caller resuming later must retry a genuine failure
+            # but must never re-fetch/re-bill Gemini for one that simply
+            # had nothing to contribute).
+            if units is not None:
                 brochures_read_ok += 1
+                processed_urls[url] = "ok"
             else:
                 brochures_unavailable += 1
+                processed_urls[url] = "unavailable"
 
             for i in indices_by_url[url]:
                 new_row, fields = _apply_units_to_row(rows[i], units)
@@ -782,12 +834,15 @@ def enrich_rows_grouped(rows: list, progress_callback=None, checkpoint_callback=
                         "brochure_link": new_row.brochure_link,
                     })
 
-            progress_callback(done, len(unique_urls), first_label.get(url))
+            progress_callback(done, len(urls_to_fetch), first_label.get(url))
 
             since_checkpoint += 1
-            is_last = done == len(unique_urls)
-            if checkpoint_callback and (since_checkpoint >= CHECKPOINT_EVERY or is_last):
-                checkpoint_callback(list(current))
+            is_last = done == len(urls_to_fetch)
+            if (checkpoint_callback or url_checkpoint_callback) and (since_checkpoint >= CHECKPOINT_EVERY or is_last):
+                if checkpoint_callback:
+                    checkpoint_callback(list(current))
+                if url_checkpoint_callback:
+                    url_checkpoint_callback({**already_processed, **processed_urls})
                 since_checkpoint = 0
 
     stats = {
@@ -796,5 +851,95 @@ def enrich_rows_grouped(rows: list, progress_callback=None, checkpoint_callback=
         "brochures_unavailable": brochures_unavailable,
         "rows_eligible": len(eligible),
         "rows_enriched": len(log),
+        "processed_urls": processed_urls,
     }
     return current, log, stats
+
+
+def run_brochure_enrichment(rows: list, staging_path: str, already_processed: dict) -> list:
+    """
+    The Streamlit-aware orchestration shared by BOTH callers that ever run
+    enrich_rows_grouped against a real staging file: app.py's automatic
+    run right after a fresh upload (already_processed={} - nothing to
+    resume yet) and pages/2_Review_and_Master.py's "Continue enrichment"
+    action on an interrupted one (already_processed=whatever
+    get_staging_enrichment_summary's own "processed_urls" already
+    recorded). enrich_rows_grouped itself stays the pure, callback-driven
+    core with no Streamlit/storage dependency of its own (see its own
+    docstring) - this wrapper is the one place that actually renders a
+    progress bar and persists both row-level progress and per-URL state,
+    so the two callers share identical checkpointing/persistence behavior
+    rather than two independently-maintained copies of it.
+
+    Renders its own progress bar (caller prints any introductory caption
+    first, e.g. "N row(s) have missing information..." vs. "Resuming...",
+    since that wording legitimately differs per caller) and a final
+    "Brochure enrichment complete: ..." caption once every remaining
+    brochure has been processed. Returns the enriched rows so the caller
+    can reassign its own `rows` variable to the final state.
+
+    Persists incrementally exactly like the automatic run always has:
+    update_staging_rows + set_staging_enrichment_progress (status=
+    "in_progress", the FULL cumulative processed_urls so far) at every
+    enrich_rows_grouped checkpoint, and set_staging_enrichment_summary
+    (status="complete") only once this call's own remaining brochures are
+    entirely done - so an interruption partway through a RESUME leaves
+    exactly the same kind of recoverable, explicit "in_progress" record a
+    first run's own interruption would, never silently reverting to
+    looking complete or looking like nothing ever ran.
+    """
+    eligible, unique_urls = eligible_rows_and_brochures(rows)
+    urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
+
+    progress_slot = st.empty()
+    bar = progress_slot.progress(0.0, text=f"Enriching from brochures — 0 / {len(urls_to_fetch)}")
+
+    # Written BEFORE the run starts (not just at checkpoints) so even an
+    # interruption in the first few seconds - before a single brochure has
+    # completed, let alone reached CHECKPOINT_EVERY - still leaves an
+    # "in_progress" record in meta.json rather than none at all (see
+    # set_staging_enrichment_progress's own docstring on why a missing
+    # record is otherwise indistinguishable from "nothing was eligible").
+    set_staging_enrichment_progress(staging_path, already_processed, len(unique_urls))
+
+    def on_progress(done, total, label):
+        if not total:
+            return
+        text = f"Enriching from brochures — {done} / {total}"
+        if label:
+            text += f" ({label})"
+        bar.progress(done / total, text=text)
+
+    def on_checkpoint(rows_so_far):
+        update_staging_rows(staging_path, rows_so_far)
+
+    def on_url_checkpoint(processed_urls_so_far):
+        set_staging_enrichment_progress(staging_path, processed_urls_so_far, len(unique_urls))
+
+    enriched_rows, _log, stats = enrich_rows_grouped(
+        rows, progress_callback=on_progress, checkpoint_callback=on_checkpoint,
+        url_checkpoint_callback=on_url_checkpoint, already_processed=already_processed,
+    )
+    progress_slot.empty()
+
+    cumulative_processed_urls = {**already_processed, **stats["processed_urls"]}
+    update_staging_rows(staging_path, enriched_rows)
+    set_staging_enrichment_summary(staging_path, stats, cumulative_processed_urls)
+
+    counts = _derive_cumulative_counts(cumulative_processed_urls)
+    summary = (
+        f"{len(unique_urls)} unique brochure(s) considered, "
+        f"{counts['ok']} read successfully, {stats['rows_enriched']} row(s) enriched this run."
+    )
+    if counts["unavailable"]:
+        summary += f" {counts['unavailable']} brochure(s) could not be processed."
+    st.caption(f"Brochure enrichment complete: {summary}")
+
+    return enriched_rows
+
+
+def _derive_cumulative_counts(processed_urls: dict) -> dict:
+    return {
+        "ok": sum(1 for v in processed_urls.values() if v == "ok"),
+        "unavailable": sum(1 for v in processed_urls.values() if v == "unavailable"),
+    }
