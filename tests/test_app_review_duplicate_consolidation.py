@@ -67,7 +67,7 @@ class RealPatternConsolidationTests(IsolatedCwdTestCase):
 
         # No "Possible duplicate" card at all - fully auto-consolidated.
         self.assertEqual([e for e in at.expander if "Possible duplicate" in (e.label or "")], [])
-        self.assertNotIn("⚠️ Needs a decision", [s.value for s in at.subheader])
+        self.assertNotIn("⚠️ Needs your decision", [s.value for s in at.subheader])
 
         summary_text = "".join(c.value for c in at.caption)
         self.assertIn("3 extracted row(s)", summary_text)
@@ -119,7 +119,7 @@ class RealPatternConsolidationTests(IsolatedCwdTestCase):
         )
 
         at = _run_review_page()
-        self.assertIn("⚠️ Needs a decision", [s.value for s in at.subheader])
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
         self.assertEqual(len([e for e in at.expander if "Possible duplicate" in (e.label or "")]), 1)
 
         summary_text = "".join(c.value for c in at.caption)
@@ -197,7 +197,7 @@ class ExistingMasterInteractionTests(IsolatedCwdTestCase):
         )
 
         at = _run_review_page()
-        self.assertIn("Matched — changes detected", [s.value for s in at.subheader])
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
 
 
 class SummaryBannerTests(IsolatedCwdTestCase):

@@ -52,11 +52,18 @@ class CollisionGroupRendersAsOneDecisionTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_identical_collision_renders_as_one_expander_not_two(self):
-        # Master already has a bare-bones Copthall House row (no address/
-        # submarket/features/contacts yet) - this upload's two sheets both
-        # fill in the SAME 6 fields identically, the exact reported shape.
+        # Master already has a Copthall House row with its OWN address
+        # already on file (only submarket/lat/lng/features/contacts still
+        # blank) - deliberately avoids also exercising house_number_changed
+        # (a real, separate, unrelated safeguard that fires whenever
+        # address_1 goes from blank to populated - not what this test is
+        # about). This upload's two sheets both fill in the same remaining
+        # fields identically, the exact reported shape.
         master_writer.write_master([
-            ListingRow(building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor"),
+            ListingRow(
+                building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor",
+                address_1="1 Copthall Avenue",
+            ),
         ])
         shared_fields = dict(
             building="Copthall House", provider="Copthall Estates", floor_unit="4th Floor",
@@ -71,23 +78,34 @@ class CollisionGroupRendersAsOneDecisionTests(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception)
 
-        # Force manual review so every field's expander actually renders -
-        # in the default auto-accept mode, a fully-agreeing collision group
-        # like this one is silently auto-applied with NO expander at all
-        # (the strongest form of "no manual click needed" - see
-        # _render_collision_group's auto_accept short-circuit), which
-        # wouldn't let this test distinguish "one expander" from "zero
-        # expanders". Manual mode forces the group to actually render so the
-        # "one, not two" fix is directly observable.
-        at.toggle(key="manual_review_toggle").set_value(True).run()
-        self.assertFalse(at.exception)
-
-        copthall_expanders = [e for e in at.expander if "Copthall House" in (e.label or "")]
-        self.assertEqual(len(copthall_expanders), 1)
-
-        # And no leftover per-source-value "pick one" radio anywhere - every
-        # field genuinely agreed, so nothing needed a disagreement decision.
+        # Every field genuinely agrees between the two sources, so this
+        # group auto-applies silently - no "Needs your decision" card of
+        # any kind, no leftover per-source "pick one" radio, and it's
+        # counted/shown exactly ONCE (not twice) in the automatic-updates
+        # summary - the real "one property, one update" consolidation the
+        # reported bug was about, now surfaced through that summary instead
+        # of a manual-review toggle forcing a normally-silent path to render.
+        self.assertNotIn("⚠️ Needs your decision", [s.value for s in at.subheader])
         self.assertEqual([r for r in at.radio if r.label == "Keep value from:"], [])
+
+        info_text = "".join(i.value for i in at.info)
+        self.assertIn("1 existing property will be updated automatically.", info_text)
+
+        # st.expander's own contents run on every rerun regardless of
+        # collapsed/expanded state (a purely client-side visual toggle) -
+        # at.markdown already reflects this expander's full contents with
+        # no need to simulate opening it.
+        self.assertTrue(any(e.label == "View changes" for e in at.expander))
+        copthall_markdowns = [
+            m for m in at.markdown if "Copthall House" in (m.value or "") and "field(s)" not in (m.value or "")
+        ]
+        # One markdown header per changed FIELD for this one property (not
+        # per source) - confirms the group was consolidated into a single
+        # property's worth of changes, not double-counted. address_1 isn't
+        # here - it's identical to what master already had, so it's not a
+        # change at all.
+        changed_fields = {"submarket", "lat", "lng", "special_features", "contacts"}
+        self.assertEqual(len(copthall_markdowns), len(changed_fields))
 
     def test_one_field_disagreement_still_forces_only_that_one_choice(self):
         master_writer.write_master([

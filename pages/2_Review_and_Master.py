@@ -257,33 +257,51 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
 
 def _render_let_status_decision(m, key_prefix: str) -> str:
     """
-    Prominently shown - never inside a collapsed expander like a normal
-    field diff - when a matched row's update contains wording suggesting
-    the property is no longer available (see
-    master_merge.mentions_let_status). Whether this property still belongs
-    in master at all is a more fundamental question than "which fields to
-    accept", so it gets its own explicit choice instead of being folded
-    into the ordinary per-field checkboxes.
+    Prominently shown at the top of the "Needs your decision" section (see
+    _render_pending_review) whenever a matched row's update contains
+    wording suggesting the property is no longer available (see
+    master_merge.mentions_let_status) - reframed as the actual property-
+    level decision a reviewer needs to make, never exposed as a raw
+    special_features/state_of_space before/after field diff: whether this
+    property still belongs in master at all is a more fundamental question
+    than "which field value to accept", so the whole row's update is
+    presented as one status-change event, not a field to tick or skip.
 
-    Defaults to "keep" (the non-destructive option) if the reviewer never
-    touches the radio and just clicks Approve - this is a review trigger
-    forcing a human to look, not a trap that silently deletes anything.
+    Three explicit choices, defaulting to "apply" (accept the new status,
+    keep the property) if the reviewer never touches the radio and just
+    clicks Approve - a status like "Under Offer" must NOT automatically
+    mean remove; a reviewer who wants that has to say so explicitly.
+    "Keep current information" is a genuine third option, distinct from
+    "apply" - it leaves the existing master record completely untouched
+    (this update contributes nothing at all for this row), for a reviewer
+    who believes the status change isn't actually accurate/current, without
+    forcing them into an all-or-nothing accept/remove choice.
     """
-    st.warning(
-        f"🏷️ **{display_utils.row_label(m.new_row.model_dump())}** — this update's wording suggests "
-        "the property may no longer be available."
-    )
+    label = display_utils.row_label(m.new_row.model_dump())
+    provider = m.new_row.provider or "The latest update"
+    # The new status text(s) that actually triggered this - see
+    # LET_STATUS_FIELDS - shown verbatim, never invented; normally just one.
+    status_text = "; ".join(m.diffs[f][1] for f in m.let_status_fields)
+
+    st.warning(f"**{label}**\n\n{provider} now lists this space as **{status_text}**.")
     for f in m.let_status_fields:
         old_val, new_val = m.diffs[f]
-        st.markdown(f"**{f}**")
         display_utils.render_before_after(old_val, new_val)
 
     choice = st.radio(
-        "What should happen to this property?",
-        ["Keep in master — apply this update", "Remove this property from master entirely"],
+        "What would you like to do?",
+        [
+            f"Keep as {status_text} — keep the property in master and apply the new status.",
+            "Remove property — remove it from master.",
+            "Keep current information — ignore this status update and leave the existing record unchanged.",
+        ],
         key=f"{key_prefix}_let_decision",
     )
-    return "remove" if choice.startswith("Remove") else "keep"
+    if choice.startswith("Remove property"):
+        return "remove"
+    if choice.startswith("Keep current information"):
+        return "ignore"
+    return "apply"
 
 
 def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix: str) -> str:
@@ -1134,235 +1152,124 @@ def _render_pending_review(pending: list):
 
     colliding_changed_ids = {id(m) for group in plan.collisions for m in group}
     colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}
-    any_collisions = bool(colliding_changed_ids or colliding_unmatched_ids)
 
     # See master_merge.is_detail_loss - a matched row whose special_features/
-    # contacts update looks like it dropped real information is forced into
-    # manual review exactly like a same-batch collision, rather than being
-    # auto-appliable.
+    # contacts update looks like it dropped real information needs a manual
+    # look rather than being auto-appliable, exactly like a same-batch
+    # collision.
     risky_changed_ids = {id(m) for m in plan.matched_changed if m.risky_fields}
-    any_risky = bool(risky_changed_ids - colliding_changed_ids)
 
     # See master_merge.mentions_let_status - wording suggesting a property
-    # is no longer available always forces a manual keep/remove decision,
-    # same principle as a same-batch collision never being auto-resolved.
+    # is no longer available always forces an explicit decision, same
+    # principle as a same-batch collision never being auto-resolved.
     let_status_ids = {id(m) for m in plan.matched_changed if m.let_status_fields}
-    any_let_status = bool(let_status_ids)
-
-    if any_collisions:
-        st.warning(
-            "Some rows in this batch appear to target the same property (marked "
-            "⚠️ below) — these always need a manual pick before the rest can be "
-            "applied, rather than write order silently deciding a winner."
-        )
-
-    if any_risky:
-        st.warning(
-            "Some updates (marked ⚠️ below) look like they may be missing detail "
-            "compared to what's already stored — these need a manual look before "
-            "being applied automatically."
-        )
-
-    if any_let_status:
-        st.warning(
-            "Some updates (marked 🏷️ below) look like they may mean a property is "
-            "no longer available — these always need a manual keep-or-remove "
-            "decision, regardless of auto-accept."
-        )
-
-    manual_review = st.toggle(
-        "Review each field manually instead of applying automatically",
-        key="manual_review_toggle",
-    )
-    auto_accept = not manual_review
-
-    if auto_accept:
-        auto_changed = [
-            m for m in plan.matched_changed
-            if id(m) not in colliding_changed_ids and id(m) not in risky_changed_ids and id(m) not in let_status_ids
-        ]
-        auto_new = [u for u in plan.unmatched if id(u) not in colliding_unmatched_ids]
-        summary_parts = []
-        if auto_changed:
-            summary_parts.append(f"update {len(auto_changed)} propert{'y' if len(auto_changed) == 1 else 'ies'}")
-        if auto_new:
-            summary_parts.append(f"add {len(auto_new)} new propert{'y' if len(auto_new) == 1 else 'ies'}")
-        if summary_parts:
-            st.info(
-                "This will " + " and ".join(summary_parts) + "."
-                + (" Rows flagged above need manual review first." if (any_collisions or any_risky or any_let_status) else "")
-            )
-        elif not any_collisions and not any_risky and not any_let_status:
-            st.info("Nothing to apply automatically — every row already matches the master with no changes.")
 
     _render_discard_pending(pending, new_rows)
 
-    updates = {}          # master_index -> {field: approved_value} - real, review-worthy changes only
-    silent_by_index = {}  # master_index -> {field: value} - tolerant-formatting fixes, never shown in the diff UI
+    # auto_updates is populated purely by the safe, already-considered-safe
+    # path below, with no click of any kind. decision_updates/new_rows_
+    # final/removed_indices are populated ONLY by something a reviewer
+    # explicitly decided in the "Needs your decision" section (a radio/
+    # selectbox/checkbox click). Kept as two separate update dicts (merged
+    # into one only right before the Approve button, see `updates` below)
+    # specifically so the "Automatic updates" -> "View changes" summary can
+    # show EXACTLY the auto-applied set, never conflated with something a
+    # reviewer just decided - each decision card already shows its own
+    # before/after inline, so repeating it in that summary would just be
+    # noise.
+    auto_updates = {}
+    decision_updates = {}
+    silent_by_index = {}  # master_index -> {field: value} - tolerant-formatting fixes, never shown in any diff UI
     new_rows_final = []   # ListingRow objects confirmed as genuinely new
     removed_indices = set()  # master_index values confirmed no longer available - see _render_let_status_decision
 
     def _apply_silent(m):
-        # Applies regardless of auto/manual mode and regardless of whether
-        # the row's real diff (if any) was approved - a tolerant-formatting
-        # fix (case/whitespace only, see master_merge.silent_field_updates)
-        # is independent of that decision and never itself needs review.
+        # Applies regardless of whether the row's real diff (if any) needed
+        # a decision - a tolerant-formatting fix (case/whitespace only, see
+        # master_merge.silent_field_updates) is independent of that and
+        # never itself needs review.
         if m.silent_updates:
             entry = silent_by_index.setdefault(m.master_index, {})
             entry.update(m.silent_updates)
             entry["source_file"] = m.new_row.source_file
 
-    if plan.matched_changed:
-        if not auto_accept or colliding_changed_ids or risky_changed_ids or let_status_ids:
-            st.subheader("Matched — changes detected")
-        collision_groups_by_index = {group[0].master_index: group for group in plan.collisions}
-        rendered_collision_indices = set()
-        for i, m in enumerate(plan.matched_changed):
-            is_collision = id(m) in colliding_changed_ids
-            is_risky = id(m) in risky_changed_ids
-            is_let_status = id(m) in let_status_ids
-            _apply_silent(m)
+    # ---- Classify every matched-row change into exactly one bucket -
+    # never rendered here, just sorted; see the sections below for where
+    # each bucket actually appears on screen.
+    auto_matched = []
+    decision_let_status = []
+    decision_collision_groups = []
+    decision_solo_collision = []  # a collision group that shrank to exactly one non-let-status member - see below
+    decision_risky = []
 
-            if is_let_status:
-                key_prefix = f"matched_{i}_{m.property_id}"
-                decision = _render_let_status_decision(m, key_prefix)
-                if decision == "remove":
-                    removed_indices.add(m.master_index)
-                else:
-                    entry = updates.setdefault(m.master_index, {})
-                    entry.update({f: new_val for f, (old_val, new_val) in m.diffs.items()})
-                    entry["source_file"] = m.new_row.source_file
-                continue
+    collision_groups_by_index = {group[0].master_index: group for group in plan.collisions}
+    queued_collision_indices = set()
 
-            if is_collision:
-                if m.master_index in rendered_collision_indices:
-                    continue  # this group's peer already rendered the whole group below
-                rendered_collision_indices.add(m.master_index)
-                # A collision group's own let-status members (if any) were
-                # already pulled out above, individually, before this loop
-                # ever reaches them - only the remaining, non-let-status
-                # members are compared against each other here.
-                group = [g for g in collision_groups_by_index[m.master_index] if id(g) not in let_status_ids]
-                if len(group) < 2:
-                    # Nothing left to compare against as a group (a sibling
-                    # was pulled into its own let-status decision above) -
-                    # fall through to the ordinary single-row rendering,
-                    # still flagged ⚠️ since it did collide with something.
-                    if group:
-                        _render_matched_row(group[0], f"matched_{i}_{group[0].property_id}", "⚠️ ", False, updates)
-                    continue
-                _render_collision_group(group, i, plan, updates, auto_accept)
-                continue
-
-            if auto_accept and not is_risky:
-                entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
-                entry["source_file"] = m.new_row.source_file
-                updates[m.master_index] = entry
-                continue
-
-            _render_matched_row(m, f"matched_{i}_{m.property_id}", "⚠️ " if is_risky else "", True, updates)
+    for m in plan.matched_changed:
+        _apply_silent(m)
+        if id(m) in let_status_ids:
+            decision_let_status.append(m)
+            continue
+        if id(m) in colliding_changed_ids:
+            if m.master_index in queued_collision_indices:
+                continue  # this group's peer already queued the whole group
+            queued_collision_indices.add(m.master_index)
+            # A collision group's own let-status members (if any) were
+            # already pulled out above - only the remaining, non-let-status
+            # members are compared against each other as a group. If that
+            # leaves exactly one (a sibling was pulled into its own let-
+            # status decision), there's nothing left to compare it AGAINST
+            # as a group - _render_collision_group expects 2+ members - so
+            # it falls through to the ordinary single-row rendering
+            # instead, still forced into a deliberate accept (default_
+            # checked=False) since it did collide with something.
+            group = [g for g in collision_groups_by_index[m.master_index] if id(g) not in let_status_ids]
+            if len(group) >= 2:
+                # Same "does this genuinely need a look" check _render_
+                # collision_group makes internally (see its own auto_accept
+                # short-circuit) - computed here too, BEFORE deciding which
+                # bucket this group belongs in, so a fully-agreeing group
+                # (every field already agrees, nothing risky) lands in
+                # auto_matched-equivalent territory (auto_updates directly)
+                # instead of triggering "Needs your decision" with nothing
+                # actually rendered under it for this group.
+                dicts = [g.new_row.model_dump() for g in group]
+                group_risky = frozenset().union(*(g.risky_fields for g in group))
+                agree_diffs = {}
+                needs_choice_any = False
+                for f in master_merge.collision_group_fields(group):
+                    values = [d.get(f) for d in dicts]
+                    needs_choice, resolved = master_merge.matched_collision_field_choice(values, f)
+                    if needs_choice:
+                        needs_choice_any = True
+                    else:
+                        agree_diffs[f] = resolved
+                if needs_choice_any or group_risky:
+                    decision_collision_groups.append(group)
+                elif agree_diffs:
+                    labels = [d.get("source_file") or f"Row {gi + 1}" for gi, d in enumerate(dicts)]
+                    entry = auto_updates.setdefault(m.master_index, {})
+                    entry.update(agree_diffs)
+                    entry["source_file"] = " + ".join(labels)
+            elif group:
+                decision_solo_collision.append(group[0])
+            continue
+        if id(m) in risky_changed_ids:
+            decision_risky.append(m)
+            continue
+        auto_matched.append(m)
 
     for m in plan.matched_unchanged:
         _apply_silent(m)
 
-    if plan.unmatched:
-        collision_ids = {id(u) for group in plan.unmatched_collisions for u in group}
-        near_miss = [u for u in plan.unmatched if id(u) not in collision_ids and u.suggestions]
-        plain_new = [u for u in plan.unmatched if id(u) not in collision_ids and not u.suggestions]
+    for m in auto_matched:
+        entry = {f: new_val for f, (old_val, new_val) in m.diffs.items()}
+        entry["source_file"] = m.new_row.source_file
+        auto_updates[m.master_index] = entry
 
-        # Ordinary new properties: no batch duplicate, no near-miss against
-        # master - nothing to decide, so this stays a plain one-line list
-        # (see master_merge.new_property_labels) rather than the detailed
-        # comparison view below, which is reserved for rows that actually
-        # need a decision. Collapsed by default (a real upload can easily
-        # have 15+ of these with nothing to review) so it doesn't push the
-        # rows that DO need a decision below the fold - Streamlit expanders
-        # default to collapsed unless expanded=True is passed, so this
-        # needs no extra session state of its own.
-        if plain_new:
-            n = len(plain_new)
-            with st.expander(f"📄 {n} new propert{'y' if n == 1 else 'ies'} will be added — click to view"):
-                for label in master_merge.new_property_labels([u.new_row for u in plain_new]):
-                    st.write(label)
-            new_rows_final.extend(
-                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
-            )
-
-        # near_miss (against an existing master property) and
-        # unmatched_collisions (against another row in this same upload)
-        # both genuinely need a human decision - grouped under one shared,
-        # always-visible heading (never collapsed, unlike plain_new above)
-        # so it's obvious at a glance which rows are just FYI vs. waiting
-        # on an answer.
-        if near_miss or plan.unmatched_collisions:
-            st.subheader("⚠️ Needs a decision")
-            st.caption(
-                "Some of these look similar to a property already in master; others look "
-                "like the same property may have been listed twice in this upload. Open "
-                "each one and decide: is this the same property, or genuinely different?"
-            )
-
-            # Near-misses against an EXISTING master property (not a batch
-            # duplicate) - a genuine decision (is this actually that property,
-            # reworded/typo'd?), so it keeps the detailed link-or-confirm UI.
-            if near_miss:
-                master_options = {"— add as new —": None}
-                for rec in plan.master_records:
-                    master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
-
-                for i, u in enumerate(near_miss):
-                    row_dict = u.new_row.model_dump()
-                    key_prefix = f"near_miss_{i}"
-                    with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
-                        st.caption(
-                            "Possible near-misses already in the master: "
-                            + ", ".join(display_utils.row_label(s) for s in u.suggestions)
-                        )
-
-                        choice_label = st.selectbox(
-                            "What should happen with this row?",
-                            list(master_options.keys()),
-                            key=f"{key_prefix}_choice",
-                        )
-                        linked_property_id = master_options[choice_label]
-
-                        if linked_property_id is None:
-                            # "— add as new —" is the default selectbox choice, so this is
-                            # already the no-action outcome - no extra checkbox needed to
-                            # confirm it. A reviewer who believes this IS the near-miss
-                            # property says so by picking it from the dropdown above, which
-                            # routes into the `else` branch instead.
-                            new_rows_final.append(
-                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
-                            )
-                        else:
-                            target_index = next(
-                                idx for idx, rec in enumerate(plan.master_records)
-                                if rec["property_id"] == linked_property_id
-                            )
-                            old_rec = plan.master_records[target_index]
-                            diffs = master_merge.diff_fields(old_rec, row_dict)
-                            st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
-                            if diffs:
-                                risky_fields = frozenset(
-                                    f for f in diffs
-                                    if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
-                                )
-                                approved_fields = _render_field_rows(
-                                    diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
-                                )
-                                if approved_fields:
-                                    entry = updates.setdefault(target_index, {})
-                                    entry.update(approved_fields)
-                                    entry["source_file"] = u.new_row.source_file
-
-            # Intra-batch duplicates: two or more pending rows independently
-            # failing to match master, but matching EACH OTHER (see
-            # master_merge._dedup_key) - offered a field-level merge into one
-            # property, not a forced choice between "add both" or "add one,
-            # discard the other's data".
-            for i, group in enumerate(plan.unmatched_collisions):
-                _render_intra_batch_duplicate_group(group, f"batch_dup_{i}", new_rows_final)
+    collision_ids = {id(u) for group in plan.unmatched_collisions for u in group}
+    near_miss = [u for u in plan.unmatched if id(u) not in collision_ids and u.suggestions]
+    plain_new = [u for u in plan.unmatched if id(u) not in collision_ids and not u.suggestions]
 
     matched_master_indices = {m.master_index for m in plan.matched_changed} | {
         m.master_index for m in plan.matched_unchanged
@@ -1370,23 +1277,164 @@ def _render_pending_review(pending: list):
     stale_indices = master_merge.find_stale_candidates(
         new_rows, plan.master_records, matched_master_indices, fully_occupied_buildings=fully_occupied_buildings,
     )
-    if stale_indices:
-        st.subheader("🕳️ No longer present in latest availability")
-        st.caption(
-            "These existing master properties weren't matched by anything in this upload, but their "
-            "own building was covered by it — meaning the latest availability data no longer mentions "
-            "them. Review each one: keep it if it's still genuinely available, or remove it if it's "
-            "no longer offered."
-        )
-        for idx in stale_indices:
-            rec = plan.master_records[idx]
-            provider_label = rec.get("provider") or "this provider's"
-            decision = _render_stale_candidate_decision(rec, provider_label, f"stale_{idx}")
-            if decision == "remove":
-                removed_indices.add(idx)
 
+    any_decisions = bool(
+        decision_let_status or decision_collision_groups or decision_solo_collision or decision_risky
+        or near_miss or plan.unmatched_collisions or stale_indices
+    )
+
+    # ==== 1. Needs your decision - every genuinely manual property-level
+    # decision, together, at the top - never interleaved with the ordinary,
+    # already-safe changes rendered further down. ====
+    if any_decisions:
+        st.subheader("⚠️ Needs your decision")
+
+        for i, m in enumerate(decision_let_status):
+            decision = _render_let_status_decision(m, f"let_status_{i}_{m.property_id}")
+            if decision == "remove":
+                removed_indices.add(m.master_index)
+            elif decision == "apply":
+                entry = decision_updates.setdefault(m.master_index, {})
+                entry.update({f: new_val for f, (old_val, new_val) in m.diffs.items()})
+                entry["source_file"] = m.new_row.source_file
+            # "ignore" - this update contributes nothing for this row at all.
+            st.divider()
+
+        for i, group in enumerate(decision_collision_groups):
+            _render_collision_group(group, i, plan, decision_updates, auto_accept=True)
+
+        for i, m in enumerate(decision_solo_collision):
+            _render_matched_row(m, f"solo_collision_{i}_{m.property_id}", "⚠️ ", False, decision_updates)
+
+        for i, m in enumerate(decision_risky):
+            _render_matched_row(m, f"risky_{i}_{m.property_id}", "⚠️ ", True, decision_updates)
+
+        # near_miss (against an existing master property) and
+        # unmatched_collisions (against another row in this same upload)
+        # both genuinely need a human decision - one shared explainer
+        # covering both, since a reviewer sees whichever mix this batch
+        # happens to have.
+        if near_miss or plan.unmatched_collisions:
+            st.caption(
+                "Some of these look similar to a property already in master; others look "
+                "like the same property may have been listed twice in this upload. Open "
+                "each one and decide: is this the same property, or genuinely different?"
+            )
+
+        # Near-misses against an EXISTING master property (not a batch
+        # duplicate) - a genuine decision (is this actually that property,
+        # reworded/typo'd?).
+        if near_miss:
+            master_options = {"— add as new —": None}
+            for rec in plan.master_records:
+                master_options[f"{display_utils.row_label(rec)} ({rec['property_id'][:8]})"] = rec["property_id"]
+
+            for i, u in enumerate(near_miss):
+                row_dict = u.new_row.model_dump()
+                key_prefix = f"near_miss_{i}"
+                with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
+                    st.caption(
+                        "Possible near-misses already in the master: "
+                        + ", ".join(display_utils.row_label(s) for s in u.suggestions)
+                    )
+
+                    choice_label = st.selectbox(
+                        "What should happen with this row?",
+                        list(master_options.keys()),
+                        key=f"{key_prefix}_choice",
+                    )
+                    linked_property_id = master_options[choice_label]
+
+                    if linked_property_id is None:
+                        # "— add as new —" is the default selectbox choice, so this is
+                        # already the no-action outcome - no extra checkbox needed to
+                        # confirm it. A reviewer who believes this IS the near-miss
+                        # property says so by picking it from the dropdown above, which
+                        # routes into the `else` branch instead.
+                        new_rows_final.append(
+                            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                        )
+                    else:
+                        target_index = next(
+                            idx for idx, rec in enumerate(plan.master_records)
+                            if rec["property_id"] == linked_property_id
+                        )
+                        old_rec = plan.master_records[target_index]
+                        diffs = master_merge.diff_fields(old_rec, row_dict)
+                        st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
+                        if diffs:
+                            risky_fields = frozenset(
+                                f for f in diffs
+                                if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
+                            )
+                            approved_fields = _render_field_rows(
+                                diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
+                            )
+                            if approved_fields:
+                                entry = decision_updates.setdefault(target_index, {})
+                                entry.update(approved_fields)
+                                entry["source_file"] = u.new_row.source_file
+
+        # Intra-batch duplicates: two or more pending rows independently
+        # failing to match master, but matching EACH OTHER (see
+        # master_merge._dedup_key) with a genuine field conflict - offered
+        # a field-level merge into one property, not a forced choice
+        # between "add both" or "add one, discard the other's data".
+        for i, group in enumerate(plan.unmatched_collisions):
+            _render_intra_batch_duplicate_group(group, f"batch_dup_{i}", new_rows_final)
+
+        if stale_indices:
+            st.caption(
+                "These existing master properties weren't matched by anything in this upload, but "
+                "their own building was covered by it — meaning the latest availability data no "
+                "longer mentions them. Review each one: keep it if it's still genuinely available, "
+                "or remove it if it's no longer offered."
+            )
+            for idx in stale_indices:
+                rec = plan.master_records[idx]
+                provider_label = rec.get("provider") or "this provider's"
+                decision = _render_stale_candidate_decision(rec, provider_label, f"stale_{idx}")
+                if decision == "remove":
+                    removed_indices.add(idx)
+
+    # ==== 2. Automatic updates - one summary, details behind a single
+    # "View changes" expander; no field-by-field Apply buttons for changes
+    # already considered safe. ====
+    if auto_updates:
+        n = len(auto_updates)
+        st.subheader("✅ Automatic updates")
+        st.info(f"{n} existing propert{'y' if n == 1 else 'ies'} will be updated automatically.")
+        with st.expander("View changes"):
+            auto_diff_rows, _, _ = master_merge.build_approval_summary(plan, auto_updates, [], frozenset())
+            for d in auto_diff_rows:
+                st.markdown(f"**{d['property']}** — {d['field']}")
+                display_utils.render_before_after(d["old"], d["new"])
+
+    # ==== 3. New properties ====
+    if plain_new:
+        n = len(plain_new)
+        st.subheader("📄 New properties")
+        st.info(f"{n} new propert{'y' if n == 1 else 'ies'} will be added.")
+        with st.expander("View new properties"):
+            for label in master_merge.new_property_labels([u.new_row for u in plain_new]):
+                st.write(label)
+        new_rows_final.extend(
+            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
+        )
+
+    # ==== 4. No changes ====
     if plan.matched_unchanged:
-        st.caption(f"{len(plan.matched_unchanged)} row(s) matched with no changes.")
+        n = len(plan.matched_unchanged)
+        st.caption(f"{n} propert{'y' if n == 1 else 'ies'} matched with no changes.")
+
+    if not any_decisions and not auto_updates and not plain_new and not plan.matched_unchanged:
+        st.info("Nothing to apply — this upload has no rows to review.")
+
+    # Merged only now, right before Approve - see auto_updates/decision_
+    # updates' own comment above for why they stay separate until here.
+    updates = {idx: dict(fields) for idx, fields in auto_updates.items()}
+    for idx, fields in decision_updates.items():
+        updates.setdefault(idx, {}).update(fields)
 
     if st.button("Approve → Master", type="primary"):
         with st.spinner("Updating master spreadsheet..."):

@@ -61,8 +61,13 @@ class StaleCandidateUiTests(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception)
 
+        # Folded into the shared "Needs your decision" section (see pages/
+        # 2_Review_and_Master.py's own restructure) rather than its own
+        # dedicated subheader - _render_stale_candidate_decision's own
+        # warning still names the property and says why explicitly.
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
         warnings = "".join(w.value for w in at.warning)
-        self.assertIn("No longer present", "".join(h.value for h in at.subheader) + warnings)
+        self.assertIn("no longer present", warnings.lower())
         self.assertIn("27 Lime Street", warnings)
 
         stale_radios = [r for r in at.radio if r.label == "What should happen to this property?"]

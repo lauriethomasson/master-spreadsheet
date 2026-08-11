@@ -57,12 +57,15 @@ class PlainNewSectionTests(IsolatedCwdTestCase):
         at = _run_review_page()
         self.assertFalse(at.exception)
 
-        plain_new_expanders = [e for e in at.expander if (e.label or "").startswith("📄")]
-        self.assertEqual(len(plain_new_expanders), 1)
-        self.assertEqual(plain_new_expanders[0].label, "📄 3 new properties will be added — click to view")
+        self.assertIn("📄 New properties", [s.value for s in at.subheader])
+        info_text = "".join(i.value for i in at.info)
+        self.assertIn("3 new properties will be added.", info_text)
+
+        new_props_expanders = [e for e in at.expander if e.label == "View new properties"]
+        self.assertEqual(len(new_props_expanders), 1)
         # Streamlit expanders default to collapsed unless expanded=True is
         # passed - confirm this one wasn't given that.
-        self.assertFalse(plain_new_expanders[0].proto.expanded)
+        self.assertFalse(new_props_expanders[0].proto.expanded)
 
     def test_no_plain_new_section_when_there_are_no_plain_new_rows(self):
         # A genuinely CONFLICTING duplicate pair (different size_sqft for
@@ -81,11 +84,12 @@ class PlainNewSectionTests(IsolatedCwdTestCase):
 
         at = _run_review_page()
 
-        self.assertEqual([e for e in at.expander if (e.label or "").startswith("📄")], [])
+        self.assertNotIn("📄 New properties", [s.value for s in at.subheader])
+        self.assertEqual([e for e in at.expander if e.label == "View new properties"], [])
 
 
 class NeedsADecisionHeadingTests(IsolatedCwdTestCase):
-    HEADING = "⚠️ Needs a decision"
+    HEADING = "⚠️ Needs your decision"
     EXPLAINER_TAIL = "Open each one and decide: is this the same property, or genuinely different?"
 
     def test_heading_and_explainer_for_near_miss(self):

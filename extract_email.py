@@ -61,9 +61,15 @@ since this email may list several unrelated buildings:
   are in the same building and it feels redundant to repeat it — never leave building null.
 - submarket: the ALL-CAPS section header this building falls under, normalized to title case
   (e.g. "Soho", "West End", "Mid Town")
-- address_1: leave this null unless a street address is stated for THIS SPECIFIC property
-  (not the sender's own mailing address — see above). Most emails of this type never state one.
-- postcode: leave this null for the same reason, with the same exception.
+- address_1: the street address for THIS SPECIFIC property, whenever one is stated - commonly
+  printed directly under or right beside the building's own name (e.g. "2 Leonard Circus"
+  immediately followed by its own line "2 Leonard Circus, EC2A 4LW"; "15 Hatfields" followed by
+  "Chadwick Court, London SE1 8DJ"). Extract this whenever it's genuinely there - only leave it
+  null when the email truly never states one for that property (never the sender's own mailing
+  address - see above).
+- postcode: the UK postcode for this same specific property, extracted from that same address
+  line whenever one is stated (e.g. "EC2A 4LW", "SE1 8DJ") - same rule as address_1: only leave
+  this null when the email truly never states one.
 
 Also extract for each unit:
 - floor_unit: the unit's label exactly as given — a floor ("6th floor", "G Floor", "3rd Floor"),
@@ -142,8 +148,8 @@ Return your answer as a single JSON object with this exact structure:
     {
       "building": "...",
       "submarket": "..." or null,
-      "address_1": null,
-      "postcode": null,
+      "address_1": "..." or null,
+      "postcode": "..." or null,
       "floor_unit": "..." or null,
       "size_sqft": number or null,
       "desks_min": integer or null,
