@@ -2587,6 +2587,16 @@ class SpecialFeaturesMergeTests(unittest.TestCase):
 
 
 class ContactsMergeTests(unittest.TestCase):
+    """
+    contacts, for a confidently matched same-provider row, always resolves
+    to the newest NONBLANK value verbatim - never merged/accumulated with
+    master's old one (see CONTACTS_NEWEST_WINS_FIELDS' own docstring).
+    Changed from the earlier union-merge behavior specifically because a
+    replaced agent's own stale details must not persist forever just
+    because they were once correct ("John Smith" -> "Sarah Jones" must
+    become "Sarah Jones", never "John Smith; Sarah Jones").
+    """
+
     def _matched_contacts(self, old_val, new_val):
         master_df = _master_df([{
             "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "contacts": old_val,
@@ -2597,38 +2607,87 @@ class ContactsMergeTests(unittest.TestCase):
         plan = master_merge.build_merge_plan([new_row], master_df)
         return plan.matched_changed[0]
 
+    def test_old_contact_a_new_contact_b_replaces_with_b_only(self):
+        matched = self._matched_contacts("John Smith", "Sarah Jones")
+        self.assertEqual(matched.diffs["contacts"], ("John Smith", "Sarah Jones"))
+        self.assertNotIn("John Smith", matched.diffs["contacts"][1])
+
+    def test_richer_restatement_of_the_same_contact_replaces_with_the_richer_value(self):
+        matched = self._matched_contacts(
+            "John Smith — john@example.com", "John Smith — john@example.com — 020 1234 5678",
+        )
+        self.assertEqual(matched.diffs["contacts"][1], "John Smith — john@example.com — 020 1234 5678")
+
+    def test_old_one_contact_new_two_contacts_replaces_with_both_new_ones_only(self):
+        matched = self._matched_contacts("John Smith", "Sarah Jones; David Brown")
+        self.assertEqual(matched.diffs["contacts"][1], "Sarah Jones; David Brown")
+        self.assertNotIn("John Smith", matched.diffs["contacts"][1])
+
     def test_new_blank_preserves_old_contact(self):
         master_df = _master_df([{
             "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
-            "contacts": "Jane Smith, jane@example.com",
+            "contacts": "John Smith",
         }])
         new_row = ListingRow(
             building="1 Example Street", provider="UNION", floor_unit="3rd Floor", contacts=None,
         )
         plan = master_merge.build_merge_plan([new_row], master_df)
         self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(plan.matched_unchanged[0].new_row.contacts, None)
 
-    def test_richer_contact_details_are_preserved(self):
-        matched = self._matched_contacts(
-            "Jane Smith — Agent", "Jane Smith — Agent — jane@example.com — 020 7946 0000",
+    def test_old_blank_new_contact_is_used(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "contacts": None,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", contacts="Sarah Jones",
         )
-        self.assertNotIn("contacts", matched.risky_fields)
-        self.assertEqual(matched.diffs["contacts"][1], "Jane Smith — Agent — jane@example.com — 020 7946 0000")
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["contacts"], (None, "Sarah Jones"))
 
-    def test_clearly_replaced_contact_is_preserved_alongside_the_new_one(self):
-        # No safe signal exists to tell "Bob replaced Jane" apart from "Bob
-        # is a second, simultaneously-valid contact" - defaulting to
-        # preserving both (never silently dropping Jane) is the safe,
-        # information-preserving choice the brief itself sanctions as a
-        # fallback when both are clearly valid. Deliberately no shared
-        # words at all between the two (different names, different email
-        # domains) - a real, unrelated second contact, not a reworded
-        # restatement of the first.
-        matched = self._matched_contacts("Jane Smith, jane@agentco.com", "Bob Jones, bob@anotherfirm.com")
-        self.assertNotIn("contacts", matched.risky_fields)
-        merged = matched.diffs["contacts"][1]
-        self.assertIn("Bob Jones, bob@anotherfirm.com", merged)
-        self.assertIn("Jane Smith, jane@agentco.com", merged)
+    def test_identical_contacts_produce_no_change(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "contacts": "John Smith, john@example.com",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor",
+            contacts="John Smith, john@example.com",
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.matched_unchanged), 1)
+
+    def test_contact_replacement_does_not_require_manual_review(self):
+        matched = self._matched_contacts("John Smith", "Sarah Jones")
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_repeated_provider_updates_never_accumulate_historical_contacts(self):
+        # Simulates two successive updates from the same provider, each
+        # applied to master in turn - the SECOND update's own diff must
+        # only ever compare against the FIRST update's own result, never
+        # somehow retain the very first, now-doubly-stale contact.
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "contacts": "John Smith",
+        }])
+        first_update = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", contacts="Sarah Jones",
+        )
+        first_plan = master_merge.build_merge_plan([first_update], master_df)
+        updates = {m.master_index: {"contacts": m.diffs["contacts"][1]} for m in first_plan.matched_changed}
+        merged_records = master_merge.apply_merge(first_plan.master_records, updates, [])
+
+        second_update = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", contacts="David Brown",
+        )
+        second_plan = master_merge.build_merge_plan(
+            [second_update], pd.DataFrame([r.model_dump() for r in merged_records]),
+        )
+        matched = second_plan.matched_changed[0]
+        self.assertEqual(matched.diffs["contacts"][1], "David Brown")
+        self.assertNotIn("John Smith", matched.diffs["contacts"][1])
+        self.assertNotIn("Sarah Jones", matched.diffs["contacts"][1])
 
 
 class BrochureFallbackDoesNotOverrideProviderTests(unittest.TestCase):
@@ -2664,41 +2723,225 @@ class BrochureFallbackDoesNotOverrideProviderTests(unittest.TestCase):
         self.assertEqual(matched.diffs["special_features"], (None, "Private terrace"))
         self.assertEqual(matched.risky_fields, frozenset())
 
+    def test_brochure_populated_current_contacts_can_update_master(self):
+        # Same principle, for contacts specifically - a row whose own
+        # contacts field could only have come from brochure enrichment
+        # (the provider's own source left it blank) still becomes the
+        # newest current contact set once it reaches master_merge.
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "contacts": None,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor",
+            contacts="Sarah Jones, sarah@example.com",
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["contacts"], (None, "Sarah Jones, sarah@example.com"))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_explicit_provider_contacts_stay_protected_from_brochure_overwrite_upstream(self):
+        # This protection lives one layer upstream, in brochure_enrichment.
+        # py's own _apply_units_to_row (never assigns to a field that's
+        # already non-blank on the row it's enriching) - NOT re-implemented
+        # or re-tested here (out of scope for this change), just confirmed
+        # still in force by inspecting that module's own guarantee, which
+        # this task did not touch.
+        import brochure_enrichment
+        row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor",
+            contacts="Explicit Provider Contact, provider@example.com",
+        )
+        units = brochure_enrichment._BrochureUnits([])
+        units.contacts = "Brochure Contact, brochure@example.com"
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertEqual(new_row.contacts, "Explicit Provider Contact, provider@example.com")
+        self.assertNotIn("contacts", fields)
+
+
+_METERS_PER_DEGREE_LAT = 111320.0
+
+
+def _lat_offset(base_lat, meters):
+    """A pure north/south coordinate offset of approximately `meters`,
+    keeping longitude fixed - avoids needing the latitude-dependent
+    longitude scaling (cos(lat)) in test setup; confirmed against the real
+    haversine_distance_meters (see the sanity checks in HaversineDistance
+    Tests below) to be accurate to well under 1% at this scale, more than
+    precise enough for a boundary test with a several-meter margin either
+    side of a threshold."""
+    return base_lat + meters / _METERS_PER_DEGREE_LAT
+
+
+class HaversineDistanceTests(unittest.TestCase):
+    def test_same_point_is_zero(self):
+        self.assertEqual(master_merge.haversine_distance_meters(51.5142, -0.1494, 51.5142, -0.1494), 0.0)
+
+    def test_known_small_offset_is_approximately_correct(self):
+        # A pure ~50m north/south offset (see _lat_offset) - confirms this
+        # is a real geographic distance calculation, not a raw decimal
+        # comparison (a flat degree-based epsilon would treat this
+        # identically to a much larger east/west offset at this latitude).
+        distance = master_merge.haversine_distance_meters(51.5142, -0.1494, _lat_offset(51.5142, 50), -0.1494)
+        self.assertAlmostEqual(distance, 50, delta=1)
+
+    def test_symmetric(self):
+        a = master_merge.haversine_distance_meters(51.5142, -0.1494, 51.5150, -0.1400)
+        b = master_merge.haversine_distance_meters(51.5150, -0.1400, 51.5142, -0.1494)
+        self.assertAlmostEqual(a, b, delta=0.001)
+
 
 class GeocodeLocationRiskTests(unittest.TestCase):
     """
     lat/lng get no provenance tag distinguishing an explicit provider-
     stated coordinate from one geocode.py generated via its own API calls
-    (see GEOCODE_RISK_FIELDS' own docstring) - so ANY change to an already-
-    known coordinate always needs a manual look, regardless of source, and
-    a coordinate is only ever silently trusted while master had none.
+    (see GEOCODE_RISK_FIELDS' own docstring). A confidence-based location
+    comparison (see _is_same_location/_location_change_is_safe) replaces
+    the earlier "any change always needs a look" rule: a trivially small
+    movement (SAME_LOCATION_METERS) is not even a diff at all, a larger
+    move is auto-applied only when corroborated by matching address_1+
+    postcode (up to CORROBORATED_LOCATION_METERS), and anything beyond
+    that - or without corroboration - still needs a manual look.
     """
 
-    def test_new_coordinate_replacing_an_existing_one_is_flagged(self):
+    def _plan(self, old_lat, old_lng, new_lat, new_lng, old_extra=None, new_extra=None):
         master_df = _master_df([{
-            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "building": "2 Leonard Circus", "provider": "UNION", "floor_unit": "5th Floor",
+            "lat": old_lat, "lng": old_lng, **(old_extra or {}),
+        }])
+        new_row = ListingRow(
+            building="2 Leonard Circus", provider="UNION", floor_unit="5th Floor",
+            lat=new_lat, lng=new_lng, **(new_extra or {}),
+        )
+        return master_merge.build_merge_plan([new_row], master_df)
+
+    def test_tiny_difference_is_treated_as_equivalent(self):
+        # ~10m - well under SAME_LOCATION_METERS - not even a diff, master
+        # keeps its exact existing coordinate rather than being rewritten.
+        plan = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 10), -0.1494)
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.matched_unchanged), 1)
+
+    def test_small_entrance_centroid_shift_does_not_require_review(self):
+        # ~35m - the realistic rooftop-vs-entrance/centroid range this
+        # threshold exists to absorb (see SAME_LOCATION_METERS' own
+        # docstring) - same outcome as the tiny-difference case above.
+        plan = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 35), -0.1494)
+        self.assertEqual(len(plan.matched_changed), 0)
+
+    def test_at_the_same_location_threshold_boundary(self):
+        # ~48m (under 50) - same location. ~55m (over 50) - a real diff.
+        under = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 48), -0.1494)
+        self.assertEqual(len(under.matched_changed), 0)
+
+        over = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 55), -0.1494)
+        self.assertEqual(len(over.matched_changed), 1)
+        self.assertIn("lat", over.matched_changed[0].diffs)
+
+    def test_old_valid_new_blank_preserves_old(self):
+        master_df = _master_df([{
+            "building": "2 Leonard Circus", "provider": "UNION", "floor_unit": "5th Floor",
             "lat": 51.5142, "lng": -0.1494,
         }])
         new_row = ListingRow(
-            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", lat=51.5200, lng=-0.1400,
+            building="2 Leonard Circus", provider="UNION", floor_unit="5th Floor", lat=None, lng=None,
         )
         plan = master_merge.build_merge_plan([new_row], master_df)
+        self.assertEqual(len(plan.matched_changed), 0)
+
+    def test_old_blank_new_valid_fills_automatically(self):
+        plan = self._plan(None, None, 51.5142, -0.1494)
+        matched = plan.matched_changed[0]
+        self.assertNotIn("lat", matched.risky_fields)
+        self.assertNotIn("lng", matched.risky_fields)
+
+    def test_lat_and_lng_are_judged_and_updated_as_one_pair(self):
+        # Only lat actually differs (lng identical) - the pair distance is
+        # still what's measured (not per-field), and BOTH fields end up
+        # consistently untouched together (lng was never a diff to begin
+        # with; lat's own tiny movement is removed from diffs too, not
+        # left as a lone, independently-judged field).
+        plan = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 20), -0.1494)
+        self.assertEqual(len(plan.matched_changed), 0)
+
+    def test_confident_same_property_same_address_postcode_resolves_moderate_move(self):
+        # The brief's own worked example: 2 Leonard Circus, EC2A 4LW,
+        # matching address/postcode both sides, coordinates move ~120m
+        # (over the same-location tier, under the corroborated ceiling).
+        plan = self._plan(
+            51.5142, -0.1494, _lat_offset(51.5142, 120), -0.1494,
+            old_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+            new_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("lat", matched.diffs)
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_materially_distant_with_conflicting_postcode_does_not_auto_apply(self):
+        plan = self._plan(
+            51.5142, -0.1494, _lat_offset(51.5142, 120), -0.1400,
+            old_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+            new_extra={"address_1": "2 Leonard Circus", "postcode": "EC1A 9XY"},
+        )
         matched = plan.matched_changed[0]
         self.assertIn("lat", matched.risky_fields)
         self.assertIn("lng", matched.risky_fields)
 
-    def test_filling_a_previously_blank_coordinate_is_not_flagged(self):
-        master_df = _master_df([{
-            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
-            "lat": None, "lng": None,
-        }])
-        new_row = ListingRow(
-            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", lat=51.5142, lng=-0.1494,
-        )
-        plan = master_merge.build_merge_plan([new_row], master_df)
+    def test_moderate_move_without_any_corroborating_address_stays_risky(self):
+        plan = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 120), -0.1494)
         matched = plan.matched_changed[0]
-        self.assertNotIn("lat", matched.risky_fields)
-        self.assertNotIn("lng", matched.risky_fields)
+        self.assertIn("lat", matched.risky_fields)
+
+    def test_at_the_corroborated_ceiling_boundary(self):
+        extra = ({"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},) * 2
+        under = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 148), -0.1494, *extra)
+        self.assertEqual(under.matched_changed[0].risky_fields, frozenset())
+
+        over = self._plan(51.5142, -0.1494, _lat_offset(51.5142, 152), -0.1494, *extra)
+        self.assertIn("lat", over.matched_changed[0].risky_fields)
+
+    def test_wrong_building_geocode_remains_protected_even_with_matching_key(self):
+        # A confident provider+building+floor match alone is never enough
+        # - a substantial, uncorroborated move (no address/postcode given
+        # at all) must stay risky exactly as before this feature existed.
+        plan = self._plan(51.5142, -0.1494, 51.5200, -0.1400)
+        matched = plan.matched_changed[0]
+        self.assertIn("lat", matched.risky_fields)
+        self.assertIn("lng", matched.risky_fields)
+
+    def test_meaningful_unsafe_movement_stays_risky_even_with_corroboration(self):
+        # ~900m, well beyond CORROBORATED_LOCATION_METERS - matching
+        # address/postcode never overrides a move this large.
+        plan = self._plan(
+            51.5142, -0.1494, _lat_offset(51.5142, 900), -0.1494,
+            old_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+            new_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("lat", matched.risky_fields)
+
+    def test_not_judged_by_raw_decimal_string_equality(self):
+        # Deliberately verbose, differently-formatted decimals that still
+        # represent a real, tiny (~15m) movement - proves real geographic
+        # distance is used, not how similar the digit strings look.
+        plan = self._plan(51.5142000, -0.1494000, 51.51421347, -0.14941102)
+        self.assertEqual(len(plan.matched_changed), 0)
+
+    def test_lat_lng_cannot_become_a_mixed_old_new_pair(self):
+        # A genuine, corroborated update - both fields must resolve
+        # TOGETHER (neither risky), never one applied and the other left
+        # pending/stale.
+        plan = self._plan(
+            51.5142, -0.1494, _lat_offset(51.5142, 100), -0.1400,
+            old_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+            new_extra={"address_1": "2 Leonard Circus", "postcode": "EC2A 4LW"},
+        )
+        matched = plan.matched_changed[0]
+        both_present = {"lat", "lng"} <= set(matched.diffs)
+        both_risky = {"lat", "lng"} <= matched.risky_fields
+        both_safe = not (matched.risky_fields & {"lat", "lng"})
+        self.assertTrue(both_present)
+        self.assertTrue(both_risky or both_safe)  # never exactly one of the two
 
     def test_explicit_valid_new_address_can_still_update_freely(self):
         # address_1/postcode are deliberately NOT in GEOCODE_RISK_FIELDS -

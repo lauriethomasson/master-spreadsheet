@@ -24,6 +24,7 @@ and has no awareness that a merge happened at all.
 """
 
 import difflib
+import math
 import re
 import typing
 import uuid
@@ -55,6 +56,34 @@ DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "s
 # length/retention check on them would just be noise.
 RISKY_TEXT_FIELDS = ("special_features", "contacts")
 
+# Subset of RISKY_TEXT_FIELDS that gets build_merge_plan's own OLD-vs-NEW
+# (matched-row) merge/detail-loss-risk treatment - special_features only.
+# contacts is deliberately excluded here: for a confidently matched same-
+# provider/property row, the newest nonblank contact set is authoritative
+# (see build_merge_plan's own CONTACTS_NEWEST_WINS_FIELDS handling) rather
+# than merged with a possibly-stale old one - a departing agent's own
+# details must not persist forever just because they were once correct
+# (confirmed real want: "John Smith" -> "Sarah Jones" must become "Sarah
+# Jones", never "John Smith; Sarah Jones"). contacts stays listed in
+# RISKY_TEXT_FIELDS itself (unchanged) for the SEPARATE same-batch
+# collision-peer path (matched_collision_field_choice/_text_variants_
+# compatible) - there, "richest compatible peer variant" is still the
+# right question, since neither peer row is "the old one" to begin with
+# (both are this same batch's own current data, not an update over time).
+DETAIL_LOSS_MERGE_FIELDS = ("special_features",)
+
+# contacts, for a confidently matched row, always resolves to the newest
+# NONBLANK value the incoming row supplies, verbatim - never merged with
+# master's old value (see DETAIL_LOSS_MERGE_FIELDS' own docstring for why),
+# and never flagged risky (a normal contact replacement needs no manual
+# click). This is really just "contacts behaves like any other ordinary
+# scalar field" - diff_fields already does exactly this (new nonblank
+# replaces old, new blank preserves old, identical values are no diff) -
+# nothing extra to implement, this constant exists purely so that intent
+# is named and easy to find, the same way DETAIL_LOSS_MERGE_FIELDS/
+# GEOCODE_RISK_FIELDS/HOUSE_NUMBER_FIELDS are.
+CONTACTS_NEWEST_WINS_FIELDS = ("contacts",)
+
 # Which of RISKY_TEXT_FIELDS gets the extra comma-splitting described in
 # _detail_items - special_features only. contacts' own per-person format is
 # "Name, email, phone" (a single genuine item, comma-joined internally) -
@@ -84,9 +113,135 @@ HOUSE_NUMBER_FIELDS = ("address_1", "building")
 # unlike address_1/postcode, deliberately left OUT of this list since a
 # genuine provider correction there is common and already safe (see
 # HOUSE_NUMBER_FIELDS' own structural-change guard), lat/lng has no
-# comparable signal at all, so any change to an already-known coordinate
-# always needs a look.
+# comparable signal at all - see _location_change_risk below for how a
+# change here is actually judged (distance + corroborating identity
+# evidence), rather than every change being flagged unconditionally.
 GEOCODE_RISK_FIELDS = ("lat", "lng")
+
+_EARTH_RADIUS_METERS = 6371000.0
+
+
+def haversine_distance_meters(lat1, lng1, lat2, lng2) -> float:
+    """
+    Great-circle distance between two (lat, lng) points in meters - a
+    proper geographic distance, not a raw decimal-degree comparison (a
+    fixed number of degrees covers very different real distances at
+    different latitudes/for lat vs lng, so comparing digits or a flat
+    epsilon on the coordinates themselves would be meaningless).
+    """
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = min(1.0, a)  # clamp against floating-point rounding pushing a hair past 1.0 at ~0 distance
+    return 2 * _EARTH_RADIUS_METERS * math.asin(math.sqrt(a))
+
+
+# Two thresholds, both anchored to a real, confirmed failure mode already
+# documented in this project: geocode.py's own docstring records a genuine
+# wrong-building Places API match landing "hundreds of meters to over a
+# kilometer away" from the real target - i.e. a real wrong match starts
+# somewhere in the hundreds of meters. Both thresholds below sit well
+# under that with a deliberate safety margin, never approaching it:
+#
+# - SAME_LOCATION_METERS (50m): a coordinate difference this small is
+#   never treated as a meaningful change at all, regardless of any other
+#   evidence - it covers the genuine, expected noise of re-geocoding the
+#   same real building (rooftop vs street-entrance vs geometric-center
+#   anchor, or a slightly different Places/Geocoding API result for the
+#   same address), which routinely differs by tens of meters for a single
+#   building's own footprint, without ever reaching into "another building
+#   down the street" territory - central London buildings can sit as
+#   close as a few tens of meters apart, so this is deliberately kept
+#   small rather than generously rounded up.
+# - CORROBORATED_LOCATION_METERS (150m): the ceiling for auto-resolving a
+#   LARGER move, and only ever with independent corroborating evidence
+#   (see _has_corroborating_location_evidence) - still comfortably below
+#   the "hundreds of meters" real wrong-match floor, wide enough to also
+#   cover a materially different anchor point for a large building's own
+#   footprint. Beyond this, a change is NEVER auto-resolved regardless of
+#   what else agrees - matching+building+floor alone is never enough on
+#   its own (see that function's own docstring).
+SAME_LOCATION_METERS = 50
+CORROBORATED_LOCATION_METERS = 150
+
+
+def _has_corroborating_location_evidence(old_rec: dict, new_dict: dict) -> bool:
+    """
+    True only when address_1 AND postcode are BOTH non-blank on both sides
+    AND agree (tolerant-equal, see _values_equal/_normalize_postcode) -
+    deliberately requiring both together, never just one: building,
+    provider, and floor_unit are already guaranteed equal for any row this
+    is called on at all (that's what a confident match already means - see
+    build_merge_plan), so address_1+postcode agreeing too is genuine EXTRA
+    identity evidence beyond the match itself, not a restatement of it.
+
+    No provenance exists (and none is invented here) to tell an explicit
+    provider-stated address/postcode apart from a geocoded one - this
+    checks only whether the CURRENT upload's own address_1/postcode agree
+    with what master already has, regardless of how either originally got
+    there. If address_1 or postcode themselves changed too (or either is
+    blank on either side), this returns False - a simultaneous address AND
+    coordinate change is exactly the case that should still get a human's
+    attention (see GEOCODE_RISK_FIELDS' own docstring), not a reason to
+    also wave the coordinate change through.
+    """
+    old_address, new_address = old_rec.get("address_1"), new_dict.get("address_1")
+    old_postcode, new_postcode = old_rec.get("postcode"), new_dict.get("postcode")
+    if _is_blank(old_address) or _is_blank(new_address) or _is_blank(old_postcode) or _is_blank(new_postcode):
+        return False
+    return _values_equal(old_address, new_address) and _normalize_postcode(old_postcode) == _normalize_postcode(new_postcode)
+
+
+def _location_distance_meters(old_rec: dict, new_dict: dict):
+    """
+    Real distance in meters between old_rec's and new_dict's own (lat, lng)
+    pairs, or None if either side is missing one half of its own pair -
+    there's no coordinate pair to measure a real distance between in that
+    case, so callers fall back to the existing, more conservative "any
+    change needs a look" behavior rather than guessing at a partial one.
+    Shared by _is_same_location/_location_change_is_safe so both always
+    judge lat and lng TOGETHER as one location, never independently.
+    """
+    old_lat, old_lng = old_rec.get("lat"), old_rec.get("lng")
+    new_lat, new_lng = new_dict.get("lat"), new_dict.get("lng")
+    if _is_blank(old_lat) or _is_blank(old_lng) or _is_blank(new_lat) or _is_blank(new_lng):
+        return None
+    return haversine_distance_meters(float(old_lat), float(old_lng), float(new_lat), float(new_lng))
+
+
+def _is_same_location(old_rec: dict, new_dict: dict) -> bool:
+    """
+    True when a lat/lng difference is trivially small (see
+    SAME_LOCATION_METERS) and should be treated as no meaningful change AT
+    ALL - not merely "safe to auto-apply", but removed from the diff
+    entirely (see build_merge_plan), so master's existing coordinate is
+    left completely untouched rather than being rewritten to a barely-
+    different value on every single upload. False whenever either side is
+    missing half its own coordinate pair (see _location_distance_meters) -
+    handled as an ordinary diff instead, same as before this existed.
+    """
+    distance = _location_distance_meters(old_rec, new_dict)
+    return distance is not None and distance <= SAME_LOCATION_METERS
+
+
+def _location_change_is_safe(old_rec: dict, new_dict: dict) -> bool:
+    """
+    True when a lat/lng change on an already-non-blank master coordinate -
+    one _is_same_location has already said is NOT trivially small - should
+    still be safe to auto-apply anyway: a larger-but-still-plausible move
+    corroborated by matching address_1+postcode (see
+    _has_corroborating_location_evidence), and only up to
+    CORROBORATED_LOCATION_METERS. False (never safe) whenever either side
+    is missing one half of its own (lat, lng) pair, or the move exceeds
+    CORROBORATED_LOCATION_METERS regardless of any corroboration - matching
+    provider+building+floor alone is never enough on its own (see
+    GEOCODE_RISK_FIELDS' own docstring).
+    """
+    distance = _location_distance_meters(old_rec, new_dict)
+    if distance is None or distance > CORROBORATED_LOCATION_METERS:
+        return False
+    return _has_corroborating_location_evidence(old_rec, new_dict)
 
 # Free-text fields where wording indicating a property is no longer on the
 # market might appear - the two descriptive prose fields, never a matching
@@ -1473,8 +1628,8 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             diffs = diff_fields(old_rec, new_dict)
             silent = silent_field_updates(old_rec, new_dict)
 
-            # Auto-merge a RISKY_TEXT_FIELDS update BEFORE risky_fields is
-            # computed below, whenever it's safe to (see merge_compatible_
+            # Auto-merge a DETAIL_LOSS_MERGE_FIELDS update BEFORE risky_fields
+            # is computed below, whenever it's safe to (see merge_compatible_
             # text's own docstring): is_detail_loss says old_val has a
             # genuine item new_val doesn't restate, but is_richness_
             # regression says new_val isn't a drastic, all-round terser
@@ -1487,7 +1642,26 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             # value is constructed to always contain every old item it
             # didn't just deliberately drop, so is_detail_loss(old_val,
             # merged_val) is guaranteed to come back False.
-            for f in RISKY_TEXT_FIELDS:
+            #
+            # contacts is deliberately NOT in this loop (see CONTACTS_
+            # NEWEST_WINS_FIELDS' own docstring) - its diff, if any, is left
+            # completely untouched here, so it flows through exactly like
+            # any other ordinary scalar field: new nonblank value wins
+            # verbatim, ever merged with master's old one.
+
+            # A trivially small lat/lng movement (see _is_same_location) is
+            # not a meaningful property change at all - removed from diffs
+            # entirely, BEFORE risky_fields/matched_changed below ever see
+            # it, so master's existing coordinate is left completely
+            # untouched rather than being rewritten to a barely-different
+            # value on every single upload. If this was the row's only
+            # diff, it now correctly lands in matched_unchanged instead of
+            # matched_changed - genuinely nothing changed.
+            if ("lat" in diffs or "lng" in diffs) and _is_same_location(old_rec, new_dict):
+                diffs.pop("lat", None)
+                diffs.pop("lng", None)
+
+            for f in DETAIL_LOSS_MERGE_FIELDS:
                 if f not in diffs:
                     continue
                 old_val, new_val = diffs[f]
@@ -1500,26 +1674,33 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
 
             risky_fields = frozenset(
                 f for f in diffs
-                if f in RISKY_TEXT_FIELDS and (is_detail_loss(*diffs[f]) or is_richness_regression(*diffs[f]))
+                if f in DETAIL_LOSS_MERGE_FIELDS and (is_detail_loss(*diffs[f]) or is_richness_regression(*diffs[f]))
             ) | frozenset(
                 f for f in diffs
                 if f in HOUSE_NUMBER_FIELDS and house_number_changed(*diffs[f])
             ) | frozenset(
-                # Geocoded fields get no provenance tag distinguishing an
-                # explicit provider-stated coordinate from one this pipeline
-                # generated via geocode.py's own API calls (see that
-                # module's own docstring) - unlike address_1/postcode,
+                # lat/lng get no provenance tag distinguishing an explicit
+                # provider-stated coordinate from one this pipeline
+                # generated via geocode.py's own API calls (see GEOCODE_
+                # RISK_FIELDS' own docstring) - unlike address_1/postcode,
                 # which are deliberately left freely auto-updatable (a
                 # genuine provider correction is common and safe there, and
                 # house_number_changed already catches the one structural
-                # danger), lat/lng has no comparable safe-update signal at
-                # all, so ANY change to an already-non-blank coordinate
-                # always needs a look rather than risking a bad geocode
-                # silently overwriting a previously correct, verified
-                # location. A blank old value is unaffected - filling in a
-                # never-before-known coordinate is not a REPLACEMENT.
+                # danger). A trivially small movement never even reaches
+                # here (already removed from diffs above, see
+                # _is_same_location) - what remains is a genuinely larger
+                # move, safe to auto-apply only when independently
+                # corroborated by address_1+postcode both still agreeing
+                # (see _location_change_is_safe's own docstring); anything
+                # else on an already-non-blank master coordinate still
+                # needs a look. A blank old value is unaffected either way -
+                # filling in a never-before-known coordinate is not a
+                # REPLACEMENT. Both fields are added or withheld from
+                # risky_fields TOGETHER, as one location decision, never
+                # independently.
                 f for f in diffs
                 if f in GEOCODE_RISK_FIELDS and not _is_blank(old_rec.get(f))
+                and not _location_change_is_safe(old_rec, new_dict)
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])
