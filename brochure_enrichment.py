@@ -59,7 +59,9 @@ on.
 """
 
 import concurrent.futures
+import ctypes
 import functools
+import platform
 import re
 import sys
 from urllib.parse import urlparse
@@ -72,6 +74,41 @@ from brochure_link_resolver import REQUEST_TIMEOUT, USER_AGENT, is_generic_link,
 from master_merge import normalize_key
 from schema import ListingRow
 from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
+
+
+def _trim_memory() -> None:
+    """
+    Best-effort hint to the OS allocator to return freed-but-unreturned
+    heap pages back to the OS, called once per completed brochure (see
+    enrich_rows_grouped's own main loop) - a direct response to a
+    confirmed, measured finding, not a speculative addition: rendering the
+    same real sample PDF 30x with fitz.TOOLS.store_shrink(100) called
+    after every render (exactly what render_pages already does) still grew
+    RSS by ~22MB, even with gc.collect() run immediately before each
+    measurement - i.e. not live Python objects waiting to be collected,
+    and not MuPDF's own store (which store_shrink's own docstring
+    confirms IS being fully freed - "Free 'percent' of current store
+    size"). The remaining explanation is glibc's own allocator not handing
+    genuinely-freed pages back to the OS - normal allocator behavior, but
+    one that still counts against a container's cgroup memory limit (RSS
+    doesn't distinguish "live object" from "freed but retained by the
+    allocator for reuse"), and directly relevant here: a prior real Cloud
+    Run OOM already occurred at 2062 MiB against a 2048 MiB limit, a
+    margin this kind of per-brochure residual could plausibly close over
+    enough brochures.
+
+    glibc-only (Linux) - malloc_trim(0) has no equivalent, and no such
+    accumulation risk worth chasing, on this project's Windows dev
+    environment, so this is a safe no-op there (and anywhere else the
+    symbol isn't found) rather than something that needs its own
+    Linux-only test path to stay correct.
+    """
+    if platform.system() != "Linux":
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 # The only fields enrich_row ever assigns to, and only when the row's own
 # value is blank - see the module docstring for why this list alone is the
@@ -476,6 +513,16 @@ def _match_unit(row: ListingRow, units: list):
     row_building_key = normalize_key(row.building)
     if not row_building_key:
         return None
+    # units is raw Gemini JSON (see _extract_brochure_units's own
+    # docstring - never validated against ExtractedFields the way the
+    # direct-PDF-upload path's units are) - a stray non-dict entry (a
+    # confirmed real failure mode: a malformed JSON array item) is simply
+    # excluded here rather than raising on it, so ONE bad entry degrades
+    # to "one less candidate to match against", never a crash that
+    # would otherwise take the entire batch down with it (see this
+    # function's own caller in enrich_rows_grouped for the belt-and-
+    # braces try/except around this too).
+    units = [u for u in units if isinstance(u, dict)]
     building_matches = [u for u in units if normalize_key(u.get("building")) == row_building_key]
     if not building_matches:
         return None
@@ -498,12 +545,27 @@ def _match_unit(row: ListingRow, units: list):
         tolerance = max(_SIZE_MATCH_MIN_TOLERANCE_SQFT, row.size_sqft * _SIZE_MATCH_TOLERANCE_FRACTION)
         size_matches = [
             u for u in building_matches
-            if u.get("size_sqft") and abs(float(u["size_sqft"]) - row.size_sqft) <= tolerance
+            if _safe_float(u.get("size_sqft")) is not None
+            and abs(_safe_float(u["size_sqft"]) - row.size_sqft) <= tolerance
         ]
         if len(size_matches) == 1:
             return size_matches[0]
 
     return None
+
+
+def _safe_float(value):
+    """float(value), or None for anything that isn't genuinely numeric -
+    a raw Gemini unit's own size_sqft is supposed to be "a plain number"
+    per the extraction prompt, but is never schema-validated for this
+    enrichment path (see _match_unit's own docstring), so a stray non-
+    numeric value (e.g. a range string the prompt's own instructions say
+    not to produce, but nothing here enforces) must not raise - treated
+    as "doesn't match", never a crash."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _apply_units_to_row(row: ListingRow, units):
@@ -804,6 +866,7 @@ def enrich_rows_grouped(
         futures = [executor.submit(_fetch_one, url) for url in urls_to_fetch]
         for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
             url, units = future.result()
+            _trim_memory()
 
             # is not None, not plain truthiness - _extract_brochure_units
             # returns [] (falsy) for a brochure that was successfully
@@ -824,7 +887,29 @@ def enrich_rows_grouped(
                 processed_urls[url] = "unavailable"
 
             for i in indices_by_url[url]:
-                new_row, fields = _apply_units_to_row(rows[i], units)
+                # Confirmed real, reproducible bug this guards against: raw
+                # units come straight from Gemini's own JSON (see
+                # _extract_brochure_units's own docstring - never validated
+                # against ExtractedFields the way the direct-PDF-upload
+                # path's units are), so a single malformed entry (e.g. a
+                # stray non-dict item, or a non-numeric size_sqft) makes
+                # _match_unit raise - previously UNCAUGHT here, in the main
+                # thread, entirely outside _fetch_one's own try/except,
+                # which crashed this whole function (and the surrounding
+                # Streamlit script) over ONE bad brochure - every remaining
+                # brochure lost, not just that one. Treated exactly like
+                # "no confident match" on failure: the row is left
+                # unchanged, never guessed at from data that couldn't even
+                # be read correctly.
+                try:
+                    new_row, fields = _apply_units_to_row(rows[i], units)
+                except Exception as e:
+                    print(
+                        f"[brochure_enrichment] Could not apply units from {url!r} to "
+                        f"{rows[i].building!r} ({e!r}) — leaving this row unchanged.",
+                        file=sys.stderr,
+                    )
+                    new_row, fields = rows[i], []
                 current[i] = new_row
                 if fields:
                     log.append({

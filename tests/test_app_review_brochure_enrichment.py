@@ -95,6 +95,31 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
         self.assertIn("Brochure enrichment", caption_text)
         self.assertIn("1 row(s) enriched", caption_text)
 
+    def test_completed_run_never_shows_a_continue_button(self):
+        # Continue enrichment exists ONLY as recovery for an interrupted
+        # (status="in_progress") run - a genuinely complete file must
+        # never offer it, or a reviewer could click it expecting to
+        # resume something that already finished.
+        path = save_staging_file(
+            [ListingRow(
+                building="16 Dufour's Place", floor_unit="3rd Floor",
+                brochure_link="https://example.com/brochure.pdf",
+                special_features="Roof terrace",
+            )],
+            "Union.xlsx", content_hash="hash-complete-no-continue",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 1},
+            {"https://example.com/brochure.pdf": "ok"},
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        continue_buttons = [b for b in at.button if "Continue enrichment" in (b.label or "")]
+        self.assertEqual(continue_buttons, [])
+
     def test_no_summary_shown_when_enrichment_never_ran_for_this_file(self):
         save_staging_file(
             [ListingRow(building="16 Dufour's Place", floor_unit="3rd Floor", special_features="Already there")],

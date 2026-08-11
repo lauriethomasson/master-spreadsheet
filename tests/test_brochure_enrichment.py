@@ -44,6 +44,29 @@ class EnrichmentTestCase(unittest.TestCase):
         brochure_enrichment._extract_brochure_units.cache_clear()
 
 
+class TrimMemoryTests(unittest.TestCase):
+    def test_no_op_on_non_linux(self):
+        with patch("brochure_enrichment.platform.system", return_value="Windows"), \
+             patch("brochure_enrichment.ctypes.CDLL") as mock_cdll:
+            brochure_enrichment._trim_memory()
+
+        mock_cdll.assert_not_called()
+
+    def test_calls_malloc_trim_on_linux(self):
+        mock_libc = MagicMock()
+        with patch("brochure_enrichment.platform.system", return_value="Linux"), \
+             patch("brochure_enrichment.ctypes.CDLL", return_value=mock_libc) as mock_cdll:
+            brochure_enrichment._trim_memory()
+
+        mock_cdll.assert_called_once_with("libc.so.6")
+        mock_libc.malloc_trim.assert_called_once_with(0)
+
+    def test_never_raises_even_if_the_symbol_is_missing(self):
+        with patch("brochure_enrichment.platform.system", return_value="Linux"), \
+             patch("brochure_enrichment.ctypes.CDLL", side_effect=OSError("not found")):
+            brochure_enrichment._trim_memory()  # must not raise
+
+
 class NeedsEnrichmentTests(EnrichmentTestCase):
     def test_blank_special_features_needs_enrichment(self):
         row = ListingRow(building="A", special_features=None, state_of_space="Cat A")
@@ -514,6 +537,77 @@ class ApplyUnitsToRowNonStringGuardTests(unittest.TestCase):
         self.assertEqual(fields, ["state_of_space"])
 
 
+class MalformedUnitEntryTests(unittest.TestCase):
+    """
+    Confirmed real, reproducible production bug: units is raw Gemini JSON,
+    never schema-validated for this enrichment path (unlike the direct-
+    PDF-upload path's own ExtractedFields validation) - a single malformed
+    entry (a stray non-dict item, or a non-numeric size_sqft) previously
+    made _match_unit raise, uncaught, in enrich_rows_grouped's own main
+    thread loop, entirely outside _fetch_one's try/except - crashing the
+    WHOLE batch over one bad brochure. _match_unit now filters non-dict
+    entries out before matching, and enrich_rows_grouped's own per-row
+    apply step has its own try/except too (belt and braces).
+    """
+
+    def test_match_unit_skips_a_non_dict_entry_instead_of_raising(self):
+        row = ListingRow(building="A", floor_unit="1st")
+        units = [None, {"building": "A", "floor_unit": "1st", "special_features": "Fine"}]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "Fine")
+
+    def test_match_unit_returns_none_when_every_entry_is_malformed(self):
+        row = ListingRow(building="A", floor_unit="1st")
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, [None, "not a dict either", 42]))
+
+    def test_non_numeric_size_sqft_is_ignored_not_raised(self):
+        row = ListingRow(building="A", floor_unit="Suite Z", size_sqft=2000)
+        units = [
+            {"building": "A", "floor_unit": "1st Floor", "size_sqft": "not a number"},
+            {"building": "A", "floor_unit": "2nd Floor", "size_sqft": 2005},
+        ]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["size_sqft"], 2005)
+
+    def test_enrich_rows_grouped_never_crashes_on_a_malformed_unit_entry(self):
+        rows = [
+            ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+            ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
+            ListingRow(building="C", brochure_link="https://example.com/c.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            if "b.pdf" in url:
+                return [None, {"building": "B", "floor_unit": None, "special_features": "Recovered"}]
+            return [{"building": url, "floor_unit": None, "special_features": "fine"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[1].special_features, "Recovered")
+        self.assertEqual(stats["unique_brochures_considered"], 3)
+        self.assertEqual(stats["processed_urls"]["https://example.com/b.pdf"], "ok")
+
+    def test_a_unit_that_raises_when_applied_leaves_only_that_row_unchanged(self):
+        # A stray non-dict entry is the confirmed real case, but the
+        # per-row try/except in enrich_rows_grouped is belt-and-braces on
+        # top of _match_unit's own filtering - this proves the outer guard
+        # independently, by making _apply_units_to_row itself raise.
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[{"building": "A"}]), \
+             patch("brochure_enrichment._apply_units_to_row", side_effect=RuntimeError("boom")):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(log, [])
+
+
 class EnrichRowTests(EnrichmentTestCase):
     def _mock_units(self, units):
         return patch("brochure_enrichment._extract_brochure_units", return_value=units)
@@ -940,6 +1034,39 @@ class EnrichRowsGroupedTests(EnrichmentTestCase):
         self.assertIsNone(enriched[0].special_features)
         self.assertEqual(enriched[1].special_features, "Good")
 
+    def test_multiple_independent_failures_do_not_stop_the_batch(self):
+        # Several DIFFERENT failure modes scattered through the run - a
+        # raised exception, a None (unavailable) result, and a malformed
+        # units entry - none of them may stop any OTHER brochure from
+        # being attempted, and every genuinely good one must still
+        # succeed regardless of how many bad ones surround it.
+        rows = [
+            ListingRow(building=f"B{i}", brochure_link=f"https://example.com/{i}.pdf", special_features=None)
+            for i in range(6)
+        ]
+
+        def _fake(url):
+            if "0.pdf" in url:
+                raise RuntimeError("boom")
+            if "2.pdf" in url:
+                return None
+            if "4.pdf" in url:
+                return [None, "also not a dict"]
+            idx = url.split("/")[-1].split(".")[0]
+            return [{"building": f"B{idx}", "floor_unit": None, "special_features": f"Feature {idx}"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)  # raised
+        self.assertIsNone(enriched[2].special_features)  # unavailable
+        self.assertIsNone(enriched[4].special_features)  # malformed, no confident match
+        self.assertEqual(enriched[1].special_features, "Feature 1")
+        self.assertEqual(enriched[3].special_features, "Feature 3")
+        self.assertEqual(enriched[5].special_features, "Feature 5")
+        self.assertEqual(stats["unique_brochures_considered"], 6)
+        self.assertEqual(stats["rows_enriched"], 3)
+
     def test_no_confident_match_leaves_row_unchanged(self):
         rows = [ListingRow(building="A", floor_unit="Suite Z", brochure_link="https://example.com/x.pdf", special_features=None)]
         units = [
@@ -996,6 +1123,22 @@ class EnrichRowsGroupedTests(EnrichmentTestCase):
 
         self.assertEqual(len(checkpoints), 1)
         self.assertEqual(checkpoints[0][0].special_features, "F")
+
+    def test_trim_memory_is_called_once_per_completed_brochure(self):
+        # Direct response to a confirmed, measured finding (see
+        # _trim_memory's own docstring): store_shrink(100) alone still
+        # leaves real residual RSS growth across repeated renders - this
+        # confirms the mitigation is actually wired into the main loop,
+        # once per brochure, not just present as an unused helper.
+        rows = [
+            ListingRow(building=f"B{i}", brochure_link=f"https://example.com/{i}.pdf", special_features=None)
+            for i in range(4)
+        ]
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[]), \
+             patch("brochure_enrichment._trim_memory") as mock_trim:
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(mock_trim.call_count, 4)
 
     def test_rows_with_nothing_missing_are_excluded_from_the_run(self):
         rows = [ListingRow(

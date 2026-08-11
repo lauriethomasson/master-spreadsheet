@@ -41,6 +41,16 @@ BASE = Path(__file__).resolve().parent.parent
 
 
 def _clear_pending():
+    # Clears file_store's own st.cache_data-backed lookup caches FIRST -
+    # this file's tests share the real repo's staging/ directory (never an
+    # isolated cwd), so a stale cached listing/hash-lookup from an
+    # immediately-preceding test in a DIFFERENT class could otherwise
+    # either miss a file that needs deleting here, or hand a LATER test a
+    # stale path/result that doesn't reflect what THIS test just did.
+    from storage import file_store as _file_store
+    _file_store._list_pending_staging_files_cached.clear()
+    _file_store._find_previous_upload_by_hash_cached.clear()
+    _file_store._load_staging_as_dataframe_cached.clear()
     for p in list_pending_staging_files():
         (BASE / p).unlink(missing_ok=True)
         (BASE / p).with_suffix(".meta.json").unlink(missing_ok=True)
@@ -244,6 +254,35 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         df = load_staging_as_dataframe(pending[0])
         self.assertEqual(df.iloc[0]["building"], "Building 0")
 
+    def test_base_extraction_survives_even_a_catastrophic_enrichment_crash(self):
+        # Belt-and-braces on top of enrich_rows_grouped's own per-brochure
+        # isolation (see MalformedUnitEntryTests in test_brochure_
+        # enrichment.py) - app.py's own try/except around the WHOLE
+        # run_brochure_enrichment call is what must save the day if
+        # something entirely unanticipated still raises above that layer;
+        # this proves that outer safety net directly, by making the whole
+        # function raise, not just one brochure's own fetch.
+        with patch("brochure_enrichment.run_brochure_enrichment", side_effect=RuntimeError("unexpected crash")):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", _union_style_workbook(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        success_text = "".join(s.value for s in at.success)
+        self.assertIn("Extracted and staged", success_text)
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("unexpected error", warning_text)
+        pending = list_pending_staging_files()
+        self.assertEqual(len(pending), 1)
+        df = load_staging_as_dataframe(pending[0])
+        self.assertEqual(df.iloc[0]["building"], "Building 0")
+
 
 class ReuploadWhileIncompleteTests(unittest.TestCase):
     """
@@ -271,15 +310,6 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
     def setUp(self):
         _clear_pending()
         brochure_enrichment._extract_brochure_units.cache_clear()
-        # This class deletes/rewrites staging files directly (not just
-        # through the app's own API, unlike a real upload) - clearing
-        # these caches too avoids a stale cross-test cached listing/lookup
-        # within the same process (other test classes in this same file
-        # share the real repo's staging/ directory, never an isolated cwd).
-        from storage import file_store as _file_store
-        _file_store._list_pending_staging_files_cached.clear()
-        _file_store._find_previous_upload_by_hash_cached.clear()
-        _file_store._load_staging_as_dataframe_cached.clear()
 
     def tearDown(self):
         _clear_pending()
@@ -314,8 +344,18 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
         with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
             at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at2.run()
+            # A different filename, IDENTICAL bytes - content_hash is
+            # byte-based, filename-independent (see app.py's own
+            # _spreadsheet_content_hash), so this is still genuinely a
+            # "re-upload of the same file" for dedup purposes; using a
+            # distinct stem here only avoids save_staging_file's own
+            # second-resolution timestamped filename colliding with the
+            # FIRST upload's staging path if both happen within the same
+            # wall-clock second (a real, narrow, pre-existing edge case in
+            # save_staging_file, unrelated to what THIS test is about -
+            # see this test's own module docstring).
             at2.file_uploader[0].upload(
-                "Union.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "Union-reupload.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             at2.run()
             extract_buttons = [b for b in at2.button if b.label == "Extract"]

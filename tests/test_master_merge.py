@@ -867,6 +867,37 @@ class SourceRowIdentityPreservedTests(unittest.TestCase):
         self.assertEqual(len(consolidated.unmatched), 2)
         self.assertEqual(consolidated.unmatched_collisions, [])
 
+    # Documents the deliberate limitation _partition_by_source_submarket's
+    # own docstring describes: a future provider file could intentionally
+    # list the SAME building/floor/submarket twice with a genuinely
+    # different source-supplied value (desks, here) - this architecture has
+    # no way to prove that's two real listings rather than one drifted
+    # duplicate, so it is NOT auto-split (unlike a genuine submarket
+    # difference) and NOT auto-merged (the values genuinely disagree) -
+    # it falls through to the existing, already-safe manual-review
+    # fallback, exactly as it would with no submarket involved at all.
+    # Generic/non-UNION on purpose, proving this boundary isn't format-
+    # specific either.
+    def test_same_submarket_with_a_meaningful_value_difference_still_needs_manual_review(self):
+        row_a = ListingRow(
+            building="Riverside House", provider="Meridian Workspace", floor_unit="3rd",
+            submarket="Riverside", desks_max=20,
+        )
+        row_b = ListingRow(
+            building="Riverside House", provider="Meridian Workspace", floor_unit="3rd",
+            submarket="Riverside", desks_max=45,
+        )
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        self.assertEqual(len(groups), 1)  # NOT split apart - same submarket, still one candidate group
+
+        plan = master_merge.MergePlan([], [], [], unmatched, [], groups)
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 2)  # NOT auto-merged - values genuinely disagree
+        self.assertEqual(len(consolidated.unmatched_collisions), 1)  # left for a human to decide
+
 
 class NexusPlaceSourceRowVsPhysicalIdentityTests(unittest.TestCase):
     """

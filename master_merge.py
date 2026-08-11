@@ -1307,6 +1307,41 @@ def _partition_by_source_submarket(indices: list, unmatched: list) -> list:
     compatible with under this same tolerant rule, exactly as if this
     function didn't exist for it.
 
+    THE BROADER PRINCIPLE this is one instance of, not the whole of: two
+    genuinely intentional source listings must never be collapsed (or
+    forced into a merge/manual-duplicate decision) merely because
+    building+provider+floor identity matches - submarket is simply the
+    ONE currently-available field this module can PROVE reflects the
+    original file's own structure (a real per-row column, or a per-sheet
+    structural fallback populated before geocoding ever runs - see
+    fill_missing_submarket_from_structural_header) rather than the
+    pipeline's own downstream guesswork.
+
+    A future case with the SAME submarket (or none at all) but a genuinely
+    different, non-blank source-supplied value elsewhere - size_sqft,
+    rent_pcm, desks_max, state_of_space, brochure_link, or anything else
+    DIFF_FIELDS covers - is NOT given this same auto-preserve treatment,
+    even though it MIGHT also be two intentional listings rather than a
+    drifted duplicate. That's a deliberate limitation, not an oversight:
+    this codebase has no signal that reliably tells "two intentional
+    listings, same everything except this one stated difference" apart
+    from "one accidental duplicate whose values happen to disagree" for
+    any of those fields the way submarket's own structural provenance
+    does - inventing one would mean guessing at exactly the kind of
+    silent, hard-to-audit decision this whole module exists to avoid (see
+    _group_has_genuine_conflict's own docstring: "incorrect enrichment is
+    worse than a blank field", the same principle applied to identity
+    decisions here). Such a case is therefore left to fall through to the
+    EXISTING, already-safe fallback unchanged: _group_has_genuine_conflict
+    still flags a genuine non-blank disagreement on any DIFF_FIELDS value
+    as a real conflict needing manual review, exactly as it always has,
+    regardless of whether submarket happens to match. A human reviewing it
+    can tell "two real listings" from "a data-entry drift" in a way this
+    code cannot; if a future format's provenance changes so a NEW field
+    becomes as provably structural as submarket is today, extending this
+    same treatment to it is a deliberate follow-up, not something to infer
+    here.
+
     Deliberately provider-agnostic and format-agnostic: this reads only
     ListingRow's own submarket field, never a provider name, a sheet name,
     or any hardcoded area string - it applies identically to any current or
