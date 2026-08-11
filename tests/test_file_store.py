@@ -420,5 +420,166 @@ class BrochureEnrichmentProgressTests(IsolatedCwdTestCase):
         )
 
 
+class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
+    """
+    active_and_superseded_staging_files/group_pending_by_content_hash - a
+    real production report: the SAME UNION workbook staged twice (once
+    interrupted at 30/126 brochures, once completed at 126/126) both
+    pending at once, combining into a false 550-row/hundreds-of-conflicts
+    Review batch. These two staging entries share one content_hash (byte-
+    identical source file) - only the more enrichment-complete one should
+    ever be "active" (the one Review reads rows from); the other is
+    "superseded" - still a completely ordinary pending entry for every
+    other purpose (staging management's own listing, its own Discard
+    button), just excluded from row-combination/counts.
+    """
+
+    _staged_counter = 0
+
+    def _staged(self, content_hash, status=None, processed_urls=None, unique=1, n_rows=275, filename="UNION.xlsx"):
+        # save_staging_file's own path is {second-resolution timestamp}_
+        # {filename stem}.xlsx (see its own docstring) - a distinct suffix
+        # per call here guarantees a distinct staging path regardless of
+        # real wall-clock timing, since several calls in one fast test
+        # method easily land within the same second otherwise (a real,
+        # narrow, pre-existing collision risk in save_staging_file itself,
+        # unrelated to what these tests are about). The VISIBLE filename
+        # recorded in each entry's own meta.json is still exactly
+        # `filename` (unsuffixed) - see get_staging_filename - so tests
+        # that need two entries to genuinely SHARE one filename still can.
+        type(self)._staged_counter += 1
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        unique_filename = f"{stem}__{type(self)._staged_counter}{suffix}"
+        path = file_store.save_staging_file(
+            [ListingRow(building="A")] * n_rows, unique_filename, content_hash=content_hash,
+        )
+        meta = file_store._read_meta(path)
+        meta["filename"] = filename
+        file_store._write_meta(path, meta)
+        if status == "complete":
+            file_store.set_staging_enrichment_summary(
+                path, {"unique_brochures_considered": unique, "rows_eligible": n_rows, "rows_enriched": 0},
+                processed_urls or {f"https://{i}.pdf": "ok" for i in range(unique)},
+            )
+        elif status == "in_progress":
+            file_store.set_staging_enrichment_progress(path, processed_urls or {}, unique)
+        return path
+
+    # 1/8. Two staging entries with identical source content are uniquely
+    # identifiable, and their shared identity is recognized.
+    def test_identical_content_hash_groups_the_two_entries_together(self):
+        incomplete = self._staged("hash-union", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126)
+        complete = self._staged("hash-union", status="complete", unique=126)
+
+        groups = file_store.group_pending_by_content_hash([incomplete, complete])
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(set(groups["hash-union"]), {incomplete, complete})
+        self.assertNotEqual(incomplete, complete)  # still two distinct, uniquely-identifiable paths
+
+    # 2. One 30/126 incomplete + one 126/126 complete copy -> complete
+    # copy is active for Review.
+    def test_complete_copy_is_active_incomplete_copy_is_superseded(self):
+        incomplete = self._staged(
+            "hash-union", status="in_progress",
+            processed_urls={f"https://{i}.pdf": "ok" for i in range(30)}, unique=126,
+        )
+        complete = self._staged("hash-union", status="complete", unique=126)
+
+        active, superseded = file_store.active_and_superseded_staging_files([incomplete, complete])
+
+        self.assertEqual(active, [complete])
+        self.assertEqual(superseded, [incomplete])
+
+    # 4. Both entries can still be individually identified in staging
+    # management regardless of active/superseded status.
+    def test_superseded_entry_is_still_a_normal_pending_file_in_every_other_respect(self):
+        incomplete = self._staged("hash-union", status="in_progress", unique=126)
+        complete = self._staged("hash-union", status="complete", unique=126)
+
+        active, superseded = file_store.active_and_superseded_staging_files([incomplete, complete])
+
+        # The superseded path is still a real, readable, individually
+        # discardable staging entry - "superseded" is a Review-page
+        # display/counting decision only, never a deletion.
+        self.assertIsNotNone(file_store.get_staging_enrichment_summary(superseded[0]))
+        self.assertEqual(file_store.get_staging_filename(superseded[0]), "UNION.xlsx")
+
+    # 9. Same filename with genuinely different content is NOT treated as
+    # identical.
+    def test_same_filename_different_content_hash_are_never_grouped(self):
+        path_a = self._staged("hash-june", status="complete", unique=5)
+        path_b = self._staged("hash-july", status="complete", unique=5)
+
+        groups = file_store.group_pending_by_content_hash([path_a, path_b])
+
+        self.assertEqual(len(groups), 2)
+        active, superseded = file_store.active_and_superseded_staging_files([path_a, path_b])
+        self.assertEqual(set(active), {path_a, path_b})
+        self.assertEqual(superseded, [])
+
+    # 12/13. Genuinely different uploads (different content) both remain
+    # active - June vs July, or any two unrelated files, are never
+    # superseded against each other merely because they share a filename
+    # or have overlapping properties.
+    def test_genuinely_different_uploads_are_never_superseded(self):
+        june = self._staged("hash-june-availability", status="complete", unique=10)
+        july = self._staged("hash-july-availability", status="complete", unique=10)
+        unrelated = self._staged("hash-other-provider", status="complete", unique=3)
+
+        active, superseded = file_store.active_and_superseded_staging_files([june, july, unrelated])
+
+        self.assertEqual(set(active), {june, july, unrelated})
+        self.assertEqual(superseded, [])
+
+    def test_a_blank_content_hash_is_never_grouped_with_anything(self):
+        no_hash_a = file_store.save_staging_file([ListingRow(building="A")], "old-upload.xlsx")
+        no_hash_b = file_store.save_staging_file([ListingRow(building="B")], "old-upload-2.xlsx")
+
+        groups = file_store.group_pending_by_content_hash([no_hash_a, no_hash_b])
+        self.assertEqual(groups, {})
+
+        active, superseded = file_store.active_and_superseded_staging_files([no_hash_a, no_hash_b])
+        self.assertEqual(set(active), {no_hash_a, no_hash_b})
+        self.assertEqual(superseded, [])
+
+    def test_never_touched_enrichment_loses_to_any_real_progress(self):
+        never_touched = self._staged("hash-union", status=None, unique=126)
+        in_progress = self._staged("hash-union", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126)
+
+        active, superseded = file_store.active_and_superseded_staging_files([never_touched, in_progress])
+
+        self.assertEqual(active, [in_progress])
+        self.assertEqual(superseded, [never_touched])
+
+    def test_a_genuine_tie_breaks_toward_the_most_recent_entry(self):
+        # Both fully complete, identical enrichment completeness - recency
+        # is the LAST resort tie-break here, never the primary signal (see
+        # this function's own docstring), but a tie must still resolve to
+        # something deterministic rather than crashing/being ambiguous.
+        first = self._staged("hash-union", status="complete", unique=5)
+        second = self._staged("hash-union", status="complete", unique=5)
+
+        active, superseded = file_store.active_and_superseded_staging_files([first, second])
+
+        self.assertEqual(len(active), 1)
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(set(active) | set(superseded), {first, second})
+
+    def test_three_way_group_still_resolves_to_exactly_one_active(self):
+        a = self._staged("hash-union", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126)
+        b = self._staged(
+            "hash-union", status="in_progress",
+            processed_urls={f"https://{i}.pdf": "ok" for i in range(30)}, unique=126,
+        )
+        c = self._staged("hash-union", status="complete", unique=126)
+
+        active, superseded = file_store.active_and_superseded_staging_files([a, b, c])
+
+        self.assertEqual(active, [c])
+        self.assertEqual(set(superseded), {a, b})
+
+
 if __name__ == "__main__":
     unittest.main()

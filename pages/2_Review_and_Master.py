@@ -13,12 +13,14 @@ import page_setup
 from schema import ListingRow
 from storage import blob_store
 from storage.file_store import (
+    active_and_superseded_staging_files,
     clean_value,
     dataframe_to_listing_rows,
     discard_pending_staging_files,
     get_staging_enrichment_summary,
     get_staging_filename,
     get_staging_fully_occupied_buildings,
+    get_staging_row_count,
     list_pending_staging_files,
     load_staging_as_dataframe,
     mark_as_approved,
@@ -851,12 +853,19 @@ def _render_discard_pending(pending: list, new_rows: list):
     """
     Lets a reviewer walk away from a pending batch entirely rather than
     being stuck reviewing something they never meant to act on (e.g. the
-    wrong file was uploaded). Whole-batch, not per-file: the pending-review
-    UI already has no per-file grouping at all - every pending file's rows
-    are combined into one diff/plan and one "Approve -> Master" button
-    covers the lot, so "discard" applies at the same granularity. Per-file
-    discard would need its own "pending files" list UI first, which
-    doesn't exist today.
+    wrong file was uploaded) - deliberately still whole-batch (discards
+    every entry in `pending`, active and superseded alike): the "Approve ->
+    Master" flow above is itself whole-batch (one diff/plan, one button),
+    so "discard everything currently pending" stays available at that same
+    granularity. A reviewer who wants to discard just ONE specific staging
+    entry (e.g. an obsolete, superseded copy of a file also pending, or
+    simply the wrong one of several unrelated uploads) uses the per-file
+    "Discard this upload" button in the staging-management section instead
+    (see _render_single_file_discard/_render_brochure_enrichment_summary) -
+    that one, not this one, is what a real production report confirmed was
+    genuinely missing: with 2+ pending uploads, this whole-batch action was
+    previously the ONLY discard option at all, with no way to remove just
+    one without losing every other pending upload too.
 
     Two-click confirm, same pattern as "Restore this version" in the
     Version history section below - this is a real, permanent deletion
@@ -941,23 +950,74 @@ def _render_master_lookup(master_df: pd.DataFrame) -> None:
         st.caption(f"{len(df)} of {len(master_df)} row(s) shown.")
 
 
-def _render_brochure_enrichment_summary(pending: list) -> None:
+def _render_single_file_discard(path: str) -> None:
     """
-    Read-only "brochure enrichment: N rows enriched" caption per pending
-    file that actually went through it - purely informational for a file
-    that finished normally, no button, nothing to forget. Enrichment itself
-    runs automatically, immediately after a fresh spreadsheet upload's base
-    rows are staged (see app.py's _run_automatic_brochure_enrichment) - by
-    the time a file is even visible here, its own enrichment (if any was
-    eligible) has already run and already been folded into the very rows
-    combined_df reads below; there is nothing left here to trigger for a
-    file that completed.
+    A "Discard this upload" button (two-click confirm, same pattern as
+    _render_discard_pending's own whole-batch action and "Restore this
+    version" below) that targets EXACTLY this one staging path - never the
+    whole `pending` list. discard_pending_staging_files(paths) itself
+    already only ever deletes exactly the paths it's given; the real
+    production bug this fixes is upstream of that function entirely - the
+    OLD UI never called it with anything narrower than the full pending
+    list, so a reviewer with 2+ pending uploads had no way to discard just
+    one (see this module's own real report: an incomplete run and a
+    completed run of the SAME source file, both pending, and clicking the
+    only discard button available would have deleted both).
+
+    Session-state keys are suffixed with `path` itself (a real, unique
+    staging path, e.g. "staging/20260811_..._UNION.xlsx") - never the
+    filename, which two entries here can share - so confirming discard on
+    one entry can never leave a stale confirm flag armed against a
+    DIFFERENT entry, and clicking Confirm always targets whichever single
+    path this specific render call was for.
+    """
+    confirm_key = f"discard_single_confirm_{path}"
+    if st.button("Discard this upload", key=f"discard_single_{path}"):
+        st.session_state[confirm_key] = True
+
+    if st.session_state.get(confirm_key):
+        st.warning(
+            "Are you sure? This permanently discards ONLY this one staging entry — no changes will be "
+            "applied to master, and this cannot be undone (nothing was ever written to master.xlsx, so "
+            "there's no version to restore)."
+        )
+        confirm_cols = st.columns(2)
+        if confirm_cols[0].button("Confirm discard", key=f"discard_single_confirm_btn_{path}", type="primary"):
+            n = get_staging_row_count(path)
+            discard_pending_staging_files([path])
+            st.session_state.pop(confirm_key, None)
+            st.session_state["just_discarded"] = n
+            st.rerun()
+        if confirm_cols[1].button("Cancel", key=f"discard_single_cancel_{path}"):
+            st.session_state.pop(confirm_key, None)
+            st.rerun()
+
+
+def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) -> None:
+    """
+    Staging management: one block per pending upload - filename, its OWN
+    row count, its OWN brochure-enrichment status, and its OWN individually-
+    targeted Discard button (see _render_single_file_discard) - so two
+    entries that happen to share a filename (the real, motivating case: the
+    same source workbook re-uploaded while an earlier run's enrichment was
+    still incomplete, leaving one "30/126" entry and one "126/126" entry
+    both pending under the identical name) are never confused with each
+    other, and discarding one can never accidentally remove the other, or
+    master rows, or a DIFFERENT entry's own enrichment metadata.
+
+    superseded (see active_and_superseded_staging_files, computed once by
+    _render_pending_review and passed to both this function and the merge
+    plan above) marks entries whose rows were excluded from that merge
+    plan and from the counts above it - not hidden, just labeled, since the
+    reviewer must still be able to find and explicitly discard the
+    leftover copy rather than have it silently vanish or silently keep
+    contributing duplicate rows forever.
 
     get_staging_enrichment_summary returns None for a file enrichment never
-    touched at all (no eligible rows, or an upload predating this feature) -
-    silently skipped, not shown as "0 processed", so this section is simply
-    absent for the common case where a provider's spreadsheet already had
-    everything ENRICHABLE_FIELDS covers.
+    touched at all (no eligible rows, or an upload predating this
+    feature) - shown with no enrichment caption at all in that case, same
+    as before this staging-management section existed, just still gets its
+    own identity/row-count line and Discard button now.
 
     stats["status"] == "in_progress" means the run that wrote this never
     reached its own final set_staging_enrichment_summary call - an
@@ -974,44 +1034,69 @@ def _render_brochure_enrichment_summary(pending: list) -> None:
     re-sent to Gemini, so this is genuinely a resume, not a restart. Not an
     automatic retry loop: it only ever runs again when this exact button is
     clicked, exactly once per click. Re-uploading the identical file
-    instead would NOT help (see app.py's own content-hash dedup - an
-    unchanged file's bytes are reused as-is), so Continue is the only real
-    recovery action offered.
+    instead would NOT help it directly (see app.py's own content-hash
+    dedup and its own "continue the matched entry's progress" handling),
+    so Continue here remains the explicit recovery action.
     """
+    superseded_set = set(superseded)
     for path in pending:
-        stats = get_staging_enrichment_summary(path)
-        if not stats:
-            continue
         filename = get_staging_filename(path)
-        if stats.get("status") == "in_progress":
-            remaining = stats["unique_brochures_considered"] - stats["brochures_done"]
-            st.warning(
-                f"⚠️ Brochure enrichment incomplete — {filename}: {stats['brochures_done']}/"
-                f"{stats['unique_brochures_considered']} unique brochure(s) checked before this run stopped "
-                "(the app was likely interrupted or restarted mid-run). Blank descriptive fields on this "
-                f"file's rows may simply be unchecked, not confirmed blank. {remaining} brochure(s) remain."
-            )
-            if st.button(f"Continue enrichment ({remaining} remaining)", key=f"continue_enrichment_{path}"):
-                rows = dataframe_to_listing_rows(load_staging_as_dataframe(path))
-                with st.spinner("Resuming brochure enrichment..."):
-                    brochure_enrichment.run_brochure_enrichment(
-                        rows, path, already_processed=stats["processed_urls"],
-                    )
-                st.rerun()
-            continue
-        summary = (
-            f"Brochure enrichment — {filename}: {stats['unique_brochures_considered']} unique brochure(s) "
-            f"considered, {stats['rows_enriched']} row(s) enriched."
-        )
-        if stats["brochures_unavailable"]:
-            summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
-        st.caption(summary)
+        n_rows = get_staging_row_count(path)
+        stats = get_staging_enrichment_summary(path)
+
+        with st.container(border=True):
+            label = f"**{filename}** — {n_rows} row(s)"
+            if path in superseded_set:
+                label += " — _superseded by a more complete copy of this same file, pending above_"
+            st.markdown(label)
+
+            if stats and stats.get("status") == "in_progress":
+                remaining = stats["unique_brochures_considered"] - stats["brochures_done"]
+                st.warning(
+                    f"⚠️ Brochure enrichment incomplete: {stats['brochures_done']}/"
+                    f"{stats['unique_brochures_considered']} unique brochure(s) checked before this run "
+                    "stopped (the app was likely interrupted or restarted mid-run). Blank descriptive "
+                    f"fields on this file's rows may simply be unchecked, not confirmed blank. "
+                    f"{remaining} brochure(s) remain."
+                )
+                if st.button(f"Continue enrichment ({remaining} remaining)", key=f"continue_enrichment_{path}"):
+                    rows = dataframe_to_listing_rows(load_staging_as_dataframe(path))
+                    with st.spinner("Resuming brochure enrichment..."):
+                        brochure_enrichment.run_brochure_enrichment(
+                            rows, path, already_processed=stats["processed_urls"],
+                        )
+                    st.rerun()
+            elif stats:
+                summary = (
+                    f"Brochure enrichment: Complete — {stats['unique_brochures_considered']}/"
+                    f"{stats['unique_brochures_considered']} checked, {stats['rows_enriched']} row(s) enriched."
+                )
+                if stats["brochures_unavailable"]:
+                    summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
+                st.caption(summary)
+
+            _render_single_file_discard(path)
 
 
 def _render_pending_review(pending: list):
+    # Splits `pending` into active vs superseded BEFORE anything else reads
+    # rows from it - see active_and_superseded_staging_files' own docstring
+    # for the real problem this exists to prevent: the SAME source file
+    # re-uploaded (byte-identical, hence a shared content_hash) while an
+    # earlier run's brochure enrichment was still incomplete leaves TWO
+    # staging entries for one real upload. Only `active` (the more
+    # enrichment-complete member of each content_hash group, or the lone
+    # member of a group of one) ever contributes rows to the merge plan or
+    # counts below - a `superseded` entry is still a completely normal
+    # member of `pending` for every other purpose (staging management's
+    # own per-file listing/discard button, see _render_brochure_
+    # enrichment_summary), it just never gets to double-count its own
+    # building/floor rows against its more-complete twin.
+    active, superseded = active_and_superseded_staging_files(pending)
+
     with st.spinner("Loading..."):
         combined_df = display_utils.sort_by_provider(pd.concat(
-            [load_staging_as_dataframe(path) for path in pending], ignore_index=True
+            [load_staging_as_dataframe(path) for path in active], ignore_index=True
         ))
         new_rows = dataframe_to_listing_rows(combined_df)
         master_df = master_writer.load_master_as_dataframe() if master_writer.master_exists() else _empty_master_df()
@@ -1027,10 +1112,10 @@ def _render_pending_review(pending: list):
         total_unmatched_before = len(plan.unmatched)
         plan = master_merge.consolidate_unmatched_duplicates(plan)
         fully_occupied_buildings = [
-            fo for path in pending for fo in get_staging_fully_occupied_buildings(path)
+            fo for path in active for fo in get_staging_fully_occupied_buildings(path)
         ]
 
-    st.caption(master_merge.pending_status_line(len(pending), plan))
+    st.caption(master_merge.pending_status_line(len(active), plan))
     auto_consolidated_rows = total_unmatched_before - len(plan.unmatched)
     if auto_consolidated_rows or plan.unmatched_collisions:
         st.caption(
@@ -1039,8 +1124,13 @@ def _render_pending_review(pending: list):
             f"{len(plan.unmatched_collisions)} conflict(s) need your review, "
             f"{len(plan.unmatched)} unique row(s) ready."
         )
+    if superseded:
+        st.caption(
+            f"{len(superseded)} pending staging file(s) are an earlier/less-complete processing run of "
+            "a file also pending above and are excluded from these counts — see below to discard them."
+        )
     _render_master_lookup(master_df)
-    _render_brochure_enrichment_summary(pending)
+    _render_brochure_enrichment_summary(pending, superseded)
 
     colliding_changed_ids = {id(m) for group in plan.collisions for m in group}
     colliding_unmatched_ids = {id(u) for group in plan.unmatched_collisions for u in group}

@@ -293,23 +293,26 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
     """
     Content-hash dedup (see app.py's own find_previous_upload_by_hash)
     reuses an already-extracted result for a byte-identical re-upload
-    rather than re-extracting/re-enriching (see app.py's own "if
-    is_spreadsheet_source and not reused:" guard around _run_automatic_
-    brochure_enrichment - pre-existing, unchanged behavior) - an incomplete
-    prior result (a run interrupted partway through - see
-    set_staging_enrichment_progress) must never be silently treated as
-    done just because the file was uploaded again.
+    rather than re-extracting - but when the matched entry's OWN brochure
+    enrichment was left incomplete, the NEW (re-upload) staging entry now
+    CONTINUES that progress automatically (see app.py's own
+    resume_already_processed) rather than silently freezing at the same
+    partial state forever with no automatic path to ever finish - a real
+    production report confirmed a re-upload used to just sit there
+    unfinished. Already-"ok" brochures are still never re-fetched/re-sent
+    to Gemini just because this landed on a new staging path rather than
+    the original one.
 
     Each upload event still stages its OWN file (see save_staging_file's
     own docstring - "reused or freshly extracted alike", a pre-existing,
     unrelated design choice for multi-file-batch durability), so a
-    re-upload genuinely produces a SECOND pending entry; this is not a
-    duplication this feature introduces or is meant to fix, and the
-    ORIGINAL (first) file's own incomplete status/rows are what must
-    survive the reuse untouched - checked here, not "only one file exists"
-    (see this module's own docstring on this known, pre-existing
-    limitation for the "Continue enrichment" story: a user should ideally
-    reach for it on the same pending file rather than re-uploading at all).
+    re-upload genuinely produces a SECOND pending entry - the ORIGINAL
+    (first) file's own status is never retroactively changed by this (only
+    the NEW entry's own progresses), and Review & Master's own content-
+    hash-based supersede logic (see storage.file_store.
+    active_and_superseded_staging_files) is what keeps the two from
+    double-counting rows once both are pending - see
+    test_app_review_pending_staging_management.py for that half.
     """
 
     def setUp(self):
@@ -320,7 +323,7 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
         _clear_pending()
         brochure_enrichment._extract_brochure_units.cache_clear()
 
-    def test_reuploading_the_same_file_while_incomplete_does_not_mark_it_complete(self):
+    def test_reuploading_the_same_file_while_incomplete_continues_its_progress(self):
         file_bytes = _union_style_workbook()
 
         with patch("brochure_enrichment._extract_brochure_units", side_effect=RuntimeError("interrupted")):
@@ -346,7 +349,10 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
         from storage.file_store import set_staging_enrichment_progress
         set_staging_enrichment_progress(original_path, {}, 1)
 
-        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+        with patch(
+            "brochure_enrichment._extract_brochure_units",
+            return_value=[{"building": "Building 0", "floor_unit": "0th Floor", "special_features": "Recovered"}],
+        ) as mock_extract:
             at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at2.run()
             # A different filename, IDENTICAL bytes - content_hash is
@@ -367,16 +373,57 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
             extract_buttons[0].click().run()
             self.assertFalse(at2.exception)
 
-        # Reused, not re-extracted or re-enriched - no new brochure call at
-        # all for the re-upload event itself (the content-hash match skips
-        # _run_automatic_brochure_enrichment entirely - see app.py's own
-        # "not reused" guard).
-        mock_extract.assert_not_called()
-        # The ORIGINAL file's own incomplete status survives untouched -
-        # never silently promoted to "complete" just because the file was
-        # uploaded again elsewhere.
+        # The re-upload's OWN staging entry continued the matched entry's
+        # progress - the one remaining eligible brochure WAS attempted.
+        mock_extract.assert_called_once()
+        pending_after = list_pending_staging_files()
+        new_path = next(p for p in pending_after if p != original_path)
+        new_stats = get_staging_enrichment_summary(new_path)
+        self.assertEqual(new_stats["status"], "complete")
+        df = load_staging_as_dataframe(new_path)
+        self.assertEqual(df.iloc[0]["special_features"], "Recovered")
+
+        # The ORIGINAL file's own status is never retroactively changed -
+        # only the NEW entry progresses.
         stats = get_staging_enrichment_summary(original_path)
         self.assertEqual(stats["status"], "in_progress")
+
+    def test_reuploading_a_complete_match_does_not_re_run_enrichment(self):
+        # The counterpart case: nothing to continue when the matched
+        # entry's own enrichment already finished - this must stay a pure
+        # reuse, exactly as before this feature existed.
+        file_bytes = _union_style_workbook()
+
+        with patch(
+            "brochure_enrichment._extract_brochure_units",
+            return_value=[{"building": "Building 0", "floor_unit": "0th Floor", "special_features": "Done"}],
+        ):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        pending = list_pending_staging_files()
+        original_stats = get_staging_enrichment_summary(pending[0])
+        self.assertEqual(original_stats["status"], "complete")
+
+        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+            at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at2.run()
+            at2.file_uploader[0].upload(
+                "Union-reupload.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at2.run()
+            extract_buttons = [b for b in at2.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at2.exception)
+
+        mock_extract.assert_not_called()
 
 
 class FingerprintIncludesBrochureEnrichmentAgainTests(unittest.TestCase):

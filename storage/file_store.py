@@ -89,6 +89,22 @@ def get_staging_filename(path: str) -> str:
     return _read_meta(path).get("filename", path)
 
 
+def get_staging_row_count(path: str) -> int:
+    """n_rows as recorded at save_staging_file time - the ORIGINAL row
+    count for this staging file, not re-derived from its current .xlsx
+    (which never changes row count after the fact anyway, only field
+    values - see update_staging_rows' own docstring). Used for a per-file
+    staging-management listing (see pages/2_Review_and_Master.py) where
+    two entries sharing a filename otherwise look identical at a glance."""
+    return _read_meta(path).get("n_rows", 0)
+
+
+def get_staging_timestamp(path: str) -> str:
+    """The ISO-format upload timestamp recorded at save_staging_file time -
+    same per-file staging-management use as get_staging_row_count above."""
+    return _read_meta(path).get("timestamp")
+
+
 def update_staging_rows(path: str, rows: list[ListingRow]) -> None:
     """
     Overwrites an already-staged file's OWN rows in place at the same path -
@@ -379,6 +395,115 @@ def discard_pending_staging_files(paths: list) -> None:
     for path in paths:
         blob_store.delete(path)
         blob_store.delete(_meta_path(path))
+
+
+def _enrichment_completeness_rank(path: str) -> tuple:
+    """
+    (status_rank, brochures_done) - higher sorts as more enrichment-
+    complete/preferred, for active_and_superseded_staging_files' own
+    ordering between two staging files that share the same content_hash.
+    complete (2) beats any in-progress state (1), which beats a file
+    enrichment never even touched (0, get_staging_enrichment_summary
+    returns None - see that function's own docstring on why that's not a
+    zero-valued dict); within the same status, more brochures actually
+    checked wins. Never the sole signal on its own - see
+    active_and_superseded_staging_files' own docstring on why recency is
+    only ever the LAST tie-break, after this.
+    """
+    stats = get_staging_enrichment_summary(path)
+    if not stats:
+        return (0, 0)
+    status_rank = 2 if stats.get("status") == "complete" else 1
+    return (status_rank, stats.get("brochures_done", 0))
+
+
+def group_pending_by_content_hash(pending: list) -> dict:
+    """
+    {content_hash: [paths...]} for every entry in `pending` that has a
+    genuine, non-blank content_hash of its own - grouping candidate
+    staging files that are BYTE-IDENTICAL uploads of the same source file
+    (see _spreadsheet_content_hash/EXTRACTION_VERSION in app.py), never a
+    fuzzy or extracted-content-based match. An entry with no content_hash
+    at all (a pre-this-feature upload, or any future upload type that
+    doesn't set one) is deliberately EXCLUDED here rather than grouped
+    under some placeholder key - it has nothing reliable to be compared
+    against, so active_and_superseded_staging_files' own caller must
+    treat every path missing from this dict's own values as its own,
+    always-active singleton.
+    """
+    groups = {}
+    for path in pending:
+        content_hash = _read_meta(path).get("content_hash")
+        if content_hash:
+            groups.setdefault(content_hash, []).append(path)
+    return groups
+
+
+def active_and_superseded_staging_files(pending: list) -> tuple:
+    """
+    (active_paths, superseded_paths), both subsets of `pending`, in `pending`'s
+    own relative order - splits pending staging files by content_hash
+    identity (see group_pending_by_content_hash) so Review & Master's own
+    merge-plan combination (see pages/2_Review_and_Master.py's
+    _render_pending_review) reads rows from exactly ONE staging file per
+    genuinely distinct uploaded document, never once per PROCESSING RUN of
+    the same document.
+
+    Real problem this solves: re-uploading the identical source file while
+    an earlier run's brochure enrichment was still incomplete (or simply
+    re-uploading it again later) creates a SECOND staging entry - by
+    design, see save_staging_file's own docstring on per-upload durability
+    - that shares the first one's content_hash. Combining both into one
+    Review batch double-counts every real property in that file (275 rows
+    -> 550) and forces master_merge's own intra-batch duplicate logic to
+    reconcile hundreds of pairs that are really "the same upload, two
+    processing runs" rather than genuine duplicates - producing false
+    conflicts whenever the two runs' own independent geocoding happened to
+    disagree, on top of just being needless work.
+
+    Within a content_hash group of 2+ staging files, exactly ONE is
+    "active" (the one whose brochure-enrichment state is most complete -
+    see _enrichment_completeness_rank; a genuine tie breaks toward the
+    most recently written entry, the LAST resort here, never the primary
+    signal - "latest wins" alone is exactly the naive rule this function
+    deliberately does NOT implement) - every other member of that group is
+    "superseded": excluded from Review's own row-combination/counts, but
+    still a completely ordinary member of `pending` for every other
+    purpose (staging management's own per-file listing, its own
+    individual Discard button, Continue enrichment if the reviewer
+    genuinely wants to finish it anyway - superseded is a Review-page
+    display/counting decision only, never a deletion).
+
+    A path with no content_hash at all, or the lone member of its own
+    content_hash group, is always active - there is nothing to supersede
+    it, and nothing it could safely supersede either (see
+    group_pending_by_content_hash's own docstring on why a blank hash is
+    excluded from grouping rather than treated as one shared group).
+    """
+    groups = group_pending_by_content_hash(pending)
+    grouped_paths = {p for paths in groups.values() for p in paths}
+
+    active, superseded = [], []
+    for path in pending:
+        if path not in grouped_paths:
+            active.append(path)
+
+    for paths in groups.values():
+        if len(paths) == 1:
+            active.append(paths[0])
+            continue
+        ranked = sorted(
+            paths,
+            key=lambda p: (_enrichment_completeness_rank(p), _read_meta(p).get("timestamp", "")),
+            reverse=True,
+        )
+        active.append(ranked[0])
+        superseded.extend(ranked[1:])
+
+    active_order = {path: i for i, path in enumerate(pending)}
+    active.sort(key=lambda p: active_order[p])
+    superseded.sort(key=lambda p: active_order[p])
+    return active, superseded
 
 
 def clean_value(value):

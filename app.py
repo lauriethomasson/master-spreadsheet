@@ -25,6 +25,7 @@ from storage.file_store import (
     dataframe_to_listing_rows,
     find_previous_upload_by_hash,
     get_saved_critical_field_rescue,
+    get_staging_enrichment_summary,
     get_staging_fully_occupied_buildings,
     load_staging_as_dataframe,
     save_original_pdf,
@@ -184,7 +185,9 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
             row.address_1 = row.building
 
 
-def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str) -> list[ListingRow]:
+def _run_automatic_brochure_enrichment(
+    rows: list[ListingRow], staging_path: str, already_processed: dict = None,
+) -> list[ListingRow]:
     """
     Runs immediately after a FRESH spreadsheet upload's base rows are
     already staged at staging_path (see save_staging_file, called by the
@@ -194,6 +197,15 @@ def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str
     brochure_enrichment.py's own module docstring): the rows already exist
     on disk, byte-identical to what was just extracted, before this ever
     downloads or sends a single brochure to Gemini.
+
+    already_processed ({url: "ok" | "unavailable"}), when given, is a PRIOR
+    upload's own persisted brochure-enrichment progress for this exact
+    content (see the caller's own "reused but incomplete" branch below) -
+    already-"ok" brochures are never re-fetched/re-sent to Gemini just
+    because a re-upload of the identical file happened to land on a NEW
+    staging entry rather than the original one. Defaults to {} (nothing to
+    resume) for the ordinary fresh-upload case, identical to every prior
+    behavior before this parameter existed.
 
     A no-op, with no UI at all, when nothing is eligible (see
     brochure_enrichment.eligible_rows_and_brochures) - the common case for a
@@ -224,12 +236,9 @@ def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str
         f"checking {len(unique_urls)} unique brochure(s) for it. "
         "Your extracted spreadsheet data has already been saved — this step only adds extra detail."
     )
-    # already_processed is always {} here - a FRESH upload's staging file
-    # has no prior enrichment attempt to resume from at all (see pages/
-    # 2_Review_and_Master.py's own "Continue enrichment" action for the
-    # ONLY other caller of run_brochure_enrichment, which passes whatever
-    # a previous, interrupted attempt already recorded).
-    return brochure_enrichment.run_brochure_enrichment(rows, staging_path, already_processed={})
+    return brochure_enrichment.run_brochure_enrichment(
+        rows, staging_path, already_processed=already_processed or {},
+    )
 
 
 def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) -> None:
@@ -600,10 +609,31 @@ with page_setup.setup_page("upload"):
 
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
                     fully_occupied_buildings = []
+                    # Set below ONLY when previous_staging_path's own
+                    # enrichment was left incomplete - see its own use at
+                    # the automatic-enrichment call site further down.
+                    resume_already_processed = None
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
                         reused = True
+                        # A byte-identical re-upload while the ORIGINAL
+                        # match's own brochure enrichment was still
+                        # incomplete (see brochure_enrichment.run_brochure_
+                        # enrichment's own status="in_progress") must not
+                        # just freeze this new copy at that same partial
+                        # state forever, with no automatic path to ever
+                        # finish it short of the reviewer manually clicking
+                        # Continue on some OTHER staging entry - continuing
+                        # its own progress here means already-"ok"
+                        # brochures are still never re-fetched/re-billed to
+                        # Gemini (see enrich_rows_grouped's own
+                        # already_processed param), this upload just picks
+                        # up the remaining ones automatically instead of
+                        # silently going nowhere.
+                        previous_enrichment = get_staging_enrichment_summary(previous_staging_path)
+                        if previous_enrichment and previous_enrichment.get("status") == "in_progress":
+                            resume_already_processed = previous_enrichment.get("processed_urls", {})
                         # A reused result's own fully_occupied_buildings (see
                         # extract_spreadsheet_gemini.extract_sheet_with_
                         # metadata) lives in the ORIGINAL staging run's own
@@ -812,21 +842,28 @@ with page_setup.setup_page("upload"):
                     if is_spreadsheet_source and not reused:
                         st.caption(f"Spreadsheet extracted — {len(rows)} row(s) saved.")
 
-                    # Automatic, fresh-spreadsheet-extraction only - never
-                    # for a reused (byte-identical previous upload) result,
-                    # which already carries forward whatever its own
-                    # original run's enrichment did or didn't accomplish,
-                    # and never for PDF/email (see brochure_enrichment.py's
-                    # own module docstring on why those are out of scope).
-                    # Wrapped in its own try/except, on top of enrich_rows_
-                    # grouped's own internal per-brochure exception handling
-                    # - the base extraction above is ALREADY staged by this
-                    # point, so an unexpected bug here must never surface as
-                    # "extraction failed" for a file whose real extraction
-                    # genuinely succeeded.
-                    if is_spreadsheet_source and not reused:
+                    # Automatic - for a fresh spreadsheet extraction always,
+                    # and ALSO for a reused (byte-identical previous
+                    # upload) result whose own matched entry's enrichment
+                    # was left incomplete (resume_already_processed is then
+                    # non-None - see its own assignment above), so THIS
+                    # staging entry continues that progress rather than
+                    # staying frozen at it forever. A reused result whose
+                    # match was already complete still skips this entirely -
+                    # nothing left to do. Never for PDF/email (see
+                    # brochure_enrichment.py's own module docstring on why
+                    # those are out of scope). Wrapped in its own try/
+                    # except, on top of enrich_rows_grouped's own internal
+                    # per-brochure exception handling - the base extraction
+                    # above is ALREADY staged by this point, so an
+                    # unexpected bug here must never surface as "extraction
+                    # failed" for a file whose real extraction genuinely
+                    # succeeded.
+                    if is_spreadsheet_source and (not reused or resume_already_processed is not None):
                         try:
-                            rows = _run_automatic_brochure_enrichment(rows, staging_path)
+                            rows = _run_automatic_brochure_enrichment(
+                                rows, staging_path, already_processed=resume_already_processed,
+                            )
                         except Exception as e:
                             st.warning(
                                 f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
