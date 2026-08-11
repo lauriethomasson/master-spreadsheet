@@ -331,5 +331,68 @@ class FullyOccupiedBuildingsMetadataTests(IsolatedCwdTestCase):
         self.assertEqual(file_store.get_staging_fully_occupied_buildings(staging_path), [])
 
 
+class BrochureEnrichmentProgressTests(IsolatedCwdTestCase):
+    """
+    set_staging_enrichment_progress/set_staging_enrichment_summary/
+    get_staging_enrichment_summary - the interim "in_progress" marker an
+    interrupted enrichment run leaves behind (see app.py's own
+    _run_automatic_brochure_enrichment), versus the final "complete" one
+    written once enrich_rows_grouped actually finishes.
+    """
+
+    def test_no_marker_at_all_returns_none(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        self.assertIsNone(file_store.get_staging_enrichment_summary(staging_path))
+
+    def test_progress_marker_is_tagged_in_progress(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        file_store.set_staging_enrichment_progress(staging_path, 3, 10)
+
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+        self.assertEqual(stats["status"], "in_progress")
+        self.assertEqual(stats["brochures_done"], 3)
+        self.assertEqual(stats["unique_brochures_considered"], 10)
+
+    def test_final_summary_overwrites_an_earlier_progress_marker(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+        file_store.set_staging_enrichment_progress(staging_path, 3, 10)
+
+        file_store.set_staging_enrichment_summary(staging_path, {
+            "unique_brochures_considered": 10, "brochures_read_ok": 10,
+            "brochures_unavailable": 0, "rows_eligible": 10, "rows_enriched": 10,
+        })
+
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+        self.assertEqual(stats["status"], "complete")
+        self.assertEqual(stats["rows_enriched"], 10)
+
+    def test_final_summary_always_tagged_complete_even_without_a_prior_progress_marker(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        file_store.set_staging_enrichment_summary(staging_path, {
+            "unique_brochures_considered": 1, "brochures_read_ok": 1,
+            "brochures_unavailable": 0, "rows_eligible": 1, "rows_enriched": 1,
+        })
+
+        self.assertEqual(file_store.get_staging_enrichment_summary(staging_path)["status"], "complete")
+
+    def test_a_later_progress_call_can_still_overwrite_a_completed_summary(self):
+        # Not a realistic call order for one run (progress calls only ever
+        # precede the final summary call - see app.py), but confirms the
+        # two functions don't depend on call order to behave correctly,
+        # only on whichever was written last.
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+        file_store.set_staging_enrichment_summary(staging_path, {
+            "unique_brochures_considered": 1, "brochures_read_ok": 1,
+            "brochures_unavailable": 0, "rows_eligible": 1, "rows_enriched": 1,
+        })
+
+        file_store.set_staging_enrichment_progress(staging_path, 0, 5)
+
+        self.assertEqual(file_store.get_staging_enrichment_summary(staging_path)["status"], "in_progress")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import master_writer
 from schema import ListingRow
-from storage.file_store import save_staging_file, set_staging_enrichment_summary
+from storage.file_store import save_staging_file, set_staging_enrichment_progress, set_staging_enrichment_summary
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -108,6 +108,49 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
 
         caption_text = "".join(c.value for c in at.caption)
         self.assertIn("2 brochure(s) could not be processed", caption_text)
+
+    def test_interrupted_run_shows_a_warning_not_a_normal_caption(self):
+        # A run that never reached its own final set_staging_enrichment_
+        # summary call (killed process, crashed Cloud Run instance,
+        # cancelled Streamlit rerun) leaves only the interim progress
+        # marker behind (see set_staging_enrichment_progress) - this file's
+        # rows are a genuine mix of enriched and never-attempted, so this
+        # must render as an explicit warning, never the same quiet caption
+        # a genuinely finished run gets.
+        path = save_staging_file(
+            [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)],
+            "Union.xlsx", content_hash="hash-interrupted",
+        )
+        set_staging_enrichment_progress(path, 4, 10)
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("4 of 10", warning_text)
+        self.assertIn("stopped", warning_text)
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertNotIn("Brochure enrichment", caption_text)
+
+    def test_interrupted_run_warning_correctly_advises_discard_then_reupload(self):
+        # A byte-identical re-upload is REUSED as-is (see app.py's own
+        # content-hash dedup), never re-triggering enrichment - so the
+        # advice here must be to discard first, never just "re-upload",
+        # which would silently do nothing.
+        path = save_staging_file(
+            [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)],
+            "Union.xlsx", content_hash="hash-interrupted-2",
+        )
+        set_staging_enrichment_progress(path, 0, 3)
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        warning_text = "".join(w.value for w in at.warning).lower()
+        self.assertIn("discard", warning_text)
+        self.assertIn("will not retry", warning_text)
 
 
 def _pdf_response():

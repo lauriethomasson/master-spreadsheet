@@ -95,6 +95,32 @@ _REJECTED_URL_KEYWORDS = ("floorplan", "floor-plan", "youtube.com", "youtu.be")
 _SIZE_MATCH_TOLERANCE_FRACTION = 0.02
 _SIZE_MATCH_MIN_TOLERANCE_SQFT = 1.0
 
+# The leading digit run in a floor_unit label, e.g. "5" from "5th Floor",
+# "5th", "Floor 5", or a bare "5" - used by _match_unit as a fallback when an
+# exact normalize_key floor_unit match (the primary tier) fails to resolve to
+# exactly one candidate. A provider's own spreadsheet and Gemini's brochure
+# extraction routinely label the SAME floor differently in ways normalize_key
+# alone never reconciles ("5th" vs "5th Floor" vs "Floor 5" - confirmed: none
+# of these three normalize_key-equal each other) even though a human reading
+# both would recognize them as unambiguously the same floor. Digit-only
+# (never "fifth"/word ordinals) - deliberately narrow, same "start
+# conservative" precedent as brochure_link_resolver.py's own.
+_FLOOR_NUMBER_RE = re.compile(r"\d+")
+
+
+def _floor_number(floor_unit):
+    """
+    The leading digit run in `floor_unit` as an int (e.g. 5 from "5th
+    Floor"), or None if it's blank or has no digit at all (e.g. "Ground
+    Floor", "Reception") - those never participate in this fallback tier,
+    exactly as if it didn't exist for them (falls through to the existing
+    size-based tier, or no match, same as before this existed).
+    """
+    if _is_blank(floor_unit):
+        return None
+    match = _FLOOR_NUMBER_RE.search(str(floor_unit))
+    return int(match.group()) if match else None
+
 
 def _is_blank(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
@@ -413,9 +439,10 @@ def _match_unit(row: ListingRow, units: list):
     """
     The single brochure unit confidently identified as describing `row`'s
     own property, or None when there isn't one - never a fuzzy/similarity
-    match, only exact (normalize_key-equal) building names and either an
-    exact floor_unit match or a size_sqft match within a small numeric
-    tolerance (see _SIZE_MATCH_TOLERANCE_FRACTION).
+    match, only exact (normalize_key-equal) building names and then, in
+    order, an exact floor_unit match, a floor NUMBER match (see
+    _floor_number), or a size_sqft match within a small numeric tolerance
+    (see _SIZE_MATCH_TOLERANCE_FRACTION).
 
     A building with only ONE matching brochure unit is treated as a
     confident match regardless of its own floor_unit/size_sqft - a brochure
@@ -424,10 +451,25 @@ def _match_unit(row: ListingRow, units: list):
     (manned reception, showers, bike storage) legitimately apply to every
     matching row for; there is nothing else in the brochure to prefer over
     it. A building with SEVERAL matching units (a real schedule of areas)
-    only ever resolves when floor_unit or size_sqft narrows it to exactly
-    one - two or more still matching after that is ambiguous and returns
-    None, same as zero matching: incorrect enrichment is worse than a blank
-    field, so an unresolved tie is never broken by guessing.
+    only ever resolves when floor_unit (exact text, then leading floor
+    number) or size_sqft narrows it to exactly one - two or more still
+    matching after every tier is ambiguous and returns None, same as zero
+    matching: incorrect enrichment is worse than a blank field, so an
+    unresolved tie is never broken by guessing.
+
+    The floor-NUMBER tier (between the exact-text and size tiers) exists
+    because a provider's own spreadsheet and Gemini's own brochure
+    extraction routinely label the identical floor differently in ways
+    normalize_key alone never reconciles - confirmed against real brochures
+    in this repo's own tests/sample_docs/: a spreadsheet row commonly says
+    just "5th" or a bare "5" where the brochure itself says "5th Floor",
+    which fails the exact-text tier outright even though there is exactly
+    one "5"-numbered floor in the whole building and zero real ambiguity.
+    Still just as conservative as the tiers around it: only ever resolves
+    when exactly one building_match shares that row's own leading floor
+    number, never when two units coincidentally share one (e.g. "5th
+    Floor" and "5B Suite" both extracting 5) - that stays an unresolved
+    tie, same as the exact-text and size tiers already treat one.
     """
     row_building_key = normalize_key(row.building)
     if not row_building_key:
@@ -443,6 +485,12 @@ def _match_unit(row: ListingRow, units: list):
         floor_matches = [u for u in building_matches if normalize_key(u.get("floor_unit")) == row_floor_key]
         if len(floor_matches) == 1:
             return floor_matches[0]
+
+        row_floor_number = _floor_number(row.floor_unit)
+        if row_floor_number is not None:
+            number_matches = [u for u in building_matches if _floor_number(u.get("floor_unit")) == row_floor_number]
+            if len(number_matches) == 1:
+                return number_matches[0]
 
     if row.size_sqft:
         tolerance = max(_SIZE_MATCH_MIN_TOLERANCE_SQFT, row.size_sqft * _SIZE_MATCH_TOLERANCE_FRACTION)
@@ -471,6 +519,21 @@ def _apply_units_to_row(row: ListingRow, units):
     exact same object, so a caller can tell "nothing happened" apart from
     "something changed" with a plain identity/truthiness check. Never
     mutates `row`.
+
+    Every ENRICHABLE_FIELDS value taken from `unit` must be a genuine str -
+    both fields are Optional[str] on ListingRow, but `unit` is a raw Gemini
+    JSON dict that, unlike the primary upload path's own units (validated
+    through ExtractedFields - see extract.extract()), never passes through
+    any schema validation at all before reaching here. model_copy(update=...)
+    below does NOT re-validate its update dict (unlike constructing a
+    ListingRow directly) - it would otherwise silently accept whatever type
+    Gemini's JSON happened to produce (e.g. a list, if a future prompt
+    tweak ever led it to return special_features as an array instead of the
+    prompt's own requested semicolon-separated string) directly into a
+    ListingRow field that every other reader (Excel writing, text diffing
+    in master_merge.py) assumes is a plain string. Treated exactly like a
+    blank value in that case - nothing to enrich from this field, not a
+    reason to fail the whole row or the run.
     """
     if not units:
         return row, []
@@ -482,7 +545,8 @@ def _apply_units_to_row(row: ListingRow, units):
     updates = {
         field: unit[field]
         for field in ENRICHABLE_FIELDS
-        if _is_blank(getattr(row, field)) and not _is_blank(unit.get(field))
+        if _is_blank(getattr(row, field))
+        and isinstance(unit.get(field), str) and not _is_blank(unit.get(field))
     }
     if not updates:
         return row, []

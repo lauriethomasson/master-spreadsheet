@@ -31,7 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app
 import brochure_enrichment
-from storage.file_store import get_staging_enrichment_summary, list_pending_staging_files, load_staging_as_dataframe
+from storage.file_store import (
+    get_staging_enrichment_summary,
+    list_pending_staging_files,
+    load_staging_as_dataframe,
+)
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -183,6 +187,35 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         df = load_staging_as_dataframe(pending[0])
         self.assertEqual(len(df), 10)
         self.assertTrue(all(df["special_features"].notna()))
+
+    def test_a_run_that_completes_normally_is_tagged_complete_not_left_in_progress(self):
+        # _run_automatic_brochure_enrichment writes an interim
+        # "in_progress" marker before enrich_rows_grouped even starts (see
+        # set_staging_enrichment_progress) - a run that finishes normally
+        # must overwrite it with the final status="complete" summary, never
+        # leave the interim marker behind to be misread later as an
+        # interrupted run (see pages/2_Review_and_Master.py's own
+        # _render_brochure_enrichment_summary).
+        raw_units = {"units": [{
+            "building": "Building 0", "floor_unit": "0th Floor", "special_features": "Roof terrace",
+        }]}
+        with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw_units):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", _union_style_workbook(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        pending = list_pending_staging_files()
+        stats = get_staging_enrichment_summary(pending[0])
+        self.assertEqual(stats["status"], "complete")
 
     def test_a_broken_brochure_does_not_fail_the_whole_upload(self):
         # Patched at _extract_brochure_units, not httpx.get - that

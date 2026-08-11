@@ -363,6 +363,60 @@ class MatchUnitTests(unittest.TestCase):
 
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
 
+    def test_short_floor_number_matches_the_full_brochure_label(self):
+        # Real confirmed gap: a provider spreadsheet's own floor_unit is
+        # routinely just "5th" (or a bare "5") where the brochure itself
+        # says "5th Floor" - normalize_key alone never reconciles these,
+        # even though there's exactly one "5"-numbered floor and zero real
+        # ambiguity (traced against a real sample brochure in this repo's
+        # own tests/sample_docs/40_New_Bond_Street_Brochure.pdf).
+        units = [
+            {"building": "40 New Bond Street", "floor_unit": "5th Floor", "special_features": "Terrace"},
+            {"building": "40 New Bond Street", "floor_unit": "4th Floor", "special_features": "Under offer"},
+            {"building": "40 New Bond Street", "floor_unit": "3rd Floor", "special_features": "Available"},
+        ]
+
+        for floor_label in ("5th", "5", "Floor 5", "5th fl"):
+            row = ListingRow(building="40 New Bond Street", floor_unit=floor_label)
+            matched = brochure_enrichment._match_unit(row, units)
+            self.assertEqual(matched["special_features"], "Terrace", msg=f"floor_unit={floor_label!r}")
+
+    def test_floor_number_fallback_never_fires_when_exact_text_already_resolved(self):
+        # The floor-number tier only runs when the exact-text tier didn't
+        # already resolve to exactly one - a row whose floor_unit exactly
+        # matches one brochure unit must keep matching that one even if a
+        # DIFFERENT unit would coincidentally also share its floor number.
+        row = ListingRow(building="A", floor_unit="5th Floor West")
+        units = [
+            {"building": "A", "floor_unit": "5th Floor West", "special_features": "Correct"},
+            {"building": "A", "floor_unit": "5th Floor East", "special_features": "Wrong"},
+        ]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "Correct")
+
+    def test_two_units_sharing_the_same_floor_number_stay_ambiguous(self):
+        # "5th Floor" and "5B Suite" both extract floor number 5 - the
+        # fallback must still return None rather than guess between them,
+        # same principle as the exact-text and size tiers already apply.
+        row = ListingRow(building="A", floor_unit="5")
+        units = [
+            {"building": "A", "floor_unit": "5th Floor", "special_features": "One"},
+            {"building": "A", "floor_unit": "5B Suite", "special_features": "Two"},
+        ]
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
+    def test_floor_number_fallback_does_not_apply_when_row_floor_has_no_digit(self):
+        row = ListingRow(building="A", floor_unit="Ground Floor")
+        units = [
+            {"building": "A", "floor_unit": "1st Floor", "special_features": "One"},
+            {"building": "A", "floor_unit": "2nd Floor", "special_features": "Two"},
+        ]
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
     def test_no_building_match_returns_none(self):
         row = ListingRow(building="Somewhere Else")
         units = [{"building": "28 Lime Street", "floor_unit": "4th Floor"}]
@@ -388,6 +442,76 @@ class MatchUnitTests(unittest.TestCase):
         units = [{"building": "28 Lime Street", "floor_unit": "4th Floor"}]
 
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
+
+class FloorNumberTests(unittest.TestCase):
+    def test_ordinal_with_word(self):
+        self.assertEqual(brochure_enrichment._floor_number("5th Floor"), 5)
+
+    def test_bare_ordinal(self):
+        self.assertEqual(brochure_enrichment._floor_number("5th"), 5)
+
+    def test_bare_number(self):
+        self.assertEqual(brochure_enrichment._floor_number("5"), 5)
+
+    def test_number_before_word(self):
+        self.assertEqual(brochure_enrichment._floor_number("Floor 5"), 5)
+
+    def test_no_digit_returns_none(self):
+        self.assertIsNone(brochure_enrichment._floor_number("Ground Floor"))
+
+    def test_blank_returns_none(self):
+        self.assertIsNone(brochure_enrichment._floor_number(None))
+        self.assertIsNone(brochure_enrichment._floor_number(""))
+
+    def test_two_digit_number_not_confused_with_a_single_digit(self):
+        self.assertEqual(brochure_enrichment._floor_number("15th Floor"), 15)
+        self.assertNotEqual(brochure_enrichment._floor_number("15th Floor"), brochure_enrichment._floor_number("5th"))
+
+
+class ApplyUnitsToRowNonStringGuardTests(unittest.TestCase):
+    """
+    _apply_units_to_row's units come from raw Gemini JSON (see
+    _extract_brochure_units), never validated against ExtractedFields the
+    way the primary upload path's own units are (see extract.extract()) -
+    and model_copy(update=...) does not re-validate field types the way
+    constructing a ListingRow directly would. A non-str value for an
+    ENRICHABLE_FIELDS field must be treated exactly like a blank one
+    (skipped), never silently written into a ListingRow field that every
+    other reader assumes is a plain string.
+    """
+
+    def test_list_value_is_not_applied(self):
+        row = ListingRow(building="A", floor_unit="1st", special_features=None)
+        units = [{"building": "A", "floor_unit": "1st", "special_features": ["Kitchen", "Showers"]}]
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.special_features)
+        self.assertEqual(fields, [])
+        self.assertIs(new_row, row)
+
+    def test_numeric_value_is_not_applied(self):
+        row = ListingRow(building="A", floor_unit="1st", state_of_space=None)
+        units = [{"building": "A", "floor_unit": "1st", "state_of_space": 42}]
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.state_of_space)
+        self.assertEqual(fields, [])
+
+    def test_other_valid_string_field_still_applies_alongside_a_bad_one(self):
+        row = ListingRow(building="A", floor_unit="1st", special_features=None, state_of_space=None)
+        units = [{
+            "building": "A", "floor_unit": "1st",
+            "special_features": ["not", "a", "string"], "state_of_space": "Cat A",
+        }]
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.special_features)
+        self.assertEqual(new_row.state_of_space, "Cat A")
+        self.assertEqual(fields, ["state_of_space"])
 
 
 class EnrichRowTests(EnrichmentTestCase):

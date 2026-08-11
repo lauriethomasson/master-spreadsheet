@@ -29,6 +29,7 @@ from storage.file_store import (
     load_staging_as_dataframe,
     save_original_pdf,
     save_staging_file,
+    set_staging_enrichment_progress,
     set_staging_enrichment_summary,
     update_staging_rows,
 )
@@ -227,7 +228,17 @@ def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str
     progress_slot = st.empty()
     bar = progress_slot.progress(0.0, text=f"Enriching from brochures — 0 / {len(unique_urls)}")
 
+    # Written BEFORE the run starts (not just at checkpoints) so even an
+    # interruption in the first few seconds - before a single brochure has
+    # completed, let alone reached CHECKPOINT_EVERY - still leaves an
+    # "in_progress" record in meta.json rather than none at all (see
+    # set_staging_enrichment_progress's own docstring on why a missing
+    # record is otherwise indistinguishable from "nothing was eligible").
+    set_staging_enrichment_progress(staging_path, 0, len(unique_urls))
+    latest_progress = {"done": 0, "total": len(unique_urls)}
+
     def on_progress(done, total, label):
+        latest_progress["done"], latest_progress["total"] = done, total
         if not total:
             return
         text = f"Enriching from brochures — {done} / {total}"
@@ -237,6 +248,7 @@ def _run_automatic_brochure_enrichment(rows: list[ListingRow], staging_path: str
 
     def on_checkpoint(rows_so_far):
         update_staging_rows(staging_path, rows_so_far)
+        set_staging_enrichment_progress(staging_path, latest_progress["done"], latest_progress["total"])
 
     enriched_rows, _log, stats = brochure_enrichment.enrich_rows_grouped(
         rows, progress_callback=on_progress, checkpoint_callback=on_checkpoint,

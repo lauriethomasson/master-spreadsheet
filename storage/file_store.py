@@ -116,30 +116,69 @@ def update_staging_rows(path: str, rows: list[ListingRow]) -> None:
 
 def set_staging_enrichment_summary(path: str, stats: dict) -> None:
     """
-    Persists brochure enrichment's own summary stats (see brochure_
+    Persists brochure enrichment's own FINAL summary stats (see brochure_
     enrichment.enrich_rows_grouped's own return value) into this staging
-    file's meta.json - so Review & Master can show a read-only "brochure
-    enrichment: N rows enriched" caption for a file that's already been
-    through automatic enrichment (see app.py's own _run_automatic_brochure_
-    enrichment), durably, without needing anything in session_state that a
-    fresh browser session/server restart would lose.
+    file's meta.json, tagged status="complete" - so Review & Master can show
+    a read-only "brochure enrichment: N rows enriched" caption for a file
+    that's already been through automatic enrichment (see app.py's own
+    _run_automatic_brochure_enrichment), durably, without needing anything
+    in session_state that a fresh browser session/server restart would lose.
 
-    Absent entirely for a file where enrichment never ran at all (no
+    Called only once enrich_rows_grouped has fully returned - see
+    set_staging_enrichment_progress for the interim marker written before
+    and during the run, which this overwrites. Absent entirely (both this
+    and the interim marker) for a file where enrichment never ran at all (no
     eligible rows in the first place, or an upload predating this feature) -
     a caller should treat a missing key as "nothing to show", not as "zero
     rows enriched" (see get_staging_enrichment_summary).
     """
     meta = _read_meta(path)
-    meta["brochure_enrichment"] = stats
+    meta["brochure_enrichment"] = {**stats, "status": "complete"}
+    _write_meta(path, meta)
+
+
+def set_staging_enrichment_progress(path: str, brochures_done: int, unique_brochures_considered: int) -> None:
+    """
+    Persists an INTERIM brochure-enrichment marker - status="in_progress"
+    plus how many of the run's own unique brochures have completed so far -
+    written before enrich_rows_grouped starts (brochures_done=0) and again
+    at each of its own checkpoints (see app.py's _run_automatic_brochure_
+    enrichment), specifically so an interruption (a killed process, a
+    crashed Cloud Run instance, a cancelled Streamlit rerun) that stops the
+    run before set_staging_enrichment_summary's own final call is ever
+    reached still leaves SOME record in meta.json, rather than none at all.
+
+    Without this, an interrupted run's staging rows end up a genuine mix of
+    enriched and never-attempted rows (see enrich_rows_grouped's own
+    checkpoint_callback, which already durably persists whatever was
+    completed) while get_staging_enrichment_summary stays None forever -
+    indistinguishable from "enrichment never ran/had nothing eligible" (see
+    that function's own docstring), so a reviewer has no way to tell a
+    blank special_features cell here apart from a brochure that was
+    genuinely checked and had nothing. set_staging_enrichment_summary's own
+    status="complete" tag overwrites this once the run actually finishes;
+    a status="in_progress" entry still present when Review & Master reads
+    it back means the run that wrote it never got that far.
+    """
+    meta = _read_meta(path)
+    meta["brochure_enrichment"] = {
+        "status": "in_progress",
+        "brochures_done": brochures_done,
+        "unique_brochures_considered": unique_brochures_considered,
+    }
     _write_meta(path, meta)
 
 
 def get_staging_enrichment_summary(path: str) -> dict:
     """
-    The stats dict set_staging_enrichment_summary last wrote for this
-    staging file, or None if brochure enrichment never ran for it at all
-    (see that function's own docstring on why this is None, not a
-    zero-valued dict, in that case).
+    The stats dict set_staging_enrichment_summary (status="complete") or
+    set_staging_enrichment_progress (status="in_progress", a run that never
+    finished) last wrote for this staging file, or None if brochure
+    enrichment never even started for it (see those functions' own
+    docstrings on why this is None, not a zero-valued dict, in that case).
+    Callers must check stats["status"] before treating this as a finished
+    result - see pages/2_Review_and_Master.py's own _render_brochure_
+    enrichment_summary.
     """
     return _read_meta(path).get("brochure_enrichment")
 

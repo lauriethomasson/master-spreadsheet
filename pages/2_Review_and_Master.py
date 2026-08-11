@@ -885,12 +885,32 @@ def _render_brochure_enrichment_summary(pending: list) -> None:
     silently skipped, not shown as "0 processed", so this section is simply
     absent for the common case where a provider's spreadsheet already had
     everything ENRICHABLE_FIELDS covers.
+
+    stats["status"] == "in_progress" means the run that wrote this never
+    reached its own final set_staging_enrichment_summary call - an
+    interruption (killed process, crashed Cloud Run instance, cancelled
+    Streamlit rerun) partway through (see set_staging_enrichment_progress's
+    own docstring). Surfaced as an explicit warning, never folded into the
+    same "complete" caption below: this file's rows are a genuine mix of
+    enriched and never-attempted, and a blank special_features/state_of_
+    space cell here is NOT confirmation the brochure had nothing - it may
+    simply not have been checked yet.
     """
     for path in pending:
         stats = get_staging_enrichment_summary(path)
         if not stats:
             continue
         filename = get_staging_filename(path)
+        if stats.get("status") == "in_progress":
+            st.warning(
+                f"Brochure enrichment — {filename}: only {stats['brochures_done']} of "
+                f"{stats['unique_brochures_considered']} unique brochure(s) were checked before this run "
+                "stopped (the app was likely interrupted or restarted mid-run). Blank descriptive fields on "
+                "this file's rows may simply be unchecked, not confirmed blank. Re-uploading the exact same "
+                "file again will NOT retry it (an unchanged file is reused as-is, enrichment included) — "
+                "discard this pending upload below first, then re-upload it to run enrichment from scratch."
+            )
+            continue
         summary = (
             f"Brochure enrichment — {filename}: {stats['unique_brochures_considered']} unique brochure(s) "
             f"considered, {stats['rows_enriched']} row(s) enriched."
