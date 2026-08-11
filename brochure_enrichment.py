@@ -976,8 +976,18 @@ def run_brochure_enrichment(rows: list, staging_path: str, already_processed: di
     eligible, unique_urls = eligible_rows_and_brochures(rows)
     urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
 
+    # progress bar + the "keep this page open" caption share ONE placeholder
+    # (progress_slot.container(), not two separate st.empty() calls) so the
+    # single progress_slot.empty() below clears both together - the caption
+    # must disappear at exactly the same moment the progress bar does,
+    # never lingering or vanishing separately.
     progress_slot = st.empty()
-    bar = progress_slot.progress(0.0, text=f"Enriching from brochures — 0 / {len(urls_to_fetch)}")
+    with progress_slot.container():
+        bar = st.progress(0.0, text=f"Enriching from brochures — 0 / {len(urls_to_fetch)}")
+        st.caption(
+            "Please keep this page open and avoid clicking or navigating while brochures are being "
+            "enriched. Your progress is saved if the process is interrupted."
+        )
 
     # Written BEFORE the run starts (not just at checkpoints) so even an
     # interruption in the first few seconds - before a single brochure has

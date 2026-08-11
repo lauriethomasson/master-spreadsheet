@@ -130,6 +130,11 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
 
         caption_text = "".join(c.value for c in at.caption)
         self.assertIn("Brochure enrichment complete", caption_text)
+        # The "keep this page open" caption shares run_brochure_enrichment's
+        # own progress_slot placeholder with the progress bar (see that
+        # function's own docstring) - both must disappear together once
+        # the run has actually finished, never linger after completion.
+        self.assertNotIn("keep this page open", caption_text)
 
     def test_no_eligible_rows_means_no_brochure_calls_at_all(self):
         with patch("brochure_enrichment.httpx.get") as mock_get, \
