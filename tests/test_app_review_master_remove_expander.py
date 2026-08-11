@@ -36,9 +36,17 @@ from schema import ListingRow
 
 BASE = Path(__file__).resolve().parent.parent
 KEY = "master_table_default_view"
-SELECTOR_KEY = f"{KEY}_selector"
+_SELECTOR_KEY_PREFIX = f"{KEY}_selector_"
 REMOVAL_FILTER_KEY = f"{KEY}_removal_filter"
 MASTER_FILTER_KEY = f"{KEY}_filter"
+
+
+def _selector_key(at) -> str:
+    """The row-selector widget's REAL current key - see test_app_review_
+    master_table.py's own copy of this helper for why it's fingerprinted
+    rather than fixed, and why this looks it up from at.dataframe instead
+    of recomputing it independently."""
+    return next(d.key for d in at.dataframe if d.key.startswith(_SELECTOR_KEY_PREFIX))
 
 
 class RemoveRowsExpanderTests(unittest.TestCase):
@@ -66,7 +74,7 @@ class RemoveRowsExpanderTests(unittest.TestCase):
         return int(sorted_df.index[sorted_df["property_id"] == property_id][0])
 
     def _select_rows(self, at, positions):
-        at.session_state[SELECTOR_KEY] = {
+        at.session_state[_selector_key(at)] = {
             "selection": {"rows": list(positions), "columns": [], "cells": []}
         }
 
@@ -80,7 +88,7 @@ class RemoveRowsExpanderTests(unittest.TestCase):
         return next(t for t in at.text_input if t.key == MASTER_FILTER_KEY)
 
     def _remove_row_selector_df(self, at):
-        return next(d for d in at.dataframe if d.key == SELECTOR_KEY).value
+        return next(d for d in at.dataframe if d.key.startswith(_SELECTOR_KEY_PREFIX)).value
 
     def _master_table_df(self, at):
         return next(d for d in at.dataframe if d.key == KEY).value
@@ -102,7 +110,7 @@ class RemoveRowsExpanderTests(unittest.TestCase):
         # what "inside an expander" means for this page's own structure -
         # there is only ever one of each on this view).
         self.assertTrue(any(t.key == REMOVAL_FILTER_KEY for t in at.text_input))
-        self.assertTrue(any(d.key == SELECTOR_KEY for d in at.dataframe))
+        self.assertTrue(any(d.key.startswith(_SELECTOR_KEY_PREFIX) for d in at.dataframe))
         self.assertTrue(any(b.label.startswith("Remove ") for b in at.button))
 
     # 2. Expander is collapsed by default.

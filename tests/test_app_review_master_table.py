@@ -43,6 +43,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
@@ -54,7 +55,21 @@ from schema import ListingRow
 
 BASE = Path(__file__).resolve().parent.parent
 KEY = "master_table_default_view"
-SELECTOR_KEY = f"{KEY}_selector"
+_SELECTOR_KEY_PREFIX = f"{KEY}_selector_"
+
+
+def _selector_key(at) -> str:
+    """
+    The row-selector widget's REAL current key - fingerprinted on the
+    property_id sequence it's currently backed by (see pages/2_Review_and_
+    Master.py's own _selector_widget_key), not a fixed constant, so it
+    changes whenever a removal (or anything else that changes the master's
+    row set/order) happens. Looked up from at.dataframe - which always
+    reflects the most recent .run()'s real widgets - rather than
+    recomputed independently, so these tests can never drift out of sync
+    with the app's own fingerprint algorithm by duplicating it.
+    """
+    return next(d.key for d in at.dataframe if d.key.startswith(_SELECTOR_KEY_PREFIX))
 
 
 class RemoveSelectedRowNoOpTests(unittest.TestCase):
@@ -133,8 +148,11 @@ class OneClickRemovalTests(unittest.TestCase):
         Streamlit itself writes after a real multi-row selection - see this
         file's module docstring for why this is the right level to drive
         the test at, rather than through any AppTest UI wrapper (none
-        exists for this widget's row-click interaction)."""
-        at.session_state[SELECTOR_KEY] = {
+        exists for this widget's row-click interaction). Uses the widget's
+        REAL current key (see _selector_key) - requires at least one
+        at.run() to have already happened so at.dataframe has something to
+        look the key up from, true of every caller here."""
+        at.session_state[_selector_key(at)] = {
             "selection": {"rows": list(positions), "columns": [], "cells": []}
         }
 
@@ -237,10 +255,11 @@ class OneClickRemovalTests(unittest.TestCase):
         self.assertEqual(len(at.session_state["export_selected_df"]), 0)
         # The selector widget re-renders on this same settle-rerun (with a
         # freshly empty default, since export_selected_property_ids is now
-        # empty) - its key legitimately exists again with an EMPTY
+        # empty) - under a NEW fingerprinted key too, since master just
+        # shrank by one row - legitimately existing again with an EMPTY
         # selection, which is the correct end state, not a leftover stale
         # one.
-        self.assertEqual(at.session_state[SELECTOR_KEY]["selection"]["rows"], [])
+        self.assertEqual(at.session_state[_selector_key(at)]["selection"]["rows"], [])
 
         remove_btn = self._remove_button(at)
         self.assertEqual(remove_btn.label, "Remove 0 selected row(s)")
@@ -353,6 +372,226 @@ class OneClickRemovalTests(unittest.TestCase):
         df_after_removal = master_writer.load_master_as_dataframe()
         self.assertEqual(len(df_after_removal), 2)
         self.assertNotIn(edited_property_id, df_after_removal["property_id"].tolist())
+
+
+class StaleSelectionArchitectureTests(unittest.TestCase):
+    """
+    Regression coverage for a real production bug report: an IndexError
+    ("index N is out of bounds for axis 0 with size M") from
+    _render_row_selector after removing rows, a checkbox that sometimes
+    unchecks itself on a light trackpad tap, and removed rows lingering in
+    the Remove-rows selector until a manual browser refresh.
+
+    Root cause: the selector widget's key was a plain constant
+    (f"{key}_selector"), so Streamlit reused ITS OWN frontend-cached
+    position-based selection state across a rerun where the underlying
+    row set/order had genuinely changed (a removal, an edit-triggered
+    re-sort, a removal-search filter change) - a stale position could then
+    be out of range for the new, smaller data (the IndexError), or simply
+    point at the wrong row. The fix (_selector_widget_key) folds a
+    fingerprint of the CURRENTLY visible property_id sequence into the
+    key, so Streamlit mounts a genuinely new widget instance - no
+    inherited state at all - exactly when that sequence changes, and keeps
+    the SAME key otherwise (an unrelated rerun must not remount the widget
+    - that would itself reintroduce the exact kind of race a real light/
+    quick trackpad tap can lose).
+
+    AppTest cannot simulate a real browser's click-timing/light-tap
+    behavior (see _render_row_selector's own docstring on the earlier,
+    similar race that motivated splitting selection into its own widget)
+    - these tests prove the underlying state-lifecycle mechanics
+    (key stability/change, no crash on a stale position, immediate same-
+    rerun consistency) are correct by construction, not that a real
+    browser tap can no longer be mistimed.
+    """
+
+    def setUp(self):
+        self._original_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._original_cwd)
+        self._tmp.cleanup()
+
+    def _select_rows(self, at, positions):
+        at.session_state[_selector_key(at)] = {
+            "selection": {"rows": list(positions), "columns": [], "cells": []}
+        }
+
+    def _remove_button(self, at):
+        return next(b for b in at.button if b.label.startswith("Remove "))
+
+    def _write_rows(self, n):
+        master_writer.write_master([
+            ListingRow(building=f"Building {i}", provider=f"Provider {i}", floor_unit="1st",
+                       property_id=f"row-{i}")
+            for i in range(n)
+        ])
+
+    # 3. Remove after another prior removal.
+    def test_remove_after_a_prior_removal(self):
+        self._write_rows(4)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        self._select_rows(at, [0])
+        self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(master_writer.load_master_as_dataframe()), 3)
+
+        # Second removal, same session, same widget/key machinery - must
+        # resolve fresh against the NEW (3-row) dataframe, not anything
+        # left over from the first removal's own (4-row) one.
+        self._select_rows(at, [0])
+        self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+
+        df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(df), 2)
+
+    # 4/13. Stale selected position larger than the new dataframe length
+    # never crashes.
+    def test_stale_out_of_range_position_never_crashes(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        # Simulates the exact real report: a position that would have been
+        # valid against a LARGER prior dataframe, injected directly against
+        # the CURRENT (correct) widget key - the defensive bounds-clamp in
+        # _render_row_selector must swallow this, never raise, regardless
+        # of the key-fingerprint fix already making this scenario far less
+        # likely to occur for real.
+        at.session_state[_selector_key(at)] = {
+            "selection": {"rows": [347], "columns": [], "cells": []}
+        }
+        at.run()
+
+        self.assertFalse(at.exception)
+        self.assertEqual(len(master_writer.load_master_as_dataframe()), 3)
+
+    # 6/8. Remove table immediately loses deleted rows, in the SAME rerun
+    # the removal click itself triggers - no browser refresh simulated or
+    # required.
+    def test_remove_table_immediately_loses_deleted_rows_same_rerun(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        selector_before = next(d for d in at.dataframe if d.key.startswith(_SELECTOR_KEY_PREFIX))
+        self.assertEqual(len(selector_before.value), 3)
+
+        self._select_rows(at, [0])
+        self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+
+        selector_after = next(d for d in at.dataframe if d.key.startswith(_SELECTOR_KEY_PREFIX))
+        self.assertEqual(len(selector_after.value), 2)
+
+    # 7. Main master table immediately loses deleted rows too, same rerun.
+    def test_main_table_immediately_loses_deleted_rows_same_rerun(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        self._select_rows(at, [0])
+        self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+
+        main_table = next(d for d in at.dataframe if d.key == KEY)
+        self.assertEqual(len(main_table.value), 2)
+
+    # 9. Selection state clears deleted property IDs.
+    def test_selection_state_drops_removed_property_ids(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        removed_id = master_writer.load_master_as_dataframe().iloc[0]["property_id"]
+        self._select_rows(at, [0])
+        self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+
+        self.assertNotIn(removed_id, at.session_state["export_selected_property_ids"])
+        self.assertEqual(at.session_state["export_selected_property_ids"], set())
+
+    # 10. Non-removed selection remains valid when a removal attempt fails
+    # (nothing was actually deleted, so nothing should be silently
+    # unselected either).
+    def test_failed_removal_leaves_selection_and_master_untouched(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        selected_id = master_writer.load_master_as_dataframe().iloc[0]["property_id"]
+        self._select_rows(at, [0])
+
+        with patch("master_writer.write_master", side_effect=RuntimeError("disk full")):
+            self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(len(master_writer.load_master_as_dataframe()), 3)
+        self.assertIn(selected_id, at.session_state["export_selected_property_ids"])
+
+    # 12. Changing the removal filter after selecting never removes the
+    # wrong (now-visible-instead) row.
+    def test_filter_change_after_selection_removes_the_originally_selected_row(self):
+        self._write_rows(4)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        target_id = master_writer.load_master_as_dataframe().iloc[0]["property_id"]
+        self._select_rows(at, [0])
+        at.run()
+        self.assertEqual(at.session_state["export_selected_property_ids"], {target_id})
+
+        # Filter narrows the selector to a completely DIFFERENT row than
+        # the one still tracked as selected.
+        filter_input = next(t for t in at.text_input if t.key == f"{KEY}_removal_filter")
+        filter_input.set_value("Building 3").run()
+        self.assertFalse(at.exception)
+
+        self._remove_button(at).click().run()
+        self.assertFalse(at.exception)
+
+        df = master_writer.load_master_as_dataframe()
+        self.assertNotIn(target_id, df["property_id"].tolist())
+        self.assertEqual(len(df), 3)
+
+    # 14. Widget keys remain stable across an ordinary rerun that doesn't
+    # change the underlying row set/order.
+    def test_selector_key_is_stable_across_an_unrelated_rerun(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        key_before = _selector_key(at)
+
+        # An unrelated widget interaction (the MAIN table's own,
+        # independent search box) triggers a full rerun without touching
+        # master or the removal selector's own filter at all.
+        master_filter = next(t for t in at.text_input if t.key == f"{KEY}_filter")
+        master_filter.set_value("Building 1").run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(_selector_key(at), key_before)
+
+    # 15. Selection state is not overwritten/reset on an ordinary rerun.
+    def test_selection_persists_across_an_unrelated_rerun(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        target_id = master_writer.load_master_as_dataframe().iloc[0]["property_id"]
+        self._select_rows(at, [0])
+        at.run()
+        self.assertEqual(at.session_state["export_selected_property_ids"], {target_id})
+
+        master_filter = next(t for t in at.text_input if t.key == f"{KEY}_filter")
+        master_filter.set_value("something unrelated").run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(at.session_state["export_selected_property_ids"], {target_id})
 
 
 if __name__ == "__main__":

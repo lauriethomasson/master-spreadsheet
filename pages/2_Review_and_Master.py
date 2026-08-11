@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 
 import pandas as pd
@@ -385,7 +386,7 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
 
         selected_positions = _render_row_selector(df, removal_filtered_df, key)
         st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
-        _render_selection_actions(df, selected_positions, key)
+        _render_selection_actions(df, removal_filtered_df, selected_positions, key)
 
     query = st.text_input("Search master spreadsheet", key=f"{key}_filter")
     filtered_df = display_df
@@ -417,6 +418,50 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
 # editable table's own width. Deliberately not configurable per call site -
 # every caller of _render_master_table wants the same at-a-glance identity.
 _SELECTOR_COLUMNS = ("provider", "building", "floor_unit", "address_1")
+
+
+def _selector_widget_key(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> str:
+    """
+    The removal selector's own st.dataframe widget key, suffixed with a
+    short fingerprint of the property_id sequence CURRENTLY backing it
+    (filtered_df's own row order, resolved to df's property_id column).
+
+    Position (selection["selection"]["rows"], returned by that widget) is
+    only ever meaningful relative to whatever exact rows/order it was
+    rendered against - a stale widget instance (same key, but its
+    frontend-cached selection state computed against an EARLIER df/
+    filtered_df) has no reliable way to translate its remembered positions
+    onto a genuinely different row set. Confirmed real failure modes this
+    causes when the key stays constant across such a change: an out-of-
+    range position after master shrinks (a removal - IndexError), and a
+    stale row set/order lingering on screen after a removal until an
+    unrelated rerun or a manual browser refresh happens to reset it.
+    Folding this fingerprint into the key instead means Streamlit mounts a
+    genuinely NEW widget instance - with no inherited frontend state at
+    all - exactly when the row set or its order changes (a removal, an
+    edit-triggered re-sort via sort_by_provider, a removal-search filter
+    change), and _render_row_selector's own selection_default (computed
+    fresh from export_selected_property_ids every render) becomes the
+    widget's real starting state again rather than being silently ignored
+    in favor of a carried-over one.
+
+    Deliberately UNCHANGED across a rerun that doesn't alter which
+    property_ids are visible or their order (typing in an unrelated
+    widget elsewhere on the page, an unrelated button click) - remounting
+    the widget on every such rerun would itself be a bug: a genuine
+    in-flight browser click needs its target widget instance to survive
+    from the click to the next rerun uninterrupted to be reliably
+    recorded at all, and gratuitous remounts are exactly the kind of race
+    a real user's light/quick trackpad tap can lose (see this module's
+    prior, already-fixed report of a similar race - _render_row_selector's
+    own docstring).
+    """
+    if "property_id" in df.columns:
+        ids = tuple(df.loc[filtered_df.index, "property_id"])
+    else:
+        ids = tuple(filtered_df.index)
+    fingerprint = hashlib.sha256(repr(ids).encode("utf-8")).hexdigest()[:16]
+    return f"{key}_selector_{fingerprint}"
 
 
 def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> list:
@@ -455,6 +500,18 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
     all) removes it from that specific race entirely, while leaving the
     real editable data_editor (and its auto-save behavior) completely
     untouched - the two widgets never share one commit pathway again.
+
+    The widget's own key is fingerprinted on the CURRENT filtered_df's
+    property_id sequence (see _selector_widget_key) rather than being a
+    plain constant - see that function's own docstring for the stale-
+    position IndexError/stuck-stale-row bugs this exists to prevent, and
+    why it deliberately does NOT remount on every ordinary rerun. Even so,
+    selected_row_positions is still defensively clamped to filtered_df's
+    current length below - belt and braces alongside the key fix, never a
+    substitute for it: this alone would silently avoid a crash without
+    fixing the underlying "which row does this position actually mean"
+    problem, so it exists purely to guarantee this function can never
+    raise, not as the real fix.
     """
     selector_columns = [c for c in _SELECTOR_COLUMNS if c in filtered_df.columns]
     selector_df = filtered_df[selector_columns] if selector_columns else filtered_df
@@ -475,9 +532,9 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
         on_select="rerun",
         selection_mode="multi-row",
         selection_default={"selection": {"rows": default_rows}},
-        key=f"{key}_selector",
+        key=_selector_widget_key(df, filtered_df, key),
     )
-    selected_row_positions = selection["selection"]["rows"]
+    selected_row_positions = [p for p in selection["selection"]["rows"] if 0 <= p < len(filtered_df)]
 
     if "property_id" in df.columns:
         visible_ids = set(df.loc[filtered_df.index, "property_id"])
@@ -489,25 +546,39 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
     return filtered_df.index[selected_row_positions].tolist()
 
 
-def _clear_row_selection(df: pd.DataFrame, key: str) -> None:
+def _clear_row_selection(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> None:
     """Shared by "Clear selection" and a successful removal - resets the
     tracked selection AND the selector widget's own stale state (otherwise
     its cached selection from before this click would just reapply itself
     on the next render, on top of the now-empty export_selected_property_
     ids, leaving rows looking still selected despite the tracked set
-    genuinely being empty)."""
+    genuinely being empty).
+
+    filtered_df is whatever the CURRENT render just passed to
+    _render_row_selector - needed to compute the exact same fingerprinted
+    key that widget instance was actually mounted under (see
+    _selector_widget_key), since a plain constant key no longer matches
+    what's really in st.session_state. For the "Clear selection" case, df/
+    filtered_df are unchanged, so this key is the same one the very next
+    render will recompute and reuse - deleting it here is what makes that
+    next render see a genuinely fresh widget rather than one whose cached
+    positions still reflect the pre-clear selection. For the successful-
+    removal case, master itself is about to shrink, so the NEXT render
+    will compute a different fingerprint (and therefore a different key)
+    regardless - deleting this now-orphaned entry is just hygiene, not
+    load-bearing for that case, but costs nothing to do uniformly."""
     st.session_state["export_selected_property_ids"] = set()
     st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
-    selector_key = f"{key}_selector"
+    selector_key = _selector_widget_key(df, filtered_df, key)
     if selector_key in st.session_state:
         del st.session_state[selector_key]
 
 
-def _render_selection_actions(df: pd.DataFrame, selected_positions: list, key: str) -> None:
+def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selected_positions: list, key: str) -> None:
     with st.container(horizontal=True):
         st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
         if st.button("Clear selection", key=f"{key}_clear_selection", disabled=not selected_positions):
-            _clear_row_selection(df, key)
+            _clear_row_selection(df, filtered_df, key)
             st.rerun()
 
         # Reuses the exact same apply_merge/write_master path a let-status
@@ -554,7 +625,7 @@ def _render_selection_actions(df: pd.DataFrame, selected_positions: list, key: s
             if write_failed:
                 st.error(f"Removal failed, master was not changed: {write_failed}")
             else:
-                _clear_row_selection(df, key)
+                _clear_row_selection(df, filtered_df, key)
                 st.session_state["last_removal"] = {
                     "count": len(removed_indices),
                     "version_path": previous_version_path,
