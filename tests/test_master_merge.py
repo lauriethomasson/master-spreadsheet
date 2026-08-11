@@ -269,6 +269,107 @@ class GroupHasGenuineConflictTests(unittest.TestCase):
         self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
 
 
+class GroupHasGenuineConflictBrochureLinkOverrideTests(unittest.TestCase):
+    """
+    Direct unit tests for _group_has_genuine_conflict's postcode/address_1
+    exception (see _brochure_link_identity_override) - the conflict-stage
+    half of the real Nexus Place fix (see BrochureLinkOverridesPostcode
+    ConflictTests for the grouping-stage half and the full real-world
+    story). These call _group_has_genuine_conflict directly, same style
+    as GroupHasGenuineConflictTests above, rather than going through the
+    whole build-a-plan/consolidate pipeline.
+    """
+
+    def test_postcode_conflict_with_shared_brochure_is_not_genuine(self):
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC4M 4AB", "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC1M 3HA", "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_address_1_conflict_with_shared_brochure_is_not_genuine(self):
+        # address_1 is backfilled from the exact same geocode.py API
+        # result as postcode (see _group_has_genuine_conflict's own
+        # docstring) - the real Nexus Place pair disagrees on both for
+        # that reason, so the override must cover both, not postcode alone.
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "address_1": "25 Farringdon Street", "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "address_1": "25-27 Farringdon Road", "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_postcode_and_address_1_both_conflicting_with_shared_brochure_is_not_genuine(self):
+        # The real Nexus Place shape: both geocoded fields disagree at
+        # once, still excused by the one shared brochure_link.
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC4M 4AB", "address_1": "25 Farringdon Street",
+             "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC1M 3HA", "address_1": "25-27 Farringdon Road",
+             "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_postcode_conflict_with_one_blank_brochure_and_agreeing_nonblank_is_not_genuine(self):
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC4M 4AB", "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC1M 3HA", "brochure_link": None},
+        ]
+        self.assertFalse(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_postcode_conflict_with_different_brochures_is_still_genuine(self):
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC4M 4AB", "brochure_link": "https://example.com/a.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC1M 3HA", "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_postcode_conflict_with_no_brochure_at_all_is_still_genuine(self):
+        # The ordinary, unrelated-properties case - no brochure evidence
+        # of any kind, so a real postcode disagreement still requires
+        # manual review exactly as it always has.
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th", "postcode": "EC4M 4AB"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th", "postcode": "EC1M 3HA"},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_building_conflict_with_shared_brochure_is_still_genuine(self):
+        # The override is scoped to postcode/address_1 only - a
+        # genuinely different building (clearly different property
+        # identity) must still block auto-merge even with a shared
+        # brochure_link (e.g. a provider data-entry error linking the
+        # wrong document to two unrelated rows).
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Totally Different Building", "provider": "UNION", "floor_unit": "5th",
+             "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+    def test_size_conflict_with_shared_brochure_and_postcode_conflict_is_still_genuine(self):
+        # A brochure_link match excuses ONLY the postcode/address_1
+        # disagreement it exists for - any other genuine field conflict in
+        # the same group (here size_sqft) must still force manual review.
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC4M 4AB", "size_sqft": 1000.0, "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC1M 3HA", "size_sqft": 5000.0, "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
+
+
 class MergeUnmatchedGroupTests(unittest.TestCase):
     def _group(self, rows):
         return [master_merge.UnmatchedRow(r) for r in rows]
@@ -430,6 +531,173 @@ class ConsolidateUnmatchedDuplicatesTests(unittest.TestCase):
         consolidated = master_merge.consolidate_unmatched_duplicates(plan)
 
         self.assertEqual(len(consolidated.unmatched), 2)  # the Kitt's pair merged; Copthall row untouched
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+
+class BrochureLinkOverridesPostcodeConflictTests(unittest.TestCase):
+    """
+    Real reported false negative: the real UNION "Nexus Place - 25
+    Farringdon Place" / 5th floor row appears on both the "City" and
+    "Clerkenwell & Farringdon" sheets of the same real workbook - byte-
+    identical building/floor_unit/brochure_link - but geocode.py's own
+    submarket-biased Places search (each sheet's own different area name
+    used as a disambiguation hint) returned two DIFFERENT real postcodes
+    for the same actual building (confirmed against the real API: EC4M
+    4AB vs EC1M 3HA). The postcode-conflict guard in
+    _group_unmatched_duplicates correctly-by-design refused to merge
+    genuinely different postcodes - but that "conflict" was a geocoding
+    artifact here, not real identity evidence, while the identical
+    brochure_link (much stronger, provider-issued evidence) was never
+    consulted at all. See master_merge._group_unmatched_duplicates' own
+    docstring for the full explanation.
+    """
+
+    _UNSET = object()
+
+    def _rows(self, brochure_link_b=_UNSET):
+        row_a = ListingRow(
+            building="Nexus Place -  25 Farringdon Place", floor_unit="5th",
+            postcode="EC4M 4AB", address_1="25 Farringdon Street",
+            brochure_link="https://app.box.com/s/cktz4q797wgzo5dgoi1flvrcf2d70ae2",
+            source_file="UNION.xlsx — City",
+        )
+        row_b = ListingRow(
+            building="Nexus Place -  25 Farringdon Place", floor_unit="5th",
+            postcode="EC1M 3HA", address_1="25-27 Farringdon Road",
+            brochure_link=row_a.brochure_link if brochure_link_b is self._UNSET else brochure_link_b,
+            source_file="UNION.xlsx — Clerkenwell & Farringdon",
+        )
+        return row_a, row_b
+
+    def test_real_nexus_place_pattern_now_grouped(self):
+        row_a, row_b = self._rows()
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 2)
+
+    def test_real_nexus_place_pattern_auto_consolidates_with_no_manual_review(self):
+        row_a, row_b = self._rows()
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        plan = master_merge.MergePlan([], [], [], unmatched, [], groups)
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+        # The postcode conflict itself must not silently vanish without a
+        # trace - matched_collision_field_choice still flags it internally
+        # (see _merge_unmatched_group), it's just not forced into a manual
+        # duplicate-identity decision purely because of it.
+
+    def test_different_brochure_links_do_not_override_the_postcode_conflict(self):
+        # Same street/provider/floor_unit, genuinely different postcodes,
+        # AND genuinely different brochures - no strong counter-evidence,
+        # so the postcode conflict must still block the merge exactly as
+        # before this fix.
+        row_a, row_b = self._rows(brochure_link_b="https://app.box.com/s/completely-different-brochure")
+
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(groups, [])
+
+    def test_no_brochure_link_at_all_does_not_override_the_postcode_conflict(self):
+        row_a, row_b = self._rows(brochure_link_b=None)
+        row_a = row_a.model_copy(update={"brochure_link": None})
+
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(groups, [])
+
+    def test_genuinely_different_house_number_still_blocks_even_with_shared_brochure(self):
+        # The override is scoped to the postcode/address_1 checks ONLY - a
+        # disagreeing house number (sourced from the provider's own text,
+        # not geocoding) must still block the merge even if a
+        # brochure_link happens to be shared (e.g. a provider data-entry
+        # error linking the wrong document) - never weakened by this fix.
+        row_a = ListingRow(
+            building="14 Example Street", floor_unit="5th", postcode="EC1A 1AA",
+            brochure_link="https://example.com/shared.pdf",
+        )
+        row_b = ListingRow(
+            building="18 Example Street", floor_unit="5th", postcode="EC1A 1AA",
+            brochure_link="https://example.com/shared.pdf",
+        )
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(groups, [])
+
+    def test_unrelated_buildings_sharing_a_brochure_link_are_not_merged(self):
+        # The override only ever fires WITHIN the address-tier's own
+        # existing street+provider+floor_unit match - two rows for
+        # genuinely different streets are never even candidates for this
+        # override, regardless of brochure_link.
+        row_a = ListingRow(
+            building="1 Totally Different Road", floor_unit="5th", postcode="EC4M 4AB",
+            brochure_link="https://example.com/shared.pdf",
+        )
+        row_b = ListingRow(
+            building="Nexus Place -  25 Farringdon Place", floor_unit="5th", postcode="EC1M 3HA",
+            brochure_link="https://example.com/shared.pdf",
+        )
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(groups, [])
+
+    def test_different_floor_units_never_grouped_even_with_shared_brochure(self):
+        # floor_unit is part of the address-tier grouping key itself - two
+        # rows for different floors of the same street are never even
+        # candidates for the postcode/brochure override, regardless of how
+        # strong the brochure evidence is.
+        row_a, row_b = self._rows()
+        row_b = row_b.model_copy(update={"floor_unit": "6th"})
+
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(groups, [])
+
+    def test_one_blank_postcode_auto_consolidates_regardless_of_this_fix(self):
+        # A blank postcode is "no opinion", not a conflict, even without
+        # any brochure_link evidence at all - this already worked before
+        # this fix and must keep working identically after it.
+        row_a, row_b = self._rows()
+        row_b = row_b.model_copy(update={"postcode": None})
+
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        plan = master_merge.MergePlan([], [], [], unmatched, [], groups)
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
+        self.assertEqual(consolidated.unmatched_collisions, [])
+
+    def test_one_blank_brochure_link_with_agreeing_nonblank_still_auto_consolidates(self):
+        # Only one row actually carries the brochure_link, the other is
+        # blank on it (no opinion) - the "blank means no opinion"
+        # tolerance already applied to every other field extends to this
+        # override too, so this still counts as agreement, not a
+        # disagreement, and the postcode conflict is still excused.
+        row_a, row_b = self._rows()
+        row_b = row_b.model_copy(update={"brochure_link": None})
+
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+        plan = master_merge.MergePlan([], [], [], unmatched, [], groups)
+
+        consolidated = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(len(consolidated.unmatched), 1)
         self.assertEqual(consolidated.unmatched_collisions, [])
 
 

@@ -1064,11 +1064,42 @@ def _group_has_genuine_conflict(dicts: list) -> bool:
     left for a human: automatically combining them would only ever change
     the DATA'S MEANING if some field genuinely disagrees, never merely
     because there happen to be several source rows.
+
+    postcode AND address_1 get one narrow exception, mirroring
+    _group_unmatched_duplicates' own grouping-stage override: a
+    disagreement on either is excused - not counted as a genuine conflict
+    - when `dicts` also share one identical, non-blank brochure_link (see
+    _brochure_link_identity_override). Reusing that SAME helper here (not
+    a second, separately-tuned check) is what makes the two stages
+    consistent - a group _group_unmatched_duplicates only formed because
+    of this override must not then turn around and get stuck in manual
+    review for the exact disagreement it was already excused for (real
+    case: the Nexus Place pair, byte-identical brochure_link, genuinely
+    different geocoded postcodes - see _group_unmatched_duplicates'
+    docstring).
+
+    address_1 is included alongside postcode, not just postcode alone,
+    because it is backfilled by the exact same geocode.py API call/result
+    as postcode whenever the source document didn't state one
+    (_address_line1_and_postcode is called once and unpacks both from the
+    same address_components list - see geocode.py's geocode_row Tier 2) -
+    the real Nexus Place pair this override exists for disagrees on BOTH
+    for that reason, not postcode alone, so excusing postcode while still
+    treating address_1 as a hard conflict would leave the exact same
+    geocoding artifact blocking the exact same real case this fix targets.
+
+    Every OTHER field - including building and floor_unit, which come
+    straight from the provider's own text and are never touched by
+    geocode.py, so a genuinely different property/unit still blocks
+    auto-merge even if it happens to share a brochure_link - is checked
+    with no such exception.
     """
-    return any(
-        matched_collision_field_choice([d.get(f) for d in dicts], f)[0]
-        for f in DIFF_FIELDS
-    )
+    weak_geocoded_fields = ("postcode", "address_1")
+    for f in DIFF_FIELDS:
+        needs_choice, _ = matched_collision_field_choice([d.get(f) for d in dicts], f)
+        if needs_choice and not (f in weak_geocoded_fields and _brochure_link_identity_override(dicts)):
+            return True
+    return False
 
 
 def _merge_unmatched_group(group: list) -> ListingRow:
@@ -1235,6 +1266,31 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
     return MergePlan(master_records, matched_changed, matched_unchanged, unmatched, collisions, unmatched_collisions)
 
 
+def _brochure_link_identity_override(dicts: list) -> bool:
+    """
+    True when `dicts` (dumped ListingRow dicts) share one identical,
+    non-blank brochure_link - a provider-issued document tied to one
+    specific property, treated as stronger, less error-prone identity
+    evidence than a geocoded postcode (see _group_unmatched_duplicates'
+    own docstring for the confirmed real Nexus Place case this exists
+    for). A blank brochure_link on some rows is "no opinion", the exact
+    same tolerance matched_collision_field_choice already applies to
+    every other field: this is NOT "every row individually carries a
+    brochure_link", only that none of the non-blank ones disagree, AND at
+    least one non-blank value exists at all (all rows blank is an absence
+    of evidence, not evidence of identity, so does not qualify).
+
+    One shared check, called from BOTH _group_unmatched_duplicates (to
+    allow grouping rows despite a genuine postcode disagreement) and
+    _group_has_genuine_conflict (to then also excuse that SAME postcode
+    disagreement from forcing manual review) - so the grouping stage and
+    the merge-safety stage can never disagree about whether this specific,
+    narrow override applies to a given set of rows.
+    """
+    links = {d.get("brochure_link") for d in dicts if not _is_blank(d.get("brochure_link"))}
+    return len(links) == 1
+
+
 def _group_unmatched_duplicates(unmatched: list) -> list:
     """
     Groups pending rows that both independently failed to match master but
@@ -1250,8 +1306,25 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
        St" / "Charterhouse Street") - guarded against merging two rows with
        genuinely different, disagreeing house numbers (_leading_house_
        number) or genuinely different non-blank postcodes, either of which
-       means a different real property/unit despite the shared street name,
-       not a spelling variant of the same one.
+       normally means a different real property/unit despite the shared
+       street name, not a spelling variant of the same one - UNLESS every
+       member of the group also shares one identical, non-blank
+       brochure_link (see the postcode-conflict check below), in which case
+       that overrides the postcode signal specifically, never the house-
+       number one.
+
+       Confirmed real case this override exists for: the real UNION "Nexus
+       Place - 25 Farringdon Place" / 5th floor row appears on both the
+       "City" and "Clerkenwell & Farringdon" sheets of the same real
+       workbook, byte-identical building/floor_unit/brochure_link - but
+       geocode.py's own submarket-biased Places search (each sheet's own
+       different area name used as a disambiguation hint, see geocode_row's
+       Tier 2) returned two DIFFERENT real postcodes for the same actual
+       building (EC4M 4AB vs EC1M 3HA, confirmed against the real API).
+       Without the override, that geocoding artifact alone permanently
+       split one real property into two never-linked rows, with the
+       genuinely strong evidence (an identical, provider-issued brochure
+       document link) never even consulted.
 
     Returns groups of size > 1 only, exactly like the single-pass version
     this replaces.
@@ -1298,7 +1371,22 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
             if not _is_blank(unmatched[i].new_row.postcode)
         }
         if len(postcodes) > 1:
-            continue  # genuinely different postcodes - real signal against merging
+            # A real postcode disagreement is normally strong signal
+            # against merging (see this function's own docstring) - EXCEPT
+            # when every member of this SAME provider+floor_unit+street
+            # group also agrees on one identical, non-blank brochure_link
+            # (see _brochure_link_identity_override) - a provider-issued
+            # document tied to one specific property is stronger, less
+            # error-prone identity evidence than a geocoded postcode
+            # (which this pipeline derives via an API call biased by each
+            # sheet's own submarket text, not sourced from the provider's
+            # own spreadsheet at all - see the confirmed real Nexus Place
+            # case above). Never overrides the house-number check above,
+            # which comes straight from the provider's own text, not from
+            # geocoding.
+            group_dicts = [unmatched[i].new_row.model_dump() for i in indices]
+            if not _brochure_link_identity_override(group_dicts):
+                continue
         for i in indices[1:]:
             union(indices[0], i)
 
