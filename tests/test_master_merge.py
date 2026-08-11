@@ -2560,6 +2560,21 @@ class SpecialFeaturesMergeTests(unittest.TestCase):
         self.assertEqual(merged, "Reception no longer staffed")
         self.assertNotIn("Manned reception desk".lower(), merged.lower())
 
+    def test_competing_availability_status_is_not_concatenated(self):
+        # Real bug found against a real Knotel availability update: an old
+        # "Available: Now" and a new "Under Offer" share NO significant
+        # word at all (so the topic-overlap-based negation check above
+        # never fires for them), but these are still two competing claims
+        # about the same thing, not two independent facts - before
+        # _is_availability_statement existed, this concatenated into a
+        # nonsensical "Under Offer; Available: Now".
+        matched = self._matched_special_features("Available: Now", "Under Offer")
+        self.assertEqual(matched.diffs["special_features"][1], "Under Offer")
+
+    def test_new_availability_date_replacing_old_is_not_concatenated(self):
+        matched = self._matched_special_features("Available: Now", "Let")
+        self.assertEqual(matched.diffs["special_features"][1], "Let")
+
     def test_reworded_same_fact_is_not_duplicated(self):
         matched = self._matched_special_features(
             "Benefits from a large private terrace landscaped with plants, trees and premium Italian outdoor furniture",

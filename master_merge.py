@@ -633,18 +633,37 @@ def _split_list_items(text: str, field_name: str = None) -> list[str]:
     return expanded
 
 
-# Small, explicit, hand-maintained signal that a NEW item is stating a
-# feature's removal/unavailability rather than just omitting it - same
-# "conservative, human-curated list, never generalized NLP" philosophy as
-# this file's own LET_STATUS_KEYWORDS/KNOWN_PROVIDERS/_STREET_SUFFIX_
-# EXPANSIONS. Used only by merge_compatible_text, and only to decide
-# whether an OLD item that shares a topic with this new one should be
-# dropped rather than carried forward - never to invent or reword
-# anything; the new item's own text is always used exactly as given.
-_FEATURE_NEGATION_KEYWORDS = ("no longer", "removed", "not available", "unavailable", "not included", "withdrawn")
+# Small, explicit, hand-maintained EXTRA signal that a NEW item is stating
+# a feature's removal/unavailability rather than just omitting it - things
+# LET_STATUS_KEYWORDS doesn't already cover, since that list is about the
+# whole LISTING no longer being on the market, not one specific feature
+# ("gym removed", "not included") - checked ALONGSIDE mentions_let_status
+# below, not instead of it. Same "conservative, human-curated list, never
+# generalized NLP" philosophy as LET_STATUS_KEYWORDS/KNOWN_PROVIDERS/
+# _STREET_SUFFIX_EXPANSIONS. Used only by merge_compatible_text, and only
+# to decide whether an OLD item that shares a topic with this new one
+# should be dropped rather than carried forward - never to invent or
+# reword anything; the new item's own text is always used exactly as given.
+_FEATURE_NEGATION_KEYWORDS = ("no longer", "removed", "not available", "unavailable", "not included")
 
 
 def _item_mentions_negation(item: str) -> bool:
+    """
+    True if `item` reads as stating something is no longer there/available -
+    reuses mentions_let_status (this file's own existing "let"/"under
+    offer"/"withdrawn"/etc. detector, complete with its word-boundary and
+    pre-/re-/sub-let exclusions) as the PRIMARY signal, since a feature-
+    level phrase like "Under Offer" is exactly the same vocabulary as a
+    whole-listing one - confirmed against real data: a real Knotel update's
+    "Under Offer" replacing an old "Available: Now" was, before this reuse,
+    concatenated into a nonsensical "Under Offer; Available: Now" because
+    the negation list here didn't happen to include a word LET_STATUS_
+    KEYWORDS already had. _FEATURE_NEGATION_KEYWORDS adds a few extra,
+    narrower words that are about one feature specifically, not the whole
+    listing, which mentions_let_status was never meant to catch.
+    """
+    if mentions_let_status(item):
+        return True
     lowered = item.lower()
     return any(kw in lowered for kw in _FEATURE_NEGATION_KEYWORDS)
 
@@ -661,6 +680,35 @@ def _item_shares_a_topic(item_a: str, item_b: str) -> bool:
     own 0.5 threshold, but are obviously about the same fact turning false.
     """
     return bool(_significant_words(item_a) & _significant_words(item_b))
+
+
+def _is_availability_statement(item: str) -> bool:
+    """
+    True if `item` itself reads as a current-availability-status claim
+    ("Available", "Available: Now", "Available from September 1, 2026",
+    "Under Offer", "Let", ...) rather than an independent amenity/fact.
+
+    Confirmed necessary against a REAL Knotel availability update: an old
+    "Available: Now" and a new "Under Offer" share NO significant word at
+    all (so _item_shares_a_topic - the general negation-drop's own gate -
+    never fires for them), yet these are obviously two competing claims
+    about the exact same thing, not two independent facts - concatenating
+    them ("Under Offer; Available: Now") is nonsensical. Confirmed correct
+    per extract.py's own PROMPT, which documents availability timing as
+    belonging in special_features, not state_of_space - Knotel's own real
+    availability emails state exactly this kind of phrase per unit, and
+    two claims of this kind never coexist the way "private terrace" and
+    "newly fitted kitchen" safely do; one always supersedes the other,
+    exactly like a scalar/current-state field, even though this
+    particular fact happens to live inside special_features's own text.
+
+    mentions_let_status already recognizes the "no longer on the market"
+    subset of this vocabulary; "available" is the one further word needed
+    to recognize the affirmative side of the same concept.
+    """
+    if mentions_let_status(item):
+        return True
+    return bool(re.search(r"\bavailable\b", item.lower()))
 
 
 def merge_compatible_text(old_val, new_val, field_name: str = None) -> str:
@@ -680,10 +728,15 @@ def merge_compatible_text(old_val, new_val, field_name: str = None) -> str:
     freshest source for anything it actually restates), then any old_val
     item that's neither:
     - already restated/reworded in new_val (see _items_similar) - would
-      just duplicate what new_val already says, in old_val's stale wording, or
+      just duplicate what new_val already says, in old_val's stale wording,
     - explicitly negated by a new_val item sharing its topic (see
       _item_shares_a_topic/_item_mentions_negation) - carrying that item
-      forward would concatenate a claim new_val has just contradicted.
+      forward would concatenate a claim new_val has just contradicted, or
+    - itself a current-availability-status claim (see _is_availability_
+      statement) that a new_val item of the SAME kind supersedes - these
+      never coexist as two independent facts (see that function's own
+      docstring for the real case this covers, where the two sides share
+      no word at all so the topic-overlap check above can't catch it).
 
     Always joined with "; ", the field's own documented canonical
     separator (see extract.py's PROMPT) - regardless of whether either
@@ -701,6 +754,8 @@ def merge_compatible_text(old_val, new_val, field_name: str = None) -> str:
             _item_shares_a_topic(old_item, new_item) and _item_mentions_negation(new_item)
             for new_item in new_items
         ):
+            continue
+        if _is_availability_statement(old_item) and any(_is_availability_statement(ni) for ni in new_items):
             continue
         merged.append(old_item)
 
