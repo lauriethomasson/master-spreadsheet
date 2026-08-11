@@ -55,6 +55,14 @@ DIFF_FIELDS = [f for f in ListingRow.model_fields if f not in ("property_id", "s
 # length/retention check on them would just be noise.
 RISKY_TEXT_FIELDS = ("special_features", "contacts")
 
+# Which of RISKY_TEXT_FIELDS gets the extra comma-splitting described in
+# _detail_items - special_features only. contacts' own per-person format is
+# "Name, email, phone" (a single genuine item, comma-joined internally) -
+# the same comma-splitting there would shred one contact into three fake
+# items, so it always stays semicolon/newline-only, exactly as before this
+# existed.
+_MERGE_COMMA_SPLIT_FIELDS = frozenset({"special_features"})
+
 # The two fields a leading house number (see _leading_house_number/
 # house_number_changed) can appear in - checked independently of
 # RISKY_TEXT_FIELDS in build_merge_plan's risky_fields computation, since a
@@ -64,6 +72,21 @@ RISKY_TEXT_FIELDS = ("special_features", "contacts")
 # would otherwise auto-apply unreviewed unless it happened to also collide
 # with another row in the same batch.
 HOUSE_NUMBER_FIELDS = ("address_1", "building")
+
+# Coordinates this pipeline itself generates via geocode.py's own API calls
+# whenever a row's source left them blank (see that module's geocode_row) -
+# never overwritten there once a row already has both, but that guarantee
+# only covers ONE row's own extraction, not a later upload's row being
+# diffed against a DIFFERENT, already-correct master value here. No field-
+# level provenance exists to tell "this value was explicitly stated" apart
+# from "this value was API-generated" once a row reaches this module (see
+# build_merge_plan's own risky_fields computation for the full reasoning) -
+# unlike address_1/postcode, deliberately left OUT of this list since a
+# genuine provider correction there is common and already safe (see
+# HOUSE_NUMBER_FIELDS' own structural-change guard), lat/lng has no
+# comparable signal at all, so any change to an already-known coordinate
+# always needs a look.
+GEOCODE_RISK_FIELDS = ("lat", "lng")
 
 # Free-text fields where wording indicating a property is no longer on the
 # market might appear - the two descriptive prose fields, never a matching
@@ -472,7 +495,7 @@ def silent_field_updates(old: dict, new: dict) -> dict:
     return updates
 
 
-def _detail_items(text: str) -> list[str]:
+def _detail_items(text: str, field_name: str = None) -> list[str]:
     """Splits a free-text list field (special_features, contacts) into its
     individual items - on ";" and newline ONLY, matching the delimiters
     those fields are actually documented to use (see extract.py's
@@ -490,9 +513,29 @@ def _detail_items(text: str) -> list[str]:
     A too-short fragment (stray punctuation/an empty trailing segment from
     a trailing ";") is dropped; it's not solid enough evidence either way
     for the similarity check in is_detail_loss to build on.
+
+    field_name, when it's "special_features" specifically (see
+    _MERGE_COMMA_SPLIT_FIELDS), ALSO splits each semicolon/newline chunk
+    further on a comma immediately followed by whitespace - a real list
+    separator ("Private terrace, 10-person boardroom" -> 2 items) - never a
+    comma immediately followed by more digits ("36,000", a thousands
+    separator - never followed by whitespace, so never split). Contacts is
+    deliberately excluded even when comma-splitting would otherwise apply -
+    its own per-person format IS "Name, email, phone", so this same rule
+    would shred one contact's own details into three fake items, exactly
+    the failure mode the paragraph above already explains rejecting comma-
+    splitting for generally. Defaults to None (the original, unchanged
+    semicolon/newline-only split) so every existing caller that doesn't
+    pass this is completely unaffected.
     """
     parts = re.split(r"[;\n]+", text.lower())
-    return [p.strip() for p in parts if len(p.strip()) >= 3]
+    items = [p.strip() for p in parts if len(p.strip()) >= 3]
+    if field_name not in _MERGE_COMMA_SPLIT_FIELDS:
+        return items
+    expanded = []
+    for item in items:
+        expanded.extend(p.strip() for p in re.split(r",\s+", item) if len(p.strip()) >= 3)
+    return expanded
 
 
 def _significant_words(item: str) -> frozenset:
@@ -529,7 +572,7 @@ def _items_similar(item_a: str, item_b: str) -> bool:
     return overlap / min(len(words_a), len(words_b)) >= ITEM_SIMILARITY_THRESHOLD
 
 
-def is_detail_loss(old_val, new_val) -> bool:
+def is_detail_loss(old_val, new_val, field_name: str = None) -> bool:
     """
     True when `new_val` looks like it dropped a genuine item `old_val` had,
     rather than just rewording/shortening it - e.g. a brochure re-upload's
@@ -547,19 +590,121 @@ def is_detail_loss(old_val, new_val) -> bool:
     fact compressed into a short paraphrase looks identical, by either of
     those measures, to a fact being deleted outright).
 
-    Only called for RISKY_TEXT_FIELDS, and only a review trigger (see that
-    constant's docstring) - never applied automatically, callers still let a
-    human apply, correct, or skip the field in manual review.
+    field_name is passed straight through to _detail_items (see its own
+    docstring) - defaults to None, the original semicolon/newline-only
+    split, so every existing call site (there are several - the risky-
+    field gate below, the peer-collision path, direct test calls) keeps
+    its exact prior behavior unless it explicitly opts into comma-splitting.
+
+    Used two ways: as a review trigger (the original, still-used meaning -
+    see RISKY_TEXT_FIELDS' own docstring - never applied automatically on
+    its own) AND, when field_name is given, as the gate for whether
+    merge_compatible_text should run at all (see build_merge_plan) - in
+    that second use, TRUE does not mean "force a review", it means "there's
+    a genuine old item worth carrying forward into an automatic merge".
     """
     if _is_blank(old_val) or _is_blank(new_val):
         return False
 
-    old_items = _detail_items(str(old_val))
-    new_items = _detail_items(str(new_val))
+    old_items = _detail_items(str(old_val), field_name)
+    new_items = _detail_items(str(new_val), field_name)
     if not old_items:
         return False
 
     return any(not any(_items_similar(old_item, new_item) for new_item in new_items) for old_item in old_items)
+
+
+def _split_list_items(text: str, field_name: str = None) -> list[str]:
+    """
+    Case-PRESERVING counterpart to _detail_items - same splitting rules
+    (semicolon/newline always, plus comma-then-whitespace for
+    special_features specifically - see that function's own docstring),
+    but keeps each item's original text intact rather than lowercasing it,
+    since merge_compatible_text's output is real text a person reads, not
+    just a comparison key.
+    """
+    parts = re.split(r"[;\n]+", text)
+    items = [p.strip() for p in parts if len(p.strip()) >= 3]
+    if field_name not in _MERGE_COMMA_SPLIT_FIELDS:
+        return items
+    expanded = []
+    for item in items:
+        expanded.extend(p.strip() for p in re.split(r",\s+", item) if len(p.strip()) >= 3)
+    return expanded
+
+
+# Small, explicit, hand-maintained signal that a NEW item is stating a
+# feature's removal/unavailability rather than just omitting it - same
+# "conservative, human-curated list, never generalized NLP" philosophy as
+# this file's own LET_STATUS_KEYWORDS/KNOWN_PROVIDERS/_STREET_SUFFIX_
+# EXPANSIONS. Used only by merge_compatible_text, and only to decide
+# whether an OLD item that shares a topic with this new one should be
+# dropped rather than carried forward - never to invent or reword
+# anything; the new item's own text is always used exactly as given.
+_FEATURE_NEGATION_KEYWORDS = ("no longer", "removed", "not available", "unavailable", "not included", "withdrawn")
+
+
+def _item_mentions_negation(item: str) -> bool:
+    lowered = item.lower()
+    return any(kw in lowered for kw in _FEATURE_NEGATION_KEYWORDS)
+
+
+def _item_shares_a_topic(item_a: str, item_b: str) -> bool:
+    """
+    True if item_a and item_b share ANY significant word at all - a much
+    weaker bar than _items_similar's own ratio (which decides "these are
+    the same restated fact"). Used only alongside _item_mentions_negation
+    in merge_compatible_text: two items can plausibly be ABOUT the same
+    subject (share a topic) without being similar enough to count as a
+    reword of each other - e.g. "Manned reception desk" and "Reception no
+    longer staffed" share only "reception", nowhere near _items_similar's
+    own 0.5 threshold, but are obviously about the same fact turning false.
+    """
+    return bool(_significant_words(item_a) & _significant_words(item_b))
+
+
+def merge_compatible_text(old_val, new_val, field_name: str = None) -> str:
+    """
+    The value to use for a RISKY_TEXT_FIELDS update once is_detail_loss has
+    already established old_val has at least one item new_val doesn't
+    restate, AND is_richness_regression has already established new_val
+    isn't a drastically terser replacement (see build_merge_plan's own
+    call site - never called directly on a pair that failed either check).
+
+    Preserves BOTH sources' useful, non-conflicting information rather
+    than either extreme: never a blind overwrite (which would silently
+    drop whatever old_val's items weren't restated in new_val) and never a
+    blind concatenation (which would keep a fact new_val has explicitly
+    negated sitting right alongside its own contradiction). Result order is
+    new_val's own items first (in new_val's own current wording - the
+    freshest source for anything it actually restates), then any old_val
+    item that's neither:
+    - already restated/reworded in new_val (see _items_similar) - would
+      just duplicate what new_val already says, in old_val's stale wording, or
+    - explicitly negated by a new_val item sharing its topic (see
+      _item_shares_a_topic/_item_mentions_negation) - carrying that item
+      forward would concatenate a claim new_val has just contradicted.
+
+    Always joined with "; ", the field's own documented canonical
+    separator (see extract.py's PROMPT) - regardless of whether either
+    source used commas, semicolons, or a mix; normalizing the join
+    character is not a loss of information, just a formatting choice.
+    """
+    new_items = _split_list_items(str(new_val), field_name)
+    old_items = _split_list_items(str(old_val), field_name)
+
+    merged = list(new_items)
+    for old_item in old_items:
+        if any(_items_similar(old_item, new_item) for new_item in new_items):
+            continue
+        if any(
+            _item_shares_a_topic(old_item, new_item) and _item_mentions_negation(new_item)
+            for new_item in new_items
+        ):
+            continue
+        merged.append(old_item)
+
+    return "; ".join(merged) if merged else str(new_val)
 
 
 # Threshold for is_richness_regression - a new value under HALF of the old
@@ -621,11 +766,44 @@ def is_richness_regression(old_val, new_val) -> bool:
     return new_words / old_words < RICHNESS_RATIO_THRESHOLD
 
 
+def _floor_unit_key(building, floor_unit) -> str:
+    """
+    normalize_key(floor_unit), with a redundant leading occurrence of the
+    row's OWN building name stripped first - confirmed real shape: the same
+    real unit's floor_unit extracted as "Hallmark 6th Floor" in one upload
+    and plain "6th Floor" in another (building "Hallmark" in both) - an
+    exact normalize_key comparison never reconciles these two strings even
+    though a human reads them as unambiguously the same floor, since
+    building+provider already agree and only floor_unit carries the
+    redundant building-name prefix one source happened to repeat.
+
+    Deliberately a plain prefix strip, never a fuzzy/similarity match: only
+    fires when floor_unit's own normalized text literally BEGINS with
+    building's own normalized text followed by a word boundary - "Hallmark
+    6th Floor" strips to "6th floor" (building "Hallmark"), but "Hallmark
+    House 6th Floor" does NOT strip against building "Hallmark" (the next
+    character after the shared prefix is "h", not a boundary) - a genuinely
+    different, longer building name is never partially matched against a
+    shorter one this way. A floor_unit that just short of literally repeats
+    the building name (any other real-world phrasing) falls through
+    unchanged, exactly as before this existed - still exact-match-only,
+    same "conservative, human catches it" philosophy as normalize_key
+    itself.
+    """
+    floor_key = normalize_key(floor_unit)
+    building_key = normalize_key(building)
+    if building_key and floor_key.startswith(building_key):
+        rest = floor_key[len(building_key):]
+        if rest == "" or rest[0] == " ":
+            return rest.strip()
+    return floor_key
+
+
 def _fallback_key(row: dict) -> tuple:
     return (
         normalize_key(row.get("building")),
         normalize_key(row.get("provider")),
-        normalize_key(row.get("floor_unit")),
+        _floor_unit_key(row.get("building"), row.get("floor_unit")),
     )
 
 
@@ -1239,12 +1417,54 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             old_rec = master_records[master_idx]
             diffs = diff_fields(old_rec, new_dict)
             silent = silent_field_updates(old_rec, new_dict)
+
+            # Auto-merge a RISKY_TEXT_FIELDS update BEFORE risky_fields is
+            # computed below, whenever it's safe to (see merge_compatible_
+            # text's own docstring): is_detail_loss says old_val has a
+            # genuine item new_val doesn't restate, but is_richness_
+            # regression says new_val isn't a drastic, all-round terser
+            # replacement (the one shape that must stay a manual review,
+            # unmerged, exactly as before this existed - see that
+            # function's own docstring). Mutating diffs[f] here, rather
+            # than adding a separate resolved-value field, is what lets the
+            # EXISTING risky_fields expression right below re-evaluate
+            # against the MERGED value with no changes of its own: a merged
+            # value is constructed to always contain every old item it
+            # didn't just deliberately drop, so is_detail_loss(old_val,
+            # merged_val) is guaranteed to come back False.
+            for f in RISKY_TEXT_FIELDS:
+                if f not in diffs:
+                    continue
+                old_val, new_val = diffs[f]
+                if _is_blank(old_val) or _is_blank(new_val):
+                    continue
+                if is_richness_regression(old_val, new_val):
+                    continue
+                if is_detail_loss(old_val, new_val, field_name=f):
+                    diffs[f] = (old_val, merge_compatible_text(old_val, new_val, field_name=f))
+
             risky_fields = frozenset(
                 f for f in diffs
                 if f in RISKY_TEXT_FIELDS and (is_detail_loss(*diffs[f]) or is_richness_regression(*diffs[f]))
             ) | frozenset(
                 f for f in diffs
                 if f in HOUSE_NUMBER_FIELDS and house_number_changed(*diffs[f])
+            ) | frozenset(
+                # Geocoded fields get no provenance tag distinguishing an
+                # explicit provider-stated coordinate from one this pipeline
+                # generated via geocode.py's own API calls (see that
+                # module's own docstring) - unlike address_1/postcode,
+                # which are deliberately left freely auto-updatable (a
+                # genuine provider correction is common and safe there, and
+                # house_number_changed already catches the one structural
+                # danger), lat/lng has no comparable safe-update signal at
+                # all, so ANY change to an already-non-blank coordinate
+                # always needs a look rather than risking a bad geocode
+                # silently overwriting a previously correct, verified
+                # location. A blank old value is unaffected - filling in a
+                # never-before-known coordinate is not a REPLACEMENT.
+                f for f in diffs
+                if f in GEOCODE_RISK_FIELDS and not _is_blank(old_rec.get(f))
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])

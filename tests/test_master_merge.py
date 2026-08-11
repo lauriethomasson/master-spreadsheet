@@ -2380,5 +2380,423 @@ class FindStaleCandidatesTests(unittest.TestCase):
         self.assertEqual(stale, [0])
 
 
+class ConfidentSameProviderAutoUpdateTests(unittest.TestCase):
+    """
+    The updated-provider workflow: for a row confidently matched to an
+    existing master property/unit (same provider, same normalized building
+    + floor_unit), an ordinary scalar/current-state change should already
+    auto-apply with no manual click - see build_merge_plan's own
+    auto_accept-eligible risky_fields computation (pages/2_Review_and_
+    Master.py's auto_accept mode already applies anything NOT in
+    risky_fields without a per-field decision). These tests prove that's
+    true for every DIFF_FIELDS category the brief calls out, not just
+    special_features/contacts - no new logic was needed for any of these,
+    since matching already requires provider+building+floor_unit/postcode
+    agreement and diff_fields already treats a new non-blank value as a
+    genuine update, blank as "no new information".
+    """
+
+    def _matched(self, master_row: dict, new_row: ListingRow):
+        master_df = _master_df([master_row])
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        self.assertEqual(len(plan.matched_changed), 1, "row did not confidently match master")
+        return plan.matched_changed[0]
+
+    def test_new_rent_replaces_old_rent(self):
+        matched = self._matched(
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "rent_pcm": 5000.0},
+            ListingRow(building="1 Example Street", provider="UNION", floor_unit="3rd Floor", rent_pcm=5500.0),
+        )
+        self.assertEqual(matched.diffs["rent_pcm"], (5000.0, 5500.0))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_new_size_replaces_old_size(self):
+        matched = self._matched(
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "size_sqft": 1000.0},
+            ListingRow(building="1 Example Street", provider="UNION", floor_unit="3rd Floor", size_sqft=1200.0),
+        )
+        self.assertEqual(matched.diffs["size_sqft"], (1000.0, 1200.0))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_new_desks_replaces_old_desks(self):
+        matched = self._matched(
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "desks_max": 10},
+            ListingRow(building="1 Example Street", provider="UNION", floor_unit="3rd Floor", desks_max=14),
+        )
+        self.assertEqual(matched.diffs["desks_max"], (10, 14))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_fully_fitted_to_cat_a_results_in_cat_a(self):
+        matched = self._matched(
+            {
+                "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+                "state_of_space": "Fully Fitted",
+            },
+            ListingRow(
+                building="1 Example Street", provider="UNION", floor_unit="3rd Floor", state_of_space="CAT A",
+            ),
+        )
+        self.assertEqual(matched.diffs["state_of_space"], ("Fully Fitted", "CAT A"))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_cat_a_to_fully_fitted_results_in_fully_fitted(self):
+        matched = self._matched(
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "state_of_space": "CAT A"},
+            ListingRow(
+                building="1 Example Street", provider="UNION", floor_unit="3rd Floor", state_of_space="Fully Fitted",
+            ),
+        )
+        self.assertEqual(matched.diffs["state_of_space"], ("CAT A", "Fully Fitted"))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_blank_new_scalar_does_not_erase_old_nonblank_value(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "rent_pcm": 5000.0,
+        }])
+        new_row = ListingRow(building="1 Example Street", provider="UNION", floor_unit="3rd Floor", rent_pcm=None)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        # No change at all - a blank new value contributes nothing, so this
+        # row lands in matched_unchanged, not matched_changed.
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.matched_unchanged), 1)
+
+    def test_old_blank_new_nonblank_scalar_updates(self):
+        matched = self._matched(
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "rent_pcm": None},
+            ListingRow(building="1 Example Street", provider="UNION", floor_unit="3rd Floor", rent_pcm=4200.0),
+        )
+        self.assertEqual(matched.diffs["rent_pcm"], (None, 4200.0))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+
+class SpecialFeaturesMergeTests(unittest.TestCase):
+    """
+    merge_compatible_text/build_merge_plan's new auto-merge behavior for
+    special_features - preserves compatible information from BOTH sources
+    instead of either a blind overwrite (loses old detail) or forcing a
+    manual click for an ordinary, safely-mergeable update.
+    """
+
+    def _matched_special_features(self, old_val, new_val):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "special_features": old_val,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", special_features=new_val,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        return plan.matched_changed[0]
+
+    def test_old_blank_new_text_is_used(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "special_features": None,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor",
+            special_features="Private terrace",
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["special_features"], (None, "Private terrace"))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_new_blank_preserves_old(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "special_features": "Private terrace",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", special_features=None,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(plan.matched_unchanged[0].new_row.special_features, None)
+
+    def test_compatible_additions_are_merged_without_duplication(self):
+        # The brief's own example: neither side's comma-joined phrase
+        # disproves the other's, so both facts survive, and the shared
+        # "Private terrace" phrase isn't repeated.
+        matched = self._matched_special_features(
+            "Private terrace, 10-person boardroom", "Private terrace, newly fitted kitchen",
+        )
+        self.assertNotIn("special_features", matched.risky_fields)
+        merged = matched.diffs["special_features"][1]
+        self.assertIn("newly fitted kitchen", merged)
+        self.assertIn("10-person boardroom", merged)
+        self.assertEqual(merged.lower().count("private terrace"), 1)
+
+    def test_semicolon_itemized_compatible_addition_is_merged(self):
+        matched = self._matched_special_features(
+            "Bike racks; showers", "Bike racks; showers; new rooftop terrace",
+        )
+        self.assertNotIn("special_features", matched.risky_fields)
+        # Already-compatible (is_detail_loss was False here to begin with -
+        # see IsDetailLossTests) - new_val already stood alone correctly.
+        self.assertEqual(matched.diffs["special_features"][1], "Bike racks; showers; new rooftop terrace")
+
+    def test_shorter_generic_new_value_does_not_destroy_richer_old_detail(self):
+        # is_richness_regression still gates this - a drastic compression
+        # stays manual review, unmerged, exactly as before this feature
+        # existed (must not silently reduce to just "Fully fitted").
+        matched = self._matched_special_features(
+            "12-person boardroom, 3 meeting rooms, breakout area, fitted kitchen", "Fully fitted",
+        )
+        self.assertIn("special_features", matched.risky_fields)
+        self.assertEqual(
+            matched.diffs["special_features"],
+            ("12-person boardroom, 3 meeting rooms, breakout area, fitted kitchen", "Fully fitted"),
+        )
+
+    def test_genuine_contradiction_is_not_concatenated(self):
+        # New explicitly negates an old fact about the same topic (shares
+        # "reception" but scores nowhere near _items_similar's own
+        # reword threshold) - the old claim must be dropped, not kept
+        # alongside its own contradiction.
+        matched = self._matched_special_features("Manned reception desk", "Reception no longer staffed")
+        merged = matched.diffs["special_features"][1]
+        self.assertEqual(merged, "Reception no longer staffed")
+        self.assertNotIn("Manned reception desk".lower(), merged.lower())
+
+    def test_reworded_same_fact_is_not_duplicated(self):
+        matched = self._matched_special_features(
+            "Benefits from a large private terrace landscaped with plants, trees and premium Italian outdoor furniture",
+            "Private landscaped terrace",
+        )
+        # is_richness_regression fires here too (ratio 0.20, a known
+        # accepted case - see that constant's own docstring) - stays
+        # manual review, unmerged, same as the "Fully fitted" case above.
+        self.assertIn("special_features", matched.risky_fields)
+
+
+class ContactsMergeTests(unittest.TestCase):
+    def _matched_contacts(self, old_val, new_val):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor", "contacts": old_val,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", contacts=new_val,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        return plan.matched_changed[0]
+
+    def test_new_blank_preserves_old_contact(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "contacts": "Jane Smith, jane@example.com",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", contacts=None,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        self.assertEqual(len(plan.matched_changed), 0)
+
+    def test_richer_contact_details_are_preserved(self):
+        matched = self._matched_contacts(
+            "Jane Smith — Agent", "Jane Smith — Agent — jane@example.com — 020 7946 0000",
+        )
+        self.assertNotIn("contacts", matched.risky_fields)
+        self.assertEqual(matched.diffs["contacts"][1], "Jane Smith — Agent — jane@example.com — 020 7946 0000")
+
+    def test_clearly_replaced_contact_is_preserved_alongside_the_new_one(self):
+        # No safe signal exists to tell "Bob replaced Jane" apart from "Bob
+        # is a second, simultaneously-valid contact" - defaulting to
+        # preserving both (never silently dropping Jane) is the safe,
+        # information-preserving choice the brief itself sanctions as a
+        # fallback when both are clearly valid. Deliberately no shared
+        # words at all between the two (different names, different email
+        # domains) - a real, unrelated second contact, not a reworded
+        # restatement of the first.
+        matched = self._matched_contacts("Jane Smith, jane@agentco.com", "Bob Jones, bob@anotherfirm.com")
+        self.assertNotIn("contacts", matched.risky_fields)
+        merged = matched.diffs["contacts"][1]
+        self.assertIn("Bob Jones, bob@anotherfirm.com", merged)
+        self.assertIn("Jane Smith, jane@agentco.com", merged)
+
+
+class BrochureFallbackDoesNotOverrideProviderTests(unittest.TestCase):
+    """
+    brochure_enrichment.py's own _apply_units_to_row only ever fills a
+    field that's genuinely blank on the row it's enriching (see that
+    module's own docstring/tests, e.g. test_populated_special_features_
+    not_overwritten) - so by the time a row reaches master_merge, if a
+    provider's own source stated special_features/contacts, brochure
+    enrichment has already left it untouched. master_merge itself has no
+    way to distinguish a value that was provider-explicit from one a
+    brochure fallback filled - both are just "this row's own current
+    value" - so the correct behavior at THIS layer is simply that a row's
+    own non-blank value always wins over master's old one when compatible,
+    and is treated as ordinary content otherwise - exactly the same rule
+    already proven above, confirmed here at the master-merge boundary too.
+    """
+
+    def test_a_row_whose_value_could_only_have_come_from_brochure_fallback_still_updates_normally(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "special_features": None,
+        }])
+        # Simulates brochure_enrichment already having filled this row's
+        # own special_features (the provider's own source left it blank) -
+        # master_merge treats it exactly like any other non-blank value.
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor",
+            special_features="Private terrace",
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["special_features"], (None, "Private terrace"))
+        self.assertEqual(matched.risky_fields, frozenset())
+
+
+class GeocodeLocationRiskTests(unittest.TestCase):
+    """
+    lat/lng get no provenance tag distinguishing an explicit provider-
+    stated coordinate from one geocode.py generated via its own API calls
+    (see GEOCODE_RISK_FIELDS' own docstring) - so ANY change to an already-
+    known coordinate always needs a manual look, regardless of source, and
+    a coordinate is only ever silently trusted while master had none.
+    """
+
+    def test_new_coordinate_replacing_an_existing_one_is_flagged(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "lat": 51.5142, "lng": -0.1494,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", lat=51.5200, lng=-0.1400,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertIn("lat", matched.risky_fields)
+        self.assertIn("lng", matched.risky_fields)
+
+    def test_filling_a_previously_blank_coordinate_is_not_flagged(self):
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "lat": None, "lng": None,
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor", lat=51.5142, lng=-0.1494,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertNotIn("lat", matched.risky_fields)
+        self.assertNotIn("lng", matched.risky_fields)
+
+    def test_explicit_valid_new_address_can_still_update_freely(self):
+        # address_1/postcode are deliberately NOT in GEOCODE_RISK_FIELDS -
+        # confirmed unaffected by this feature (see BuildMergePlanRiskyFieldsTests'
+        # own pre-existing test_non_risky_field_shrinking_is_never_flagged).
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "UNION", "floor_unit": "3rd Floor",
+            "address_1": "1 Example Street", "postcode": "EC1A 1AA",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="UNION", floor_unit="3rd Floor",
+            address_1="1 Example Street", postcode="EC1A 1BB",
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+        self.assertIn("postcode", matched.diffs)
+        self.assertEqual(matched.risky_fields, frozenset())
+
+
+class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
+    """
+    _floor_unit_key - the redundant-building-name-prefix fix. Confidently
+    matches once the redundant prefix is normalized away, but never
+    weakens genuine floor/unit distinctions (6th vs 7th, North vs South,
+    different buildings) - see BuildMergePlanFuzzyBuildingTests/MatchUnit-
+    style tests elsewhere in this file for the pre-existing safeguards
+    this must not loosen.
+    """
+
+    def test_redundant_building_name_prefix_still_matches(self):
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "6th Floor"}])
+        new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="Hallmark 6th Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_reverse_direction_also_matches(self):
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark 6th Floor"}])
+        new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="6th Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_different_floor_numbers_still_kept_separate(self):
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark 6th Floor"}])
+        new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="Hallmark 7th Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+    def test_north_and_south_still_kept_separate(self):
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark North Wing"}])
+        new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="Hallmark South Wing")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+    def test_a_different_building_that_happens_to_start_the_same_is_not_stripped(self):
+        # "Hallmark House" must never be treated as building "Hallmark"
+        # plus a floor label - the character right after the shared prefix
+        # isn't a word boundary, so no stripping happens at all here.
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark House 2nd Floor"}])
+        new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="2nd Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+
+class AmbiguousIdentityStillManualTests(unittest.TestCase):
+    """Confirms the updated-provider auto-apply behavior never reaches a
+    row whose identity/unit match is genuinely ambiguous - unchanged
+    pre-existing safeguards, not new logic, but worth proving explicitly
+    alongside the new auto-update behavior."""
+
+    def test_ambiguous_floor_match_stays_unmatched_not_auto_applied(self):
+        master_df = _master_df([
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st Floor", "rent_pcm": 1000.0},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "2nd Floor", "rent_pcm": 2000.0},
+        ])
+        # No postcode, floor_unit doesn't exact-match either existing row -
+        # ambiguous, must not guess.
+        new_row = ListingRow(building="1 Example Street", provider="UNION", floor_unit="Suite Z", rent_pcm=3000.0)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+    def test_different_submarket_source_rows_remain_separate_new_properties(self):
+        # Two intentionally-separate source listings (see
+        # _partition_by_source_submarket) sharing no existing master row -
+        # both remain genuinely new, never silently merged.
+        new_rows = [
+            ListingRow(building="Nexus Place", provider="UNION", floor_unit="5th Floor", submarket="City"),
+            ListingRow(
+                building="Nexus Place", provider="UNION", floor_unit="5th Floor", submarket="Clerkenwell & Farringdon",
+            ),
+        ]
+        plan = master_merge.build_merge_plan(new_rows, _master_df([]))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(len(plan.unmatched_collisions), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
