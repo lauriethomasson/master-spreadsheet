@@ -17,12 +17,32 @@ circular and pointless), and email rows are left for a later change.
 Field scope is deliberately narrow: ENRICHABLE_FIELDS below is the ONLY set
 of fields this module ever assigns to. Every other ListingRow field
 (provider, internal_ref, building, floor_unit, size_sqft, rent_pcm,
-rent_psf, brochure_link, postcode, address_1, desks_min, desks_max,
-contacts) is never touched by this module at all - not "protected by a
-priority rule that could have a bug", genuinely absent from any code path
-here, which is safer than a runtime overwrite-guard for the same reason
+rent_psf, brochure_link, postcode, address_1, desks_min, desks_max) is
+never touched by this module at all - not "protected by a priority rule
+that could have a bug", genuinely absent from any code path here, which is
+safer than a runtime overwrite-guard for the same reason
 finalize_brochure_link's own rules are enforced in code rather than left to
 a model to decide (see that module's own docstring).
+
+Brochure information is applied at the WIDEST level the brochure itself
+clearly supports, never wider - three levels, each narrower than the last,
+each overwriting the same field when a narrower one is also available (see
+_apply_units_to_row's own docstring for the exact precedence):
+1. Property/document-wide (property_features, contacts - see
+   _extract_brochure_units) - genuinely true of every row sharing this
+   brochure_link, applied regardless of whether a specific building or
+   floor/unit can be matched at all.
+2. Building-wide (building_features - see _match_building_feature) -
+   applied whenever the row's own building exactly (normalize_key) matches
+   one brochure building with its own distinct building-level text, again
+   regardless of whether a specific floor/unit within it can be matched.
+3. Floor/unit-specific (a matched unit's own special_features/
+   state_of_space - see _match_unit) - only ever applied to the one row a
+   specific floor/unit was confidently matched to; never leaks to a
+   different floor in the same building, because it only ever comes from
+   _match_unit's own conservative, exact-match-only building+floor
+   identification (see that function's own docstring) - there is no fuzzy/
+   similarity matching anywhere in this module, at any of the three levels.
 
 No new ListingRow field is added for provenance - enrich_rows/enrich_rows_
 grouped return a separate log (see their own docstrings) instead, so a
@@ -113,10 +133,12 @@ def _trim_memory() -> None:
 # The only fields enrich_row ever assigns to, and only when the row's own
 # value is blank - see the module docstring for why this list alone is the
 # safety mechanism, not a separate overwrite-guard. Deliberately narrow for
-# this first version: desks_min/desks_max/address_1/postcode/contacts are
-# all plausible future candidates (see brochure_link_resolver.py's own
-# "start conservative" precedent) but are not attempted here.
-ENRICHABLE_FIELDS = ("special_features", "state_of_space")
+# this first version: desks_min/desks_max/address_1/postcode are all
+# plausible future candidates (see brochure_link_resolver.py's own "start
+# conservative" precedent) but are not attempted here. contacts IS included -
+# see _apply_units_to_row's own docstring for why it's sourced differently
+# from the other two (a document-level value, never a per-unit one).
+ENRICHABLE_FIELDS = ("special_features", "state_of_space", "contacts")
 
 # Matched against the URL only (never a fetch) - a floor plan or a video is
 # never a brochure regardless of what it turns out to contain, and fetching
@@ -411,13 +433,42 @@ def _fetch_pdf_bytes(url: str):
     return response.content
 
 
+class _BrochureUnits(list):
+    """
+    A plain list of unit dicts (see _extract_brochure_units's own docstring
+    below) that ALSO carries this brochure's own document-level
+    property_features/contacts, and its building-level building_features,
+    as extra attributes - never as extra list elements. Every existing
+    caller/test that already treats this as a plain list (truthiness,
+    len(), iteration, indexing) is completely unaffected, since it
+    genuinely IS one; only code that explicitly asks for
+    .property_features/.contacts/.building_features (see
+    _apply_units_to_row/_match_building_feature) sees them.
+
+    This is deliberately NOT a new return shape (e.g. a tuple or dict) -
+    dozens of existing tests mock _extract_brochure_units with a bare
+    return_value=[...]/None, and a plain `list`/None still satisfies every
+    getattr(units, "property_features", None) check below with None,
+    exactly as if that brochure had stated nothing at that level - so none
+    of those mocks needed to change for this.
+    """
+
+    property_features = None
+    contacts = None
+    building_features = None
+
+
 @functools.lru_cache(maxsize=64)
 def _extract_brochure_units(url: str):
     """
     The raw brochure units (see extract.extract_raw_units) for `url` - each
     a dict with its own building/floor_unit/size_sqft/special_features/
     state_of_space, exactly as extract.py's own PROMPT already extracts them
-    for an uploaded PDF.
+    for an uploaded PDF. Returns a _BrochureUnits (see above), so this
+    brochure's own document-level property_features/contacts - genuinely
+    true of the WHOLE document, never one specific floor - travel alongside
+    the per-unit list without requiring every existing caller to unpack a
+    different shape.
 
     This lru_cache is a CROSS-RUN optimization only (e.g. two separate
     enrichment clicks, or two pending files sharing a brochure) - it is
@@ -471,7 +522,22 @@ def _extract_brochure_units(url: str):
             file=sys.stderr,
         )
         return None
-    return raw.get("units", [])
+
+    units = _BrochureUnits(raw.get("units", []))
+    property_features = raw.get("property_features")
+    units.property_features = property_features if isinstance(property_features, str) else None
+    contacts = raw.get("contacts")
+    units.contacts = contacts if isinstance(contacts, str) else None
+    # Raw Gemini JSON, same as units above - never schema-validated before
+    # reaching here, so a malformed entry (missing/non-string "building" or
+    # "features") is simply excluded rather than raising (see _match_unit's
+    # own docstring for the identical reasoning about a stray bad unit).
+    units.building_features = [
+        bf for bf in raw.get("building_features") or []
+        if isinstance(bf, dict) and isinstance(bf.get("building"), str) and isinstance(bf.get("features"), str)
+        and not _is_blank(bf.get("building")) and not _is_blank(bf.get("features"))
+    ]
+    return units
 
 
 def _match_unit(row: ListingRow, units: list):
@@ -554,6 +620,34 @@ def _match_unit(row: ListingRow, units: list):
     return None
 
 
+def _match_building_feature(row: ListingRow, units):
+    """
+    The building-wide features text (a plain str) confidently identified as
+    describing `row`'s own building, or None - the level-B counterpart to
+    _match_unit's floor-level matching and units.property_features's
+    document-level fallback (see _apply_units_to_row's own docstring for how
+    the three combine). Sourced from units.building_features (see
+    _extract_brochure_units), one {"building", "features"} entry per
+    building the brochure itself gave distinct building-level text for.
+
+    Same exact-match-only philosophy as _match_unit: normalize_key-equal
+    building names, never fuzzy/similarity matching. Two entries that
+    happen to normalize_key-equal the row's own building (shouldn't occur -
+    the prompt asks for one entry per distinct building - but never assumed)
+    is treated as ambiguous and returns None, same as zero matches.
+    """
+    building_features = getattr(units, "building_features", None)
+    if not building_features:
+        return None
+    row_building_key = normalize_key(row.building)
+    if not row_building_key:
+        return None
+    matches = [bf for bf in building_features if normalize_key(bf.get("building")) == row_building_key]
+    if len(matches) == 1:
+        return matches[0]["features"]
+    return None
+
+
 def _safe_float(value):
     """float(value), or None for anything that isn't genuinely numeric -
     a raw Gemini unit's own size_sqft is supposed to be "a plain number"
@@ -584,11 +678,38 @@ def _apply_units_to_row(row: ListingRow, units):
     "something changed" with a plain identity/truthiness check. Never
     mutates `row`.
 
-    Every ENRICHABLE_FIELDS value taken from `unit` must be a genuine str -
-    both fields are Optional[str] on ListingRow, but `unit` is a raw Gemini
-    JSON dict that, unlike the primary upload path's own units (validated
-    through ExtractedFields - see extract.extract()), never passes through
-    any schema validation at all before reaching here. model_copy(update=...)
+    Three independent sources, applied at three different scopes, from
+    widest to narrowest - see the module docstring for the full "widest
+    safe level" rationale. Each later, narrower source OVERWRITES the same
+    key in `updates` set by an earlier, wider one when both apply, since a
+    more specific value is always preferred over a less specific one:
+
+    1. DOCUMENT-level (contacts, special_features's property_features
+       fallback - see units.property_features/units.contacts, set by
+       _extract_brochure_units) - genuinely true of every row sharing this
+       brochure_link regardless of which floor/unit or even which building
+       it is, so both are applied even when neither of the two steps below
+       finds anything. contacts is ALWAYS sourced this way, never from a
+       per-unit dict - the extraction prompt only ever asks for contacts
+       once, for the whole document (see extract.py's own PROMPT), so no
+       per-unit dict ever carries its own "contacts" key.
+    2. BUILDING-level (special_features's building_features fallback - see
+       _match_building_feature) - applied whenever the row's own building
+       exactly matches one brochure building with distinct building-wide
+       text, again regardless of whether a specific floor/unit can be
+       matched - a building-wide fact is still true of every floor in that
+       building even when this particular row's own floor can't be pinned
+       down.
+    3. UNIT-level (state_of_space, and special_features's own value when
+       present - see _match_unit) - only ever applied when a SPECIFIC
+       floor/unit is confidently matched, since neither is safe to assume
+       applies beyond the one unit it was actually stated for.
+
+    Every value taken from `units`/`unit` must be a genuine str - fields
+    are Optional[str] on ListingRow, but `units`/`unit` are raw Gemini JSON
+    that, unlike the primary upload path's own units (validated through
+    ExtractedFields - see extract.extract()), never passes through any
+    schema validation at all before reaching here. model_copy(update=...)
     below does NOT re-validate its update dict (unlike constructing a
     ListingRow directly) - it would otherwise silently accept whatever type
     Gemini's JSON happened to produce (e.g. a list, if a future prompt
@@ -599,19 +720,31 @@ def _apply_units_to_row(row: ListingRow, units):
     blank value in that case - nothing to enrich from this field, not a
     reason to fail the whole row or the run.
     """
-    if not units:
-        return row, []
+    updates = {}
 
-    unit = _match_unit(row, units)
-    if unit is None:
-        return row, []
+    if units is not None:
+        contacts = getattr(units, "contacts", None)
+        if _is_blank(row.contacts) and isinstance(contacts, str) and not _is_blank(contacts):
+            updates["contacts"] = contacts
 
-    updates = {
-        field: unit[field]
-        for field in ENRICHABLE_FIELDS
-        if _is_blank(getattr(row, field))
-        and isinstance(unit.get(field), str) and not _is_blank(unit.get(field))
-    }
+        property_features = getattr(units, "property_features", None)
+        if _is_blank(row.special_features) and isinstance(property_features, str) and not _is_blank(property_features):
+            updates["special_features"] = property_features
+
+        building_features = _match_building_feature(row, units)
+        if _is_blank(row.special_features) and isinstance(building_features, str) and not _is_blank(building_features):
+            updates["special_features"] = building_features  # more specific than property_features above
+
+    if units:
+        unit = _match_unit(row, units)
+        if unit is not None:
+            for field in ENRICHABLE_FIELDS:
+                if field == "contacts":
+                    continue  # document-level only - see this function's own docstring
+                value = unit.get(field)
+                if _is_blank(getattr(row, field)) and isinstance(value, str) and not _is_blank(value):
+                    updates[field] = value  # a genuine unit match beats both fallbacks above
+
     if not updates:
         return row, []
 
@@ -625,10 +758,12 @@ def enrich_row(row: ListingRow):
     link, fetch/parse failure, or no confident match - all indistinguishable
     to the caller by design, since incorrect enrichment is worse than a
     blank field and none of these cases should behave differently from any
-    other), or a NEW ListingRow (model_copy) with one or both of
-    ENRICHABLE_FIELDS filled in when a confident match provided a genuinely
-    new, non-blank value for a field that was blank. enriched_fields lists
-    exactly which fields changed - [] whenever row is returned as-is.
+    other), or a NEW ListingRow (model_copy) with one or more of
+    ENRICHABLE_FIELDS filled in from a genuinely applicable, non-blank
+    brochure value for a field that was blank - see _apply_units_to_row's
+    own docstring for exactly which fields require a specific unit match
+    vs. which apply from the whole document. enriched_fields lists exactly
+    which fields changed - [] whenever row is returned as-is.
 
     Fetches row's own brochure_link every call (through the cross-run
     lru_cache, see _extract_brochure_units) - correct for a single row in

@@ -324,7 +324,19 @@ how many properties or units it covers):
   company's branding elsewhere — use only what this specific document actually shows.
 - contacts: every contact person or generic contact listed in the document (e.g. "Sales" if no named
   person is given). Format each contact as "Name, email, phone" — omit any of the three pieces that
-  aren't given. If there are multiple contacts, join them with "; ".
+  aren't given. If there are multiple contacts, join them with "; ". Contact details often appear on
+  a later/closing page (an agent panel, a "get in touch" page) as well as a cover or intro page — check
+  every page before concluding there are none. Leave null only if the document genuinely names no
+  contact/agent anywhere.
+- property_features: notable amenities, certifications, or characteristics stated as applying to the
+  WHOLE property/development this document describes, not to one specific building or unit within it —
+  e.g. general sustainability/accreditation credentials ("WiredScore Platinum", "BREEAM Excellent",
+  "WELL Platinum Enabled"), or shared campus-wide facilities ("16 showers & 108 lockers", "160 cycle
+  spaces", "natural ventilation"), as a semicolon-separated list. Only include something here if it is
+  stated as applying to the property/development as a whole. If the document covers multiple entirely
+  unrelated properties, or a feature is only ever described for one specific building rather than the
+  whole site, leave this null rather than guessing it's shared — that belongs in building_features
+  instead (see below, after the units). Leave null if the document states nothing at this level.
 
 Then, identify EVERY SEPARATE AVAILABLE UNIT/SPACE described in the brochure. A brochure may describe
 just one unit, many units within one building (e.g. a schedule of areas listing multiple floors), or
@@ -377,8 +389,10 @@ Also extract for each unit:
   HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out", "manage
   preferences", "manage your subscription", or "email preferences", it must NEVER be used as a brochure_link,
   even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
-- special_features: a semicolon-separated list of notable amenities, inclusions, or notes
-  (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth"). Fit-out timing/
+- special_features: a semicolon-separated list of notable amenities, inclusions, or notes specific to
+  THIS unit/floor (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth"). A
+  characteristic shared by the WHOLE building this unit is in (not just this one floor) belongs in
+  building_features instead (see below, after the units) — do not repeat it here. Fit-out timing/
   completion details belong here too, as descriptive text (e.g. "Fit out to be completed in
   July 2026") — never in state_of_space, which only ever holds the fit-out category itself.
 - state_of_space: the physical fit-out condition/readiness of the space — NOT when it becomes
@@ -389,11 +403,27 @@ Also extract for each unit:
   still a real value here (e.g. "Fitout Underway") — that's not a reason to leave this null.
   Leave null only if the document truly gives no indication of fit-out condition at all.
 
+After the units, also extract building_features: an array of {"building", "features"} objects — one
+entry for each DISTINCT building name (matching a "building" value used above) that has its own
+descriptive text describing that WHOLE building specifically — not one particular floor within it, and
+not the whole property/development (that's property_features, above). This is common in a brochure
+covering several buildings on one site: a short paragraph about each individual building's own
+character, construction, or amenities, often printed right next to that building's own schedule of
+areas (e.g. "original steel columns, exposed beams and a spectacular canalside frontage" describing one
+specific building, distinct from a neighbouring building's own different paragraph). Only include a
+building here if the document genuinely states something at this specific level for it — omit a
+building entirely (don't include an empty-string entry) if nothing building-specific is stated for it,
+and never invent or infer building-level text from general knowledge.
+
 Return your answer as a single JSON object with this exact structure:
 
 {
   "provider": "..." or null,
   "contacts": "..." or null,
+  "property_features": "..." or null,
+  "building_features": [
+    {"building": "...", "features": "..."}
+  ],
   "units": [
     {
       "building": "...",

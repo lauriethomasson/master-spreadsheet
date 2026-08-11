@@ -24,6 +24,20 @@ import brochure_enrichment
 from schema import ListingRow
 
 
+def _brochure_units(units, property_features=None, contacts=None, building_features=None):
+    """A _BrochureUnits (see brochure_enrichment.py's own class) built from
+    plain test data - the real shape _extract_brochure_units returns,
+    used here so tests exercising the property/building-level fallbacks
+    (which only ever read these as extra attributes, never as list
+    elements) match what the real function actually hands to
+    _apply_units_to_row/enrich_row/enrich_rows_grouped."""
+    result = brochure_enrichment._BrochureUnits(units)
+    result.property_features = property_features
+    result.contacts = contacts
+    result.building_features = building_features or []
+    return result
+
+
 def _response(status_code=200, content=b"%PDF-1.4 fake pdf bytes", content_type="application/pdf"):
     resp = MagicMock()
     resp.status_code = status_code
@@ -76,9 +90,13 @@ class NeedsEnrichmentTests(EnrichmentTestCase):
         row = ListingRow(building="A", special_features="Nice", state_of_space=None)
         self.assertTrue(brochure_enrichment.needs_enrichment(row))
 
-    def test_both_populated_does_not_need_enrichment(self):
-        row = ListingRow(building="A", special_features="Nice", state_of_space="Cat A")
+    def test_all_three_populated_does_not_need_enrichment(self):
+        row = ListingRow(building="A", special_features="Nice", state_of_space="Cat A", contacts="Jane, jane@x.com")
         self.assertFalse(brochure_enrichment.needs_enrichment(row))
+
+    def test_blank_contacts_needs_enrichment(self):
+        row = ListingRow(building="A", special_features="Nice", state_of_space="Cat A", contacts=None)
+        self.assertTrue(brochure_enrichment.needs_enrichment(row))
 
 
 class EligibleBrochureUrlTests(unittest.TestCase):
@@ -467,6 +485,49 @@ class MatchUnitTests(unittest.TestCase):
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
 
 
+class MatchBuildingFeatureTests(unittest.TestCase):
+    """_match_building_feature - the building-level (level B) counterpart
+    to _match_unit, same exact-match-only philosophy."""
+
+    def test_matches_by_exact_building_name(self):
+        row = ListingRow(building="The Canal Building")
+        units = _brochure_units(
+            [],
+            building_features=[
+                {"building": "The Canal Building", "features": "Exposed beams; canalside frontage"},
+                {"building": "The Mill", "features": "Exposed brickwork"},
+            ],
+        )
+
+        self.assertEqual(
+            brochure_enrichment._match_building_feature(row, units), "Exposed beams; canalside frontage",
+        )
+
+    def test_no_matching_building_returns_none(self):
+        row = ListingRow(building="Somewhere Else")
+        units = _brochure_units([], building_features=[{"building": "The Canal Building", "features": "Beams"}])
+
+        self.assertIsNone(brochure_enrichment._match_building_feature(row, units))
+
+    def test_blank_building_features_returns_none(self):
+        row = ListingRow(building="The Canal Building")
+        units = _brochure_units([])
+
+        self.assertIsNone(brochure_enrichment._match_building_feature(row, units))
+
+    def test_duplicate_building_entries_stay_ambiguous(self):
+        row = ListingRow(building="The Canal Building")
+        units = _brochure_units(
+            [],
+            building_features=[
+                {"building": "The Canal Building", "features": "One"},
+                {"building": "The Canal Building", "features": "Two"},
+            ],
+        )
+
+        self.assertIsNone(brochure_enrichment._match_building_feature(row, units))
+
+
 class FloorNumberTests(unittest.TestCase):
     def test_ordinal_with_word(self):
         self.assertEqual(brochure_enrichment._floor_number("5th Floor"), 5)
@@ -606,6 +667,243 @@ class MalformedUnitEntryTests(unittest.TestCase):
 
         self.assertIsNone(enriched[0].special_features)
         self.assertEqual(log, [])
+
+
+class ThreeLevelEnrichmentTests(unittest.TestCase):
+    """
+    Regression tests for a real, confirmed gap: a real Regent's Wharf
+    brochure clearly states property-wide amenities (WiredScore Platinum,
+    BREEAM Excellent, showers/lockers, cycle spaces) on one page and
+    building-specific descriptions (The Canal Building's own exposed
+    beams/canalside frontage, The Packing House's own rooftop terrace) next
+    to each sub-building's own schedule of areas - none of which ever
+    reached any row's special_features, because _apply_units_to_row only
+    ever considered a SPECIFIC matched floor/unit's own text, with no
+    concept of "document-wide" or "building-wide" at all. Traced against
+    the real PDF: raw Gemini extraction correctly captured all of this once
+    the extraction prompt was asked for property_features/building_features
+    (see extract.py's own PROMPT) - the gap was that _apply_units_to_row
+    never looked for or applied either.
+
+    Fix: brochure information is now applied at the WIDEST level the
+    brochure itself clearly supports - property/document-wide (property_
+    features, contacts), then building-wide (building_features), then
+    floor/unit-specific (a matched unit's own fields) - each narrower level
+    overwriting the same field only when it's actually available, never
+    fabricated. See _apply_units_to_row's own docstring for the exact
+    precedence and brochure_enrichment.py's own module docstring for the
+    overall rationale.
+    """
+
+    def test_property_wide_feature_survives_with_no_exact_floor_match(self):
+        # No floor_unit at all on the row (can't be matched to any specific
+        # unit), but the row's building IS one of the brochure's own
+        # buildings - the document-wide property_features must still apply.
+        row = ListingRow(building="The Canal Building", floor_unit=None, special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": None}],
+            property_features="WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers")
+        self.assertEqual(fields, ["special_features"])
+
+    def test_property_wide_feature_applies_even_when_building_does_not_match_any_unit(self):
+        # Property-wide facts are true of the WHOLE document, regardless of
+        # building - this row's own building isn't even one of the
+        # brochure's buildings, but it shares this SAME brochure_link (the
+        # only way _apply_units_to_row is ever called for it), so the
+        # document-wide fallback still applies.
+        row = ListingRow(building="A Building Not In This Brochure", special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor"}],
+            property_features="Gas free buildings; natural ventilation",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "Gas free buildings; natural ventilation")
+
+    def test_building_specific_feature_only_reaches_its_own_building(self):
+        canal_row = ListingRow(building="The Canal Building", floor_unit=None, special_features=None)
+        mill_row = ListingRow(building="The Mill", floor_unit=None, special_features=None)
+        units = _brochure_units(
+            [
+                {"building": "The Canal Building", "floor_unit": "5th Floor"},
+                {"building": "The Mill", "floor_unit": "5th Floor"},
+            ],
+            building_features=[
+                {"building": "The Canal Building", "features": "Exposed beams; canalside frontage"},
+                {"building": "The Mill", "features": "Exposed brickwork; courtyard balconies"},
+            ],
+        )
+
+        canal_new, _ = brochure_enrichment._apply_units_to_row(canal_row, units)
+        mill_new, _ = brochure_enrichment._apply_units_to_row(mill_row, units)
+
+        self.assertEqual(canal_new.special_features, "Exposed beams; canalside frontage")
+        self.assertEqual(mill_new.special_features, "Exposed brickwork; courtyard balconies")
+
+    def test_building_specific_feature_does_not_reach_an_unrelated_building(self):
+        other_row = ListingRow(building="The Packing House", floor_unit=None, special_features=None)
+        units = _brochure_units(
+            [{"building": "The Packing House", "floor_unit": "Ground Floor"}],
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams; canalside frontage"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(other_row, units)
+
+        self.assertIsNone(new_row.special_features)
+        self.assertEqual(fields, [])
+
+    def test_floor_specific_feature_never_leaks_to_a_different_floor(self):
+        row_5th = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)
+        row_4th = ListingRow(building="The Canal Building", floor_unit="4th Floor", special_features=None)
+        units = _brochure_units([
+            {"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"},
+            {"building": "The Canal Building", "floor_unit": "4th Floor", "special_features": None},
+        ])
+
+        new_5th, _ = brochure_enrichment._apply_units_to_row(row_5th, units)
+        new_4th, _ = brochure_enrichment._apply_units_to_row(row_4th, units)
+
+        self.assertEqual(new_5th.special_features, "Includes mezzanine")
+        self.assertIsNone(new_4th.special_features)  # never inherits the 5th floor's own mezzanine
+
+    def test_unmatched_floor_still_gets_building_level_fallback(self):
+        # A real confirmed Regent's Wharf shape: several floors within one
+        # building have NO floor-specific special_features of their own at
+        # all - a failure to find unit-specific text must not throw away
+        # the building-wide fact this row can still safely receive.
+        row = ListingRow(building="The Canal Building", floor_unit="4th Floor", special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "4th Floor", "special_features": None}],
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams; canalside frontage"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "Exposed beams; canalside frontage")
+        self.assertEqual(fields, ["special_features"])
+
+    def test_matched_unit_specific_text_beats_both_wider_fallbacks(self):
+        row = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"}],
+            property_features="WiredScore Platinum",
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "Includes mezzanine")
+
+    def test_existing_special_features_never_overwritten_by_any_level(self):
+        row = ListingRow(
+            building="The Canal Building", floor_unit="5th Floor", special_features="Genuine provider text",
+        )
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"}],
+            property_features="WiredScore Platinum",
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "Genuine provider text")
+        self.assertEqual(fields, [])
+        self.assertIs(new_row, row)
+
+    def test_contacts_retained_without_requiring_a_floor_match(self):
+        row = ListingRow(building="The Canal Building", floor_unit=None, contacts=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor"}],
+            contacts="Jane Smith, jane@agent.com, 020 7946 0000",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.contacts, "Jane Smith, jane@agent.com, 020 7946 0000")
+        self.assertEqual(fields, ["contacts"])
+
+    def test_missing_contacts_stay_blank_never_invented(self):
+        row = ListingRow(building="The Canal Building", floor_unit="5th Floor", contacts=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"}],
+            contacts=None,
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.contacts)
+        self.assertNotIn("contacts", fields)
+
+    def test_existing_contacts_never_overwritten(self):
+        row = ListingRow(building="The Canal Building", contacts="Existing Agent, existing@agent.com")
+        units = _brochure_units([], contacts="Different Agent, different@agent.com")
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.contacts, "Existing Agent, existing@agent.com")
+        self.assertEqual(fields, [])
+
+    def test_ambiguous_unit_match_stays_conservative_property_wide_still_applies(self):
+        # Two floors, neither identifiable from the row's own vague label -
+        # _match_unit correctly returns None (no unit-level guess), but the
+        # document-wide property_features fallback is unaffected by that.
+        row = ListingRow(building="The Canal Building", floor_unit="Suite Z", special_features=None)
+        units = _brochure_units(
+            [
+                {"building": "The Canal Building", "floor_unit": "1st Floor", "special_features": "One"},
+                {"building": "The Canal Building", "floor_unit": "2nd Floor", "special_features": "Two"},
+            ],
+            property_features="WiredScore Platinum",
+        )
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertEqual(new_row.special_features, "WiredScore Platinum")
+
+    def test_regents_wharf_style_campus_enriches_applicable_rows_at_the_right_level(self):
+        # End-to-end shape mirroring the real confirmed brochure: a
+        # property-wide amenities blurb, per-building descriptive text, and
+        # a schedule of areas where several floors have no floor-specific
+        # text of their own at all.
+        units = _brochure_units(
+            [
+                {"building": "Thorley Works", "floor_unit": "5th Floor", "special_features": "1,851 sq ft outdoor space"},
+                {"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"},
+                {"building": "The Canal Building", "floor_unit": "4th Floor", "special_features": None},
+                {"building": "The Packing House", "floor_unit": "Ground Floor", "special_features": None},
+            ],
+            property_features="WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers",
+            building_features=[
+                {"building": "The Canal Building", "features": "Exposed beams; canalside frontage"},
+                {"building": "The Packing House", "features": "Stunning rooftop terrace"},
+            ],
+        )
+
+        thorley, _ = brochure_enrichment._apply_units_to_row(
+            ListingRow(building="Thorley Works", floor_unit="5th Floor", special_features=None), units,
+        )
+        canal_5th, _ = brochure_enrichment._apply_units_to_row(
+            ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None), units,
+        )
+        canal_4th, _ = brochure_enrichment._apply_units_to_row(
+            ListingRow(building="The Canal Building", floor_unit="4th Floor", special_features=None), units,
+        )
+        packing_ground, _ = brochure_enrichment._apply_units_to_row(
+            ListingRow(building="The Packing House", floor_unit="Ground Floor", special_features=None), units,
+        )
+
+        # Floor-specific text wins where it exists.
+        self.assertEqual(thorley.special_features, "1,851 sq ft outdoor space")
+        self.assertEqual(canal_5th.special_features, "Includes mezzanine")
+        # No floor-specific text -> building-level fallback, never blank.
+        self.assertEqual(canal_4th.special_features, "Exposed beams; canalside frontage")
+        self.assertEqual(packing_ground.special_features, "Stunning rooftop terrace")
 
 
 class EnrichRowTests(EnrichmentTestCase):
@@ -750,7 +1048,7 @@ class EnrichRowTests(EnrichmentTestCase):
     def test_row_with_nothing_missing_never_triggers_extraction(self):
         row = ListingRow(
             building="A", floor_unit="1st", brochure_link="https://example.com/brochure.pdf",
-            special_features="Already have this", state_of_space="Cat A",
+            special_features="Already have this", state_of_space="Cat A", contacts="Jane, jane@x.com",
         )
         with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
             new_row, fields = brochure_enrichment.enrich_row(row)
@@ -812,6 +1110,40 @@ class EnrichRowsBatchTests(EnrichmentTestCase):
         mock_extract.assert_called_once()
         self.assertEqual(len(log), 3)
         self.assertEqual([r.special_features for r in enriched], ["Two", "Three", "Four"])
+
+    def test_extract_brochure_units_end_to_end_carries_property_and_building_features(self):
+        # Proves the REAL _extract_brochure_units (not a test-only helper)
+        # correctly turns a raw Gemini dict's new property_features/
+        # building_features/contacts keys into the extra attributes
+        # _apply_units_to_row reads - only render_and_extract (the actual
+        # Gemini call) is mocked here, exactly like the real network path.
+        rows = [
+            ListingRow(building="The Canal Building", floor_unit="4th Floor", brochure_link="https://example.com/rw.pdf", special_features=None, contacts=None),
+            ListingRow(building="The Packing House", floor_unit="Ground Floor", brochure_link="https://example.com/rw.pdf", special_features=None, contacts=None),
+        ]
+        raw = {
+            "provider": None,
+            "contacts": "Jane Smith, jane@agent.com, 020 7946 0000",
+            "property_features": "WiredScore Platinum; BREEAM Excellent",
+            "building_features": [
+                {"building": "The Canal Building", "features": "Exposed beams; canalside frontage"},
+                {"building": "The Packing House", "features": "Stunning rooftop terrace"},
+            ],
+            "units": [
+                {"building": "The Canal Building", "floor_unit": "4th Floor", "special_features": None},
+                {"building": "The Packing House", "floor_unit": "Ground Floor", "special_features": None},
+            ],
+        }
+
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw):
+            enriched, log = brochure_enrichment.enrich_rows(rows)
+
+        self.assertEqual(enriched[0].special_features, "Exposed beams; canalside frontage")
+        self.assertEqual(enriched[1].special_features, "Stunning rooftop terrace")
+        self.assertEqual(enriched[0].contacts, "Jane Smith, jane@agent.com, 020 7946 0000")
+        self.assertEqual(enriched[1].contacts, "Jane Smith, jane@agent.com, 020 7946 0000")
 
     def test_building_level_feature_enriches_multiple_matching_floors(self):
         rows = [
@@ -888,7 +1220,7 @@ class EligibleRowsAndBrochuresTests(unittest.TestCase):
         rows = [
             ListingRow(building="A", floor_unit="1st", brochure_link="https://example.com/a.pdf", special_features=None),
             ListingRow(building="A", floor_unit="2nd", brochure_link="https://example.com/a.pdf", special_features=None),
-            ListingRow(building="B", floor_unit="1st", brochure_link="https://example.com/b.pdf", special_features="Already there", state_of_space="Cat A"),
+            ListingRow(building="B", floor_unit="1st", brochure_link="https://example.com/b.pdf", special_features="Already there", state_of_space="Cat A", contacts="Jane, jane@x.com"),
             ListingRow(building="C", floor_unit="1st", brochure_link=None, special_features=None),
         ]
         eligible, urls = brochure_enrichment.eligible_rows_and_brochures(rows)
@@ -896,7 +1228,7 @@ class EligibleRowsAndBrochuresTests(unittest.TestCase):
         self.assertEqual(urls, ["https://example.com/a.pdf"])
 
     def test_no_eligible_rows_returns_empty(self):
-        rows = [ListingRow(building="A", special_features="x", state_of_space="y")]
+        rows = [ListingRow(building="A", special_features="x", state_of_space="y", contacts="z")]
         eligible, urls = brochure_enrichment.eligible_rows_and_brochures(rows)
         self.assertEqual(eligible, [])
         self.assertEqual(urls, [])
@@ -1143,6 +1475,7 @@ class EnrichRowsGroupedTests(EnrichmentTestCase):
     def test_rows_with_nothing_missing_are_excluded_from_the_run(self):
         rows = [ListingRow(
             building="A", brochure_link="https://example.com/a.pdf", special_features="Done", state_of_space="Cat A",
+            contacts="Jane, jane@x.com",
         )]
         with patch("brochure_enrichment._extract_brochure_units") as mock_units:
             enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
