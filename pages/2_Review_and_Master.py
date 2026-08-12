@@ -368,12 +368,23 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     (or edit - see _process_manual_edits) to the wrong row. property_id is
     immune to re-sorting, so it survives that reload intact.
 
-    Removal (inside its own collapsed-by-default "Remove rows" expander) and
-    editing (the main table below it) each have their OWN search bar, over
-    their OWN widget key - deliberately never shared, so searching to find
-    a row to remove can never narrow what the main table shows, or vice
-    versa (a real request: the two are different tasks a person does at
-    different times, and conflating their search state was confusing). Both
+    The row-selector (search bar + selector table + selection status/Remove
+    button) is rendered directly in the main table flow, always visible -
+    NOT tucked inside a collapsed expander (a prior design; see git history
+    for "Move row removal into a collapsed Remove rows expander" and this
+    module's own now-updated test suite). Confirmed real regression report
+    that reverted it: selection feeds the Export step just as much as it
+    feeds removal, but hiding it behind a control literally labeled "Remove
+    rows" made the export workflow look like it had disappeared entirely -
+    a reviewer who only wants to export a few rows, never remove anything,
+    had no reason to ever open that control. Selection and removal still
+    each have their OWN search bar, over their OWN widget key - deliberately
+    never shared, so searching to find a row to select/remove can never
+    narrow what the main editable table shows, or vice versa (a real
+    request: the two are different tasks a person does at different times,
+    and conflating their search state was confusing) - this independence is
+    unaffected by no longer being wrapped in an expander; only the
+    visibility changed, not the underlying search/selection mechanism. Both
     still narrow only what's DISPLAYED to their own widget, never what df/
     master_records themselves contain - each widget's own positional state
     is always relative to whatever (possibly filtered) subset was actually
@@ -384,13 +395,6 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     the re-sort case above - a filter is just another way a row's position
     can shift out from under a stale positional reference.
 
-    st.expander's own contents run on every rerun regardless of whether the
-    user currently has it open or collapsed on screen (collapsing is a
-    purely client-side visual toggle, not a conditional Python branch) - so
-    nothing about the Remove-rows section (its own search text, tracked
-    selection, or the master table/write log below it) is created, reset,
-    or skipped differently depending on that toggle.
-
     Returns True if a real field edit was saved this render - the caller
     should st.rerun() so the rest of the page reflects the fresh master
     (download button bytes, write-log caption, Version history) rather than
@@ -399,15 +403,16 @@ def _render_master_table(df: pd.DataFrame, key: str) -> bool:
     visible = display_utils.visible_columns(df)
     display_df = df[visible].copy()
 
-    with st.expander("Remove rows", expanded=False):
-        removal_query = st.text_input("Search rows to remove", key=f"{key}_removal_filter")
-        removal_filtered_df = display_df
-        if removal_query.strip():
-            removal_filtered_df = display_df[_search_mask(df, removal_query, _REMOVAL_SEARCH_COLUMNS)]
+    removal_query = st.text_input("Search rows to select", key=f"{key}_removal_filter")
+    removal_filtered_df = display_df
+    if removal_query.strip():
+        removal_filtered_df = display_df[_search_mask(df, removal_query, _REMOVAL_SEARCH_COLUMNS)]
 
-        selected_positions = _render_row_selector(df, removal_filtered_df, key)
-        st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
-        _render_selection_actions(df, removal_filtered_df, selected_positions, key)
+    selected_positions = _render_row_selector(df, removal_filtered_df, key)
+    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
+    _render_selection_actions(df, removal_filtered_df, selected_positions, key)
+
+    st.divider()
 
     query = st.text_input("Search master spreadsheet", key=f"{key}_filter")
     filtered_df = display_df
@@ -543,7 +548,7 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
         filtered_property_ids = df.loc[filtered_df.index, "property_id"]
         default_rows = [i for i, pid in enumerate(filtered_property_ids) if pid in selected_ids]
 
-    st.caption("Select rows to remove:")
+    st.caption("Select rows (for export or removal):")
     selection = st.dataframe(
         selector_df,
         column_config=display_utils.label_column_config(selector_df),
