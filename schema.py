@@ -22,6 +22,7 @@ class ExtractedFields(BaseModel):
     rent_pcm: Optional[float] = None
     rent_psf: Optional[float] = None
     brochure_link: Optional[str] = None
+    floorplan_link: Optional[str] = None  # a genuinely different document from brochure_link - never a substitute
     special_features: Optional[str] = None
     state_of_space: Optional[str] = None
     contacts: Optional[str] = None  # all contacts combined, one per line/semicolon, each as "Name, email, phone"
@@ -50,6 +51,7 @@ class ListingRow(BaseModel):
     rent_pcm: Optional[float] = None
     rent_psf: Optional[float] = None
     brochure_link: Optional[str] = None
+    floorplan_link: Optional[str] = None  # a genuinely different document from brochure_link - never a substitute
     special_features: Optional[str] = None
     state_of_space: Optional[str] = None
     contacts: Optional[str] = None  # all contacts combined, one per line/semicolon, each as "Name, email, phone"

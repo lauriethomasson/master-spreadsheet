@@ -65,6 +65,77 @@ KNOWN_NON_BROCHURE_DOMAINS = (
 )
 
 
+# Checked against a candidate URL's own text only (never a fetch) - a floor
+# plan is a genuinely different document from a brochure regardless of what
+# it turns out to contain, so its own URL/link-text shape is already enough
+# to rule it out, without spending a network round trip to confirm it. Also
+# reused by brochure_enrichment.py's own pre-fetch eligibility filter, so
+# both places share one definition rather than two independently-drifting
+# keyword lists.
+FLOORPLAN_URL_KEYWORDS = ("floorplan", "floor-plan", "floor plan")
+
+
+def is_floorplan_not_brochure_url(url: str) -> bool:
+    """
+    True when `url`'s own text (URL or filename) clearly identifies it as a
+    floor plan AND gives no competing signal that it's also (or instead) a
+    brochure - see FLOORPLAN_URL_KEYWORDS. A URL/filename that mentions BOTH
+    (e.g. ".../Building-Brochure-and-Floorplans.pdf" - a real, common
+    combined-document naming pattern) is deliberately left alone here:
+    discarding a genuine brochure link just because its own name also
+    happens to mention floor plans would be exactly the wrong side of
+    "incorrect enrichment is worse than a blank field" to err on, when the
+    safer reading of an ambiguous name is to keep the link rather than null
+    out a real one. Never a fetch - matched against the URL's own text only,
+    same as FLOORPLAN_URL_KEYWORDS' other use sites.
+    """
+    if not url:
+        return False
+    lowered = url.lower()
+    return "brochure" not in lowered and any(kw in lowered for kw in FLOORPLAN_URL_KEYWORDS)
+
+
+def looks_like_url(value) -> bool:
+    """
+    True only when `value` is genuinely shaped like a URL, as opposed to a
+    placeholder a provider uses to mean "no brochure yet" - "TBC", "Coming
+    Soon", "N/A", "None", "-", or blank. This is a narrower, EARLIER gate
+    than is_generic_link (which assumes its input already IS a real URL and
+    only asks whether it's merely a bare, non-listing-specific homepage) -
+    is_generic_link alone doesn't reliably catch every placeholder shape
+    (e.g. "N/A" normalizes to "https://N/A", parsed as netloc="N",
+    path="/A" - a non-empty path, so is_generic_link would NOT flag it).
+
+    True for anything with an explicit http(s):// scheme already - a real
+    hyperlink target (e.g. openpyxl's cell.hyperlink.target, or a URL
+    Gemini extracted from actual document text) always has one, and text
+    this explicit is never a placeholder. Otherwise requires a domain-
+    shaped string with no whitespace and a dotted, letters-only suffix,
+    optionally followed by a port and/or a path/query/fragment (e.g.
+    "app.box.com/s/abc123", "app.box.com:8443/s/abc123",
+    "example.com?ref=1", matching _normalize_url's own "add a scheme if
+    missing" treatment elsewhere in this module) - a placeholder like
+    "TBC"/"N/A"/"-"/"None" has no dotted-domain shape at all and is
+    correctly rejected regardless. Confirmed real gap this widened shape
+    fixes: a genuine hyperlink target recovered from a staging file this
+    app itself already wrote (see staging_writer.read_xlsx_with_hyperlinks)
+    that happens to include an explicit port, or a bare query string with
+    no path segment, was previously indistinguishable from a placeholder
+    and silently nulled on reload (see storage.file_store._sanitize_url_
+    like_fields) even though nothing about the link had changed.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    if re.match(r"^https?://", text, re.IGNORECASE):
+        return True
+    if re.search(r"\s", text):
+        return False
+    return bool(re.match(r"^[^\s/]+\.[a-zA-Z]{2,}(?::\d+)?(?:[/?#]\S*)?$", text))
+
+
 def is_generic_link(url: str) -> bool:
     """
     True for a bare company homepage or top-level marketing domain with no
@@ -337,20 +408,43 @@ def finalize_brochure_link(raw_link, *, is_pdf: bool, pdf_fallback_link: str):
     4. Nothing genuine found and the source is an email - stays null; an
        email is not itself a brochure.
 
-    Belt-and-suspenders guard: regardless of what Gemini decided, a link
+    Belt-and-suspenders guards: regardless of what Gemini decided, a link
     that is itself shaped like an unsubscribe/preferences-center URL (see
-    ADMIN_LINK_KEYWORDS) is never treated as genuine and never followed -
-    in practice Gemini should never surface one of these in the first
-    place, since resolve_email_tracking_links already strips them out of
-    the text before extraction, but this is a second, independent check
-    for the case where Gemini is given a raw link directly (e.g. a PDF
-    brochure with an embedded unsubscribe link) or otherwise still
-    surfaces one.
+    ADMIN_LINK_KEYWORDS) or UNAMBIGUOUSLY a floor plan and nothing else (see
+    is_floorplan_not_brochure_url) is never treated as genuine and never
+    followed - in practice Gemini should never surface either in the first
+    place (the extraction prompts already say so explicitly), but these are
+    second, independent, deterministic checks for the case where Gemini is
+    given a raw link directly (e.g. a PDF brochure with an embedded
+    unsubscribe or floor-plan link) or otherwise still surfaces one. A link
+    whose own text mentions BOTH ("...Brochure-and-Floorplans.pdf", a real
+    combined-document naming pattern) is deliberately kept here - see is_
+    floorplan_not_brochure_url's own docstring on why. Also never a genuine
+    link at all when it doesn't even look like a URL (see looks_like_url) -
+    a raw provider value that's really a placeholder ("TBC", "N/A", "-")
+    rather than a real link, which is_generic_link alone doesn't reliably
+    catch (see its own docstring).
     """
     if raw_link and _is_admin_link(raw_link):
         print(
             f"[finalize_brochure_link] {raw_link!r} looks like an unsubscribe/preferences link — "
             "discarding rather than following it.",
+            file=sys.stderr,
+        )
+        raw_link = None
+
+    if raw_link and is_floorplan_not_brochure_url(raw_link):
+        print(
+            f"[finalize_brochure_link] {raw_link!r} looks like a floor plan, not a brochure — "
+            "discarding rather than using it as brochure_link.",
+            file=sys.stderr,
+        )
+        raw_link = None
+
+    if raw_link and not looks_like_url(raw_link):
+        print(
+            f"[finalize_brochure_link] {raw_link!r} doesn't look like a real URL — discarding rather than "
+            "treating it as a genuine brochure link.",
             file=sys.stderr,
         )
         raw_link = None
@@ -362,3 +456,40 @@ def finalize_brochure_link(raw_link, *, is_pdf: bool, pdf_fallback_link: str):
         return pdf_fallback_link
 
     return None
+
+
+def finalize_floorplan_link(raw_link):
+    """
+    floorplan_link's own, much narrower counterpart to finalize_brochure_
+    link - a floor plan has no PDF-fallback default (rule 3) and no email-
+    stays-null rule (rule 4) to apply, since neither the uploaded document
+    itself nor "nothing found" is ever itself a floor plan the way a whole
+    PDF upload can genuinely BE its own brochure. Only ever returns
+    `raw_link` unchanged, or None when it isn't genuinely usable at all:
+    an admin/unsubscribe-shaped link (see ADMIN_LINK_KEYWORDS), a generic
+    bare homepage (see is_generic_link), or text that doesn't even look
+    like a URL (see looks_like_url - the same placeholder-text gap that
+    motivates finalize_brochure_link's own identical check). Never resolves
+    through a landing-page hop the way finalize_brochure_link's rule 1
+    does - a floor plan link is expected to already point directly at the
+    document (or a page that IS the floor plan), not a portfolio landing
+    page worth following one hop deeper.
+    """
+    if not raw_link:
+        return None
+    if _is_admin_link(raw_link):
+        print(
+            f"[finalize_floorplan_link] {raw_link!r} looks like an unsubscribe/preferences link — "
+            "discarding rather than following it.",
+            file=sys.stderr,
+        )
+        return None
+    if not looks_like_url(raw_link):
+        print(
+            f"[finalize_floorplan_link] {raw_link!r} doesn't look like a real URL — discarding.",
+            file=sys.stderr,
+        )
+        return None
+    if is_generic_link(raw_link):
+        return None
+    return raw_link

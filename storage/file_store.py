@@ -25,6 +25,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from brochure_link_resolver import looks_like_url
 from schema import ListingRow
 from staging_writer import read_xlsx_with_hyperlinks, write_rows_to_xlsx
 from storage import blob_store
@@ -146,7 +147,25 @@ def _derive_enrichment_counts(processed_urls: dict, unique_brochures_considered:
     }
 
 
-def set_staging_enrichment_summary(path: str, stats: dict, processed_urls: dict) -> None:
+def _derive_floorplan_counts(floorplan_processed_urls: dict, unique_floorplans_considered: int) -> dict:
+    """floorplans_done/floorplans_read_ok/floorplans_unavailable - the
+    secondary floorplan-link pass's own counterpart to _derive_enrichment_
+    counts (see its own docstring), tracked separately from the brochure
+    counts above so "how many brochures remain" and "how many floorplans
+    remain" can never be conflated into one, wrongly-optimistic number."""
+    floorplan_processed_urls = floorplan_processed_urls or {}
+    return {
+        "unique_floorplans_considered": unique_floorplans_considered,
+        "floorplans_done": len(floorplan_processed_urls),
+        "floorplans_read_ok": sum(1 for v in floorplan_processed_urls.values() if v == "ok"),
+        "floorplans_unavailable": sum(1 for v in floorplan_processed_urls.values() if v == "unavailable"),
+    }
+
+
+def set_staging_enrichment_summary(
+    path: str, stats: dict, processed_urls: dict,
+    floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0,
+) -> None:
     """
     Persists brochure enrichment's own FINAL summary stats into this
     staging file's meta.json, tagged status="complete" - so Review & Master
@@ -168,13 +187,19 @@ def set_staging_enrichment_summary(path: str, stats: dict, processed_urls: dict)
     persisted record can never disagree with what's actually in
     processed_urls, regardless of what the caller's own stats dict says.
 
+    floorplan_processed_urls/unique_floorplans_considered are the SAME kind
+    of cumulative record, for the secondary floorplan-link pass (see
+    enrich_rows_grouped's own floorplan_already_processed param) - optional,
+    defaulting to "no floorplans considered at all" so every existing
+    caller that only ever enriched from brochures is unaffected.
+
     Called only once enrich_rows_grouped has fully processed every
-    remaining brochure - see set_staging_enrichment_progress for the
-    interim marker written before and during a run, which this overwrites.
-    Absent entirely (both this and the interim marker) for a file where
-    enrichment never ran at all (no eligible rows in the first place, or an
-    upload predating this feature) - a caller should treat a missing key as
-    "nothing to show", not as "zero rows enriched" (see
+    remaining brochure AND floorplan - see set_staging_enrichment_progress
+    for the interim marker written before and during a run, which this
+    overwrites. Absent entirely (both this and the interim marker) for a
+    file where enrichment never ran at all (no eligible rows in the first
+    place, or an upload predating this feature) - a caller should treat a
+    missing key as "nothing to show", not as "zero rows enriched" (see
     get_staging_enrichment_summary).
     """
     meta = _read_meta(path)
@@ -184,27 +209,41 @@ def set_staging_enrichment_summary(path: str, stats: dict, processed_urls: dict)
         "rows_enriched": stats["rows_enriched"],
         "processed_urls": dict(processed_urls),
         **_derive_enrichment_counts(processed_urls, stats["unique_brochures_considered"]),
+        "floorplan_processed_urls": dict(floorplan_processed_urls or {}),
+        **_derive_floorplan_counts(floorplan_processed_urls, unique_floorplans_considered),
     }
     _write_meta(path, meta)
 
 
-def set_staging_enrichment_progress(path: str, processed_urls: dict, unique_brochures_considered: int) -> None:
+def set_staging_enrichment_progress(
+    path: str, processed_urls: dict, unique_brochures_considered: int,
+    floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0,
+) -> None:
     """
     Persists an INTERIM brochure-enrichment marker - status="in_progress"
-    plus the FULL CUMULATIVE per-URL outcome map so far (see
-    set_staging_enrichment_summary's own docstring on why this is the
-    cumulative map, not just this run's own increment) - written before
-    enrich_rows_grouped starts (processed_urls={} on a fresh run, or
-    whatever a prior interrupted attempt already recorded on a resume) and
-    again at each of its own checkpoints (see app.py's
-    _run_automatic_brochure_enrichment and pages/2_Review_and_Master.py's
-    own "Continue enrichment" action), specifically so an interruption (a
-    killed process, a crashed Cloud Run instance, a cancelled Streamlit
-    rerun) that stops the run before set_staging_enrichment_summary's own
-    final call is ever reached still leaves SOME record in meta.json,
-    rather than none at all - AND so a SUBSEQUENT resume knows exactly
-    which brochures to skip (see enrich_rows_grouped's own already_processed
-    param), never just "how many", which alone can't identify WHICH ones.
+    plus the FULL CUMULATIVE per-URL outcome map so far, for BOTH the
+    brochure pass and the secondary floorplan pass (see set_staging_
+    enrichment_summary's own docstring on why these are the cumulative
+    maps, not just this run's own increment) - written before enrich_rows_
+    grouped starts (processed_urls={} on a fresh run, or whatever a prior
+    interrupted attempt already recorded on a resume) and again at each of
+    its own checkpoints, for EITHER pass (see app.py's _run_automatic_
+    brochure_enrichment and pages/2_Review_and_Master.py's own "Continue
+    enrichment" action), specifically so an interruption (a killed process,
+    a crashed Cloud Run instance, a cancelled Streamlit rerun) that stops
+    the run before set_staging_enrichment_summary's own final call is ever
+    reached - during the brochure pass OR the floorplan pass, which only
+    ever starts once every brochure is already marked "done" - still leaves
+    SOME record in meta.json, rather than none at all, AND so a SUBSEQUENT
+    resume knows exactly which brochures/floorplans to skip (see enrich_
+    rows_grouped's own already_processed/floorplan_already_processed
+    params), never just "how many", which alone can't identify WHICH ones.
+
+    floorplan_processed_urls/unique_floorplans_considered default to "no
+    floorplans considered at all" so every existing caller that only ever
+    passes the brochure-side arguments is unaffected - a genuinely floorplan
+    -eligible run threads its own real values through instead (see
+    brochure_enrichment.run_brochure_enrichment).
 
     Without this, an interrupted run's staging rows end up a genuine mix of
     enriched and never-attempted rows (see enrich_rows_grouped's own
@@ -212,17 +251,23 @@ def set_staging_enrichment_progress(path: str, processed_urls: dict, unique_broc
     completed) while get_staging_enrichment_summary stays None forever -
     indistinguishable from "enrichment never ran/had nothing eligible" (see
     that function's own docstring), so a reviewer has no way to tell a
-    blank special_features cell here apart from a brochure that was
-    genuinely checked and had nothing. set_staging_enrichment_summary's own
-    status="complete" tag overwrites this once the run actually finishes;
-    a status="in_progress" entry still present when Review & Master reads
-    it back means the run that wrote it never got that far.
+    blank special_features cell here apart from a brochure/floorplan that
+    was genuinely checked and had nothing. set_staging_enrichment_summary's
+    own status="complete" tag overwrites this once the run actually
+    finishes; a status="in_progress" entry still present when Review &
+    Master reads it back means the run that wrote it never got that far -
+    and, critically, "0 remaining" only holds once BOTH unique_brochures_
+    considered - brochures_done AND unique_floorplans_considered -
+    floorplans_done are zero, never brochures alone (see pages/2_Review_
+    and_Master.py's own "remaining" calculation).
     """
     meta = _read_meta(path)
     meta["brochure_enrichment"] = {
         "status": "in_progress",
         "processed_urls": dict(processed_urls),
         **_derive_enrichment_counts(processed_urls, unique_brochures_considered),
+        "floorplan_processed_urls": dict(floorplan_processed_urls or {}),
+        **_derive_floorplan_counts(floorplan_processed_urls, unique_floorplans_considered),
     }
     _write_meta(path, meta)
 
@@ -514,6 +559,33 @@ def clean_value(value):
     return value
 
 
+# Raw provider-supplied fields that must genuinely look like a URL (see
+# brochure_link_resolver.looks_like_url) before being trusted as a link -
+# applied here, the one choke point every dataframe-to-ListingRow
+# construction path funnels through, so it catches a source this narrowly
+# never otherwise validates at all: extract_spreadsheet.py's header-mapped
+# path copies a provider's own "Brochure" column straight across with no
+# other check in between (unlike the PDF/email/Gemini-sheet paths, which
+# already run every candidate through brochure_link_resolver.
+# finalize_brochure_link). Confirmed real failure this guards against: a
+# UNION row whose own Brochure cell reads "TBC" (the provider's own way of
+# saying "no brochure yet") was written straight through into brochure_link
+# and then rendered as a real, broken, clickable link downstream -
+# staging_writer.write_rows_to_xlsx turns ANY truthy value into a real
+# openpyxl hyperlink, and display_utils' LinkColumn renders ANY truthy
+# value as clickable. A placeholder must never survive as brochure_link -
+# only a genuine URL, or blank.
+URL_LIKE_FIELDS = ("brochure_link", "floorplan_link")
+
+
+def _sanitize_url_like_fields(cleaned: dict) -> dict:
+    for field in URL_LIKE_FIELDS:
+        value = cleaned.get(field)
+        if value is not None and not looks_like_url(value):
+            cleaned[field] = None
+    return cleaned
+
+
 def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
     """
     Skips any row with no building name, rather than only a row that's
@@ -537,6 +609,7 @@ def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
         building = cleaned.get("building")
         if building is None or (isinstance(building, str) and not building.strip()):
             continue
+        cleaned = _sanitize_url_like_fields(cleaned)
         rows.append(ListingRow(**cleaned))
     return rows
 

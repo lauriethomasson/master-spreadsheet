@@ -317,8 +317,12 @@ class SuggestMappingTests(unittest.TestCase):
 
         # These have no ListingRow equivalent at all - must never be forced
         # onto some unrelated field.
-        for header in ("For Sale", "To Let", "Min. Term", "Legal Structure", "Broker Fee", "Floor Plan", "High Res Images"):
+        for header in ("For Sale", "To Let", "Min. Term", "Legal Structure", "Broker Fee", "High Res Images"):
             self.assertIsNone(guess[header], f"{header!r} should have no guess")
+
+        # "Floor Plan" DOES have a real equivalent now - floorplan_link (see
+        # schema.py) - and must map to it, not be left unmapped.
+        self.assertEqual(guess["Floor Plan"], "floorplan_link")
 
     def test_our_own_staging_xlsx_header_format_round_trips(self):
         # staging_writer.write_rows_to_xlsx's own Title-Case header labels
@@ -392,6 +396,7 @@ class SuggestMappingTests(unittest.TestCase):
             "Link to Brochure": "brochure_link",
             "Key Features ": "special_features",
             "State of Space": "state_of_space",
+            "Link to Floorplan": "floorplan_link",
         }
         for header, field in expected_mapped.items():
             self.assertEqual(guess[header], field, f"{header!r} should map to {field!r}")
@@ -459,15 +464,23 @@ class SuggestMappingFuzzyFallbackTests(unittest.TestCase):
         # against the threshold ever being loosened past that headroom.
         headers = [
             "For Sale", "To Let", "Min. Term", "Legal Structure", "Broker Fee",
-            "Floor Plan", "High Res Images", "Patch?", "Marketing Permission",
+            "High Res Images", "Patch?", "Marketing Permission",
             "Commercial Model", "Who Onboarded?", "Landlord/Agent Onboarded",
-            "Other Info", "Access Information", "Link to Floorplan",
+            "Other Info", "Access Information",
             "Link to High Res Images", "Matterport Link",
         ]
         for header in headers:
             with self.subTest(header=header):
                 guess = extract_spreadsheet.suggest_mapping([header])
                 self.assertIsNone(guess[header], f"{header!r} should not be fuzzy-matched to anything")
+
+        # "Floor Plan"/"Link to Floorplan" DO have a real equivalent now -
+        # floorplan_link (see schema.py) - matched via the exact-synonym
+        # pass, not even reaching the fuzzy fallback this test covers.
+        for header in ("Floor Plan", "Link to Floorplan"):
+            with self.subTest(header=header):
+                guess = extract_spreadsheet.suggest_mapping([header])
+                self.assertEqual(guess[header], "floorplan_link")
 
     def test_never_fuzzy_matches_an_unmappable_field(self):
         # "Property Id" is close enough in shape to trip a looser fuzzy

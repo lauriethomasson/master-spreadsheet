@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brochure_link_resolver import finalize_brochure_link, is_generic_link
+from brochure_link_resolver import finalize_brochure_link, is_floorplan_not_brochure_url, is_generic_link, looks_like_url
 from storage import blob_store, file_store
 
 
@@ -188,6 +188,89 @@ class IsGenericLinkDomainMatchingTests(unittest.TestCase):
 
     def test_real_linkedin_company_page_is_still_rejected(self):
         self.assertTrue(is_generic_link("https://www.linkedin.com/company/example"))
+
+
+class LooksLikeUrlTests(unittest.TestCase):
+    """looks_like_url - distinguishes a genuine link (with or without an
+    explicit scheme) from a placeholder a provider uses to mean "no
+    brochure yet"."""
+
+    def test_explicit_scheme_is_always_accepted(self):
+        self.assertTrue(looks_like_url("https://app.box.com/s/abc123"))
+        self.assertTrue(looks_like_url("http://example.com"))
+
+    def test_scheme_less_domain_with_path_is_accepted(self):
+        self.assertTrue(looks_like_url("app.box.com/s/abc123"))
+
+    def test_scheme_less_domain_with_a_port_is_accepted(self):
+        # Confirmed real gap: a genuine hyperlink target recovered from a
+        # staging file this app itself already wrote, that happens to
+        # include an explicit port, used to fail this check and be
+        # silently nulled on reload (see storage.file_store._sanitize_url_
+        # like_fields) even though nothing about the link had changed.
+        self.assertTrue(looks_like_url("app.box.com:8443/s/abc123"))
+
+    def test_scheme_less_domain_with_a_bare_query_string_is_accepted(self):
+        self.assertTrue(looks_like_url("example.com?ref=1"))
+
+    def test_bare_domain_with_no_path_is_accepted(self):
+        self.assertTrue(looks_like_url("workplaceplus.co.uk"))
+
+    def test_tbc_placeholder_is_rejected(self):
+        self.assertFalse(looks_like_url("TBC"))
+
+    def test_coming_soon_placeholder_is_rejected(self):
+        self.assertFalse(looks_like_url("Coming Soon"))
+
+    def test_n_a_placeholder_is_rejected(self):
+        self.assertFalse(looks_like_url("N/A"))
+
+    def test_none_placeholder_is_rejected(self):
+        self.assertFalse(looks_like_url("None"))
+
+    def test_dash_placeholder_is_rejected(self):
+        self.assertFalse(looks_like_url("-"))
+
+    def test_blank_is_rejected(self):
+        self.assertFalse(looks_like_url(""))
+        self.assertFalse(looks_like_url(None))
+        self.assertFalse(looks_like_url("   "))
+
+
+class IsFloorplanNotBrochureUrlTests(unittest.TestCase):
+    def test_pure_floorplan_url_is_flagged(self):
+        self.assertTrue(is_floorplan_not_brochure_url("https://example.com/floorplans/a.pdf"))
+
+    def test_pure_brochure_url_is_not_flagged(self):
+        self.assertFalse(is_floorplan_not_brochure_url("https://example.com/brochure.pdf"))
+
+    def test_combined_brochure_and_floorplan_filename_is_not_flagged(self):
+        # Real, common combined-document naming pattern - a genuine
+        # brochure link must never be discarded just because its own name
+        # also happens to mention floor plans.
+        self.assertFalse(
+            is_floorplan_not_brochure_url("https://example.com/Building-Brochure-and-Floorplans.pdf"),
+        )
+
+    def test_blank_is_not_flagged(self):
+        self.assertFalse(is_floorplan_not_brochure_url(None))
+        self.assertFalse(is_floorplan_not_brochure_url(""))
+
+
+class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):
+    def test_unambiguous_floorplan_link_is_discarded(self):
+        result = finalize_brochure_link(
+            "https://example.com/floorplans/a.pdf", is_pdf=True,
+            pdf_fallback_link="https://storage.googleapis.com/bucket/x.pdf",
+        )
+        self.assertEqual(result, "https://storage.googleapis.com/bucket/x.pdf")
+
+    def test_combined_brochure_and_floorplan_link_is_kept(self):
+        result = finalize_brochure_link(
+            "https://example.com/Building-Brochure-and-Floorplans.pdf", is_pdf=True,
+            pdf_fallback_link="https://storage.googleapis.com/bucket/x.pdf",
+        )
+        self.assertEqual(result, "https://example.com/Building-Brochure-and-Floorplans.pdf")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from brochure_link_resolver import finalize_brochure_link, resolve_email_tracking_links
+from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link, resolve_email_tracking_links
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
@@ -138,6 +138,10 @@ Also extract for each unit:
   "manage preferences", "manage your subscription", or "email preferences" — anywhere in the email,
   regardless of how close it also is to a building name — it must NEVER be used as a brochure_link,
   even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
+- floorplan_link: a link specifically labeled "Floorplan"/"Floor Plan"/"View floorplan"/"Download
+  Floorplan" that sits close to this unit's own listing, if one is given — the exact link brochure_link
+  above must NEVER use. Leave null if no such link is given for this unit. Same generic-homepage/
+  unrelated-listing/unsubscribe exclusions as brochure_link apply here too.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -157,6 +161,7 @@ Return your answer as a single JSON object with this exact structure:
       "rent_pcm": number or null,
       "rent_psf": number or null,
       "brochure_link": "..." or null,
+      "floorplan_link": "..." or null,
       "special_features": "..." or null,
       "state_of_space": "..." or null
     }
@@ -238,6 +243,7 @@ def extract(eml_path: Path, original_filename: str = None) -> list[ListingRow]:
         unit["brochure_link"] = finalize_brochure_link(
             unit.get("brochure_link"), is_pdf=False, pdf_fallback_link=filename
         )
+        unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

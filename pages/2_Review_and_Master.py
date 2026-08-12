@@ -1069,19 +1069,44 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
             st.markdown(label)
 
             if stats and stats.get("status") == "in_progress":
-                remaining = stats["unique_brochures_considered"] - stats["brochures_done"]
-                st.warning(
+                # max(0, ...) - a resumed run only ever has a lower-bound
+                # guess of unique_floorplans_considered until the floorplan
+                # pass itself actually starts (see run_brochure_enrichment's
+                # own docstring) - never let a stale/optimistic guess make
+                # this go negative. .get(..., 0) - an entry written before
+                # the floorplan pass existed at all has neither key.
+                brochures_remaining = max(
+                    0, stats["unique_brochures_considered"] - stats["brochures_done"],
+                )
+                floorplans_remaining = max(
+                    0, stats.get("unique_floorplans_considered", 0) - stats.get("floorplans_done", 0),
+                )
+                # "0 remaining" must mean there is genuinely no required
+                # enrichment work left - never just "0 brochures remain
+                # while the floorplan pass hasn't even started yet" (see
+                # brochure_enrichment.run_brochure_enrichment's own
+                # docstring on why status stays "in_progress" until BOTH
+                # passes are done).
+                remaining = brochures_remaining + floorplans_remaining
+                warning_text = (
                     f"⚠️ Brochure enrichment incomplete: {stats['brochures_done']}/"
                     f"{stats['unique_brochures_considered']} unique brochure(s) checked before this run "
                     "stopped (the app was likely interrupted or restarted mid-run). Blank descriptive "
-                    f"fields on this file's rows may simply be unchecked, not confirmed blank. "
-                    f"{remaining} brochure(s) remain."
+                    f"fields on this file's rows may simply be unchecked, not confirmed blank."
                 )
+                if stats.get("unique_floorplans_considered"):
+                    warning_text += (
+                        f" {stats.get('floorplans_done', 0)}/{stats['unique_floorplans_considered']} "
+                        "unique floor plan(s) also checked before this run stopped."
+                    )
+                warning_text += f" {remaining} enrichment source(s) remain."
+                st.warning(warning_text)
                 if st.button(f"Continue enrichment ({remaining} remaining)", key=f"continue_enrichment_{path}"):
                     rows = dataframe_to_listing_rows(load_staging_as_dataframe(path))
                     with st.spinner("Resuming brochure enrichment..."):
                         brochure_enrichment.run_brochure_enrichment(
                             rows, path, already_processed=stats["processed_urls"],
+                            floorplan_already_processed=stats.get("floorplan_processed_urls", {}),
                         )
                     st.rerun()
             elif stats:
@@ -1091,6 +1116,10 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
                 )
                 if stats["brochures_unavailable"]:
                     summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
+                if stats.get("unique_floorplans_considered"):
+                    summary += (
+                        f" {stats['unique_floorplans_considered']} unique floor plan(s) also checked."
+                    )
                 st.caption(summary)
 
             _render_single_file_discard(path)

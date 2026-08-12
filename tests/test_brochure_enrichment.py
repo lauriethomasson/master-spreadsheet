@@ -114,6 +114,15 @@ class EligibleBrochureUrlTests(unittest.TestCase):
     def test_floorplan_url_is_not_eligible(self):
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url("https://sharepoint.com/floorplans/a.pdf"))
 
+    def test_combined_brochure_and_floorplan_url_is_still_eligible(self):
+        # A genuine brochure whose own filename also mentions floor plans
+        # (a real, common combined-document naming pattern) must remain
+        # eligible for enrichment - never discarded merely because its
+        # name contains the word "floorplan" too.
+        self.assertTrue(
+            brochure_enrichment._is_eligible_brochure_url("https://example.com/Building-Brochure-and-Floorplans.pdf"),
+        )
+
     def test_youtube_url_is_not_eligible(self):
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url("https://youtube.com/watch?v=abc123"))
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url("https://youtu.be/abc123"))
@@ -484,6 +493,133 @@ class MatchUnitTests(unittest.TestCase):
 
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
 
+    def test_address_suffixed_row_matches_the_bare_brochure_building_name(self):
+        # Real confirmed shape: a provider spreadsheet's own building column
+        # bakes the street address into the same field a brochure's own
+        # cover only ever states as the bare building name.
+        row = ListingRow(building="Nash House - 13a St George St", floor_unit="2nd Floor")
+        units = [{"building": "Nash House", "floor_unit": "2nd Floor", "special_features": "Roof terrace"}]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "Roof terrace")
+
+    def test_two_different_addresses_sharing_a_brand_prefix_never_cross_match(self):
+        # The regression this module's own address-suffix stripping must
+        # never reintroduce: a portfolio brochure listing two GENUINELY
+        # different physical properties that merely share a brand/prefix
+        # ("Example House") must never be treated as the same building just
+        # because both strip down to "Example House".
+        row_alpha = ListingRow(building="Example House - 10 Alpha Street", floor_unit="1st Floor")
+        row_beta = ListingRow(building="Example House - 50 Beta Street", floor_unit="1st Floor")
+        units = [
+            {"building": "Example House - 10 Alpha Street", "floor_unit": "1st Floor", "special_features": "Alpha only"},
+            {"building": "Example House - 50 Beta Street", "floor_unit": "1st Floor", "special_features": "Beta only"},
+        ]
+
+        matched_alpha = brochure_enrichment._match_unit(row_alpha, units)
+        matched_beta = brochure_enrichment._match_unit(row_beta, units)
+
+        self.assertEqual(matched_alpha["special_features"], "Alpha only")
+        self.assertEqual(matched_beta["special_features"], "Beta only")
+
+    def test_address_suffixed_row_against_two_different_bare_prefixed_buildings_stays_ambiguous(self):
+        # Same regression as above, but the ROW itself only ever states the
+        # bare brand ("Example House") with no address of its own - it can
+        # never be told apart from either brochure entry, so this must stay
+        # unresolved (never guessed) rather than silently picking one.
+        row = ListingRow(building="Example House", floor_unit="1st Floor")
+        units = [
+            {"building": "Example House - 10 Alpha Street", "floor_unit": "1st Floor", "special_features": "Alpha only"},
+            {"building": "Example House - 50 Beta Street", "floor_unit": "1st Floor", "special_features": "Beta only"},
+        ]
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
+    def test_exact_match_is_preferred_over_an_ambiguous_stripped_match(self):
+        # An EXACT name match is always sufficient identity evidence on its
+        # own, even alongside another candidate that would otherwise make
+        # the stripped-suffix tier ambiguous.
+        row = ListingRow(building="Example House - 10 Alpha Street", floor_unit="1st Floor")
+        units = [
+            {"building": "Example House - 10 Alpha Street", "floor_unit": "1st Floor", "special_features": "Exact match"},
+            {"building": "Example House - 50 Beta Street", "floor_unit": "1st Floor", "special_features": "Unrelated"},
+        ]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "Exact match")
+
+
+class BuildingAddressSuffixTests(unittest.TestCase):
+    """_strip_building_address_suffix - the identity-corroboration helper
+    behind _building_identity_matches (see its own docstring)."""
+
+    def test_strips_a_dash_separated_address(self):
+        self.assertEqual(
+            brochure_enrichment._strip_building_address_suffix("Discovery House - 28-42 Banner St"),
+            "Discovery House",
+        )
+
+    def test_strips_a_comma_separated_address(self):
+        self.assertEqual(
+            brochure_enrichment._strip_building_address_suffix("Nash House, 13a St George St"), "Nash House",
+        )
+
+    def test_leaves_a_non_address_shaped_second_half_alone(self):
+        self.assertEqual(
+            brochure_enrichment._strip_building_address_suffix("Discovery House - East Wing"),
+            "Discovery House - East Wing",
+        )
+
+    def test_blank_returns_unchanged(self):
+        self.assertIsNone(brochure_enrichment._strip_building_address_suffix(None))
+        self.assertEqual(brochure_enrichment._strip_building_address_suffix(""), "")
+
+    def test_a_building_whose_own_name_is_an_unnamed_address_range_is_never_mis_split(self):
+        # Confirmed real gap: a bare `\d.+` check alone happily strips this
+        # down to a nonsense "27" - house_number.leading_house_number
+        # recognizes the HEAD itself ("27") as already being a house number,
+        # not a genuine building name, so the split is rejected entirely.
+        self.assertEqual(
+            brochure_enrichment._strip_building_address_suffix("27-30 Lime Street"), "27-30 Lime Street",
+        )
+
+    def test_a_tail_that_is_not_a_real_house_number_is_never_split(self):
+        self.assertEqual(
+            brochure_enrichment._strip_building_address_suffix("Discovery House - Reception"),
+            "Discovery House - Reception",
+        )
+
+
+class BuildingIdentityMatchesTests(unittest.TestCase):
+    """_building_identity_matches - see its own docstring for the two-tier
+    exact/stripped-and-corroborated-by-uniqueness rule."""
+
+    def test_exact_match_returns_every_exact_index(self):
+        indices = brochure_enrichment._building_identity_matches(
+            "28 Lime Street", ["28 Lime Street", "28 Lime Street", "Somewhere Else"],
+        )
+        self.assertEqual(indices, [0, 1])
+
+    def test_unique_stripped_match_is_accepted(self):
+        indices = brochure_enrichment._building_identity_matches(
+            "Nash House - 13a St George St", ["Nash House"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_ambiguous_stripped_match_is_rejected(self):
+        indices = brochure_enrichment._building_identity_matches(
+            "Example House", ["Example House - 10 Alpha Street", "Example House - 50 Beta Street"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_blank_row_building_never_matches_anything(self):
+        self.assertEqual(brochure_enrichment._building_identity_matches("   ", ["Anything"]), [])
+
+    def test_no_candidates_returns_empty(self):
+        self.assertEqual(brochure_enrichment._building_identity_matches("28 Lime Street", []), [])
+
 
 class MatchBuildingFeatureTests(unittest.TestCase):
     """_match_building_feature - the building-level (level B) counterpart
@@ -526,6 +662,28 @@ class MatchBuildingFeatureTests(unittest.TestCase):
         )
 
         self.assertIsNone(brochure_enrichment._match_building_feature(row, units))
+
+    def test_address_suffixed_row_matches_the_bare_brochure_building_name(self):
+        row = ListingRow(building="Nash House - 13a St George St")
+        units = _brochure_units(
+            [], building_features=[{"building": "Nash House", "features": "Roof terrace"}],
+        )
+
+        self.assertEqual(brochure_enrichment._match_building_feature(row, units), "Roof terrace")
+
+    def test_two_different_addresses_sharing_a_brand_prefix_never_cross_contaminate(self):
+        row_alpha = ListingRow(building="Example House - 10 Alpha Street")
+        row_beta = ListingRow(building="Example House - 50 Beta Street")
+        units = _brochure_units(
+            [],
+            building_features=[
+                {"building": "Example House - 10 Alpha Street", "features": "Alpha only"},
+                {"building": "Example House - 50 Beta Street", "features": "Beta only"},
+            ],
+        )
+
+        self.assertEqual(brochure_enrichment._match_building_feature(row_alpha, units), "Alpha only")
+        self.assertEqual(brochure_enrichment._match_building_feature(row_beta, units), "Beta only")
 
 
 class FloorNumberTests(unittest.TestCase):
@@ -904,6 +1062,78 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         # No floor-specific text -> building-level fallback, never blank.
         self.assertEqual(canal_4th.special_features, "Exposed beams; canalside frontage")
         self.assertEqual(packing_ground.special_features, "Stunning rooftop terrace")
+
+
+class MatchFloorplanUnitTests(unittest.TestCase):
+    """_match_floorplan_unit - a single-unit floor plan must never be
+    applied to a row whose own stated floor genuinely conflicts with it."""
+
+    def test_single_unit_with_matching_floor_applies(self):
+        row = ListingRow(building="A", floor_unit="2nd Floor")
+        units = [{"floor_unit": "2nd Floor", "special_features": "12 desks; boardroom"}]
+
+        matched = brochure_enrichment._match_floorplan_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "12 desks; boardroom")
+
+    def test_single_unit_with_matching_floor_number_applies(self):
+        # "2nd" (row) vs "2nd Floor" (floor plan) - same floor-number
+        # fallback tier _match_unit already uses.
+        row = ListingRow(building="A", floor_unit="2nd")
+        units = [{"floor_unit": "2nd Floor", "special_features": "12 desks"}]
+
+        matched = brochure_enrichment._match_floorplan_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "12 desks")
+
+    def test_single_unit_with_conflicting_floor_never_applies(self):
+        # The real bug this guards against: a floor plan naming a
+        # DIFFERENT floor than the row must never be applied merely
+        # because it's the only unit extracted from that document.
+        row = ListingRow(building="A", floor_unit="2nd Floor")
+        units = [{"floor_unit": "3rd Floor", "special_features": "12 desks"}]
+
+        self.assertIsNone(brochure_enrichment._match_floorplan_unit(row, units))
+
+    def test_single_unit_with_no_floor_identity_of_its_own_still_applies(self):
+        row = ListingRow(building="A", floor_unit="2nd Floor")
+        units = [{"floor_unit": None, "special_features": "12 desks"}]
+
+        matched = brochure_enrichment._match_floorplan_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "12 desks")
+
+    def test_single_unit_applies_when_the_row_itself_states_no_floor(self):
+        row = ListingRow(building="A", floor_unit=None)
+        units = [{"floor_unit": "3rd Floor", "special_features": "12 desks"}]
+
+        matched = brochure_enrichment._match_floorplan_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "12 desks")
+
+    def test_several_units_still_resolve_by_exact_floor_text(self):
+        row = ListingRow(building="A", floor_unit="3rd Floor")
+        units = [
+            {"floor_unit": "2nd Floor", "special_features": "Wrong"},
+            {"floor_unit": "3rd Floor", "special_features": "Right"},
+        ]
+
+        matched = brochure_enrichment._match_floorplan_unit(row, units)
+
+        self.assertEqual(matched["special_features"], "Right")
+
+    def test_several_units_with_no_row_floor_match_stay_unresolved(self):
+        row = ListingRow(building="A", floor_unit="9th Floor")
+        units = [
+            {"floor_unit": "2nd Floor", "special_features": "One"},
+            {"floor_unit": "3rd Floor", "special_features": "Two"},
+        ]
+
+        self.assertIsNone(brochure_enrichment._match_floorplan_unit(row, units))
+
+    def test_no_units_returns_none(self):
+        row = ListingRow(building="A", floor_unit="2nd Floor")
+        self.assertIsNone(brochure_enrichment._match_floorplan_unit(row, []))
 
 
 class EnrichRowTests(EnrichmentTestCase):
@@ -1790,6 +2020,183 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         called_urls = {c.args[0] for c in mock_extract.call_args_list}
         self.assertEqual(called_urls, {"https://example.com/B2.pdf", "https://example.com/B3.pdf", "https://example.com/B4.pdf"})
         self.assertEqual(len(stats["processed_urls"]), 3)
+
+
+class EnrichRowsFromFloorplansCheckpointTests(unittest.TestCase):
+    """
+    _enrich_rows_from_floorplans - the floorplan pass' own checkpoint/
+    resume contract, mirroring enrich_rows_grouped's brochure-side one (see
+    that function's own docstring). Confirmed real gap this closes: this
+    pass previously had no checkpointing of its own at all - an
+    interruption partway through it silently lost every floor plan already
+    matched, and a resume had no way to skip already-checked floor plans.
+    """
+
+    def _rows(self, n):
+        return [
+            ListingRow(
+                building=f"B{i}", floor_unit="1st", floorplan_link=f"https://example.com/{i}.pdf",
+                special_features=None,
+            )
+            for i in range(n)
+        ]
+
+    def test_row_checkpoint_fires_after_every_floorplan(self):
+        rows = self._rows(3)
+        checkpoints = []
+
+        with patch(
+            "brochure_enrichment._extract_floorplan_units",
+            return_value=[{"floor_unit": None, "special_features": "Feature"}],
+        ):
+            brochure_enrichment._enrich_rows_from_floorplans(rows, checkpoint_callback=checkpoints.append)
+
+        self.assertEqual(len(checkpoints), 3)
+        self.assertTrue(all(r.special_features == "Feature" for r in checkpoints[-1]))
+
+    def test_url_checkpoint_fires_with_cumulative_state_and_total(self):
+        rows = self._rows(1)
+        already_processed = {"https://example.com/other.pdf": "ok"}
+        seen = []
+
+        with patch(
+            "brochure_enrichment._extract_floorplan_units",
+            return_value=[{"floor_unit": None, "special_features": "x"}],
+        ):
+            brochure_enrichment._enrich_rows_from_floorplans(
+                rows, already_processed=already_processed, url_checkpoint_callback=lambda d, t: seen.append((d, t)),
+            )
+
+        self.assertEqual(len(seen), 1)
+        processed, total = seen[0]
+        self.assertEqual(processed, {"https://example.com/other.pdf": "ok", "https://example.com/0.pdf": "ok"})
+        self.assertEqual(total, 1)
+
+    def test_already_ok_floorplan_is_never_refetched(self):
+        rows = self._rows(2)
+        already_processed = {"https://example.com/0.pdf": "ok"}
+
+        with patch(
+            "brochure_enrichment._extract_floorplan_units",
+            return_value=[{"floor_unit": None, "special_features": "New"}],
+        ) as mock_extract:
+            current, log, stats = brochure_enrichment._enrich_rows_from_floorplans(
+                rows, already_processed=already_processed,
+            )
+
+        mock_extract.assert_called_once_with("https://example.com/1.pdf")
+        self.assertIsNone(current[0].special_features)  # skipped - left exactly as before
+        self.assertEqual(current[1].special_features, "New")
+        self.assertEqual(stats["processed_urls"], {"https://example.com/1.pdf": "ok"})
+
+    def test_stats_report_considered_ok_and_unavailable_counts(self):
+        rows = self._rows(2)
+
+        def _fake(url):
+            return None if "0.pdf" in url else [{"floor_unit": None, "special_features": "x"}]
+
+        with patch("brochure_enrichment._extract_floorplan_units", side_effect=_fake):
+            _, _, stats = brochure_enrichment._enrich_rows_from_floorplans(rows)
+
+        self.assertEqual(stats["unique_floorplans_considered"], 2)
+        self.assertEqual(stats["floorplans_read_ok"], 1)
+        self.assertEqual(stats["floorplans_unavailable"], 1)
+
+    def test_no_eligible_floorplans_returns_zeroed_stats_with_no_callback_firing(self):
+        rows = [ListingRow(building="A", floorplan_link=None, special_features=None)]
+        checkpoints = []
+
+        current, log, stats = brochure_enrichment._enrich_rows_from_floorplans(
+            rows, checkpoint_callback=checkpoints.append,
+        )
+
+        self.assertEqual(checkpoints, [])
+        self.assertEqual(stats, {
+            "unique_floorplans_considered": 0, "floorplans_read_ok": 0,
+            "floorplans_unavailable": 0, "processed_urls": {},
+        })
+
+
+class EnrichRowsGroupedFloorplanParamsTests(EnrichmentTestCase):
+    """enrich_rows_grouped's own floorplan_already_processed/floorplan_
+    checkpoint_callback/floorplan_url_checkpoint_callback plumbing through
+    to _enrich_rows_from_floorplans, and the floorplan stats surfaced on
+    its own return value - both the early-return (no brochures to fetch at
+    all) and the normal (brochures processed first) paths."""
+
+    def test_floorplan_stats_present_even_with_zero_brochures(self):
+        rows = [
+            ListingRow(
+                building="A", floor_unit="1st", floorplan_link="https://example.com/fp.pdf", special_features=None,
+            ),
+        ]
+        with patch(
+            "brochure_enrichment._extract_floorplan_units",
+            return_value=[{"floor_unit": None, "special_features": "From floorplan"}],
+        ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "From floorplan")
+        self.assertEqual(stats["unique_floorplans_considered"], 1)
+        self.assertEqual(stats["floorplans_read_ok"], 1)
+        self.assertEqual(stats["floorplan_processed_urls"], {"https://example.com/fp.pdf": "ok"})
+
+    def test_floorplan_stats_present_after_a_real_brochure_run(self):
+        rows = [
+            ListingRow(
+                building="A", floor_unit="1st", brochure_link="https://example.com/b.pdf",
+                floorplan_link="https://example.com/fp.pdf", special_features=None,
+            ),
+        ]
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[]), \
+             patch(
+                 "brochure_enrichment._extract_floorplan_units",
+                 return_value=[{"floor_unit": None, "special_features": "From floorplan"}],
+             ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "From floorplan")
+        self.assertEqual(stats["unique_floorplans_considered"], 1)
+        self.assertEqual(stats["floorplan_processed_urls"], {"https://example.com/fp.pdf": "ok"})
+
+    def test_floorplan_already_processed_is_never_refetched(self):
+        rows = [
+            ListingRow(
+                building="A", floor_unit="1st", floorplan_link="https://example.com/fp.pdf", special_features=None,
+            ),
+        ]
+        with patch("brochure_enrichment._extract_floorplan_units") as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                rows, floorplan_already_processed={"https://example.com/fp.pdf": "ok"},
+            )
+
+        mock_extract.assert_not_called()
+        self.assertIsNone(enriched[0].special_features)
+
+    def test_floorplan_checkpoint_callbacks_fire_separately_from_brochure_ones(self):
+        rows = [
+            ListingRow(
+                building="A", floor_unit="1st", brochure_link="https://example.com/b.pdf",
+                floorplan_link="https://example.com/fp.pdf", special_features=None,
+            ),
+        ]
+        brochure_checkpoints, floorplan_checkpoints, floorplan_url_checkpoints = [], [], []
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[]), \
+             patch(
+                 "brochure_enrichment._extract_floorplan_units",
+                 return_value=[{"floor_unit": None, "special_features": "x"}],
+             ):
+            brochure_enrichment.enrich_rows_grouped(
+                rows,
+                url_checkpoint_callback=lambda d: brochure_checkpoints.append(d),
+                floorplan_checkpoint_callback=lambda r: floorplan_checkpoints.append(list(r)),
+                floorplan_url_checkpoint_callback=lambda d, t: floorplan_url_checkpoints.append((d, t)),
+            )
+
+        self.assertEqual(len(brochure_checkpoints), 1)
+        self.assertEqual(len(floorplan_checkpoints), 1)
+        self.assertEqual(floorplan_url_checkpoints, [({"https://example.com/fp.pdf": "ok"}, 1)])
 
 
 if __name__ == "__main__":

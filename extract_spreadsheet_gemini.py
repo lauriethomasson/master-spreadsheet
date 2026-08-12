@@ -22,7 +22,7 @@ import re
 import sys
 from datetime import date
 
-from brochure_link_resolver import finalize_brochure_link
+from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link
 from gemini_client import call_gemini, compute_rent, get_client
 from house_number import LEADING_HOUSE_NUMBER_RE, leading_house_number
 from schema import ExtractedFields, ListingRow
@@ -111,6 +111,9 @@ Then extract EVERY SEPARATE AVAILABLE UNIT:
   URL, never the "Floorplans" one as a substitute, even when "Brochure" isn't present at all for that
   building. If no link labeled "Brochure" is given anywhere for that row/building, brochure_link is
   null - do not fall back to a "Floorplans" (or any other differently-labeled) link.
+- floorplan_link: the URL of the link specifically labeled "Floorplan"/"Floorplans"/"Floor Plan" (e.g.
+  "Download Floorplans (https://...)") for that specific row/building, if one is given - the exact
+  link brochure_link above must NEVER use as a substitute. Null if no such link is given.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -132,7 +135,8 @@ Return your answer as a single JSON object with this exact structure:
       "rent_psf": number or null,
       "special_features": "..." or null,
       "state_of_space": "..." or null,
-      "brochure_link": "..." or null
+      "brochure_link": "..." or null,
+      "floorplan_link": "..." or null
     }
   ]
 }
@@ -403,6 +407,59 @@ def _apply_deterministic_brochure_links(units: list[dict], raw_text: str) -> Non
             unit["brochure_link"] = deterministic_url
 
 
+def _floorplan_url_from_cell_text(cell_text: str):
+    """Mirrors _brochure_url_from_cell_text, but for a cell whose own
+    display text mentions "floorplan"/"floor plan" (either spelling seen in
+    real files - "Download Floorplans" as one word) instead of "brochure" -
+    see that function's own docstring for the identical rationale."""
+    lowered = cell_text.lower()
+    if "floorplan" not in lowered and "floor plan" not in lowered:
+        return None
+    match = re.search(r"\((https?://[^)]+)\)\s*$", cell_text)
+    return match.group(1) if match else None
+
+
+def _floorplan_urls_in_block(lines: list, start: int, end: int) -> list:
+    """Mirrors _brochure_urls_in_block, for floorplan-labeled cells."""
+    urls = []
+    for line in lines[start:end]:
+        for cell_text in line.split("|"):
+            url = _floorplan_url_from_cell_text(cell_text.strip())
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def deterministic_floorplan_link_for_building(raw_text: str, building: str):
+    """Mirrors deterministic_brochure_link_for_building, reading `building`'s
+    own Floorplan-labeled hyperlink instead of its Brochure one - same
+    "never a guess" behavior: None whenever the block can't be found, has no
+    Floorplan-labeled hyperlink, or has more than one conflicting one."""
+    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
+    bounds = _building_block_bounds(lines, building)
+    if bounds is None:
+        return None
+    start, end = bounds
+    urls = _floorplan_urls_in_block(lines, start, end)
+    return urls[0] if len(urls) == 1 else None
+
+
+def _apply_deterministic_floorplan_links(units: list[dict], raw_text: str) -> None:
+    """Mirrors _apply_deterministic_brochure_links, for floorplan_link - see
+    that function's own docstring for the full rationale (identical, just a
+    different field/label pair)."""
+    cache = {}
+    for unit in units:
+        building = unit.get("building")
+        if not building:
+            continue
+        if building not in cache:
+            cache[building] = deterministic_floorplan_link_for_building(raw_text, building)
+        deterministic_url = cache[building]
+        if deterministic_url:
+            unit["floorplan_link"] = deterministic_url
+
+
 def extract_sheet(ws, sheet_label: str, filename: str) -> list[ListingRow]:
     """Thin wrapper over extract_sheet_with_metadata for every caller that
     only needs the rows themselves (the overwhelming majority - see that
@@ -485,12 +542,14 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
     # below so a recovered/corrected link still goes through the same admin-
     # link/generic-link/landing-page handling every other brochure_link does.
     _apply_deterministic_brochure_links(units, text)
+    _apply_deterministic_floorplan_links(units, text)
 
     rows = []
     for unit in units:
         unit["brochure_link"] = finalize_brochure_link(
             unit.get("brochure_link"), is_pdf=False, pdf_fallback_link=filename
         )
+        unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

@@ -9,7 +9,7 @@ import fitz  # PyMuPDF
 from google.genai import types
 from pydantic import ValidationError
 
-from brochure_link_resolver import finalize_brochure_link
+from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link
 from gemini_client import call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
@@ -389,6 +389,10 @@ Also extract for each unit:
   HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out", "manage
   preferences", "manage your subscription", or "email preferences", it must NEVER be used as a brochure_link,
   even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
+- floorplan_link: a URL specifically labeled/described as a floor plan for THIS unit (e.g. "Floor Plan",
+  "Floorplan", "View floorplan", "Download Floorplans"), if one is given — the exact link brochure_link
+  above must NEVER use. Leave null if no such link is given for this unit. Same generic-homepage/
+  unsubscribe exclusions as brochure_link apply here too.
 - special_features: a semicolon-separated list of notable amenities, inclusions, or notes specific to
   THIS unit/floor (e.g. "2 meeting rooms; deposit £36,000 required; 50Mb dedicated bandwidth"). A
   characteristic shared by the WHOLE building this unit is in (not just this one floor) belongs in
@@ -437,6 +441,7 @@ Return your answer as a single JSON object with this exact structure:
       "rent_pcm": number or null,
       "rent_psf": number or null,
       "brochure_link": "..." or null,
+      "floorplan_link": "..." or null,
       "special_features": "..." or null,
       "state_of_space": "..." or null
     }
@@ -483,7 +488,7 @@ def render_pages(pdf_source) -> list[types.Part]:
         fitz.TOOLS.store_shrink(100)
 
 
-def render_and_extract(images: list, client=None) -> dict:
+def render_and_extract(images: list, client=None, prompt: str = None) -> dict:
     """
     The second half of extract_raw_units, split out on its own so a caller
     that rendered from an in-memory bytes source (see render_pages) can
@@ -496,9 +501,16 @@ def render_and_extract(images: list, client=None) -> dict:
     client defaults to a fresh get_client() call if not given - accepting
     one explicitly only lets extract_raw_units reuse the SAME client it
     already made for this call, never a shared one across separate calls.
+
+    prompt defaults to this module's own brochure-extraction PROMPT if not
+    given - accepting one explicitly lets a caller reuse this exact render-
+    then-call-Gemini plumbing against a DIFFERENT prompt entirely (see
+    brochure_enrichment.FLOORPLAN_PROMPT, a narrower prompt for reading a
+    floor plan document rather than a marketing brochure) without
+    duplicating the render/GC/error-handling logic here.
     """
     client = client or get_client()
-    raw = call_gemini(client, PROMPT, images)
+    raw = call_gemini(client, prompt or PROMPT, images)
     del images
     gc.collect()
     return raw
@@ -585,6 +597,7 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
         unit["brochure_link"] = finalize_brochure_link(
             unit.get("brochure_link"), is_pdf=True, pdf_fallback_link=pdf_fallback_link
         )
+        unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

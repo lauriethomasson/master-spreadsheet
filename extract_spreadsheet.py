@@ -116,6 +116,10 @@ EXTRA_SYNONYMS = {
     "brochure_link": (
         "brochure pdf", "link to file", "link to brochure", "brochure link", "link to brochure pdf", "brochure",
     ),
+    "floorplan_link": (
+        "floorplan", "floor plan", "floorplans", "floor plans", "link to floorplan", "download floorplan",
+        "floorplan link", "floor plan link",
+    ),
     "state_of_space": ("current spec",),
     "address_1": ("property address 1", "address"),
     "postcode": ("property postcode",),

@@ -16,23 +16,25 @@ MAX_COLUMN_WIDTH = 40
 # Columns holding a URL - given a real openpyxl hyperlink (not just plain text)
 # so the cell is directly clickable when the .xlsx is opened in Excel/Google
 # Sheets, not just styled to look like a link. The cell's displayed text is
-# HYPERLINK_DISPLAY_TEXT, not the (often long, unreadable) raw URL - the real
-# URL only ever lives in the hyperlink target from that point on, which is
-# exactly why every read-back of a written file (read_xlsx_with_hyperlinks
-# below) has to recover it from there instead of the cell's plain value.
-HYPERLINK_COLUMNS = ["brochure_link"]
+# its own LINK_DISPLAY_TEXT entry, not the (often long, unreadable) raw URL -
+# the real URL only ever lives in the hyperlink target from that point on,
+# which is exactly why every read-back of a written file (read_xlsx_with_
+# hyperlinks below) has to recover it from there instead of the cell's plain
+# value.
+HYPERLINK_COLUMNS = ["brochure_link", "floorplan_link"]
 HYPERLINK_FONT = Font(color="0563C1", underline="single")
-HYPERLINK_DISPLAY_TEXT = "Open Brochure"
+HYPERLINK_DISPLAY_TEXT = "Open Brochure"  # kept for brochure_link/back-compat single-column callers
+LINK_DISPLAY_TEXT = {"brochure_link": "Open Brochure", "floorplan_link": "Open Floorplan"}
 
 # Columns that regularly hold long text (a multi-sentence description, several
 # contacts, or a long URL) - wrapped so the full value is visible on several
 # lines within the row instead of overflowing past the column's fixed width or
 # being clipped. Deliberately a separate list from display_utils.WIDE_TEXT_COLUMNS:
 # that one governs the in-app editable grid's column width and never includes
-# brochure_link (the grid shows a fixed "Open Brochure" label there regardless
-# of the underlying URL's length), whereas here brochure_link is exactly the
-# column most likely to overflow a written .xlsx's column width.
-WRAP_COLUMNS = ["special_features", "contacts", "brochure_link"]
+# brochure_link/floorplan_link (the grid shows a fixed "Open ..." label there
+# regardless of the underlying URL's length), whereas here they're exactly the
+# columns most likely to overflow a written .xlsx's column width.
+WRAP_COLUMNS = ["special_features", "contacts", "brochure_link", "floorplan_link"]
 WRAP_ALIGNMENT = Alignment(wrap_text=True, vertical="top")
 
 # Points, matching Excel's own row-height unit - tall enough for ~3-4 wrapped
@@ -119,12 +121,13 @@ def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
                 ws.cell(row=row_idx, column=col_idx).alignment = WRAP_ALIGNMENT
 
         if field in HYPERLINK_COLUMNS:
+            display_text = LINK_DISPLAY_TEXT.get(field, HYPERLINK_DISPLAY_TEXT)
             for row_idx in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
                 if cell.value:
                     url = cell.value
                     cell.hyperlink = url
-                    cell.value = HYPERLINK_DISPLAY_TEXT
+                    cell.value = display_text
                     cell.font = HYPERLINK_FONT
 
     if isinstance(output, (str, Path)):

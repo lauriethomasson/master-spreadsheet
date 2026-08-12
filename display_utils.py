@@ -13,7 +13,7 @@ import streamlit as st
 
 from master_merge import field_kind, row_label  # noqa: F401 - row_label re-exported for display_utils.row_label(...) call sites
 from schema import ListingRow
-from staging_writer import HYPERLINK_DISPLAY_TEXT, title_case_label
+from staging_writer import LINK_DISPLAY_TEXT, title_case_label
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
@@ -83,6 +83,7 @@ def render_before_after_editable(old_val, new_val, kind: str, key: str, multilin
 # instead of the raw URL (which would otherwise make the table unreadable).
 LINK_COLUMNS = [
     "brochure_link",
+    "floorplan_link",
 ]
 
 # Free-text columns that regularly hold multi-sentence prose (special_features)
@@ -141,7 +142,9 @@ def link_column_config(df: pd.DataFrame) -> dict:
     before (LinkColumn behaves like a text input when edited) - this only
     changes how a cell is displayed, not what's stored."""
     return {
-        col: st.column_config.LinkColumn(label=title_case_label(col), display_text=HYPERLINK_DISPLAY_TEXT)
+        col: st.column_config.LinkColumn(
+            label=title_case_label(col), display_text=LINK_DISPLAY_TEXT.get(col, "Open Link"),
+        )
         for col in LINK_COLUMNS
         if col in df.columns
     }

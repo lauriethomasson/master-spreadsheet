@@ -266,6 +266,63 @@ class DataframeToListingRowsTests(IsolatedCwdTestCase):
 
         self.assertEqual(len(rows), 1)
 
+    def test_tbc_placeholder_brochure_link_becomes_blank(self):
+        # Real confirmed case: a UNION row's own Brochure cell reads "TBC"
+        # (the provider's own way of saying "no brochure yet") - this must
+        # never survive as a real, broken, clickable link.
+        df = pd.DataFrame([{"building": "City Tower", "brochure_link": "TBC"}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_coming_soon_placeholder_floorplan_link_becomes_blank(self):
+        df = pd.DataFrame([{"building": "City Tower", "floorplan_link": "Coming Soon"}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertIsNone(rows[0].floorplan_link)
+
+    def test_a_genuinely_missing_brochure_stays_blank(self):
+        df = pd.DataFrame([{"building": "City Tower", "brochure_link": None}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_scheme_less_link_with_a_port_survives(self):
+        # Confirmed real gap: a genuine hyperlink target that happens to
+        # include an explicit port used to fail looks_like_url's old,
+        # narrower shape check and be silently nulled here.
+        df = pd.DataFrame([{"building": "City Tower", "brochure_link": "app.box.com:8443/s/abc123"}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertEqual(rows[0].brochure_link, "app.box.com:8443/s/abc123")
+
+    def test_genuine_scheme_link_round_trips_through_staging_write_and_reload(self):
+        # source -> staging write -> staging reload - a valid brochure/
+        # floorplan link must survive unchanged, never erased by the
+        # sanitizer that exists purely to catch a placeholder.
+        original = [ListingRow(
+            building="City Tower", brochure_link="https://app.box.com/s/abc123",
+            floorplan_link="https://app.box.com/s/floorplan456",
+        )]
+        staging_path = file_store.save_staging_file(original, "test.xlsx")
+
+        reloaded = file_store.dataframe_to_listing_rows(file_store.load_staging_as_dataframe(staging_path))
+
+        self.assertEqual(reloaded[0].brochure_link, "https://app.box.com/s/abc123")
+        self.assertEqual(reloaded[0].floorplan_link, "https://app.box.com/s/floorplan456")
+
+    def test_a_source_with_genuinely_no_brochure_stays_blank_through_the_round_trip(self):
+        original = [ListingRow(building="City Tower", brochure_link=None)]
+        staging_path = file_store.save_staging_file(original, "test.xlsx")
+
+        reloaded = file_store.dataframe_to_listing_rows(file_store.load_staging_as_dataframe(staging_path))
+
+        self.assertIsNone(reloaded[0].brochure_link)
+
 
 class CriticalFieldRescuePersistenceTests(IsolatedCwdTestCase):
     def test_no_rescue_saved_yet_returns_none(self):
@@ -418,6 +475,52 @@ class BrochureEnrichmentProgressTests(IsolatedCwdTestCase):
             stats["brochures_read_ok"],
             sum(1 for v in stats["processed_urls"].values() if v == "ok"),
         )
+
+    def test_callers_that_omit_floorplan_args_get_zeroed_floorplan_fields(self):
+        # Every pre-existing caller (brochures only) must be completely
+        # unaffected by the floorplan fields' existence.
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        file_store.set_staging_enrichment_progress(staging_path, {"https://a.pdf": "ok"}, 1)
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+
+        self.assertEqual(stats["unique_floorplans_considered"], 0)
+        self.assertEqual(stats["floorplans_done"], 0)
+        self.assertEqual(stats["floorplan_processed_urls"], {})
+
+    def test_progress_marker_tracks_floorplan_fields_independently_of_brochure_ones(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        file_store.set_staging_enrichment_progress(
+            staging_path, {"https://a.pdf": "ok"}, 1,
+            floorplan_processed_urls={"https://fp1.pdf": "ok", "https://fp2.pdf": "unavailable"},
+            unique_floorplans_considered=3,
+        )
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+
+        # Brochure-side fields are untouched by the floorplan ones.
+        self.assertEqual(stats["brochures_done"], 1)
+        self.assertEqual(stats["unique_brochures_considered"], 1)
+        # Floorplan-side fields are their own, independent record.
+        self.assertEqual(stats["unique_floorplans_considered"], 3)
+        self.assertEqual(stats["floorplans_done"], 2)
+        self.assertEqual(stats["floorplans_read_ok"], 1)
+        self.assertEqual(stats["floorplans_unavailable"], 1)
+
+    def test_final_summary_carries_floorplan_fields_through_too(self):
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        file_store.set_staging_enrichment_summary(
+            staging_path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 1},
+            {"https://a.pdf": "ok"},
+            floorplan_processed_urls={"https://fp1.pdf": "ok"}, unique_floorplans_considered=1,
+        )
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+
+        self.assertEqual(stats["status"], "complete")
+        self.assertEqual(stats["unique_floorplans_considered"], 1)
+        self.assertEqual(stats["floorplans_done"], 1)
+        self.assertEqual(stats["floorplan_processed_urls"], {"https://fp1.pdf": "ok"})
 
 
 class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):

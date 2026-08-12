@@ -187,6 +187,7 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
 
 def _run_automatic_brochure_enrichment(
     rows: list[ListingRow], staging_path: str, already_processed: dict = None,
+    floorplan_already_processed: dict = None,
 ) -> list[ListingRow]:
     """
     Runs immediately after a FRESH spreadsheet upload's base rows are
@@ -198,28 +199,35 @@ def _run_automatic_brochure_enrichment(
     on disk, byte-identical to what was just extracted, before this ever
     downloads or sends a single brochure to Gemini.
 
-    already_processed ({url: "ok" | "unavailable"}), when given, is a PRIOR
-    upload's own persisted brochure-enrichment progress for this exact
-    content (see the caller's own "reused but incomplete" branch below) -
-    already-"ok" brochures are never re-fetched/re-sent to Gemini just
+    already_processed/floorplan_already_processed ({url: "ok" |
+    "unavailable"}), when given, are a PRIOR upload's own persisted
+    brochure/floorplan enrichment progress for this exact content (see the
+    caller's own "reused but incomplete" branch below) - already-"ok"
+    brochures/floorplans are never re-fetched/re-sent to Gemini just
     because a re-upload of the identical file happened to land on a NEW
-    staging entry rather than the original one. Defaults to {} (nothing to
-    resume) for the ordinary fresh-upload case, identical to every prior
-    behavior before this parameter existed.
+    staging entry rather than the original one. Both default to {} (nothing
+    to resume) for the ordinary fresh-upload case, identical to every prior
+    behavior before either parameter existed.
 
-    A no-op, with no UI at all, when nothing is eligible (see
-    brochure_enrichment.eligible_rows_and_brochures) - the common case for a
-    provider whose spreadsheet already states everything ENRICHABLE_FIELDS
-    covers, and the ONLY case that should ever feel instant; the point of
-    showing real progress below is precisely for the case where it isn't.
+    A no-op, with no UI at all, only when NEITHER brochure NOR floorplan
+    enrichment has anything eligible to do (see brochure_enrichment.
+    eligible_rows_and_brochures/eligible_rows_and_floorplans) - the common
+    case for a provider whose spreadsheet already states everything
+    ENRICHABLE_FIELDS covers, and the ONLY case that should ever feel
+    instant; the point of showing real progress below is precisely for the
+    case where it isn't. Confirmed real gap this guards against: a
+    spreadsheet with zero brochure-eligible rows but at least one genuinely
+    eligible floorplan_link used to skip run_brochure_enrichment (and
+    therefore the floorplan pass) entirely, silently losing floorplan-
+    sourced enrichment that had nothing to do with brochures at all.
 
     Persists partial progress incrementally and the final result (see
     brochure_enrichment.run_brochure_enrichment, the shared Streamlit-aware
     orchestration this delegates to - also used by pages/2_Review_and_
     Master.py's own "Continue enrichment" action to resume an interrupted
     run) - so an interruption partway through loses at most a handful of
-    brochures' worth of work, never the base extraction, which was already
-    durably staged before this function was even called.
+    brochures'/floorplans' worth of work, never the base extraction, which
+    was already durably staged before this function was even called.
 
     Returns the (possibly enriched) rows so the caller can reassign its own
     `rows` variable to the final state - enrichment never changes row
@@ -228,7 +236,8 @@ def _run_automatic_brochure_enrichment(
     stale pre-enrichment list.
     """
     eligible, unique_urls = brochure_enrichment.eligible_rows_and_brochures(rows)
-    if not unique_urls:
+    eligible_floorplans, unique_floorplan_urls = brochure_enrichment.eligible_rows_and_floorplans(rows)
+    if not unique_urls and not unique_floorplan_urls:
         return rows
 
     st.caption(
@@ -238,6 +247,7 @@ def _run_automatic_brochure_enrichment(
     )
     return brochure_enrichment.run_brochure_enrichment(
         rows, staging_path, already_processed=already_processed or {},
+        floorplan_already_processed=floorplan_already_processed or {},
     )
 
 
@@ -613,6 +623,7 @@ with page_setup.setup_page("upload"):
                     # enrichment was left incomplete - see its own use at
                     # the automatic-enrichment call site further down.
                     resume_already_processed = None
+                    resume_floorplan_already_processed = None
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
@@ -634,6 +645,9 @@ with page_setup.setup_page("upload"):
                         previous_enrichment = get_staging_enrichment_summary(previous_staging_path)
                         if previous_enrichment and previous_enrichment.get("status") == "in_progress":
                             resume_already_processed = previous_enrichment.get("processed_urls", {})
+                            resume_floorplan_already_processed = previous_enrichment.get(
+                                "floorplan_processed_urls", {}
+                            )
                         # A reused result's own fully_occupied_buildings (see
                         # extract_spreadsheet_gemini.extract_sheet_with_
                         # metadata) lives in the ORIGINAL staging run's own
@@ -863,6 +877,7 @@ with page_setup.setup_page("upload"):
                         try:
                             rows = _run_automatic_brochure_enrichment(
                                 rows, staging_path, already_processed=resume_already_processed,
+                                floorplan_already_processed=resume_floorplan_already_processed,
                             )
                         except Exception as e:
                             st.warning(

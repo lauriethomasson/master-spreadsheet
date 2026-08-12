@@ -90,7 +90,10 @@ import httpx
 import streamlit as st
 
 import extract
-from brochure_link_resolver import REQUEST_TIMEOUT, USER_AGENT, is_generic_link, resolve_brochure_link
+from brochure_link_resolver import (
+    REQUEST_TIMEOUT, USER_AGENT, is_floorplan_not_brochure_url, is_generic_link, resolve_brochure_link,
+)
+from house_number import leading_house_number
 from master_merge import normalize_key
 from schema import ListingRow
 from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
@@ -140,13 +143,16 @@ def _trim_memory() -> None:
 # from the other two (a document-level value, never a per-unit one).
 ENRICHABLE_FIELDS = ("special_features", "state_of_space", "contacts")
 
-# Matched against the URL only (never a fetch) - a floor plan or a video is
-# never a brochure regardless of what it turns out to contain, and fetching
-# either would waste a network round-trip for a URL shape that's already
+# Matched against the URL only (never a fetch) - a video is never a
+# brochure regardless of what it turns out to contain, and fetching one
+# would waste a network round-trip for a URL shape that's already
 # unambiguous from its own text. is_generic_link (bare company homepage,
 # known social/professional domains) is checked separately - see
-# _is_eligible_brochure_url.
-_REJECTED_URL_KEYWORDS = ("floorplan", "floor-plan", "youtube.com", "youtu.be")
+# _is_eligible_brochure_url. A floor-plan-shaped URL is rejected too, but
+# via is_floorplan_not_brochure_url (see its own docstring) rather than a
+# bare FLOORPLAN_URL_KEYWORDS substring check - a combined "Brochure and
+# Floorplans.pdf" document must still be eligible.
+_REJECTED_URL_KEYWORDS = ("youtube.com", "youtu.be")
 
 # Numeric tolerance for matching a row's own size_sqft against a candidate
 # brochure unit's - a plain percentage band, never a similarity score. Wide
@@ -185,6 +191,96 @@ def _floor_number(floor_unit):
 
 def _is_blank(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+# Matches a " - "/","/"—" separator followed by a clause starting with a
+# house number - e.g. "Discovery House - 28-42 Banner St" or "Nash House,
+# 13a St George St". Real, confirmed shape: a provider's own spreadsheet
+# building column routinely bakes the street address into the SAME field a
+# brochure's own cover/title only ever states as the bare building name -
+# "Discovery House" (brochure) vs "Discovery House - 28-42 Banner St" (row).
+_BUILDING_ADDRESS_SUFFIX_RE = re.compile(r"^(.+?)\s*[-,–—]\s*(\d.+)$")
+
+
+def _strip_building_address_suffix(building):
+    """
+    `building` with a trailing address-shaped suffix removed, when one is
+    present - "Discovery House - 28-42 Banner St" -> "Discovery House",
+    "Nash House, 13a St George St" -> "Nash House". Returns `building`
+    unchanged (never None/"") whenever the shape isn't genuinely "a name,
+    then a real house-number-led address": no separator at all, what
+    follows the separator isn't itself a real house number per house_
+    number.leading_house_number (the same authoritative parser master_
+    merge.py/extract_spreadsheet_gemini.py already use, rather than a
+    second, independently-drifting digit check - confirmed gap: a bare
+    `\\d.+` check alone would happily strip "27-30 Lime Street" itself down
+    to a bogus "27"), or what remains BEFORE the separator is itself
+    already a house number (the real "27-30 Lime Street" case - splitting
+    at its own internal "-" would otherwise produce a nonsense "27" head,
+    not a genuine building name). Deliberately conservative, same "start
+    conservative" precedent as this module's other matching tiers: a
+    building's own genuinely distinct second half that isn't address-shaped
+    (e.g. "Discovery House - East Wing") is left alone rather than guessed
+    at.
+    """
+    if not building:
+        return building
+    match = _BUILDING_ADDRESS_SUFFIX_RE.match(str(building).strip())
+    if not match:
+        return building
+    head, tail = match.group(1).strip(), match.group(2).strip()
+    if not head or leading_house_number(head) is not None or leading_house_number(tail) is None:
+        return building
+    return head
+
+
+def _building_identity_matches(row_building, candidate_buildings: list) -> list:
+    """
+    Indices into `candidate_buildings` (a list of raw building-name strings,
+    e.g. one per brochure unit/building_features entry) that confidently
+    identify the SAME building as `row_building` - never a fuzzy/similarity
+    match, only exact-string comparisons at two tiers:
+
+    1. EXACT (both sides' own normalize_key, no suffix stripped) - always
+       sufficient identity evidence by itself. Every exact match is
+       returned, even several (e.g. a real schedule-of-areas brochure with
+       many units for the SAME building) - disambiguating between several
+       exact matches is left to the caller's own further narrowing (floor/
+       size), exactly as before this function existed.
+    2. ADDRESS-SUFFIX-STRIPPED (see _strip_building_address_suffix) - e.g.
+       "Nash House - 13a St George St" (a row) vs "Nash House" (a brochure).
+       This is explicitly weaker evidence: a shortened/stripped name alone
+       does not prove identity, since two GENUINELY DIFFERENT buildings that
+       happen to share a brand/prefix (e.g. "WeWork - 10 Fenchurch St" and
+       "WeWork - 20 Old Broad St" in the same portfolio brochure) strip to
+       the identical key. Only ever accepted when it is the SOLE candidate
+       sharing that stripped key - two or more candidates sharing it is
+       exactly as ambiguous as two or more exact matches would be if this
+       fell back to guessing between them, so it stays unresolved (empty),
+       same "incorrect enrichment is worse than a blank field" philosophy
+       as every other tier in this module. This is what makes the stripped
+       tier only ever a WEAK, corroborated signal - unique-within-this-
+       comparison is the corroboration, never the bare shortened name alone.
+
+    Returns [] when row_building has no genuine key at all (blank/
+    whitespace-only).
+    """
+    row_key = normalize_key(row_building)
+    if not row_key:
+        return []
+
+    exact = [i for i, c in enumerate(candidate_buildings) if normalize_key(c) == row_key]
+    if exact:
+        return exact
+
+    row_stripped_key = normalize_key(_strip_building_address_suffix(row_building))
+    if not row_stripped_key:
+        return []
+    stripped = [
+        i for i, c in enumerate(candidate_buildings)
+        if normalize_key(_strip_building_address_suffix(c)) == row_stripped_key
+    ]
+    return stripped if len(stripped) == 1 else []
 
 
 def needs_enrichment(row: ListingRow) -> bool:
@@ -238,6 +334,8 @@ def _is_eligible_brochure_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
+    if is_floorplan_not_brochure_url(url):
+        return False
     lowered = url.lower()
     return not any(bad in lowered for bad in _REJECTED_URL_KEYWORDS)
 
@@ -288,7 +386,7 @@ def _box_share_token(url: str):
     return match.group(1) if match else None
 
 
-def _fetch_box_shared_pdf(share_url: str):
+def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True):
     """
     PDF bytes for a Box "shared link" URL, via Box's own "direct link"
     static-download URL scheme (app.box.com/shared/static/{sharedName}.
@@ -318,7 +416,11 @@ def _fetch_box_shared_pdf(share_url: str):
       extract.py's PDF-vision pipeline;
     - the file's own name looks like a floor plan (see
       _FLOORPLAN_FILENAME_RE) - see that pattern's own docstring for the
-      real confirmed case this guards against.
+      real confirmed case this guards against. reject_floorplan_filename=
+      False (see brochure_enrichment._extract_floorplan_units, the one
+      caller that fetches a row's OWN floorplan_link rather than its
+      brochure_link) skips this specific check - a floor plan IS the
+      expected, correct content there, not a mislabeling to guard against.
     """
     try:
         page = httpx.get(
@@ -361,7 +463,7 @@ def _fetch_box_shared_pdf(share_url: str):
 
     name_match = _BOX_FILE_NAME_RE.search(html)
     file_name = name_match.group(1) if name_match else ""
-    if _FLOORPLAN_FILENAME_RE.search(file_name):
+    if reject_floorplan_filename and _FLOORPLAN_FILENAME_RE.search(file_name):
         print(
             f"[brochure_enrichment] Box share {share_url!r} looks like a floor plan ({file_name!r}) — "
             "skipping enrichment.",
@@ -392,7 +494,7 @@ def _fetch_box_shared_pdf(share_url: str):
     return response.content
 
 
-def _fetch_pdf_bytes(url: str):
+def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True):
     """
     PDF bytes fetched from `url`, or None on ANY failure - a network error,
     a timeout, or content that isn't actually a PDF once fetched (a
@@ -410,9 +512,15 @@ def _fetch_pdf_bytes(url: str):
     simply fails the _looks_like_pdf check below and enrichment is skipped
     for it - not a source this version can read, not something worth
     raising over.
+
+    reject_floorplan_filename is passed straight through to
+    _fetch_box_shared_pdf (see its own docstring) - False only when the
+    caller is deliberately fetching a floor plan (see _extract_floorplan_
+    units), where a floorplan-shaped Box file name is the expected content,
+    not a mislabeling to guard against.
     """
     if _box_share_token(url):
-        return _fetch_box_shared_pdf(url)
+        return _fetch_box_shared_pdf(url, reject_floorplan_filename=reject_floorplan_filename)
 
     try:
         target = url if url.lower().split("?")[0].endswith(".pdf") else resolve_brochure_link(url)
@@ -544,8 +652,11 @@ def _match_unit(row: ListingRow, units: list):
     """
     The single brochure unit confidently identified as describing `row`'s
     own property, or None when there isn't one - never a fuzzy/similarity
-    match, only exact (normalize_key-equal) building names and then, in
-    order, an exact floor_unit match, a floor NUMBER match (see
+    match, only exact building-name matching (see _building_identity_
+    matches - still exact-string, and only weakly, corroborated-by-
+    uniqueness tolerant of a redundant address suffix baked into one side's
+    own building field) and then, in order, an exact floor_unit
+    match, a floor NUMBER match (see
     _floor_number), or a size_sqft match within a small numeric tolerance
     (see _SIZE_MATCH_TOLERANCE_FRACTION).
 
@@ -589,7 +700,8 @@ def _match_unit(row: ListingRow, units: list):
     # function's own caller in enrich_rows_grouped for the belt-and-
     # braces try/except around this too).
     units = [u for u in units if isinstance(u, dict)]
-    building_matches = [u for u in units if normalize_key(u.get("building")) == row_building_key]
+    match_indices = _building_identity_matches(row.building, [u.get("building") for u in units])
+    building_matches = [units[i] for i in match_indices]
     if not building_matches:
         return None
     if len(building_matches) == 1:
@@ -630,21 +742,23 @@ def _match_building_feature(row: ListingRow, units):
     _extract_brochure_units), one {"building", "features"} entry per
     building the brochure itself gave distinct building-level text for.
 
-    Same exact-match-only philosophy as _match_unit: normalize_key-equal
-    building names, never fuzzy/similarity matching. Two entries that
-    happen to normalize_key-equal the row's own building (shouldn't occur -
-    the prompt asks for one entry per distinct building - but never assumed)
-    is treated as ambiguous and returns None, same as zero matches.
+    Same exact-match-only philosophy as _match_unit: exact building-name
+    matching via _building_identity_matches (still exact-string, and only
+    weakly, corroborated-by-uniqueness tolerant of a redundant address
+    suffix - see that function's own docstring), never fuzzy/similarity
+    matching. Two entries that happen to match the row's own building
+    (shouldn't occur - the prompt asks for one entry per distinct building -
+    but never assumed) is treated as ambiguous and returns None, same as
+    zero matches.
     """
     building_features = getattr(units, "building_features", None)
     if not building_features:
         return None
-    row_building_key = normalize_key(row.building)
-    if not row_building_key:
+    if not normalize_key(row.building):
         return None
-    matches = [bf for bf in building_features if normalize_key(bf.get("building")) == row_building_key]
-    if len(matches) == 1:
-        return matches[0]["features"]
+    match_indices = _building_identity_matches(row.building, [bf.get("building") for bf in building_features])
+    if len(match_indices) == 1:
+        return building_features[match_indices[0]]["features"]
     return None
 
 
@@ -751,6 +865,326 @@ def _apply_units_to_row(row: ListingRow, units):
     return row.model_copy(update=updates), list(updates.keys())
 
 
+# --- Secondary enrichment source: a row's own floorplan_link ---
+#
+# A floor plan is a genuinely different document from a brochure (see
+# schema.py's own floorplan_link docstring and brochure_link_resolver.
+# finalize_brochure_link's floor-plan backstop) - never a marketing
+# document, so it is never trusted for a property-wide or building-wide
+# fact the way units.property_features/building_features are (see
+# _apply_units_to_row above). It's a SECONDARY source only, ever
+# considered after brochure-link enrichment has already been applied (see
+# enrich_row/enrich_rows_grouped) and only for whatever that left blank -
+# and only ever fills special_features, only at the one floor a floor plan
+# document can be confidently matched to.
+
+# The only field a floor plan is ever trusted to fill - never state_of_
+# space or contacts, neither of which a floor plan drawing states at all.
+FLOORPLAN_ENRICHABLE_FIELDS = ("special_features",)
+
+FLOORPLAN_PROMPT = """You are extracting ONLY the explicit layout/feature annotations from a floor
+plan drawing - this is NOT a marketing brochure. Do not infer amenities, certifications, or any fact
+that applies to the whole property or building; only extract what is literally labeled or drawn on
+this floor plan itself for the floor(s) it shows (e.g. desk counts, meeting rooms, a boardroom, phone
+booths, a private office, a kitchen/breakout area, reception, WCs). Never invent or assume a feature
+that isn't actually labeled on the drawing.
+
+Identify each distinct floor shown (usually just one). For each one:
+- floor_unit: the floor's own label if stated on the drawing (e.g. "3rd Floor"), otherwise null.
+- special_features: every explicit layout annotation for that floor, semicolon-separated (e.g. "12
+  desks; 10-person boardroom; 4-person meeting room; private office; soft seating; kitchen/breakout;
+  dedicated WCs"). Leave null if nothing is explicitly labeled at all - never guess.
+
+Return your answer as a single JSON object with this exact structure:
+
+{
+  "units": [
+    {"floor_unit": "..." or null, "special_features": "..." or null}
+  ]
+}
+
+Return ONLY this JSON object. No preamble, no explanation, no markdown code fences - just the raw JSON.
+"""
+
+
+def needs_floorplan_enrichment(row: ListingRow) -> bool:
+    """True when at least one of FLOORPLAN_ENRICHABLE_FIELDS is genuinely
+    blank on `row` - the floorplan-specific counterpart to needs_
+    enrichment, checked before any network/Gemini activity."""
+    return any(_is_blank(getattr(row, field)) for field in FLOORPLAN_ENRICHABLE_FIELDS)
+
+
+def _is_eligible_floorplan_url(url) -> bool:
+    """
+    Like _is_eligible_brochure_url, but for floorplan_link - deliberately
+    does NOT reject a floorplan-shaped URL (FLOORPLAN_URL_KEYWORDS), since
+    that shape is exactly what's EXPECTED here, unlike for brochure_link
+    where it's a rejection reason. Still requires an explicit http(s)
+    scheme and rejects a bare company homepage/known social-profile domain
+    (see is_generic_link) and a video link - a floor plan is never hosted
+    at either of those either.
+    """
+    if _is_blank(url):
+        return False
+    if urlparse(url).scheme not in ("http", "https"):
+        return False
+    if is_generic_link(url):
+        return False
+    lowered = url.lower()
+    return not any(bad in lowered for bad in ("youtube.com", "youtu.be"))
+
+
+def eligible_rows_and_floorplans(rows: list):
+    """
+    Mirrors eligible_rows_and_brochures, for floorplan_link - (eligible_
+    rows, unique_urls), pure, no network/Gemini call. A row only ever
+    counts as floorplan-eligible by needs_floorplan_enrichment (special_
+    features specifically - see that function's own docstring), not the
+    wider needs_enrichment used for brochure_link, since floorplan
+    enrichment is deliberately narrower in scope than brochure enrichment.
+    """
+    eligible = [r for r in rows if needs_floorplan_enrichment(r) and _is_eligible_floorplan_url(r.floorplan_link)]
+    seen = set()
+    unique_urls = []
+    for r in eligible:
+        if r.floorplan_link not in seen:
+            seen.add(r.floorplan_link)
+            unique_urls.append(r.floorplan_link)
+    return eligible, unique_urls
+
+
+@functools.lru_cache(maxsize=64)
+def _extract_floorplan_units(url: str):
+    """
+    The raw floor-plan units (see FLOORPLAN_PROMPT) for `url` - a plain
+    list of {"floor_unit", "special_features"} dicts, or None on any fetch/
+    render/Gemini failure (identical failure semantics to _extract_
+    brochure_units - see its own docstring). Deliberately returns a plain
+    list, never a _BrochureUnits - a floor plan drawing has no concept of a
+    document-wide or building-wide fact, so there is nothing for those
+    extra attributes to ever hold; only unit-level (floor-matched)
+    annotations are ever extracted from one (see _apply_floorplan_units_
+    to_row).
+
+    reject_floorplan_filename=False is passed to the fetch step (see
+    _fetch_pdf_bytes) - the Box-share floorplan-filename rejection exists
+    specifically to catch a BROCHURE link that's actually a mislabeled
+    floor plan; here the floor plan IS the expected, correct content, so
+    that same filename shape must never be rejected.
+
+    Cross-run lru_cache, same "not the per-run dedup mechanism" caveat as
+    _extract_brochure_units - see that function's own docstring.
+    """
+    data = _fetch_pdf_bytes(url, reject_floorplan_filename=False)
+    if data is None:
+        return None
+
+    try:
+        with extract._RENDER_LOCK:
+            images = extract.render_pages(data)
+        data = None
+        raw = extract.render_and_extract(images, prompt=FLOORPLAN_PROMPT)
+    except Exception as e:
+        print(
+            f"[brochure_enrichment] Could not read {url!r} as a floor plan ({e!r}) — skipping enrichment.",
+            file=sys.stderr,
+        )
+        return None
+
+    units = raw.get("units")
+    return [u for u in units if isinstance(u, dict)] if isinstance(units, list) else []
+
+
+def _match_floorplan_unit(row: ListingRow, units: list):
+    """
+    The single floor plan unit describing `row`'s own floor, or None.
+    Unlike _match_unit, a floor plan unit carries no "building" field at
+    all - every unit here already necessarily describes the SAME property
+    this floorplan_link belongs to (rows are grouped by their own
+    floorplan_link before this is ever called - see _enrich_rows_from_
+    floorplans - exactly like brochure_link's own per-URL grouping), so no
+    building comparison is needed or possible.
+
+    If the floor plan names only one floor at all (len(units) == 1 - the
+    overwhelming common real case: one document, one floor) AND that one
+    unit either states no floor identity of its own, or the row itself
+    states none, or the two agree (exact text or leading floor number),
+    that unit applies - there's nothing else in the document to prefer over
+    it, same "single match is a confident match" precedent as _match_unit's
+    own building-level case. But a single unit whose OWN stated floor
+    genuinely conflicts with the row's own (e.g. row floor_unit="2nd Floor"
+    against a floor plan unit stating "3rd Floor") is never applied merely
+    because it's the only unit in the document - a floor plan naming a
+    different floor than the row is exactly as unsafe a match as no match
+    at all, same "incorrect enrichment is worse than a blank field"
+    philosophy as every other tier in this module. If it names SEVERAL
+    distinct floors, only resolves via an exact floor_unit or floor-number
+    match (see _floor_number) - an unresolved tie stays None, same
+    conservative philosophy as _match_unit throughout.
+    """
+    units = [u for u in units if isinstance(u, dict)]
+    if not units:
+        return None
+
+    if len(units) == 1:
+        unit = units[0]
+        unit_floor = unit.get("floor_unit")
+        if _is_blank(unit_floor) or _is_blank(row.floor_unit):
+            return unit
+        if normalize_key(unit_floor) == normalize_key(row.floor_unit):
+            return unit
+        unit_floor_number = _floor_number(unit_floor)
+        if unit_floor_number is not None and unit_floor_number == _floor_number(row.floor_unit):
+            return unit
+        return None  # the floor plan's own stated floor conflicts with the row's - never guess
+
+    if row.floor_unit:
+        row_floor_key = normalize_key(row.floor_unit)
+        floor_matches = [u for u in units if normalize_key(u.get("floor_unit")) == row_floor_key]
+        if len(floor_matches) == 1:
+            return floor_matches[0]
+
+        row_floor_number = _floor_number(row.floor_unit)
+        if row_floor_number is not None:
+            number_matches = [u for u in units if _floor_number(u.get("floor_unit")) == row_floor_number]
+            if len(number_matches) == 1:
+                return number_matches[0]
+
+    return None
+
+
+def _apply_floorplan_units_to_row(row: ListingRow, units):
+    """
+    (row_or_new_row, enriched_fields) - the floorplan-specific counterpart
+    to _apply_units_to_row, deliberately much narrower: ONLY ever fills
+    special_features (see FLOORPLAN_ENRICHABLE_FIELDS), and ONLY at the
+    floor-matched level (see _match_floorplan_unit) - never a property- or
+    building-wide fallback, since a floor plan drawing states neither.
+    Returns `row` unchanged (same object) whenever there's nothing to
+    apply: units is None/empty, special_features is already populated
+    (never overwritten), no confident floor match, or the matched value
+    isn't a genuine non-blank string (see _apply_units_to_row's own
+    docstring on why raw Gemini JSON is never trusted to already be the
+    right type).
+    """
+    if not units or not _is_blank(row.special_features):
+        return row, []
+    unit = _match_floorplan_unit(row, units)
+    if unit is None:
+        return row, []
+    value = unit.get("special_features")
+    if not isinstance(value, str) or _is_blank(value):
+        return row, []
+    return row.model_copy(update={"special_features": value}), ["special_features"]
+
+
+def _enrich_rows_from_floorplans(
+    rows: list, checkpoint_callback=None, already_processed: dict = None, url_checkpoint_callback=None,
+) -> tuple:
+    """
+    (rows, log, stats) - secondary enrichment pass, run AFTER brochure-link
+    enrichment (see enrich_row/enrich_rows_grouped, both of which call this
+    only once the brochure-link pass has already applied) - fills ONLY
+    FLOORPLAN_ENRICHABLE_FIELDS, ONLY at the floor-matched level (see
+    _apply_floorplan_units_to_row), from each row's OWN floorplan_link, for
+    whichever rows still need it.
+
+    Sequential, not concurrent - unlike enrich_rows_grouped's own bounded
+    worker pool (tuned against a real 126-brochure UNION file), a floor
+    plan is only ever reached as a secondary source for whatever brochure
+    enrichment already left blank, expected to be a much smaller/rarer
+    worklist; the added complexity of a second worker pool isn't justified
+    for this first version. Never raises - a fetch/Gemini failure for one
+    floor plan simply leaves every row sharing it unchanged, same "no
+    confident result is indistinguishable from a blank field" philosophy
+    as the brochure path, with the identical per-row try/except belt-and-
+    braces guard against a malformed unit entry.
+
+    already_processed/checkpoint_callback/url_checkpoint_callback mirror
+    enrich_rows_grouped's own identically-named parameters (see its own
+    docstring): a URL already marked "ok" is never re-fetched, and both
+    callbacks fire after EVERY floor plan (never batched - this worklist is
+    already expected to be small/rare, see above, so there's no CHECKPOINT_
+    EVERY-style interval to tune) so an interruption partway through this
+    pass - which used to lose every row update made so far, since nothing
+    here was ever persisted until the whole pass returned - now has exactly
+    the same recoverable, per-URL checkpoint/resume behavior the brochure
+    pass has always had, instead of silently discarding already-matched
+    floor plan work or leaving no record that this pass was even reached.
+    """
+    already_processed = already_processed or {}
+    eligible, unique_urls = eligible_rows_and_floorplans(rows)
+    urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
+    current = list(rows)
+    log = []
+    floorplans_read_ok = 0
+    floorplans_unavailable = 0
+    processed_urls = {}
+    stats = {
+        "unique_floorplans_considered": len(unique_urls), "floorplans_read_ok": 0,
+        "floorplans_unavailable": 0, "processed_urls": processed_urls,
+    }
+    if not urls_to_fetch:
+        return current, log, stats
+
+    indices_by_url = {}
+    for i, row in enumerate(rows):
+        if needs_floorplan_enrichment(row) and _is_eligible_floorplan_url(row.floorplan_link):
+            indices_by_url.setdefault(row.floorplan_link, []).append(i)
+
+    for url in urls_to_fetch:
+        try:
+            units = _extract_floorplan_units(url)
+        except Exception as e:
+            print(
+                f"[brochure_enrichment] Unexpected error reading {url!r} as a floor plan ({e!r}) — skipping.",
+                file=sys.stderr,
+            )
+            units = None
+
+        if units is not None:
+            floorplans_read_ok += 1
+            processed_urls[url] = "ok"
+        else:
+            floorplans_unavailable += 1
+            processed_urls[url] = "unavailable"
+
+        for i in indices_by_url[url]:
+            try:
+                new_row, fields = _apply_floorplan_units_to_row(current[i], units)
+            except Exception as e:
+                print(
+                    f"[brochure_enrichment] Could not apply floor plan units from {url!r} to "
+                    f"{current[i].building!r} ({e!r}) — leaving this row unchanged.",
+                    file=sys.stderr,
+                )
+                new_row, fields = current[i], []
+            current[i] = new_row
+            if fields:
+                log.append({
+                    "building": new_row.building,
+                    "floor_unit": new_row.floor_unit,
+                    "fields": fields,
+                    "brochure_link": new_row.brochure_link,
+                    "floorplan_link": url,
+                })
+
+        if checkpoint_callback:
+            checkpoint_callback(list(current))
+        if url_checkpoint_callback:
+            # Unlike the brochure pass' own url_checkpoint_callback (see
+            # enrich_rows_grouped's own docstring), the TOTAL is passed
+            # here too, not just the cumulative dict - the caller can't
+            # know len(unique_urls) upfront the way it does for brochures,
+            # since floorplan eligibility depends on what the brochure pass
+            # already filled in (see this function's own docstring).
+            url_checkpoint_callback({**already_processed, **processed_urls}, len(unique_urls))
+
+    stats["floorplans_read_ok"] = floorplans_read_ok
+    stats["floorplans_unavailable"] = floorplans_unavailable
+    return current, log, stats
+
+
 def enrich_row(row: ListingRow):
     """
     (row, enriched_fields) - row is `row` unchanged (the exact same object)
@@ -774,12 +1208,25 @@ def enrich_row(row: ListingRow):
 
     Never mutates the input row, never raises - see _extract_brochure_units/
     _fetch_pdf_bytes for where every real failure mode is caught.
-    """
-    if not needs_enrichment(row) or not _is_eligible_brochure_url(row.brochure_link):
-        return row, []
 
-    units = _extract_brochure_units(row.brochure_link)
-    return _apply_units_to_row(row, units)
+    After the brochure-link pass above, also tries the row's own
+    floorplan_link (see _apply_floorplan_units_to_row) for whatever's still
+    blank - a secondary, narrower source, never competing with a genuine
+    brochure-sourced value (see FLOORPLAN_ENRICHABLE_FIELDS's own
+    docstring). enriched_fields reflects fields changed by EITHER pass,
+    still with no duplicate entries.
+    """
+    working_row, fields = row, []
+    if needs_enrichment(row) and _is_eligible_brochure_url(row.brochure_link):
+        units = _extract_brochure_units(row.brochure_link)
+        working_row, fields = _apply_units_to_row(row, units)
+
+    if needs_floorplan_enrichment(working_row) and _is_eligible_floorplan_url(row.floorplan_link):
+        floorplan_units = _extract_floorplan_units(row.floorplan_link)
+        working_row, floorplan_fields = _apply_floorplan_units_to_row(working_row, floorplan_units)
+        fields = fields + [f for f in floorplan_fields if f not in fields]
+
+    return working_row, fields
 
 
 def enrich_rows(rows: list):
@@ -860,6 +1307,8 @@ DEFAULT_MAX_WORKERS = 5
 def enrich_rows_grouped(
     rows: list, progress_callback=None, checkpoint_callback=None, max_workers: int = DEFAULT_MAX_WORKERS,
     already_processed: dict = None, url_checkpoint_callback=None,
+    floorplan_already_processed: dict = None, floorplan_checkpoint_callback=None,
+    floorplan_url_checkpoint_callback=None,
 ):
     """
     (rows, log, stats) - like enrich_rows, but processes each DISTINCT
@@ -959,6 +1408,21 @@ def enrich_rows_grouped(
     every outcome learned so far this call) - a separate callback, not a
     second argument added to checkpoint_callback, so every existing caller
     that only ever passes checkpoint_callback is completely unaffected.
+
+    floorplan_already_processed/floorplan_checkpoint_callback/floorplan_
+    url_checkpoint_callback are the SAME resume/checkpoint contract as
+    already_processed/checkpoint_callback/url_checkpoint_callback above,
+    applied to the secondary floorplan-link pass (see _enrich_rows_from_
+    floorplans) instead of the brochure-link pass - deliberately separate
+    parameters, never a shared/reused callback, since a floorplan URL's own
+    processed-state must never be conflated with a brochure URL's (see
+    run_brochure_enrichment, the one real caller that wires both passes to
+    two distinct persisted keys). Without these, an interruption during the
+    floorplan pass - which only ever starts once every brochure is already
+    marked "done" - silently lost whatever it had already matched and left
+    the caller's own "how much remains" count blind to it entirely (see
+    this function's own returned stats: unique_floorplans_considered/
+    floorplans_read_ok/floorplans_unavailable/floorplan_processed_urls).
     """
     progress_callback = progress_callback or (lambda done, total, label: None)
     already_processed = already_processed or {}
@@ -980,10 +1444,20 @@ def enrich_rows_grouped(
 
     if not unique_urls or not urls_to_fetch:
         progress_callback(0, 0, None)
+        current, floorplan_log, floorplan_stats = _enrich_rows_from_floorplans(
+            current, checkpoint_callback=floorplan_checkpoint_callback,
+            already_processed=floorplan_already_processed,
+            url_checkpoint_callback=floorplan_url_checkpoint_callback,
+        )
+        log = log + floorplan_log
         return current, log, {
             "unique_brochures_considered": len(unique_urls), "brochures_read_ok": 0,
-            "brochures_unavailable": 0, "rows_eligible": len(eligible), "rows_enriched": 0,
+            "brochures_unavailable": 0, "rows_eligible": len(eligible), "rows_enriched": len(log),
             "processed_urls": processed_urls,
+            "unique_floorplans_considered": floorplan_stats["unique_floorplans_considered"],
+            "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
+            "floorplans_unavailable": floorplan_stats["floorplans_unavailable"],
+            "floorplan_processed_urls": floorplan_stats["processed_urls"],
         }
 
     def _fetch_one(url):
@@ -1065,6 +1539,18 @@ def enrich_rows_grouped(
                     url_checkpoint_callback({**already_processed, **processed_urls})
                 since_checkpoint = 0
 
+    # Secondary pass: whatever brochure-link enrichment above still left
+    # blank, a row's OWN floorplan_link (see FLOORPLAN_ENRICHABLE_FIELDS)
+    # may still be able to fill - run only after the brochure pass has
+    # fully applied, since floorplan enrichment is deliberately narrower
+    # and never meant to compete with a genuine brochure-sourced value.
+    current, floorplan_log, floorplan_stats = _enrich_rows_from_floorplans(
+        current, checkpoint_callback=floorplan_checkpoint_callback,
+        already_processed=floorplan_already_processed,
+        url_checkpoint_callback=floorplan_url_checkpoint_callback,
+    )
+    log = log + floorplan_log
+
     stats = {
         "unique_brochures_considered": len(unique_urls),
         "brochures_read_ok": brochures_read_ok,
@@ -1072,22 +1558,29 @@ def enrich_rows_grouped(
         "rows_eligible": len(eligible),
         "rows_enriched": len(log),
         "processed_urls": processed_urls,
+        "unique_floorplans_considered": floorplan_stats["unique_floorplans_considered"],
+        "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
+        "floorplans_unavailable": floorplan_stats["floorplans_unavailable"],
+        "floorplan_processed_urls": floorplan_stats["processed_urls"],
     }
     return current, log, stats
 
 
-def run_brochure_enrichment(rows: list, staging_path: str, already_processed: dict) -> list:
+def run_brochure_enrichment(
+    rows: list, staging_path: str, already_processed: dict, floorplan_already_processed: dict = None,
+) -> list:
     """
     The Streamlit-aware orchestration shared by BOTH callers that ever run
     enrich_rows_grouped against a real staging file: app.py's automatic
     run right after a fresh upload (already_processed={} - nothing to
     resume yet) and pages/2_Review_and_Master.py's "Continue enrichment"
-    action on an interrupted one (already_processed=whatever
-    get_staging_enrichment_summary's own "processed_urls" already
-    recorded). enrich_rows_grouped itself stays the pure, callback-driven
-    core with no Streamlit/storage dependency of its own (see its own
-    docstring) - this wrapper is the one place that actually renders a
-    progress bar and persists both row-level progress and per-URL state,
+    action on an interrupted one (already_processed/floorplan_already_
+    processed=whatever get_staging_enrichment_summary's own "processed_
+    urls"/"floorplan_processed_urls" already recorded). enrich_rows_grouped
+    itself stays the pure, callback-driven core with no Streamlit/storage
+    dependency of its own (see its own docstring) - this wrapper is the one
+    place that actually renders a progress bar and persists both row-level
+    progress and per-URL state, for BOTH the brochure and floorplan passes,
     so the two callers share identical checkpointing/persistence behavior
     rather than two independently-maintained copies of it.
 
@@ -1095,19 +1588,26 @@ def run_brochure_enrichment(rows: list, staging_path: str, already_processed: di
     first, e.g. "N row(s) have missing information..." vs. "Resuming...",
     since that wording legitimately differs per caller) and a final
     "Brochure enrichment complete: ..." caption once every remaining
-    brochure has been processed. Returns the enriched rows so the caller
-    can reassign its own `rows` variable to the final state.
+    brochure AND floorplan has been processed. Returns the enriched rows so
+    the caller can reassign its own `rows` variable to the final state.
 
     Persists incrementally exactly like the automatic run always has:
     update_staging_rows + set_staging_enrichment_progress (status=
-    "in_progress", the FULL cumulative processed_urls so far) at every
-    enrich_rows_grouped checkpoint, and set_staging_enrichment_summary
-    (status="complete") only once this call's own remaining brochures are
-    entirely done - so an interruption partway through a RESUME leaves
+    "in_progress", the FULL cumulative processed_urls so far, for both
+    passes) at every enrich_rows_grouped checkpoint, and set_staging_
+    enrichment_summary (status="complete") only once this call's own
+    remaining brochures AND floorplans are entirely done - so an
+    interruption partway through a RESUME, during EITHER pass, leaves
     exactly the same kind of recoverable, explicit "in_progress" record a
     first run's own interruption would, never silently reverting to
-    looking complete or looking like nothing ever ran.
+    looking complete or looking like nothing ever ran, and never losing
+    whatever the OTHER pass had already recorded (see known_floorplan_*
+    below - every progress write here always supplies its own full current
+    knowledge of BOTH passes, never just whichever one just changed, since
+    set_staging_enrichment_progress fully replaces the persisted record on
+    every call).
     """
+    floorplan_already_processed = floorplan_already_processed or {}
     eligible, unique_urls = eligible_rows_and_brochures(rows)
     urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
 
@@ -1124,13 +1624,27 @@ def run_brochure_enrichment(rows: list, staging_path: str, already_processed: di
             "enriched. Your progress is saved if the process is interrupted."
         )
 
+    # The floorplan pass' own true total is only known once it actually
+    # runs (floorplan eligibility depends on what the brochure pass already
+    # filled in - see _enrich_rows_from_floorplans' own docstring), so this
+    # starts as a lower bound (at least this many are already known from a
+    # prior resume) and is corrected the moment the floorplan pass' own
+    # checkpoint first fires - never left at a stale/guessed value that
+    # could otherwise make "remaining" go negative.
+    known_floorplan_processed_urls = dict(floorplan_already_processed)
+    known_unique_floorplans_considered = len(known_floorplan_processed_urls)
+
     # Written BEFORE the run starts (not just at checkpoints) so even an
     # interruption in the first few seconds - before a single brochure has
     # completed, let alone reached CHECKPOINT_EVERY - still leaves an
     # "in_progress" record in meta.json rather than none at all (see
     # set_staging_enrichment_progress's own docstring on why a missing
     # record is otherwise indistinguishable from "nothing was eligible").
-    set_staging_enrichment_progress(staging_path, already_processed, len(unique_urls))
+    set_staging_enrichment_progress(
+        staging_path, already_processed, len(unique_urls),
+        floorplan_processed_urls=known_floorplan_processed_urls,
+        unique_floorplans_considered=known_unique_floorplans_considered,
+    )
 
     def on_progress(done, total, label):
         if not total:
@@ -1144,17 +1658,43 @@ def run_brochure_enrichment(rows: list, staging_path: str, already_processed: di
         update_staging_rows(staging_path, rows_so_far)
 
     def on_url_checkpoint(processed_urls_so_far):
-        set_staging_enrichment_progress(staging_path, processed_urls_so_far, len(unique_urls))
+        set_staging_enrichment_progress(
+            staging_path, processed_urls_so_far, len(unique_urls),
+            floorplan_processed_urls=known_floorplan_processed_urls,
+            unique_floorplans_considered=known_unique_floorplans_considered,
+        )
+
+    def on_floorplan_url_checkpoint(floorplan_processed_urls_so_far, unique_floorplans_considered):
+        nonlocal known_floorplan_processed_urls, known_unique_floorplans_considered
+        known_floorplan_processed_urls = floorplan_processed_urls_so_far
+        known_unique_floorplans_considered = unique_floorplans_considered
+        # Brochures are always fully done by the time the floorplan pass
+        # even starts (see enrich_rows_grouped's own docstring) - already_
+        # processed/len(unique_urls) here is therefore still this call's
+        # own correct, complete brochure-side record, not stale.
+        set_staging_enrichment_progress(
+            staging_path, already_processed, len(unique_urls),
+            floorplan_processed_urls=known_floorplan_processed_urls,
+            unique_floorplans_considered=known_unique_floorplans_considered,
+        )
 
     enriched_rows, _log, stats = enrich_rows_grouped(
         rows, progress_callback=on_progress, checkpoint_callback=on_checkpoint,
         url_checkpoint_callback=on_url_checkpoint, already_processed=already_processed,
+        floorplan_already_processed=floorplan_already_processed,
+        floorplan_checkpoint_callback=on_checkpoint,
+        floorplan_url_checkpoint_callback=on_floorplan_url_checkpoint,
     )
     progress_slot.empty()
 
     cumulative_processed_urls = {**already_processed, **stats["processed_urls"]}
+    cumulative_floorplan_processed_urls = {**floorplan_already_processed, **stats["floorplan_processed_urls"]}
     update_staging_rows(staging_path, enriched_rows)
-    set_staging_enrichment_summary(staging_path, stats, cumulative_processed_urls)
+    set_staging_enrichment_summary(
+        staging_path, stats, cumulative_processed_urls,
+        floorplan_processed_urls=cumulative_floorplan_processed_urls,
+        unique_floorplans_considered=stats["unique_floorplans_considered"],
+    )
 
     counts = _derive_cumulative_counts(cumulative_processed_urls)
     summary = (
@@ -1163,6 +1703,12 @@ def run_brochure_enrichment(rows: list, staging_path: str, already_processed: di
     )
     if counts["unavailable"]:
         summary += f" {counts['unavailable']} brochure(s) could not be processed."
+    if stats["unique_floorplans_considered"]:
+        floorplan_counts = _derive_cumulative_counts(cumulative_floorplan_processed_urls)
+        summary += (
+            f" {stats['unique_floorplans_considered']} unique floor plan(s) also considered, "
+            f"{floorplan_counts['ok']} read successfully."
+        )
     st.caption(f"Brochure enrichment complete: {summary}")
 
     return enriched_rows
