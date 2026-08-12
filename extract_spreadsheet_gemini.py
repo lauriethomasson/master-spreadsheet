@@ -411,8 +411,19 @@ def _floorplan_url_from_cell_text(cell_text: str):
     """Mirrors _brochure_url_from_cell_text, but for a cell whose own
     display text mentions "floorplan"/"floor plan" (either spelling seen in
     real files - "Download Floorplans" as one word) instead of "brochure" -
-    see that function's own docstring for the identical rationale."""
+    see that function's own docstring for the identical rationale.
+
+    Returns None when the SAME cell's text also mentions "brochure" (e.g.
+    "Download Brochure and Floorplans") - that single link is one combined
+    document, which stays classified as a brochure only (see brochure_link_
+    resolver.is_floorplan_not_brochure_url for the identical reasoning
+    applied to a URL's own text elsewhere in this repo); without this, the
+    exact same URL would otherwise be written into BOTH brochure_link and
+    floorplan_link from one cell, an unnecessary duplication a combined
+    document's own single link never actually needs."""
     lowered = cell_text.lower()
+    if "brochure" in lowered:
+        return None
     if "floorplan" not in lowered and "floor plan" not in lowered:
         return None
     match = re.search(r"\((https?://[^)]+)\)\s*$", cell_text)

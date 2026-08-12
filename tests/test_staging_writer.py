@@ -16,6 +16,7 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 
+import pandas as pd
 from openpyxl import load_workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -109,6 +110,62 @@ class RoundTripTests(unittest.TestCase):
 
         self.assertEqual(df.iloc[0]["property_id"], "prop-123")
         self.assertEqual(df.iloc[0]["source_file"], "a.pdf")
+
+    def test_brochure_and_floorplan_links_round_trip_distinctly_never_swapped(self):
+        row = ListingRow(
+            building="A", provider="P1",
+            brochure_link="https://app.box.com/s/brochure123",
+            floorplan_link="https://app.box.com/s/floorplan456",
+        )
+        df = self._round_trip([row])
+
+        self.assertEqual(df.iloc[0]["brochure_link"], "https://app.box.com/s/brochure123")
+        self.assertEqual(df.iloc[0]["floorplan_link"], "https://app.box.com/s/floorplan456")
+
+    def test_a_genuinely_missing_floorplan_link_stays_blank_through_the_round_trip(self):
+        row = ListingRow(building="A", provider="P1", brochure_link="https://example.com/brochure.pdf")
+        df = self._round_trip([row])
+
+        self.assertEqual(df.iloc[0]["brochure_link"], "https://example.com/brochure.pdf")
+        self.assertTrue(pd.isna(df.iloc[0]["floorplan_link"]))
+
+
+class HyperlinkDisplayTextTests(unittest.TestCase):
+    """The written .xlsx cell must show a short, correctly-worded label per
+    link TYPE, never the raw URL and never the wrong field's label."""
+
+    def _cell_values(self, rows, field):
+        buffer = BytesIO()
+        write_rows_to_xlsx(rows, buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label(field)) + 1
+        return [ws.cell(row=r, column=col_idx).value for r in range(2, ws.max_row + 1)]
+
+    def test_brochure_link_shows_open_brochure(self):
+        row = ListingRow(building="A", brochure_link="https://example.com/brochure.pdf")
+        self.assertEqual(self._cell_values([row], "brochure_link"), ["Open brochure"])
+
+    def test_floorplan_link_shows_open_floor_plan(self):
+        row = ListingRow(building="A", floorplan_link="https://example.com/floorplan.pdf")
+        self.assertEqual(self._cell_values([row], "floorplan_link"), ["Open floor plan"])
+
+    def test_blank_brochure_link_shows_nothing_no_button(self):
+        row = ListingRow(building="A", brochure_link=None)
+        self.assertEqual(self._cell_values([row], "brochure_link"), [None])
+
+    def test_blank_floorplan_link_shows_nothing_no_button(self):
+        row = ListingRow(building="A", floorplan_link=None)
+        self.assertEqual(self._cell_values([row], "floorplan_link"), [None])
+
+    def test_a_row_with_both_shows_the_correct_distinct_label_for_each(self):
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/b.pdf", floorplan_link="https://example.com/f.pdf",
+        )
+        self.assertEqual(self._cell_values([row], "brochure_link"), ["Open brochure"])
+        self.assertEqual(self._cell_values([row], "floorplan_link"), ["Open floor plan"])
 
 
 class LegacyColumnCompatibilityTests(unittest.TestCase):

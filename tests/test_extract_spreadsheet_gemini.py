@@ -720,6 +720,154 @@ class DeterministicBrochureLinkForBuildingTests(unittest.TestCase):
         self.assertIsNone(url)
 
 
+class DeterministicFloorplanLinkForBuildingTests(unittest.TestCase):
+    """deterministic_floorplan_link_for_building - the exact mirror of
+    DeterministicBrochureLinkForBuildingTests above, for a building's own
+    "Download Floorplans"-labeled cell."""
+
+    def _sheet(self, rows):
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        return ws
+
+    def _riverside_block(self, ws):
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([
+            None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+            "Download Floorplans", None, None, "Download Brochure",
+        ])
+        ws["F3"].hyperlink = "https://a.example.com/floorplans"
+        ws["I3"].hyperlink = "https://b.example.com/brochure.pdf"
+
+    def test_recovers_the_single_unambiguous_floorplan_link(self):
+        ws = self._sheet([])
+        self._riverside_block(ws)
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        url = extract_spreadsheet_gemini.deterministic_floorplan_link_for_building(text, "Riverside Building")
+
+        self.assertEqual(url, "https://a.example.com/floorplans")
+
+    def test_never_returns_the_brochure_link(self):
+        ws = self._sheet([])
+        self._riverside_block(ws)
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        url = extract_spreadsheet_gemini.deterministic_floorplan_link_for_building(text, "Riverside Building")
+
+        self.assertNotEqual(url, "https://b.example.com/brochure.pdf")
+
+    def test_no_floorplan_link_in_source_returns_none(self):
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Brochure"],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+
+        url = extract_spreadsheet_gemini.deterministic_floorplan_link_for_building(text, "Riverside Building")
+
+        self.assertIsNone(url)
+
+    def test_building_block_not_found_returns_none(self):
+        url = extract_spreadsheet_gemini.deterministic_floorplan_link_for_building(
+            "Row 1: unrelated content", "Nowhere",
+        )
+        self.assertIsNone(url)
+
+
+class ClassificationIsGenericNotProviderSpecificTests(unittest.TestCase):
+    """deterministic_brochure_link_for_building/deterministic_floorplan_
+    link_for_building take only raw sheet text and a building name - no
+    provider argument exists anywhere in this classification path, so it
+    cannot special-case a provider even in principle. Proven here with a
+    deliberately fictional, generic building/provider/host - the exact
+    same code path a real UNION or any other provider's file goes through."""
+
+    def test_a_completely_fictional_generic_provider_classifies_correctly(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Zzyzx Business Park - Nowhereville"])
+        ws.append([None, "A fictional test building, not a real provider or address."])
+        ws.append([
+            None, "1 Fictional Way, ZZ1 1ZZ", None, None, None,
+            "Download Floorplans", None, None, "Download Brochure",
+        ])
+        ws["F3"].hyperlink = "https://totally-generic-host.example/s/floorplan-xyz"
+        ws["I3"].hyperlink = "https://totally-generic-host.example/s/brochure-xyz"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "1st Floor", 1000.0, 5000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        brochure_url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(
+            text, "Zzyzx Business Park",
+        )
+        floorplan_url = extract_spreadsheet_gemini.deterministic_floorplan_link_for_building(
+            text, "Zzyzx Business Park",
+        )
+
+        self.assertEqual(brochure_url, "https://totally-generic-host.example/s/brochure-xyz")
+        self.assertEqual(floorplan_url, "https://totally-generic-host.example/s/floorplan-xyz")
+
+
+class CombinedBrochureAndFloorplanCellTests(unittest.TestCase):
+    """A single cell whose own text mentions BOTH "brochure" and
+    "floorplan" (a real, common combined-document naming pattern, e.g.
+    "Download Brochure and Floorplans") is one document that stays
+    classified as a brochure only - it must never ALSO populate
+    floorplan_link with that same URL, an unnecessary duplication."""
+
+    def test_floorplan_cell_text_check_backs_off_when_brochure_is_also_present(self):
+        self.assertIsNone(
+            extract_spreadsheet_gemini._floorplan_url_from_cell_text(
+                "Download Brochure and Floorplans (https://example.com/combined.pdf)",
+            ),
+        )
+
+    def test_brochure_cell_text_check_is_unaffected(self):
+        self.assertEqual(
+            extract_spreadsheet_gemini._brochure_url_from_cell_text(
+                "Download Brochure and Floorplans (https://example.com/combined.pdf)",
+            ),
+            "https://example.com/combined.pdf",
+        )
+
+    def test_a_genuinely_floorplan_only_cell_still_classifies_as_floorplan(self):
+        self.assertEqual(
+            extract_spreadsheet_gemini._floorplan_url_from_cell_text(
+                "Download Floorplans (https://example.com/floorplan.pdf)",
+            ),
+            "https://example.com/floorplan.pdf",
+        )
+
+    def test_combined_cell_populates_only_brochure_link_end_to_end(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Brochure and Floorplans"])
+        ws["F3"].hyperlink = "https://example.com/combined.pdf"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
+
+        brochure_url = extract_spreadsheet_gemini.deterministic_brochure_link_for_building(text, "Riverside Building")
+        floorplan_url = extract_spreadsheet_gemini.deterministic_floorplan_link_for_building(
+            text, "Riverside Building",
+        )
+
+        self.assertEqual(brochure_url, "https://example.com/combined.pdf")
+        self.assertIsNone(floorplan_url)
+
+
 class ApplyDeterministicBrochureLinksEndToEndTests(unittest.TestCase):
     """Same real, confirmed shape as DeterministicBrochureLinkForBuildingTests,
     exercised through extract_sheet end to end (Gemini mocked) - proves the

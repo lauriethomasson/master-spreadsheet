@@ -143,7 +143,7 @@ def link_column_config(df: pd.DataFrame) -> dict:
     changes how a cell is displayed, not what's stored."""
     return {
         col: st.column_config.LinkColumn(
-            label=title_case_label(col), display_text=LINK_DISPLAY_TEXT.get(col, "Open Link"),
+            label=title_case_label(col), display_text=LINK_DISPLAY_TEXT.get(col, "Open link"),
         )
         for col in LINK_COLUMNS
         if col in df.columns

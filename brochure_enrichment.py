@@ -320,8 +320,9 @@ def eligible_rows_and_brochures(rows: list):
 def _is_eligible_brochure_url(url) -> bool:
     """
     True only for a URL shape worth even attempting to fetch as a brochure -
-    never a judgment about what's actually AT that URL (see _looks_like_pdf
-    for the one made after fetching). Rejects: blank/non-URL text, a bare
+    never a judgment about what's actually AT that URL (see _looks_like_
+    fetchable_document for the one made after fetching). Rejects: blank/
+    non-URL text, a bare
     company homepage or known social/professional profile domain (see
     brochure_link_resolver.is_generic_link), and a URL whose own text
     already identifies it as a floor plan or a video rather than a
@@ -340,10 +341,49 @@ def _is_eligible_brochure_url(url) -> bool:
     return not any(bad in lowered for bad in _REJECTED_URL_KEYWORDS)
 
 
-def _looks_like_pdf(content_type, data: bytes) -> bool:
+# Magic bytes for the two raster formats a floor plan drawing is actually
+# exported as (see _looks_like_fetchable_document's own docstring) - never
+# widened beyond these two specific, confirmed-real formats.
+_IMAGE_MAGIC_BYTES = (
+    b"\x89PNG\r\n\x1a\n",  # PNG
+    b"\xff\xd8\xff",  # JPEG
+)
+
+
+def _looks_like_fetchable_document(content_type, data: bytes, accept_image_formats: bool = False) -> bool:
+    """
+    True when `data` is genuinely readable by extract.render_pages/render_
+    and_extract - a real PDF always, and (only when accept_image_formats is
+    True - set only for the floorplan fetch path, see _extract_floorplan_
+    units) a real PNG/JPEG too.
+
+    Confirmed real gap this second case fixes: a floor plan is routinely
+    delivered as a scanned/exported image rather than a vector PDF (two
+    real UNION examples confirmed directly: Box reports both as a plain
+    .png) - extract.render_pages already opens and renders a raster image
+    correctly, exactly like a one-page PDF (PyMuPDF's own filetype hint is
+    advisory, not enforced - fitz.open(stream=data, filetype="pdf") still
+    opens genuine PNG/JPEG bytes correctly, confirmed directly), so nothing
+    downstream of this check needs to change - only this fetch-time gate,
+    which used to reject the bytes outright before they ever reached
+    render_pages.
+
+    Never widened to "any non-PDF content" even with accept_image_formats
+    True - a .docx, an HTML error page, or a truncated download must still
+    be rejected exactly as before; only these two specific raster formats
+    are accepted, and only for the floorplan fetch path, since 0 of 9 real
+    brochure documents traced were images while 2 of 2 real floorplan
+    documents traced were.
+    """
     if content_type and "pdf" in content_type.lower():
         return True
-    return data[:5] == b"%PDF-"
+    if data[:5] == b"%PDF-":
+        return True
+    if not accept_image_formats:
+        return False
+    if content_type and "image/" in content_type.lower():
+        return True
+    return any(data[:len(magic)] == magic for magic in _IMAGE_MAGIC_BYTES)
 
 
 # UNION's real Availability files (checked directly, across 7 real
@@ -386,9 +426,21 @@ def _box_share_token(url: str):
     return match.group(1) if match else None
 
 
-def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True):
+_BOX_PDF_ONLY_EXTENSIONS = ("pdf",)
+# Only ever used for the floorplan fetch path (accept_image_formats=True -
+# see _fetch_box_shared_pdf's own docstring) - a real, confirmed shape: two
+# real UNION floor plans are stored on Box as a plain .png, not a PDF, and
+# extract.render_pages already renders that correctly with zero changes
+# once the bytes are actually let through (see _looks_like_fetchable_
+# document's own docstring). Never widened to a brochure fetch - 0 of 9
+# real brochure documents traced were images.
+_BOX_PDF_OR_IMAGE_EXTENSIONS = ("pdf", "png", "jpg", "jpeg")
+
+
+def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True, accept_image_formats: bool = False):
     """
-    PDF bytes for a Box "shared link" URL, via Box's own "direct link"
+    Document bytes (a PDF, or - only when accept_image_formats, see below -
+    a PNG/JPEG) for a Box "shared link" URL, via Box's own "direct link"
     static-download URL scheme (app.box.com/shared/static/{sharedName}.
     {extension}) - the same underlying mechanism Box's own "Allow direct
     links" sharing setting uses to give a shared file a plain, embeddable
@@ -412,8 +464,11 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
       function existed;
     - the file owner has downloads disabled (canDownload: false) -
       respected as a deliberate choice, never bypassed;
-    - the file's own extension isn't "pdf" - nothing else is readable by
-      extract.py's PDF-vision pipeline;
+    - the file's own extension isn't one this call accepts - "pdf" only by
+      default, or "pdf"/"png"/"jpg"/"jpeg" when accept_image_formats is
+      True (see _BOX_PDF_OR_IMAGE_EXTENSIONS's own docstring on why this is
+      never widened beyond those two specific raster formats, and only for
+      the floorplan fetch path);
     - the file's own name looks like a floor plan (see
       _FLOORPLAN_FILENAME_RE) - see that pattern's own docstring for the
       real confirmed case this guards against. reject_floorplan_filename=
@@ -421,6 +476,8 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
       caller that fetches a row's OWN floorplan_link rather than its
       brochure_link) skips this specific check - a floor plan IS the
       expected, correct content there, not a mislabeling to guard against.
+      accept_image_formats is passed by that same caller, for the same
+      reason.
     """
     try:
         page = httpx.get(
@@ -453,10 +510,11 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
         return None
 
     extension = extension_match.group(1).lower()
-    if extension != "pdf":
+    allowed_extensions = _BOX_PDF_OR_IMAGE_EXTENSIONS if accept_image_formats else _BOX_PDF_ONLY_EXTENSIONS
+    if extension not in allowed_extensions:
         print(
-            f"[brochure_enrichment] Box share {share_url!r} is a .{extension or '?'} file, not a PDF — "
-            "skipping enrichment.",
+            f"[brochure_enrichment] Box share {share_url!r} is a .{extension or '?'} file, not a "
+            f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
             file=sys.stderr,
         )
         return None
@@ -484,17 +542,19 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
         )
         return None
 
-    if not _looks_like_pdf(response.headers.get("content-type"), response.content):
+    if not _looks_like_fetchable_document(
+        response.headers.get("content-type"), response.content, accept_image_formats=accept_image_formats,
+    ):
         print(
-            f"[brochure_enrichment] Box static download for {share_url!r} did not resolve to a PDF — "
-            "skipping enrichment.",
+            f"[brochure_enrichment] Box static download for {share_url!r} did not resolve to a "
+            f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
             file=sys.stderr,
         )
         return None
     return response.content
 
 
-def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True):
+def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_image_formats: bool = False):
     """
     PDF bytes fetched from `url`, or None on ANY failure - a network error,
     a timeout, or content that isn't actually a PDF once fetched (a
@@ -505,25 +565,31 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True):
     never returns the PDF directly (see that function's own docstring).
     resolve_brochure_link (already used for exactly this kind of one-hop
     landing-page resolution elsewhere in this repo - see its own docstring)
-    is tried first for anything else not already a direct .pdf URL,
-    covering a provider brochure-preview page or a landing page that links
-    to the real PDF; something that resolves to a Google Drive/SharePoint
-    share page instead (never a raw PDF byte stream from a plain GET)
-    simply fails the _looks_like_pdf check below and enrichment is skipped
-    for it - not a source this version can read, not something worth
-    raising over.
+    is tried first for anything else not already a direct .pdf (or, when
+    accept_image_formats, .png/.jpg/.jpeg) URL, covering a provider
+    brochure-preview page or a landing page that links to the real
+    document; something that resolves to a Google Drive/SharePoint share
+    page instead (never a raw document byte stream from a plain GET)
+    simply fails the _looks_like_fetchable_document check below and
+    enrichment is skipped for it - not a source this version can read, not
+    something worth raising over.
 
-    reject_floorplan_filename is passed straight through to
-    _fetch_box_shared_pdf (see its own docstring) - False only when the
-    caller is deliberately fetching a floor plan (see _extract_floorplan_
-    units), where a floorplan-shaped Box file name is the expected content,
-    not a mislabeling to guard against.
+    reject_floorplan_filename/accept_image_formats are passed straight
+    through to _fetch_box_shared_pdf (see its own docstring) - both True
+    only when the caller is deliberately fetching a floor plan (see
+    _extract_floorplan_units), where a floorplan-shaped Box file name is
+    the expected content, not a mislabeling to guard against, and a raster
+    image is a real, confirmed document shape, not a fetch failure.
     """
     if _box_share_token(url):
-        return _fetch_box_shared_pdf(url, reject_floorplan_filename=reject_floorplan_filename)
+        return _fetch_box_shared_pdf(
+            url, reject_floorplan_filename=reject_floorplan_filename, accept_image_formats=accept_image_formats,
+        )
 
+    direct_extensions = (".pdf", ".png", ".jpg", ".jpeg") if accept_image_formats else (".pdf",)
     try:
-        target = url if url.lower().split("?")[0].endswith(".pdf") else resolve_brochure_link(url)
+        clean_path = url.lower().split("?")[0]
+        target = url if clean_path.endswith(direct_extensions) else resolve_brochure_link(url)
         response = httpx.get(
             target, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}, follow_redirects=True,
         )
@@ -532,9 +598,12 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True):
         print(f"[brochure_enrichment] Could not fetch {url!r} ({e!r}) — skipping enrichment.", file=sys.stderr)
         return None
 
-    if not _looks_like_pdf(response.headers.get("content-type"), response.content):
+    if not _looks_like_fetchable_document(
+        response.headers.get("content-type"), response.content, accept_image_formats=accept_image_formats,
+    ):
         print(
-            f"[brochure_enrichment] {url!r} did not resolve to a PDF — skipping enrichment.",
+            f"[brochure_enrichment] {url!r} did not resolve to a "
+            f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
             file=sys.stderr,
         )
         return None
@@ -970,12 +1039,16 @@ def _extract_floorplan_units(url: str):
     _fetch_pdf_bytes) - the Box-share floorplan-filename rejection exists
     specifically to catch a BROCHURE link that's actually a mislabeled
     floor plan; here the floor plan IS the expected, correct content, so
-    that same filename shape must never be rejected.
+    that same filename shape must never be rejected. accept_image_formats=
+    True is passed for the same reason: a floor plan is routinely delivered
+    as a scanned/exported PNG/JPEG rather than a vector PDF (see _looks_
+    like_fetchable_document's own docstring for the confirmed real case) -
+    never passed for the brochure fetch path, which stays PDF-only.
 
     Cross-run lru_cache, same "not the per-run dedup mechanism" caveat as
     _extract_brochure_units - see that function's own docstring.
     """
-    data = _fetch_pdf_bytes(url, reject_floorplan_filename=False)
+    data = _fetch_pdf_bytes(url, reject_floorplan_filename=False, accept_image_formats=True)
     if data is None:
         return None
 

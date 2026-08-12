@@ -300,6 +300,56 @@ class FetchBoxSharedPdfTests(EnrichmentTestCase):
         self.assertIsNone(result)
         mock_get.assert_called_once()
 
+    def test_png_extension_rejected_by_default_brochure_fetch(self):
+        # A floor plan is routinely delivered as a scanned/exported image
+        # rather than a PDF (two real UNION examples confirmed directly) -
+        # but the BROCHURE fetch path (accept_image_formats defaults to
+        # False) must stay PDF-only; 0 of 9 real brochure documents traced
+        # were images.
+        share_html = _box_share_html(extension="png")
+        with patch("brochure_enrichment.httpx.get", return_value=_html_response(share_html)) as mock_get:
+            result = brochure_enrichment._fetch_box_shared_pdf("https://app.box.com/s/abc123")
+
+        self.assertIsNone(result)
+        mock_get.assert_called_once()
+
+    def test_png_extension_accepted_when_fetching_a_floorplan(self):
+        share_html = _box_share_html(extension="png", name="7th Floor - Fitted.png")
+        png_response = _response(content=b"\x89PNG\r\n\x1a\nfake png bytes", content_type="image/png")
+        with patch(
+            "brochure_enrichment.httpx.get", side_effect=[_html_response(share_html), png_response],
+        ):
+            result = brochure_enrichment._fetch_box_shared_pdf(
+                "https://app.box.com/s/abc123", reject_floorplan_filename=False, accept_image_formats=True,
+            )
+
+        self.assertEqual(result, b"\x89PNG\r\n\x1a\nfake png bytes")
+
+    def test_jpg_extension_accepted_when_fetching_a_floorplan(self):
+        share_html = _box_share_html(extension="jpg")
+        jpg_response = _response(content=b"\xff\xd8\xfffake jpeg bytes", content_type="image/jpeg")
+        with patch(
+            "brochure_enrichment.httpx.get", side_effect=[_html_response(share_html), jpg_response],
+        ):
+            result = brochure_enrichment._fetch_box_shared_pdf(
+                "https://app.box.com/s/abc123", reject_floorplan_filename=False, accept_image_formats=True,
+            )
+
+        self.assertEqual(result, b"\xff\xd8\xfffake jpeg bytes")
+
+    def test_docx_extension_still_rejected_even_when_fetching_a_floorplan(self):
+        # accept_image_formats never opens the floodgates to any non-PDF
+        # content - only the two specific raster formats a floor plan is
+        # actually confirmed to be delivered as.
+        share_html = _box_share_html(extension="docx")
+        with patch("brochure_enrichment.httpx.get", return_value=_html_response(share_html)) as mock_get:
+            result = brochure_enrichment._fetch_box_shared_pdf(
+                "https://app.box.com/s/abc123", accept_image_formats=True,
+            )
+
+        self.assertIsNone(result)
+        mock_get.assert_called_once()
+
     def test_floorplan_named_file_is_rejected(self):
         # The real, confirmed case: a UNION row's own "Brochure" column
         # pointed at a Box file literally named "3rd floor - Grosvenor
@@ -371,6 +421,77 @@ class FetchBoxSharedPdfTests(EnrichmentTestCase):
 
         self.assertIsNotNone(result)
         mock_get.assert_called_once()
+
+    def test_fetch_pdf_bytes_generic_path_rejects_image_content_by_default(self):
+        image_response = _response(content=b"\x89PNG\r\n\x1a\nfake png", content_type="image/png")
+        with patch("brochure_enrichment.httpx.get", return_value=image_response):
+            result = brochure_enrichment._fetch_pdf_bytes("https://example.com/floorplan.png")
+
+        self.assertIsNone(result)
+
+    def test_fetch_pdf_bytes_generic_path_accepts_image_content_for_a_floorplan(self):
+        image_response = _response(content=b"\x89PNG\r\n\x1a\nfake png", content_type="image/png")
+        with patch("brochure_enrichment.httpx.get", return_value=image_response) as mock_get:
+            result = brochure_enrichment._fetch_pdf_bytes(
+                "https://example.com/floorplan.png", accept_image_formats=True,
+            )
+
+        self.assertEqual(result, b"\x89PNG\r\n\x1a\nfake png")
+        # A direct .png URL is treated as already-direct, same as .pdf -
+        # resolve_brochure_link's own one-hop landing-page resolution is
+        # skipped, confirmed by there being exactly one httpx.get call.
+        mock_get.assert_called_once_with(
+            "https://example.com/floorplan.png", timeout=brochure_enrichment.REQUEST_TIMEOUT,
+            headers={"User-Agent": brochure_enrichment.USER_AGENT}, follow_redirects=True,
+        )
+
+    def test_fetch_pdf_bytes_generic_path_still_rejects_docx_for_a_floorplan(self):
+        docx_response = _response(
+            content=b"not an image or pdf",
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        with patch("brochure_enrichment.httpx.get", return_value=docx_response):
+            result = brochure_enrichment._fetch_pdf_bytes(
+                "https://example.com/floorplan.docx", accept_image_formats=True,
+            )
+
+        self.assertIsNone(result)
+
+
+class LooksLikeFetchableDocumentTests(unittest.TestCase):
+    def test_pdf_content_type_always_accepted(self):
+        self.assertTrue(brochure_enrichment._looks_like_fetchable_document("application/pdf", b"anything"))
+
+    def test_pdf_magic_bytes_always_accepted(self):
+        self.assertTrue(brochure_enrichment._looks_like_fetchable_document(None, b"%PDF-1.4 ..."))
+
+    def test_png_rejected_by_default(self):
+        self.assertFalse(brochure_enrichment._looks_like_fetchable_document("image/png", b"\x89PNG\r\n\x1a\n..."))
+
+    def test_png_accepted_with_accept_image_formats(self):
+        self.assertTrue(
+            brochure_enrichment._looks_like_fetchable_document(
+                "image/png", b"\x89PNG\r\n\x1a\n...", accept_image_formats=True,
+            ),
+        )
+
+    def test_jpeg_magic_bytes_accepted_with_accept_image_formats(self):
+        self.assertTrue(
+            brochure_enrichment._looks_like_fetchable_document(
+                None, b"\xff\xd8\xfffake jpeg", accept_image_formats=True,
+            ),
+        )
+
+    def test_docx_never_accepted_even_with_accept_image_formats(self):
+        self.assertFalse(
+            brochure_enrichment._looks_like_fetchable_document(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04...",
+                accept_image_formats=True,
+            ),
+        )
+
+    def test_html_error_page_never_accepted(self):
+        self.assertFalse(brochure_enrichment._looks_like_fetchable_document("text/html", b"<html>404</html>"))
 
 
 class MatchUnitTests(unittest.TestCase):
@@ -1062,6 +1183,111 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         # No floor-specific text -> building-level fallback, never blank.
         self.assertEqual(canal_4th.special_features, "Exposed beams; canalside frontage")
         self.assertEqual(packing_ground.special_features, "Stunning rooftop terrace")
+
+    def test_a_brochures_own_floorplan_pages_contribute_floor_specific_content(self):
+        # A brochure PDF that also contains floorplan pages is still ONE
+        # brochure document (see this module's own docstring) - Gemini's
+        # single extraction call over the whole document already reads
+        # those pages as part of `units`, so a unit's own special_features
+        # can legitimately be explicit floorplan-derived content ("72
+        # desks; 10-person boardroom") sitting right alongside a property-
+        # wide marketing blurb from the SAME document - both usable, at
+        # their own correct scope, with no special-casing needed.
+        units = _brochure_units(
+            [
+                {"building": "40 New Bond Street", "floor_unit": "5th Floor", "special_features": "72 desks; 10-person boardroom; phone booths; kitchen/breakout"},
+                {"building": "40 New Bond Street", "floor_unit": "3rd Floor", "special_features": None},
+            ],
+            property_features="WiredScore Platinum; BREEAM Excellent; manned reception",
+        )
+
+        floor_matched, _ = brochure_enrichment._apply_units_to_row(
+            ListingRow(building="40 New Bond Street", floor_unit="5th Floor", special_features=None), units,
+        )
+        # 9th Floor matches neither of the two real units in this document -
+        # _match_unit correctly returns no confident match, but that must
+        # not throw away the document-wide fact this row can still safely
+        # receive.
+        no_floor_match, _ = brochure_enrichment._apply_units_to_row(
+            ListingRow(building="40 New Bond Street", floor_unit="9th Floor", special_features=None), units,
+        )
+
+        # The floorplan-page-derived, floor-specific text wins for the row
+        # it was actually stated for.
+        self.assertEqual(floor_matched.special_features, "72 desks; 10-person boardroom; phone booths; kitchen/breakout")
+        # A DIFFERENT floor in the same document, with no floor-specific
+        # match, still safely falls back to the property-wide fact - never
+        # blank just because this document also happens to contain floor
+        # plan pages.
+        self.assertEqual(no_floor_match.special_features, "WiredScore Platinum; BREEAM Excellent; manned reception")
+
+
+class FloorplanOnlyNeverInventsWiderScopeFeaturesTests(unittest.TestCase):
+    """A floorplan-only document (see FLOORPLAN_ENRICHABLE_FIELDS) must
+    never be treated as a marketing brochure - even if its own raw units
+    dict somehow carried extra keys, only special_features is ever read
+    from it, and never at the property/building-wide level."""
+
+    def test_only_special_features_is_ever_applied_from_a_floorplan(self):
+        row = ListingRow(building="A", floor_unit="1st", contacts=None, state_of_space=None, special_features=None)
+        units = [{
+            "floor_unit": "1st", "special_features": "12 desks; boardroom",
+            # Extra keys a malformed/unexpected Gemini response could
+            # carry - never read by the floorplan path regardless.
+            "contacts": "Should Never Apply, never@example.com",
+            "state_of_space": "Should Never Apply",
+        }]
+
+        new_row, fields = brochure_enrichment._apply_floorplan_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "12 desks; boardroom")
+        self.assertIsNone(new_row.contacts)
+        self.assertIsNone(new_row.state_of_space)
+        self.assertEqual(fields, ["special_features"])
+
+    def test_a_floorplan_never_has_a_property_or_building_wide_fallback(self):
+        # Unlike _apply_units_to_row (brochure path), _apply_floorplan_
+        # units_to_row has no property_features/building_features concept
+        # at all - a floor plan drawing states neither, so there is
+        # nothing to fall back to when no floor match is found.
+        row = ListingRow(building="A", floor_unit="9th", special_features=None)
+        units = [{"floor_unit": "1st", "special_features": "12 desks"}]  # different floor, no match
+
+        new_row, fields = brochure_enrichment._apply_floorplan_units_to_row(row, units)
+
+        self.assertIsNone(new_row.special_features)
+        self.assertEqual(fields, [])
+
+
+class ExtractFloorplanUnitsImageFormatTests(EnrichmentTestCase):
+    """_extract_floorplan_units end to end - a floor plan delivered as a
+    real image (confirmed real UNION shape: Box reports it as a plain
+    .png) must be fetched, rendered, and read by Gemini exactly like a
+    PDF, not rejected at the fetch layer."""
+
+    def test_png_floorplan_is_fetched_rendered_and_extracted(self):
+        png_response = _response(content=b"\x89PNG\r\n\x1a\nfake png bytes", content_type="image/png")
+        raw = {"units": [{"floor_unit": "7th Floor", "special_features": "Meeting room; Reception; Kitchen"}]}
+        with patch("brochure_enrichment.httpx.get", return_value=png_response), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]) as mock_render, \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw) as mock_extract:
+            units = brochure_enrichment._extract_floorplan_units("https://example.com/floorplan.png")
+
+        mock_render.assert_called_once()
+        mock_extract.assert_called_once()
+        self.assertEqual(units[0]["special_features"], "Meeting room; Reception; Kitchen")
+
+    def test_non_image_non_pdf_floorplan_is_still_rejected(self):
+        docx_response = _response(
+            content=b"not readable",
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        with patch("brochure_enrichment.httpx.get", return_value=docx_response), \
+             patch("brochure_enrichment.extract.render_pages") as mock_render:
+            units = brochure_enrichment._extract_floorplan_units("https://example.com/floorplan.docx")
+
+        self.assertIsNone(units)
+        mock_render.assert_not_called()
 
 
 class MatchFloorplanUnitTests(unittest.TestCase):

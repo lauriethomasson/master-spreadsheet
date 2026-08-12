@@ -23,8 +23,8 @@ MAX_COLUMN_WIDTH = 40
 # value.
 HYPERLINK_COLUMNS = ["brochure_link", "floorplan_link"]
 HYPERLINK_FONT = Font(color="0563C1", underline="single")
-HYPERLINK_DISPLAY_TEXT = "Open Brochure"  # kept for brochure_link/back-compat single-column callers
-LINK_DISPLAY_TEXT = {"brochure_link": "Open Brochure", "floorplan_link": "Open Floorplan"}
+HYPERLINK_DISPLAY_TEXT = "Open brochure"  # kept for brochure_link/back-compat single-column callers
+LINK_DISPLAY_TEXT = {"brochure_link": "Open brochure", "floorplan_link": "Open floor plan"}
 
 # Columns that regularly hold long text (a multi-sentence description, several
 # contacts, or a long URL) - wrapped so the full value is visible on several
@@ -139,12 +139,12 @@ def read_xlsx_with_hyperlinks(data: bytes) -> pd.DataFrame:
     """
     Reads a workbook written by write_rows_to_xlsx() back into a DataFrame -
     like pd.read_excel(), except for HYPERLINK_COLUMNS, where the cell's
-    displayed text is HYPERLINK_DISPLAY_TEXT rather than the real URL (see
-    write_rows_to_xlsx). pd.read_excel only ever sees that displayed text,
-    which would silently replace every brochure_link with the literal string
-    "Open Brochure" on every read-back after a write - reads the cell's
-    actual hyperlink target instead for those columns; every other column
-    is read exactly as pd.read_excel would.
+    displayed text is its own LINK_DISPLAY_TEXT entry rather than the real
+    URL (see write_rows_to_xlsx). pd.read_excel only ever sees that
+    displayed text, which would silently replace every brochure_link with
+    the literal string "Open brochure" on every read-back after a write -
+    reads the cell's actual hyperlink target instead for those columns;
+    every other column is read exactly as pd.read_excel would.
 
     Column names are recovered from row 1's own cell text via
     _label_to_field_name, NOT assumed from ListingRow.model_fields by fixed
