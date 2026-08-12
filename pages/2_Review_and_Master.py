@@ -11,6 +11,7 @@ import master_writer
 import page_flow
 import page_setup
 from schema import ListingRow
+from staging_writer import title_case_label
 from storage import blob_store
 from storage.file_store import (
     active_and_superseded_staging_files,
@@ -325,23 +326,23 @@ def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix:
     return "remove" if choice.startswith("Remove") else "keep"
 
 
-# Search fields for the MAIN editable table's own search bar - unchanged
-# from before this section had a name of its own (see _search_mask).
-_MASTER_SEARCH_COLUMNS = ("building", "address_1", "provider", "floor_unit")
-
-# Search fields for the Remove-rows expander's OWN, separate search bar -
-# adds postcode on top of the master search's own fields, per real request:
-# a duplicate-row cleanup is often easier to spot by postcode than by
-# address text alone.
-_REMOVAL_SEARCH_COLUMNS = ("provider", "building", "address_1", "floor_unit", "postcode")
+# Search fields for the one master search bar - this used to be two
+# independent lists (_MASTER_SEARCH_COLUMNS and a Remove-rows-only
+# _REMOVAL_SEARCH_COLUMNS adding postcode - a duplicate-row cleanup is often
+# easier to spot by postcode than by address text alone) feeding two
+# completely independent search bars, from back when a compact selector
+# table and the full table were two separate widgets each with their own
+# search. Now that there's only ONE master table, there's only one search
+# box - postcode is kept in this merged list (never dropped) so that real
+# use case still works from it.
+_SEARCH_COLUMNS = ("provider", "building", "address_1", "floor_unit", "postcode")
 
 
 def _search_mask(df: pd.DataFrame, query: str, columns: tuple) -> pd.Series:
     """Boolean mask, aligned to df's own index, of every row where ANY of
-    `columns` contains `query` case-insensitively - shared by the Remove-
-    rows and master-table search bars so the two stay behaviorally
-    identical (same case-insensitive substring semantics) despite searching
-    different field sets and feeding two completely independent widgets."""
+    `columns` (see _SEARCH_COLUMNS) contains `query` case-insensitively - the
+    one filter the main master table's own search bar applies.
+    inside "Edit master spreadsheet" apply to the SAME underlying df."""
     search_cols = [c for c in columns if c in df.columns]
     mask = pd.Series(False, index=df.index)
     for c in search_cols:
@@ -349,106 +350,65 @@ def _search_mask(df: pd.DataFrame, query: str, columns: tuple) -> pd.Series:
     return mask
 
 
-def _render_master_table(df: pd.DataFrame, key: str) -> bool:
+def _render_master_table(df: pd.DataFrame, key: str) -> None:
     """
-    Full master, browsable, directly editable, and row-selectable (for the
-    export step and for bulk removal).
+    ONE full master table, browsable and natively row-selectable - the
+    single visible table for browsing, selecting, exporting, and removing.
+    Editing a property is a deliberately separate, explicit action (see
+    _render_selection_actions/_render_edit_property_form) rather than a
+    second table on screen.
 
-    Selection and editing are TWO INDEPENDENT WIDGETS, not one - see
-    _render_row_selector below for why. Every column data_editor shows is a
-    real edit target - hidden columns (property_id, source_file) are simply
-    absent from display_df, so they can't be edited through this UI at all,
-    same as before.
+    Real regression history behind this design: selection used to live
+    inside a collapsed "Remove rows" expander, which made the Export
+    workflow (which selection feeds just as much as removal) look like it
+    had disappeared entirely - fixed by making the selector always-visible.
+    That, in turn, meant two full-width tables (a compact 4-column selector
+    plus a full editable grid) were both on screen by default, which caused
+    a DIFFERENT real confusion: a reviewer testing editability on the first
+    (compact, permanently read-only by construction - st.dataframe never
+    supports editing) table concluded editing didn't work at all, when the
+    real editable table was a second widget further down the page. A third
+    design (one selector table + the same full editable grid tucked inside
+    a collapsed expander) still kept a second full-width st.data_editor
+    around purely because it happened to support editing - this is the
+    actual resolution: there is only ever ONE table. Editing one property at
+    a time is a small, explicit form (_render_edit_property_form), not a
+    second spreadsheet-shaped widget competing for the same screen space.
 
-    Row selection is tracked by property_id in session_state, not by either
+    Selection uses st.dataframe's native on_select/selection_mode (see
+    _render_row_selector) - never a manually-added editable "Select" Boolean
+    column, which is the exact design that caused a real two-click/light-
+    trackpad selection race before this split existed at all (see
+    tests/test_app_review_master_table.py's own module docstring).
+
+    Row selection is tracked by property_id in session_state, not by the
     widget's own positional state - a saved edit reloads the master (freshly
     re-sorted; see sort_by_provider), which can shift a row's position, and
     Streamlit's own widget state is keyed by position. Trusting that
-    position across a reload risks silently reapplying a stale selection
-    (or edit - see _process_manual_edits) to the wrong row. property_id is
-    immune to re-sorting, so it survives that reload intact.
-
-    The row-selector (search bar + selector table + selection status/Remove
-    button) is rendered directly in the main table flow, always visible -
-    NOT tucked inside a collapsed expander (a prior design; see git history
-    for "Move row removal into a collapsed Remove rows expander" and this
-    module's own now-updated test suite). Confirmed real regression report
-    that reverted it: selection feeds the Export step just as much as it
-    feeds removal, but hiding it behind a control literally labeled "Remove
-    rows" made the export workflow look like it had disappeared entirely -
-    a reviewer who only wants to export a few rows, never remove anything,
-    had no reason to ever open that control. Selection and removal still
-    each have their OWN search bar, over their OWN widget key - deliberately
-    never shared, so searching to find a row to select/remove can never
-    narrow what the main editable table shows, or vice versa (a real
-    request: the two are different tasks a person does at different times,
-    and conflating their search state was confusing) - this independence is
-    unaffected by no longer being wrapped in an expander; only the
-    visibility changed, not the underlying search/selection mechanism. Both
-    still narrow only what's DISPLAYED to their own widget, never what df/
-    master_records themselves contain - each widget's own positional state
-    is always relative to whatever (possibly filtered) subset was actually
-    passed to IT this render, so real_positions[i] (the real position in df
-    of whatever row sits at the MASTER table's filtered position i) is
-    threaded through to _process_manual_edits/build_manual_edit below, and
-    row selection stays keyed by property_id exactly as it already was for
-    the re-sort case above - a filter is just another way a row's position
-    can shift out from under a stale positional reference.
-
-    Returns True if a real field edit was saved this render - the caller
-    should st.rerun() so the rest of the page reflects the fresh master
-    (download button bytes, write-log caption, Version history) rather than
-    the pre-edit snapshot already in hand.
+    position across a reload risks silently reapplying a stale selection to
+    the wrong row. property_id is immune to re-sorting, so it survives that
+    reload intact. A search filter is the same kind of positional shift,
+    handled the same way - _render_row_selector resolves its own widget's
+    positions back to property_id before this function ever sees them.
     """
+    st.subheader("Master spreadsheet")
+
     visible = display_utils.visible_columns(df)
     display_df = df[visible].copy()
 
-    removal_query = st.text_input("Search rows to select", key=f"{key}_removal_filter")
-    removal_filtered_df = display_df
-    if removal_query.strip():
-        removal_filtered_df = display_df[_search_mask(df, removal_query, _REMOVAL_SEARCH_COLUMNS)]
-
-    selected_positions = _render_row_selector(df, removal_filtered_df, key)
-    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
-    _render_selection_actions(df, removal_filtered_df, selected_positions, key)
-
-    st.divider()
-
     query = st.text_input("Search master spreadsheet", key=f"{key}_filter")
     filtered_df = display_df
-    real_positions = list(range(len(df)))
     if query.strip():
-        mask = _search_mask(df, query, _MASTER_SEARCH_COLUMNS)
-        filtered_df = display_df[mask]
-        real_positions = [i for i, keep in enumerate(mask) if keep]
+        filtered_df = display_df[_search_mask(df, query, _SEARCH_COLUMNS)]
 
-    edited_df = st.data_editor(
-        filtered_df,
-        column_config={
-            **display_utils.label_column_config(filtered_df),
-            **display_utils.link_column_config(filtered_df),
-            **display_utils.wide_text_column_config(filtered_df),
-            **display_utils.numeric_column_config(filtered_df),
-        },
-        width="stretch",
-        height=600,
-        key=key,
-    )
-    st.caption(f"{len(edited_df)} of {len(df)} row(s) shown.")
-
-    return _process_manual_edits(df, real_positions, key)
-
-
-# The narrow, identifying column set _render_row_selector shows - enough to
-# tell rows apart for a bulk-removal decision without duplicating the full
-# editable table's own width. Deliberately not configurable per call site -
-# every caller of _render_master_table wants the same at-a-glance identity.
-_SELECTOR_COLUMNS = ("provider", "building", "floor_unit", "address_1")
+    selected_positions = _render_row_selector(df, filtered_df, key)
+    st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
+    _render_selection_actions(df, filtered_df, selected_positions, key)
 
 
 def _selector_widget_key(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> str:
     """
-    The removal selector's own st.dataframe widget key, suffixed with a
+    The main table's own st.dataframe selection widget key, suffixed with a
     short fingerprint of the property_id sequence CURRENTLY backing it
     (filtered_df's own row order, resolved to df's property_id column).
 
@@ -492,16 +452,29 @@ def _selector_widget_key(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
 
 def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> list:
     """
-    Renders a compact, READ-ONLY, natively row-selectable table (st.
-    dataframe's own on_select/selection_mode, added specifically for this
-    "select rows, then act on the selection" pattern) and returns
-    selected_positions - real positions in df (immune to the Remove-rows
-    expander's OWN search bar narrowing what filtered_df contains here -
-    see _render_master_table's own docstring), kept in session_state[
+    Renders the MAIN, always-visible, READ-ONLY, natively row-selectable
+    table (st.dataframe's own on_select/selection_mode, added specifically
+    for this "select rows, then act on the selection" pattern) and returns
+    selected_positions - real positions in df (immune to whatever the
+    shared search bar narrowed filtered_df to this render - see
+    _render_master_table's own docstring), kept in session_state[
     "export_selected_property_ids"] by property_id exactly as before.
 
-    A real-browser report confirmed the "Remove N selected row(s)" button
-    (see _render_selection_actions) sometimes needed two clicks to
+    Shows the full column set (with real column_config - link/wide-text/
+    numeric formatting included, so brochure/floor plan links are still
+    clickable "Open brochure"/"Open floor plan" labels) - previously this
+    was a deliberately narrow 4-column identity strip (provider/building/
+    floor_unit/address_1), with a separate full st.data_editor rendered
+    below it for actual editing. That narrow strip being the first, most
+    prominent table on the page while being permanently read-only (st.
+    dataframe never supports editing) caused a real report that editing
+    "didn't work" - the actual editable widget was a second table further
+    down, easy to miss. Editing a property is now its own explicit, single-
+    property form (see _render_edit_property_form), not a second table -
+    there is only ONE table on screen by default, and it's this one.
+
+    A real-browser report confirmed the old "Remove N selected row(s)"
+    button (see _render_selection_actions) sometimes needed two clicks to
     register. That was rigorously proven (via direct session_state
     manipulation reproducing both a single combined rerun and two genuinely
     sequential ones, in both the unfiltered AND filtered case) to NOT be a
@@ -539,8 +512,7 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
     problem, so it exists purely to guarantee this function can never
     raise, not as the real fix.
     """
-    selector_columns = [c for c in _SELECTOR_COLUMNS if c in filtered_df.columns]
-    selector_df = filtered_df[selector_columns] if selector_columns else filtered_df
+    selector_df = filtered_df
 
     selected_ids = st.session_state.get("export_selected_property_ids", set())
     default_rows = []
@@ -548,12 +520,16 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
         filtered_property_ids = df.loc[filtered_df.index, "property_id"]
         default_rows = [i for i, pid in enumerate(filtered_property_ids) if pid in selected_ids]
 
-    st.caption("Select rows (for export or removal):")
     selection = st.dataframe(
         selector_df,
-        column_config=display_utils.label_column_config(selector_df),
+        column_config={
+            **display_utils.label_column_config(selector_df),
+            **display_utils.link_column_config(selector_df),
+            **display_utils.wide_text_column_config(selector_df),
+            **display_utils.numeric_column_config(selector_df),
+        },
         width="stretch",
-        height=200,
+        height=600,
         hide_index=True,
         on_select="rerun",
         selection_mode="multi-row",
@@ -600,9 +576,35 @@ def _clear_row_selection(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
         del st.session_state[selector_key]
 
 
+def _editing_property_id_key(key: str) -> str:
+    return f"{key}_editing_property_id"
+
+
 def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selected_positions: list, key: str) -> None:
+    """
+    Export/Remove/Edit/Clear, all driven by the SAME selection - selecting
+    rows never itself edits, removes, or exports anything; each is its own
+    explicit button click. Edit selected property is enabled only when
+    EXACTLY one row is selected (see _render_edit_property_form's own
+    docstring for why editing is one property at a time, not a grid).
+
+    editing_property_id (session_state, keyed by _editing_property_id_key)
+    is deliberately independent of the LIVE selection once set - clicking
+    Edit snapshots which property_id to edit; changing the table's own
+    selection afterward (without touching Cancel/Save) does not yank the
+    form away mid-edit. It's still cleared whenever selection is cleared or
+    a removal happens, and defensively cleared if it ever points at a
+    property_id no longer in df at all (e.g. removed by a concurrent
+    action), so the form can never render for a row that no longer exists.
+    """
+    editing_key = _editing_property_id_key(key)
+    selected_ids = set(df.loc[selected_positions, "property_id"]) if "property_id" in df.columns else set()
+
     with st.container(horizontal=True):
-        st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected.")
+        count_text = f"{len(selected_positions)} of {len(df)} row(s) selected."
+        if len(selected_positions) != 1:
+            count_text += " Select exactly 1 property to edit."
+        st.caption(count_text)
 
         # Same st.switch_page(...) call page_flow.render_nav_buttons already
         # uses elsewhere in this app for page-to-page navigation - no new
@@ -610,12 +612,7 @@ def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selec
         # switches to a page that already reads export_selected_df/
         # export_selected_property_ids (see pages/3_Export.py), both of
         # which _render_row_selector above keeps current every render
-        # regardless of whether this button is ever clicked - previously
-        # the ONLY way there was navigating away manually (via the sidebar
-        # or the Back/Next buttons at the page's own bottom) and hoping that
-        # state was still populated, with no direct affordance for the
-        # export workflow this selection exists to feed sitting next to the
-        # selection itself.
+        # regardless of whether this button is ever clicked.
         if st.button(
             "Export selected →", key=f"{key}_export_selected",
             disabled=not selected_positions, type="primary",
@@ -626,17 +623,23 @@ def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selec
         # removal (during upload review, see removed_indices above) already
         # rides - same versioning/undo/write-log, just triggered directly
         # from the master table's own row selection instead of from an
-        # upload-merge diff. Added for one-time duplicate cleanup (e.g. rows
-        # left behind by a provider-name fix that changed the match key -
-        # see master_merge.py's own module docstring on why provider is
-        # part of the key at all) - no separate delete mechanism invented.
-        remove_clicked = st.button(
-            f"Remove {len(selected_positions)} selected row(s)",
-            key=f"{key}_remove_selected",
-        )
+        # upload-merge diff. Deliberately NEVER disabled=not selected_positions
+        # (see tests/test_app_review_master_table.py's own module docstring
+        # for why - conditionally disabling it reintroduces the same class
+        # of rerun-timing risk a past two-click-race investigation removed
+        # this exact disabled= for) - the empty-selection case is instead a
+        # safe inline no-op message below.
+        remove_clicked = st.button("Remove selected", key=f"{key}_remove_selected")
+
+        if st.button(
+            "Edit selected property", key=f"{key}_edit_selected",
+            disabled=len(selected_ids) != 1,
+        ):
+            st.session_state[editing_key] = next(iter(selected_ids))
 
         if st.button("Clear selection", key=f"{key}_clear_selection", disabled=not selected_positions):
             _clear_row_selection(df, filtered_df, key)
+            st.session_state[editing_key] = None
             st.rerun()
 
         # Feedback for this action lives right here, inline in the same row
@@ -671,6 +674,7 @@ def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selec
                 st.error(f"Removal failed, master was not changed: {write_failed}")
             else:
                 _clear_row_selection(df, filtered_df, key)
+                st.session_state[editing_key] = None
                 st.session_state["last_removal"] = {
                     "count": len(removed_indices),
                     "version_path": previous_version_path,
@@ -700,45 +704,47 @@ def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selec
                     st.session_state["just_restored"] = last_removal["version_path"]
                     st.rerun()
 
+    editing_property_id = st.session_state.get(editing_key)
+    if editing_property_id:
+        if "property_id" in df.columns and editing_property_id in set(df["property_id"]):
+            _render_edit_property_form(df, editing_property_id, key)
+        else:
+            st.session_state[editing_key] = None
 
-def _process_manual_edits(df: pd.DataFrame, displayed_positions: list, key: str) -> bool:
+
+def _save_property_edit(df: pd.DataFrame, property_id: str, changed_fields: dict) -> bool:
     """
-    Checks the data_editor's own edit-tracking state (st.session_state[key])
-    for real field edits since it was last reset, and if there are any,
-    saves them to master.xlsx immediately - see build_manual_edit for how
-    the delta becomes a full row list. Returns True iff a save happened.
+    Saves a single property's changed fields to master.xlsx, reusing the
+    EXACT same master_merge.build_manual_edit/apply_merge/write_master path
+    the old direct-cell-editing grid used (see git history) - a manual edit
+    from a form is not a new kind of write, just a differently-collected
+    delta ({row_position: {field: new_value}}, the same shape build_manual_
+    edit has always expected), so it rides the same versioning/undo/write-
+    log mechanism and the same validation (ListingRow(**merged) inside
+    apply_merge) rather than writing raw form values into master.xlsx
+    directly. Returns True iff a save happened (changed_fields was non-empty
+    and the write succeeded) - False for a no-op (nothing actually changed)
+    or a failed write (already reported via st.error).
 
-    displayed_positions[i] is the real position in df of whatever row sat
-    at position i in the (possibly filtered) subset _render_master_table
-    actually passed to data_editor this render - identity (0, 1, 2, ...)
-    when its own filter is empty. edited_rows's own keys are always
-    positions within THAT displayed subset, never directly meaningful
-    against df/master_records once the filter has narrowed what's shown -
-    see build_manual_edit's own handling of this same parameter for the
-    real failure mode it prevents.
-
-    Deliberately processes the WHOLE delta in one shot rather than assuming
-    "one cell changed" - a multi-cell paste lands as several changed cells
-    in a single edited_rows dict on one rerun, and that whole batch becomes
-    exactly one save/one version, not one per cell. Combined with
-    data_editor only committing a text edit on blur/Enter (never per
-    keystroke), this is what keeps a burst of typing or a paste from
-    spawning a version per character/cell.
+    property_id, not a positional index, is the caller's own identity for
+    WHICH row to edit - resolved to master_records' real position here,
+    once, right before the one place that actually needs a position
+    (build_manual_edit's own {row_position: ...} shape) - df is expected to
+    already be the freshly-loaded, 0..len(df)-1-indexed master (see
+    sort_by_provider's own reset_index(drop=True)), so this position is
+    real, not filtered/displayed.
     """
-    state = st.session_state.get(key)
-    edited_rows = state.get("edited_rows", {}) if state else {}
-    if not edited_rows:
+    if not changed_fields:
         return False
 
     master_records = [{k: clean_value(v) for k, v in rec.items()} for rec in df.to_dict(orient="records")]
+    row_pos = int(df.index[df["property_id"] == property_id][0])
     merged_rows, diff_rows, fields_changed = master_merge.build_manual_edit(
-        master_records, edited_rows, displayed_positions=displayed_positions
+        master_records, {row_pos: changed_fields}
     )
     if fields_changed == 0:
-        return False  # only "Select" checkboxes changed this render - not a data edit
+        return False
 
-    # The version to offer for Undo is whatever was newest BEFORE this edit
-    # writes a new one - same reasoning as the approve flow's previous_version_path.
     previous_versions = master_writer.list_versions(limit=1)
     previous_version_path = previous_versions[0]["path"] if previous_versions else None
 
@@ -753,15 +759,99 @@ def _process_manual_edits(df: pd.DataFrame, displayed_positions: list, key: str)
         "diff_rows": diff_rows,
         "version_path": previous_version_path,
     }
-    # Resets the widget's own edited_rows/added_rows/deleted_rows tracking -
-    # the freshly-reloaded, re-sorted master on the next render is the sole
-    # source of truth from here; reapplying this positional delta onto it
-    # risks landing on the wrong row if this edit touched the sort key
-    # itself (provider) and shifted row order. Select state isn't lost by
-    # this - it's already been captured into export_selected_property_ids
-    # (keyed by property_id, immune to the same reordering) above.
-    del st.session_state[key]
     return True
+
+
+def _render_edit_property_form(df: pd.DataFrame, property_id: str, key: str) -> None:
+    """
+    A compact, single-property edit form - deliberately NOT a second
+    st.data_editor grid. Streamlit 1.60 does have st.dialog, but AppTest has
+    no way to interact with a dialog's own contents at all (no API to open
+    one, find widgets inside it, or click Save/Cancel within it) - an
+    expander/form directly under the table is used instead specifically so
+    this form's own Save/Cancel/field behavior stays covered by real
+    regression tests, matching this codebase's own testing conventions.
+
+    Fields shown are exactly display_utils.visible_columns(df) - the same
+    editable field set the old data_editor grid always showed (property_id/
+    source_file excluded), so no new hardcoded field list exists here.
+    property_id itself is shown read-only (never an input) - it's the row's
+    own stable identity, never meant to be user-edited.
+
+    Save only ever passes ACTUALLY-changed fields to _save_property_edit -
+    every untouched field is compared against its own ORIGINAL value first,
+    so re-saving a form with nothing changed is correctly a no-op (no
+    version created, no diff line), not a same-value "change" recorded for
+    every field on screen.
+
+    st.number_input has no representable "blank" state - it always returns
+    a real float (0.0 by default for a blank int/float field, since there's
+    no None it could show instead). Comparing the SAVED value against the
+    raw original (None for a blank field) would therefore see every single
+    UNTOUCHED blank numeric field as "changed to 0.0" and silently zero it
+    out on any save at all - confirmed as a real bug while testing this
+    form end-to-end (lat/lng included, since a manually-added row/one with
+    no coordinates yet has both blank). Fixed by comparing against the
+    WIDGET's own default (0.0) for a field that started blank, not the raw
+    original None - a genuinely blank field stays blank unless the widget's
+    OWN value actually changes from what it was initialized to. The one
+    accepted tradeoff: deliberately setting a previously-blank numeric field
+    to exactly 0 looks identical to leaving it untouched and is silently
+    ignored - an inherent st.number_input limitation, not fixable without a
+    separate explicit "set to zero" control, and far safer than the
+    data-corrupting alternative.
+    """
+    row = df.loc[df["property_id"] == property_id].iloc[0]
+    visible = display_utils.visible_columns(df)
+    editing_key = _editing_property_id_key(key)
+
+    with st.expander(f"✏️ Edit {display_utils.row_label(row.to_dict())}", expanded=True):
+        st.caption(f"Property ID: {property_id}")
+        new_values = {}
+        original_for_compare = {}
+        for field in visible:
+            kind = master_merge.field_kind(field)
+            current = clean_value(row[field])
+            field_key = f"{key}_edit_{property_id}_{field}"
+            if kind in ("int", "float"):
+                default = float(current) if current is not None else 0.0
+                edited = st.number_input(
+                    title_case_label(field), value=default,
+                    step=(1.0 if kind == "int" else 0.01), key=field_key,
+                )
+                new_values[field] = int(edited) if kind == "int" else edited
+                original_for_compare[field] = int(default) if kind == "int" else default
+            elif field in display_utils.WIDE_TEXT_COLUMNS:
+                edited = st.text_area(
+                    title_case_label(field), value="" if current is None else str(current), key=field_key,
+                )
+                new_values[field] = edited if edited != "" else None
+                original_for_compare[field] = current
+            else:
+                edited = st.text_input(
+                    title_case_label(field), value="" if current is None else str(current), key=field_key,
+                )
+                new_values[field] = edited if edited != "" else None
+                original_for_compare[field] = current
+
+        save_col, cancel_col = st.columns(2)
+        save_clicked = save_col.button("Save", key=f"{key}_edit_save_{property_id}", type="primary")
+        cancel_clicked = cancel_col.button("Cancel", key=f"{key}_edit_cancel_{property_id}")
+
+        if cancel_clicked:
+            st.session_state[editing_key] = None
+            st.rerun()
+
+        if save_clicked:
+            changed_fields = {
+                field: new_val for field, new_val in new_values.items()
+                if new_val != original_for_compare[field]
+            }
+            if _save_property_edit(df, property_id, changed_fields):
+                st.session_state[editing_key] = None
+                st.rerun()
+            else:
+                st.info("No changes to save.")
 
 
 def _render_approval_confirmation(approval: dict):
@@ -869,8 +959,7 @@ def _render_full_master_view():
     with st.spinner("Loading..."):
         df = display_utils.sort_by_provider(master_writer.load_master_as_dataframe())
 
-    if _render_master_table(df, key="master_table_default_view"):
-        st.rerun()
+    _render_master_table(df, key="master_table_default_view")
 
     st.download_button(
         "Download master.xlsx",

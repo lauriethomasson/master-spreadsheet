@@ -1,23 +1,22 @@
 """
-Regression test for the text filter added above the Master default view's
-directly-editable table (see pages/2_Review_and_Master.py's
-_render_master_table) - previously only the read-only lookup on the
+Regression test for the text filter above the Master default view's ONE
+main table (see pages/2_Review_and_Master.py's _render_master_table/
+_render_row_selector) - previously only the read-only lookup on the
 pending-review screen (_render_master_lookup) had any way to narrow the
-view; the main, editable master table had none.
+view; the main table had none.
 
-Streamlit's AppTest has no support at all for driving st.data_editor cell
-edits or checkbox toggles (there is no dedicated test-element wrapper for
-it, unlike st.button/st.text_input) - it can only read back the CURRENT
-rendered value, since st.data_editor shares the same underlying "dataframe"
-proto as the read-only st.dataframe. So this file only proves the filter
-narrows what's DISPLAYED. The separate, more important correctness
-guarantee - that editing/selecting a row while filtered still resolves to
-the correct underlying row, never one at the same visual position - is
-proven at the pure-logic level in tests/test_master_merge.py's
+The main table is a natively-selectable st.dataframe (its key fingerprinted
+on the currently-visible property_id sequence - see _selector_widget_key),
+not an editable st.data_editor grid - editing one property at a time is a
+separate "Edit selected property" form (see tests/
+test_app_review_edit_property.py). This file only proves the filter narrows
+what's DISPLAYED in that one table. The separate, more important
+correctness guarantee - that a manual edit or removal made while filtered
+still resolves to the correct underlying row, never one at the same visual
+position - is proven at the pure-logic level in tests/test_master_merge.py's
 BuildManualEditTests.test_edit_at_a_filtered_position_updates_the_correct_
 real_row and MergeSelectedPropertyIdsTests (both directly exercise the
-translation logic _render_master_table itself calls into, with no
-Streamlit/AppTest involved).
+translation logic this page calls into, with no Streamlit/AppTest involved).
 
 Runs from an isolated temporary working directory (never the real repo),
 same approach as tests/test_app_review_master_lookup.py.
@@ -40,6 +39,7 @@ import master_writer
 from schema import ListingRow
 
 BASE = Path(__file__).resolve().parent.parent
+_SELECTOR_KEY_PREFIX = "master_table_default_view_selector_"
 
 
 class MasterTableSearchFilterTests(unittest.TestCase):
@@ -62,12 +62,11 @@ class MasterTableSearchFilterTests(unittest.TestCase):
         return next(t for t in at.text_input if t.key == "master_table_default_view_filter")
 
     def _table_value(self, at):
-        # Keyed lookup, not at.dataframe[0] - the Remove-rows expander's own
-        # read-only row-selector (see pages/2_Review_and_Master.py's
-        # _render_row_selector) is now ALSO a real st.dataframe rendered
-        # before this one, so index 0 no longer reliably means "the main
-        # editable table."
-        return next(d for d in at.dataframe if d.key == "master_table_default_view").value
+        # Keyed by fingerprint prefix, not a fixed key or at.dataframe[0] -
+        # see _selector_widget_key's own docstring for why the main table's
+        # real key changes whenever its visible property_id sequence does
+        # (a filter change is exactly that).
+        return next(d for d in at.dataframe if d.key.startswith(_SELECTOR_KEY_PREFIX)).value
 
     def test_unfiltered_view_shows_every_row(self):
         self._seed_master()

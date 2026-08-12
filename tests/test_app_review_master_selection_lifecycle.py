@@ -164,7 +164,7 @@ class SelectionLifecycleTests(unittest.TestCase):
         self._write_three_rows()
         at = self._open()
 
-        filt = next(t for t in at.text_input if t.key == f"{KEY}_removal_filter")
+        filt = next(t for t in at.text_input if t.key == f"{KEY}_filter")
         filt.set_value("Fleet Place").run()
 
         self._select(at, [0])  # only row visible in the filtered selector
@@ -244,9 +244,6 @@ class SelectionLifecycleTests(unittest.TestCase):
         self.assertEqual(len(selector_df), 2)
         self.assertNotIn("28 Gresham Street", selector_df["building"].tolist())
 
-        master_df = next(d for d in at.dataframe if d.key == KEY).value
-        self.assertEqual(len(master_df), 2)
-
     # 8. No stale positional indexes against a newly-shortened dataframe -
     # the real reported IndexError's own shape: select near the end of a
     # larger set, shrink it via removal, then keep interacting.
@@ -290,7 +287,7 @@ class SelectionLifecycleTests(unittest.TestCase):
         at.run()
         self.assertEqual(at.session_state["export_selected_property_ids"], {"row-A", "row-B"})
 
-        filt = next(t for t in at.text_input if t.key == f"{KEY}_removal_filter")
+        filt = next(t for t in at.text_input if t.key == f"{KEY}_filter")
         filt.set_value("Fleet Place").run()  # only row-B visible now
         self.assertEqual(at.session_state["export_selected_property_ids"], {"row-A", "row-B"})
 
