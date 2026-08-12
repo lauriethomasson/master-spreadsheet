@@ -719,7 +719,27 @@ def _items_similar(item_a: str, item_b: str) -> bool:
     intersection, not a sequence-alignment score - since paraphrasing
     routinely reorders words ("large private terrace landscaped" vs
     "private landscaped terrace") without changing the underlying fact.
+
+    An exact match (case/whitespace-normalized) is always similar, checked
+    BEFORE the significant-words comparison below - confirmed real gap this
+    guards against: a short, abbreviation/number-heavy item like "4 MR + 3
+    PB" tokenizes to "4", "mr", "3", "pb", every one of them <= 2 characters
+    and therefore filtered out by _significant_words entirely, leaving an
+    EMPTY significant-words set on both sides. The comparison below treats
+    two empty sets as "nothing to compare" and returns False - which, with
+    no exact-match check first, wrongly concluded an item was DROPPED even
+    when it was restated in new_val completely verbatim, both corrupting
+    is_detail_loss's own review trigger (a false "something was lost") and
+    merge_compatible_text's merged output (re-appending old_val's own copy
+    of an item new_val already states, producing a literal duplicate like
+    "4 MR + 3 PB; Available: December; 4 MR + 3 PB"). This never weakens
+    genuine detail-loss detection - two items that are actually different,
+    however short, still correctly fall through to the significant-words
+    comparison (or fail it) exactly as before.
     """
+    if " ".join(item_a.lower().split()) == " ".join(item_b.lower().split()):
+        return True
+
     words_a, words_b = _significant_words(item_a), _significant_words(item_b)
     if not words_a or not words_b:
         return False
@@ -1306,18 +1326,40 @@ def _suggest_similar(new_dict: dict, master_records: list) -> list:
     suggested at all (same reasoning _building_has_no_digits documents for
     the real matching tier). Showing zero suggestions is always preferable
     to showing irrelevant ones - this only ever reduces manual searching,
-    never replaces it."""
+    never replaces it.
+
+    Candidates are also scoped to new_dict's own provider (normalize_key
+    equality, the same convention _fallback_key/_fuzzy_anchor_key already
+    use) and, like _fuzzy_building_match, excludes any candidate whose OWN
+    building is a numbered address too, not just the target's - provider is
+    part of listing identity throughout this module (see _fallback_key/
+    _primary_key/_fuzzy_anchor_key), and a hint section is no exception:
+    confirmed real gap this closes - "Clerkenwell Road" (incoming, provider
+    A) previously suggested "80 Clerkenwell Road" (an unrelated existing
+    listing from a DIFFERENT provider B) as a "possible near-miss" purely
+    because SequenceMatcher scores a short address as a superstring of
+    itself very highly, regardless of which provider either one belongs to
+    or that the candidate is itself a numbered address _fuzzy_building_
+    match would already exclude on the real matching tier. A different
+    provider is never the same listing (see this module's own module-level
+    identity principle), so it must never be suggested as a possible one,
+    even as a hint a human is still free to dismiss."""
     target_building = new_dict.get("building")
     if not _building_has_no_digits(target_building):
         return []
     target = normalize_key(target_building)
     if not target:
         return []
-    keys = [normalize_key(r.get("building")) for r in master_records]
+    target_provider = normalize_key(new_dict.get("provider"))
+    candidates = [
+        r for r in master_records
+        if normalize_key(r.get("provider")) == target_provider and _building_has_no_digits(r.get("building"))
+    ]
+    keys = [normalize_key(r.get("building")) for r in candidates]
     close = set(difflib.get_close_matches(target, keys, n=3, cutoff=BUILDING_FUZZY_MATCH_THRESHOLD))
     seen = set()
     results = []
-    for rec, key in zip(master_records, keys):
+    for rec, key in zip(candidates, keys):
         if key in close and key not in seen:
             seen.add(key)
             results.append(rec)

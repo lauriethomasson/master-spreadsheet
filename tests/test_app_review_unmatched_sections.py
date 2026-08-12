@@ -157,6 +157,30 @@ class NeedsADecisionHeadingTests(IsolatedCwdTestCase):
 
         self.assertNotIn(self.HEADING, [s.value for s in at.subheader])
 
+    def test_different_provider_near_name_match_never_triggers_the_heading(self):
+        # The exact same real fuzzy pair as test_heading_and_explainer_for_
+        # near_miss above, but with the incoming row's provider changed to
+        # a DIFFERENT one (MetSpace vs UNION - the real confirmed
+        # "Clerkenwell Road" case's own shape) - provider is part of
+        # listing identity, so this must land as a plain new property, not
+        # a "possible near-miss" needing a manual decision.
+        master_writer.write_master([
+            ListingRow(
+                building="80 Clerkenwell Road", provider="UNION", floor_unit="2nd", size_sqft=1000.0,
+                property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(building="Clerkenwell Road", provider="MetSpace", floor_unit="4th Floor", size_sqft=2000.0)],
+            "different_provider.xlsx", content_hash="different-provider-hash",
+        )
+
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        self.assertNotIn(self.HEADING, [s.value for s in at.subheader])
+        self.assertIn("📄 New properties", [s.value for s in at.subheader])
+
 
 class BehaviorUnchangedAfterRestructureTests(IsolatedCwdTestCase):
     def test_near_miss_link_choice_still_updates_the_right_master_index(self):

@@ -125,6 +125,49 @@ class SectionOrderingTests(IsolatedCwdTestCase):
         self.assertEqual([t for t in at.toggle if t.key == "manual_review_toggle"], [])
 
 
+class PentonvilleStyleAutomaticUpdateTests(IsolatedCwdTestCase):
+    """The real confirmed case: a real brochure_link change alongside a
+    special_features update whose only real difference is an updated
+    availability statement plus a restated short feature item must land
+    under Automatic updates, never Needs your decision."""
+
+    def test_44_pentonville_style_row_lands_in_automatic_updates_not_needs_a_decision(self):
+        master_writer.write_master([
+            ListingRow(
+                building="44 Pentonville Road", provider="MetSpace",
+                brochure_link="https://drive.google.com/file/d/OLDID/view",
+                special_features="4 MR + 3 PB; Available: Now",
+                property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="44 Pentonville Road", provider="MetSpace",
+                brochure_link="https://drive.google.com/file/d/NEWID/view",
+                special_features="4 MR + 3 PB; Available: December",
+            )],
+            "pentonville.xlsx", content_hash="pentonville-hash",
+        )
+
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        headings = [s.value for s in at.subheader]
+        self.assertIn("✅ Automatic updates", headings)
+        self.assertNotIn("⚠️ Needs your decision", headings)
+
+        view_changes = [e for e in at.expander if e.label == "View changes"]
+        self.assertEqual(len(view_changes), 1)
+        expander_text = "".join(m.value for m in view_changes[0].markdown)
+        self.assertIn("44 Pentonville Road", expander_text)
+        self.assertIn("brochure_link", expander_text)
+        self.assertIn("special_features", expander_text)
+
+        markdown_text = "".join(m.value for m in at.markdown)
+        # No duplicated "4 MR + 3 PB" in whatever gets rendered as the new value.
+        self.assertNotIn("4 MR + 3 PB; Available: December; 4 MR + 3 PB", markdown_text)
+
+
 class LetStatusThreeChoiceTests(IsolatedCwdTestCase):
     def _staged_under_offer(self):
         master_writer.write_master([

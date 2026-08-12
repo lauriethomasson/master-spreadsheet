@@ -85,25 +85,48 @@ class SuggestSimilarTests(unittest.TestCase):
         master_records = self._master_records(
             ["27 Greville Street", "55 Grosvenor Street", "141 Fenchurch Street (Monument)"]
         )
-        new_dict = {"building": "77 Gracechurch Street"}
+        new_dict = {"building": "77 Gracechurch Street", "provider": "X"}
         self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
 
     def test_genuine_name_only_typo_still_suggested(self):
         # Same real pair FuzzyBuildingMatchTests validates for the actual
         # matching tier (0.938) - the raised threshold must not lose this.
         master_records = self._master_records(["Thirty Lighterman"])
-        new_dict = {"building": "Thirty Lightman"}
+        new_dict = {"building": "Thirty Lightman", "provider": "X"}
         self.assertEqual(len(master_merge._suggest_similar(new_dict, master_records)), 1)
 
     def test_unrelated_name_only_pair_not_suggested(self):
         # Real confirmed false-positive risk for the matching tier (0.762) -
         # below the 0.85 threshold reused here.
         master_records = self._master_records(["Orion House"])
-        new_dict = {"building": "York House"}
+        new_dict = {"building": "York House", "provider": "X"}
         self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
 
     def test_blank_building_suggests_nothing(self):
         self.assertEqual(master_merge._suggest_similar({"building": None}, self._master_records(["Kent House"])), [])
+
+    def test_different_provider_similar_building_is_never_suggested(self):
+        # The real confirmed case: incoming "Clerkenwell Road" (MetSpace)
+        # must never suggest an existing "80 Clerkenwell Road" (UNION) as a
+        # possible near-miss - provider is part of listing identity, and a
+        # different provider is never the same listing, even as a hint.
+        master_records = [{"building": "80 Clerkenwell Road", "provider": "UNION", "floor_unit": "2nd"}]
+        new_dict = {"building": "Clerkenwell Road", "provider": "MetSpace"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
+
+    def test_same_provider_similar_building_is_still_suggested(self):
+        master_records = [{"building": "Thirty Lighterman", "provider": "MetSpace", "floor_unit": "2nd"}]
+        new_dict = {"building": "Thirty Lightman", "provider": "MetSpace"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), master_records)
+
+    def test_provider_filtering_applies_before_the_fuzzy_cutoff_not_after(self):
+        # A different-provider candidate must be excluded from the
+        # candidate pool entirely, not merely scored and then discarded -
+        # confirmed here with a genuinely close typo pair that would
+        # otherwise clear BUILDING_FUZZY_MATCH_THRESHOLD easily.
+        master_records = [{"building": "Thirty Lighterman", "provider": "UNION", "floor_unit": "1st"}]
+        new_dict = {"building": "Thirty Lightman", "provider": "MetSpace"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
 
 
 class MergeFieldChoiceTests(unittest.TestCase):
@@ -1436,6 +1459,54 @@ class BuildMergePlanFuzzyBuildingTests(unittest.TestCase):
         self.assertEqual(len(plan.unmatched), 1)
 
 
+class BuildMergePlanNearMatchSuggestionProviderScopeTests(unittest.TestCase):
+    """End-to-end (build_merge_plan) coverage for the near-match SUGGESTION
+    hint's own provider scoping - distinct from the real matching tiers
+    (already correctly provider-scoped, see BuildMergePlanFuzzyBuildingTests)
+    which only decide auto-update vs. unmatched. This is specifically about
+    what UnmatchedRow.suggestions - the "possible near-misses" list a human
+    reviewer sees - contains once a row is already unmatched."""
+
+    def test_metspace_clerkenwell_road_is_not_blocked_by_union_80_clerkenwell_road(self):
+        # The real confirmed case: a MetSpace listing must land as a
+        # genuinely new property, with no "possible near-miss" pointing at
+        # an unrelated UNION listing.
+        master_df = _master_df([{"building": "80 Clerkenwell Road", "provider": "UNION", "floor_unit": "2nd"}])
+        new_row = ListingRow(building="Clerkenwell Road", provider="MetSpace", floor_unit="4th Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(plan.unmatched[0].suggestions, [])
+
+    def test_same_provider_genuine_near_match_still_suggested_for_review(self):
+        # Provider scoping must never remove a genuinely useful SAME-
+        # provider hint - only cross-provider ones.
+        master_df = _master_df([{"building": "Thirty Lighterman", "provider": "MetSpace", "floor_unit": "9th"}])
+        new_row = ListingRow(building="Thirty Lightman", provider="MetSpace", floor_unit="2nd Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(len(plan.unmatched[0].suggestions), 1)
+
+    def test_same_building_two_different_providers_becomes_two_master_rows(self):
+        # Provider is part of listing identity: the same physical building
+        # listed by two different providers must never be merged into one
+        # row - each stays (or becomes) its own separate listing.
+        master_df = _master_df([
+            {"building": "Adler House", "provider": "MetSpace", "floor_unit": "1st"},
+        ])
+        new_row = ListingRow(building="Adler House", provider="UNION", floor_unit="1st")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(plan.unmatched[0].suggestions, [])
+
+
 class DiffFieldsTests(unittest.TestCase):
     def test_changed_value_is_a_diff(self):
         diffs = master_merge.diff_fields({"building": "A"}, {"building": "B"})
@@ -1462,6 +1533,30 @@ class SilentFieldUpdatesTests(unittest.TestCase):
     def test_real_change_is_not_silent(self):
         updates = master_merge.silent_field_updates({"provider": "A"}, {"provider": "B"})
         self.assertEqual(updates, {})
+
+
+class ItemsSimilarTests(unittest.TestCase):
+    """_items_similar's exact-match short-circuit - a short, abbreviation/
+    number-heavy item (every token <= 2 chars) must still be recognized as
+    similar to an identical restatement of itself, even though its own
+    significant-words set is empty."""
+
+    def test_identical_short_abbreviation_item_is_similar_to_itself(self):
+        self.assertTrue(master_merge._items_similar("4 mr + 3 pb", "4 mr + 3 pb"))
+
+    def test_identical_item_similar_regardless_of_case_and_whitespace(self):
+        self.assertTrue(master_merge._items_similar("4 MR + 3 PB", "4   mr +   3 pb"))
+
+    def test_different_short_items_are_not_similar(self):
+        self.assertFalse(master_merge._items_similar("4 mr + 3 pb", "5 mr + 2 pb"))
+
+    def test_normal_reworded_items_still_work_as_before(self):
+        self.assertTrue(master_merge._items_similar(
+            "large private terrace landscaped with plants", "private landscaped terrace",
+        ))
+
+    def test_unrelated_normal_length_items_are_not_similar(self):
+        self.assertFalse(master_merge._items_similar("manned reception desk", "bike storage available"))
 
 
 class IsDetailLossTests(unittest.TestCase):
@@ -2584,6 +2679,62 @@ class SpecialFeaturesMergeTests(unittest.TestCase):
         # accepted case - see that constant's own docstring) - stays
         # manual review, unmerged, same as the "Fully fitted" case above.
         self.assertIn("special_features", matched.risky_fields)
+
+    def test_available_now_to_available_december_auto_updates(self):
+        # The real confirmed case: 44 Pentonville Road (MetSpace). Before
+        # the _items_similar fix, "4 MR + 3 PB" (every token <= 2 chars,
+        # filtered to an empty significant-words set) couldn't be
+        # recognized as restating itself, wrongly triggering is_detail_loss
+        # and forcing this into manual review.
+        matched = self._matched_special_features(
+            "4 MR + 3 PB; Available: Now", "4 MR + 3 PB; Available: December",
+        )
+        self.assertNotIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs["special_features"][1], "4 MR + 3 PB; Available: December")
+
+    def test_unchanged_short_feature_item_is_not_duplicated(self):
+        # Directly proves the duplication bug is gone: the shared item must
+        # appear exactly once in the result, not twice.
+        matched = self._matched_special_features(
+            "4 MR + 3 PB; Available: Now", "4 MR + 3 PB; Available: December",
+        )
+        merged = matched.diffs["special_features"][1]
+        self.assertEqual(merged.lower().count("4 mr + 3 pb"), 1)
+
+    def test_result_is_equivalent_to_the_expected_clean_value(self):
+        matched = self._matched_special_features(
+            "4 MR + 3 PB; Available: Now", "4 MR + 3 PB; Available: December",
+        )
+        self.assertEqual(matched.diffs["special_features"][1], "4 MR + 3 PB; Available: December")
+
+    def test_brochure_link_change_is_never_risky_alongside_the_auto_update(self):
+        # brochure_link is not in DETAIL_LOSS_MERGE_FIELDS at all - a real
+        # link change alongside the special_features update above must
+        # leave the whole row with zero risky_fields, landing it in
+        # Automatic updates rather than Needs your decision.
+        master_df = _master_df([{
+            "building": "44 Pentonville Road", "provider": "MetSpace", "floor_unit": None,
+            "brochure_link": "https://drive.google.com/file/d/OLDID/view",
+            "special_features": "4 MR + 3 PB; Available: Now",
+        }])
+        new_row = ListingRow(
+            building="44 Pentonville Road", provider="MetSpace", floor_unit=None,
+            brochure_link="https://drive.google.com/file/d/NEWID/view",
+            special_features="4 MR + 3 PB; Available: December",
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+
+        self.assertEqual(matched.risky_fields, frozenset())
+        self.assertEqual(
+            matched.diffs["brochure_link"],
+            ("https://drive.google.com/file/d/OLDID/view", "https://drive.google.com/file/d/NEWID/view"),
+        )
+
+    def test_a_genuinely_different_short_item_is_still_correctly_treated_as_a_change(self):
+        # The exact-match short-circuit must never make two DIFFERENT short
+        # items look similar - only literal restatement is exempted.
+        self.assertFalse(master_merge._items_similar("4 mr + 3 pb", "5 mr + 2 pb"))
 
 
 class ContactsMergeTests(unittest.TestCase):
