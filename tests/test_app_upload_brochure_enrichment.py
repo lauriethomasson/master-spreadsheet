@@ -432,19 +432,23 @@ class FingerprintIncludesBrochureEnrichmentAgainTests(unittest.TestCase):
         # again now (automatically, right after staging - see app.py's own
         # _SPREADSHEET_LOGIC_FINGERPRINT comment), so a change to its
         # matching/field rules must invalidate an already-staged result
-        # exactly like a change to extract_spreadsheet(_gemini).py already
-        # does. Recomputes the exact same formula independently and
-        # compares, so a future refactor that forgets to fold it back in
-        # fails this test.
+        # exactly like a change to extract_spreadsheet(_gemini).py/
+        # geocode.py already does. Recomputes the exact same formula
+        # independently and compares, so a future refactor that forgets to
+        # fold it back in fails this test. See tests/
+        # test_app_upload_geocode_cache_invalidation.py for the equivalent,
+        # dedicated coverage of geocode.py's own inclusion here.
         import hashlib
 
         import extract_spreadsheet
         import extract_spreadsheet_gemini
+        import geocode
 
         expected = hashlib.sha256(
             Path(extract_spreadsheet.__file__).read_bytes()
             + Path(extract_spreadsheet_gemini.__file__).read_bytes()
             + Path(brochure_enrichment.__file__).read_bytes()
+            + Path(geocode.__file__).read_bytes()
         ).hexdigest()
 
         self.assertEqual(app._SPREADSHEET_LOGIC_FINGERPRINT, expected)

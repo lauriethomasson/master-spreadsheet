@@ -18,6 +18,7 @@ import page_flow
 import page_setup
 from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
+import geocode
 from geocode import geocode_rows
 from master_merge import canonicalize_providers
 from schema import ListingRow
@@ -63,10 +64,25 @@ EXTRACTION_VERSION = "3"
 # below), so a change to its matching/field rules must invalidate an
 # already-staged result too, not silently keep serving rows enriched (or
 # not enriched) under the OLD logic.
+#
+# geocode.py is included for the same reason again, confirmed via a real
+# gap: geocode_rows() runs unconditionally right after a fresh extraction
+# for BOTH source types (see the spreadsheet and PDF/email branches below),
+# but wasn't part of either invalidation mechanism at all - neither this
+# fingerprint nor EXTRACTION_VERSION. A real geocoding-validation fix
+# (rejecting a Places candidate that contradicts the source's own postcode
+# evidence - see geocode.py's own module docstring) landed without either
+# being touched, so re-uploading an already-staged file (e.g. the real beem
+# Live Flex Availability.xlsx) kept silently reusing its pre-fix cached
+# rows/coordinates - dedup working exactly as designed, just blind to this
+# one dependency. Folding geocode.py's own source in here (see also its
+# addition to the PDF/email versioned_content below) closes that gap the
+# same automatic, self-maintaining way as the other three modules.
 _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
     Path(extract_spreadsheet.__file__).read_bytes()
     + Path(extract_spreadsheet_gemini.__file__).read_bytes()
     + Path(brochure_enrichment.__file__).read_bytes()
+    + Path(geocode.__file__).read_bytes()
 ).hexdigest()
 
 # The neutral, un-decided option in an ambiguous-sheet decision radio (see
@@ -610,10 +626,24 @@ with page_setup.setup_page("upload"):
                         }
                         content_hash = _spreadsheet_content_hash(file_bytes, decisions_for_this_file)
                     else:
+                        # geocode.py's own source is folded in here too, same
+                        # as _SPREADSHEET_LOGIC_FINGERPRINT above and for the
+                        # exact same reason (see that fingerprint's own
+                        # comment) - geocode_rows() runs unconditionally
+                        # right after extraction for PDF/email too (see the
+                        # else branch further down), so a geocoding-logic
+                        # change must invalidate an already-staged PDF/email
+                        # result exactly like a PDF/email extraction-logic
+                        # change (EXTRACTION_VERSION) already does, without
+                        # requiring anyone to remember to bump that manual
+                        # counter for a change that isn't actually about
+                        # extract.py/extract_email.py at all.
                         versioned_content = (
                             EXTRACTION_VERSION.encode("utf-8")
                             + b"\0"
                             + file_bytes
+                            + b"\0"
+                            + Path(geocode.__file__).read_bytes()
                         )
                         content_hash = hashlib.sha256(versioned_content).hexdigest()
 

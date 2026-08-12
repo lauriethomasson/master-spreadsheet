@@ -1,0 +1,232 @@
+"""
+Regression tests for a real reported gap: geocode.py's own source was not
+part of either content-hash cache-invalidation mechanism app.py uses to
+decide whether a re-uploaded file is "identical to a previous upload,
+reused rather than re-extracted" - _SPREADSHEET_LOGIC_FINGERPRINT for
+spreadsheets, EXTRACTION_VERSION (+ now geocode.py bytes too) for PDF/
+email. geocode_rows() runs unconditionally right after a fresh extraction
+for BOTH source types, so a geocoding-logic change must invalidate an
+already-staged result exactly like an extract_spreadsheet.py/
+extract_spreadsheet_gemini.py/brochure_enrichment.py change already does -
+it simply never did.
+
+Confirmed against a real report: after landing the geocoding postcode-
+validation fix (see geocode.py's own module docstring - rejecting a Places
+candidate that contradicts the source's own postcode evidence), re-
+uploading the real beem Live Flex Availability.xlsx kept showing "identical
+to a previous upload, reused rather than re-extracted" and the old, pre-fix
+coordinates - dedup working exactly as designed, just blind to this one
+dependency (extract_spreadsheet.py/extract_spreadsheet_gemini.py/
+brochure_enrichment.py changes DID correctly invalidate the cache before,
+which is why earlier fixes to those files were picked up on re-upload).
+
+Fix: fold geocode.py's own source bytes into both existing mechanisms - no
+new version-tracking system, matching the existing automatic pattern
+already used for extract_spreadsheet_gemini.py/brochure_enrichment.py.
+
+Run with:
+    .venv\\Scripts\\python.exe -m unittest tests.test_app_upload_geocode_cache_invalidation -v
+"""
+
+import hashlib
+import sys
+import unittest
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import patch
+
+from openpyxl import Workbook
+from streamlit.testing.v1 import AppTest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import app
+import geocode
+from storage.file_store import list_pending_staging_files, load_staging_as_dataframe
+
+BASE = Path(__file__).resolve().parent.parent
+
+
+def _clear_pending():
+    # Shares the real repo's staging/ directory (never an isolated cwd,
+    # same convention as test_app_upload_brochure_enrichment.py) - clears
+    # file_store's own st.cache_data-backed lookups first so a stale cached
+    # hash-lookup from an earlier test can't leak into this one.
+    from storage import file_store as _file_store
+    _file_store._list_pending_staging_files_cached.clear()
+    _file_store._find_previous_upload_by_hash_cached.clear()
+    _file_store._load_staging_as_dataframe_cached.clear()
+    for p in list_pending_staging_files():
+        (BASE / p).unlink(missing_ok=True)
+        (BASE / p).with_suffix(".meta.json").unlink(missing_ok=True)
+
+
+def _workbook(building="New Derwent House WC1") -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Availability"
+    ws.append(["Building", "Floor/Unit", "Size (sq ft)", "Monthly Rate"])
+    ws.append([building, "4th Floor", 2000, 15000])
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _upload_and_extract(at, filename, file_bytes):
+    at.file_uploader[0].upload(
+        filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    at.run()
+    extract_buttons = [b for b in at.button if b.label == "Extract"]
+    extract_buttons[0].click().run()
+    return at
+
+
+class FingerprintCompositionTests(unittest.TestCase):
+    """Pure, no upload involved - proves geocode.py is genuinely part of
+    the formula, not just mentioned in a comment."""
+
+    def test_spreadsheet_fingerprint_is_computed_from_geocode_py_bytes_too(self):
+        expected = hashlib.sha256(
+            Path(app.extract_spreadsheet.__file__).read_bytes()
+            + Path(app.extract_spreadsheet_gemini.__file__).read_bytes()
+            + Path(app.brochure_enrichment.__file__).read_bytes()
+            + Path(geocode.__file__).read_bytes()
+        ).hexdigest()
+        self.assertEqual(app._SPREADSHEET_LOGIC_FINGERPRINT, expected)
+
+    def test_a_hash_computed_under_a_different_fingerprint_never_matches_current(self):
+        # Simulates "this cached entry was produced by older geocoding
+        # code" - a hash computed under a DIFFERENT (older) fingerprint must
+        # never be treated as identical by the CURRENT _spreadsheet_content_
+        # hash, i.e. an old processing-version result can never masquerade
+        # as current.
+        file_bytes = _workbook()
+        old_hash = hashlib.sha256(
+            b"pretend-old-fingerprint-before-the-geocode-fix" + b"\0" + file_bytes + b"\0" + b"{}"
+        ).hexdigest()
+        current_hash = app._spreadsheet_content_hash(file_bytes, {})
+        self.assertNotEqual(old_hash, current_hash)
+
+    def test_same_bytes_and_decisions_hash_identically_every_call(self):
+        # Same source + same (current) processing version still reuses -
+        # the positive case this fix must not break.
+        file_bytes = _workbook()
+        self.assertEqual(
+            app._spreadsheet_content_hash(file_bytes, {}),
+            app._spreadsheet_content_hash(file_bytes, {}),
+        )
+
+    def test_different_bytes_hash_differently(self):
+        self.assertNotEqual(
+            app._spreadsheet_content_hash(_workbook("Building A"), {}),
+            app._spreadsheet_content_hash(_workbook("Building B"), {}),
+        )
+
+    def test_filename_never_participates_in_the_hash(self):
+        # content_hash is purely byte-based, filename-independent (see
+        # _spreadsheet_content_hash's own signature - it takes no filename
+        # at all) - a different filename + identical bytes + same version
+        # CAN reuse, the existing, intended behavior, confirmed end-to-end
+        # in UploadReuseAcrossAFingerprintChangeTests below (which uses two
+        # different filenames for the same bytes throughout).
+        import inspect
+        self.assertNotIn("filename", inspect.signature(app._spreadsheet_content_hash).parameters)
+
+
+class UploadReuseAcrossAFingerprintChangeTests(unittest.TestCase):
+    """
+    End-to-end via the real app.py upload flow. geocode.call_places_text_
+    search is mocked (ZERO_RESULTS) purely to keep this fast/deterministic
+    and avoid real network calls - the actual geocoding OUTCOME is
+    irrelevant here, only whether it runs at all (call count) vs is skipped
+    entirely by the reuse path.
+    """
+
+    def setUp(self):
+        _clear_pending()
+
+    def tearDown(self):
+        _clear_pending()
+
+    def test_same_bytes_same_fingerprint_reuses_and_skips_geocoding(self):
+        file_bytes = _workbook()
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            _upload_and_extract(at, "test.xlsx", file_bytes)
+            self.assertFalse(at.exception)
+            self.assertEqual(mock_places.call_count, 1)
+
+            at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at2.run()
+            _upload_and_extract(at2, "test-reupload.xlsx", file_bytes)
+            self.assertFalse(at2.exception)
+
+            # Reused - geocode was never called a second time.
+            self.assertEqual(mock_places.call_count, 1)
+
+        markdown_text = "".join(m.value for m in at2.markdown)
+        self.assertIn("identical to a previous upload, reused rather than re-extracted", markdown_text)
+
+    def test_same_bytes_but_fingerprint_changed_does_not_reuse_and_regeocodes(self):
+        # Simulates exactly the real Beem report: the source bytes are
+        # unchanged, but geocode.py's own logic (folded into
+        # _SPREADSHEET_LOGIC_FINGERPRINT) has changed since the first
+        # upload - the second upload must NOT reuse the stale cached rows,
+        # and must run geocoding again under the current code.
+        #
+        # AppTest.from_file re-execs app.py fresh (exec(code, module.
+        # __dict__)) in its OWN namespace on every .run() - patching the
+        # `app` module THIS test file imported has no effect on that exec'd
+        # copy at all, they're different module objects entirely. What both
+        # genuinely share is the same running Python process, so patching
+        # pathlib.Path.read_bytes itself (real, unpatched, for every path
+        # except geocode.py's own file) reaches the exec'd script's own
+        # Path(geocode.__file__).read_bytes() call just as it would a real
+        # source change to geocode.py on disk - without touching the real
+        # file.
+        file_bytes = _workbook()
+        real_read_bytes = Path.read_bytes
+        geocode_path = Path(geocode.__file__).resolve()
+
+        def _fake_read_bytes(self):
+            data = real_read_bytes(self)
+            if self.resolve() == geocode_path:
+                return data + b"\0-simulated-geocode-py-change"
+            return data
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            _upload_and_extract(at, "test.xlsx", file_bytes)
+            self.assertFalse(at.exception)
+            self.assertEqual(mock_places.call_count, 1)
+
+            with patch.object(Path, "read_bytes", _fake_read_bytes):
+                at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+                at2.run()
+                _upload_and_extract(at2, "test-reupload.xlsx", file_bytes)
+                self.assertFalse(at2.exception)
+
+            # NOT reused - geocoding actually ran again under the "new" code.
+            self.assertEqual(mock_places.call_count, 2)
+
+        markdown_text = "".join(m.value for m in at2.markdown)
+        self.assertNotIn("identical to a previous upload, reused rather than re-extracted", markdown_text)
+
+        # Both uploads produced their own staging entry (see save_staging_
+        # file's own "reused or freshly extracted alike" docstring) - the
+        # second one's rows came from genuinely re-running the current
+        # pipeline, not a stale copy.
+        pending = list_pending_staging_files()
+        self.assertEqual(len(pending), 2)
+        for path in pending:
+            df = load_staging_as_dataframe(path)
+            self.assertEqual(len(df), 1)
+            self.assertEqual(df.iloc[0]["building"], "New Derwent House WC1")
+
+
+if __name__ == "__main__":
+    unittest.main()
