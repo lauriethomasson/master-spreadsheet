@@ -602,10 +602,25 @@ def _clear_row_selection(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
 
 def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selected_positions: list, key: str) -> None:
     with st.container(horizontal=True):
-        st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected — carries over to the Export step.")
-        if st.button("Clear selection", key=f"{key}_clear_selection", disabled=not selected_positions):
-            _clear_row_selection(df, filtered_df, key)
-            st.rerun()
+        st.caption(f"{len(selected_positions)} of {len(df)} row(s) selected.")
+
+        # Same st.switch_page(...) call page_flow.render_nav_buttons already
+        # uses elsewhere in this app for page-to-page navigation - no new
+        # mechanism, and no second export-selection state: this only ever
+        # switches to a page that already reads export_selected_df/
+        # export_selected_property_ids (see pages/3_Export.py), both of
+        # which _render_row_selector above keeps current every render
+        # regardless of whether this button is ever clicked - previously
+        # the ONLY way there was navigating away manually (via the sidebar
+        # or the Back/Next buttons at the page's own bottom) and hoping that
+        # state was still populated, with no direct affordance for the
+        # export workflow this selection exists to feed sitting next to the
+        # selection itself.
+        if st.button(
+            "Export selected →", key=f"{key}_export_selected",
+            disabled=not selected_positions, type="primary",
+        ):
+            st.switch_page("pages/3_Export.py")
 
         # Reuses the exact same apply_merge/write_master path a let-status
         # removal (during upload review, see removed_indices above) already
@@ -619,6 +634,10 @@ def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selec
             f"Remove {len(selected_positions)} selected row(s)",
             key=f"{key}_remove_selected",
         )
+
+        if st.button("Clear selection", key=f"{key}_clear_selection", disabled=not selected_positions):
+            _clear_row_selection(df, filtered_df, key)
+            st.rerun()
 
         # Feedback for this action lives right here, inline in the same row
         # as the button, rather than as a separate banner above the table -

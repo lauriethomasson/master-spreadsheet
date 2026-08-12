@@ -368,6 +368,50 @@ class RemoveRowsExpanderTests(unittest.TestCase):
         self.assertEqual(len(at.session_state["export_selected_df"]), 0)
         self.assertEqual(at.session_state["export_selected_property_ids"], set())
 
+    # 15. "Export selected ->" is disabled with nothing selected - selection
+    # alone (never this button) is what carries rows to the Export page, and
+    # a disabled state is the visible signal that nothing is selected yet.
+    def test_export_button_is_disabled_with_nothing_selected(self):
+        self._write_three_rows()
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        export_btn = next(b for b in at.button if b.label == "Export selected →")
+        self.assertTrue(export_btn.disabled)
+
+    # 16. Selecting a row enables "Export selected ->" - the direct
+    # affordance this file's own module docstring says the restructure was
+    # missing (previously the only path to the Export page was navigating
+    # away manually and hoping export_selected_df was still populated).
+    def test_export_button_is_enabled_once_a_row_is_selected(self):
+        self._write_three_rows()
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        self._select_rows(at, [self._position_of("row-A")])
+        at.run()
+
+        export_btn = next(b for b in at.button if b.label == "Export selected →")
+        self.assertFalse(export_btn.disabled)
+
+    # 17. Clicking "Export selected ->" switches to the Export page without
+    # altering the selection state it's meant to carry across - it must
+    # never clear or otherwise touch export_selected_df/
+    # export_selected_property_ids, only navigate.
+    def test_export_button_click_switches_page_without_touching_selection(self):
+        self._write_three_rows()
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        self._select_rows(at, [self._position_of("row-A"), self._position_of("row-B")])
+        at.run()
+        selected_before = set(at.session_state["export_selected_property_ids"])
+
+        export_btn = next(b for b in at.button if b.label == "Export selected →")
+        export_btn.click().run()
+
+        self.assertEqual(at.session_state["export_selected_property_ids"], selected_before)
+
 
 if __name__ == "__main__":
     unittest.main()
