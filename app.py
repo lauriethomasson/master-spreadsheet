@@ -763,16 +763,35 @@ with page_setup.setup_page("upload"):
 
                         sheet_progress.empty()
                         geocode_rows(rows)
-                        # apply_filename_guess/apply_building_fallback=True
-                        # only for header-mapped rows - a Gemini-extracted
-                        # sheet has already made its own genuine judgment
-                        # call about whether a provider/address genuinely
-                        # exists (same reasoning as PDF/email, see both
-                        # functions' own docstrings), so guessing on top of
-                        # that would risk exactly the "misrepresenting a
-                        # landlord-direct listing as agent-represented"
-                        # problem those docstrings warn about.
-                        fill_missing_provider(header_mapped_rows, uploaded_file.name, apply_filename_guess=True)
+                        # fill_missing_provider applies to EVERY spreadsheet
+                        # row here, header-mapped or Gemini-fallback alike -
+                        # apply_filename_guess=True is scoped by SOURCE TYPE
+                        # (spreadsheet vs PDF/email, see that function's own
+                        # docstring), never by which extraction METHOD this
+                        # particular sheet happened to need internally. A
+                        # spreadsheet that needed the Gemini fallback (e.g.
+                        # a repeating per-building block layout header-
+                        # mapping can't resolve) is still a spreadsheet
+                        # source - it has no column stating a provider
+                        # either way, so the filename is exactly as reliable
+                        # a fallback for it as for a header-mapped sheet.
+                        # Confirmed real gap this closes: a real beem Live
+                        # Flex Availability.xlsx sheet that fell back to
+                        # Gemini extraction (see classify_sheet_for_
+                        # extraction) ended up with a genuinely blank
+                        # provider, even though guess_provider_name(
+                        # uploaded_file.name) resolves to a real, correct
+                        # "beem" - previously only ever applied to
+                        # header_mapped_rows, never gemini_rows, based on
+                        # reasoning that actually belongs to PDF/email (see
+                        # extract.py/extract_email.py's OWN Gemini-decided
+                        # provider case, which fill_missing_address_from_
+                        # building below is correctly still scoped away
+                        # from - a spreadsheet row's blank address_1 is a
+                        # separate, deliberate judgment call this file's own
+                        # docstring already reasons through independently,
+                        # untouched here).
+                        fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=True)
                         fill_missing_address_from_building(header_mapped_rows, apply_building_fallback=True)
 
                         # Brochure enrichment deliberately does NOT run here

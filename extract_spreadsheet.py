@@ -107,12 +107,29 @@ CRITICAL_FIELDS = ("building",)
 # case-label synonym; "Price p/sq.ft" normalizes to "price psqft", already
 # present below) - confirming UNION genuinely varies this wording sheet-to-
 # sheet within the SAME workbook, not just file-to-file.
+#
+# building's own "property" and rent_pcm/rent_psf's own "managed rent per
+# month"/"managed rent per sqft" were added once confirmed against a real
+# beem Live Flex Availability.xlsx - "Property" is a generic, common
+# commercial-property spreadsheet header for the property/building
+# identifier (not this one provider's own wording), and "Managed rent" is
+# this provider's own generic phrasing for what other providers call
+# "Monthly Rate"/"Marketing Price ... PCM". Exact synonyms, not a fuzzy-
+# threshold change - see suggest_mapping's own docstring on why pass 1
+# (exact match) is what a header like this one word ("Property") needs:
+# _fuzzy_field_score's own bidirectional-coverage requirement can never
+# resolve a single-word header on its own merits (nothing to compare
+# against beyond mere identity), so this would otherwise never map at all
+# without an explicit synonym, regardless of threshold.
 EXTRA_SYNONYMS = {
+    "building": ("property",),
     "floor_unit": ("floorunit", "floor"),
     "size_sqft": ("size sq ft", "sq ft", "size"),
     "desks_max": ("desks",),
-    "rent_pcm": ("marketing price based on min term pcm", "monthly rate"),
-    "rent_psf": ("marketing price based on min term psf", "price psqft", "price per sq ft"),
+    "rent_pcm": ("marketing price based on min term pcm", "monthly rate", "managed rent per month"),
+    "rent_psf": (
+        "marketing price based on min term psf", "price psqft", "price per sq ft", "managed rent per sqft",
+    ),
     "brochure_link": (
         "brochure pdf", "link to file", "link to brochure", "brochure link", "link to brochure pdf", "brochure",
     ),
@@ -671,6 +688,13 @@ _PROVIDER_GUESS_STOPWORDS = frozenset({
     "availability", "external", "export", "extract", "download", "report",
     "update", "updated", "current", "live", "final", "draft", "copy",
     "schedule", "listing", "listings", "spreadsheet", "sheet", "data",
+    # "flex" added once confirmed against a real filename ("beem Live Flex
+    # Availability.xlsx") - describes the TYPE of space on offer (flexible
+    # workspace), the same generic-boilerplate role "Availability"/"Live"
+    # already play, not a provider's own identity. Only ever strips the
+    # standalone word "flex" - a compound name like "Flexspace" is one
+    # single token and is never split apart or affected by this at all.
+    "flex",
 })
 
 # Providers this pipeline already recognizes by name - once a filename's

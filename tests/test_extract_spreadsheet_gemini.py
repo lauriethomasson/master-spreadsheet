@@ -1205,50 +1205,6 @@ class ExtractUpdateDateTests(unittest.TestCase):
         self.assertIsNone(extract_spreadsheet_gemini.extract_update_date(text))
 
 
-class LooksLikeFlatDataTableTests(unittest.TestCase):
-    def _sheet(self, rows):
-        wb = Workbook()
-        ws = wb.active
-        for row in rows:
-            ws.append(row)
-        return ws
-
-    def test_real_portfolio_shape_is_a_flat_table(self):
-        rows = [[None, "Area", "Station", "Building", "Office", "Sq.Ft", "Price Per Sq.Ft", "Monthly List Price"]]
-        for i in range(10):
-            rows.append([None, "City", "Bank", f"Building {i}", "3rd Floor", 1000 + i, 150, 12000])
-        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet(rows))
-
-        self.assertTrue(extract_spreadsheet_gemini._looks_like_flat_data_table(text))
-
-    def test_real_incentives_shape_is_not_a_flat_table(self):
-        # Mostly prose/commission-structure paragraphs plus a name/phone
-        # column far to the right of otherwise-blank cells - wide after
-        # trailing-blank trimming, but never 2+ numeric cells on one row.
-        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
-            [None, "Copthall Estates Incentives - Updated 03/08/26", None, None, None, None, None, None, None, None,
-             None, "To register a lead or discuss an enquiry, contact:"],
-            [None, "Standard Commission", None, None, None, None, None, None, None, None, None,
-             "Enquiry@copthallestates.com  0203 002 2503"],
-            [None, "10% on the first 12 months, 2% on months 13-24 for any deals with a lease term of 36 months "
-                   "or longer. Payable when the deal enters year 3.", None, None, None, None, None, None, None,
-             None, None, "Kiri Norton-Brennan - 0795 811 8382"],
-            [None, None, None, None, None, None, None, None, None, None, None, "Megan Copsey - 0794 393 2852"],
-            [None, "89 Charterhouse Street - Enhanced Incentive"],
-            [None, "Achieved Year 1 Rent: Enhanced Commission Rate Achieved +1.5% of Year 1 rent"],
-            [None, "11 Cursitor Street - Viewing Incentive"],
-        ]))
-
-        self.assertFalse(extract_spreadsheet_gemini._looks_like_flat_data_table(text))
-
-    def test_few_numeric_rows_is_not_a_flat_table(self):
-        rows = [[None, "Area", "Station", "Building", "Office", "Sq.Ft"]]
-        rows.append([None, "City", "Bank", "50 Gresham", "3rd Floor", 973])
-        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet(rows))
-
-        self.assertFalse(extract_spreadsheet_gemini._looks_like_flat_data_table(text))
-
-
 class ClassifySheetForExtractionTests(unittest.TestCase):
     """classify_sheet_for_extraction - the three-outcome classification
     (auto_skip / ambiguous / authoritative) app.py's upload-time decision UI
@@ -1312,9 +1268,9 @@ class ClassifySheetForExtractionTests(unittest.TestCase):
         self.assertEqual(result["reasons"], [])
 
     def test_incentives_shaped_sheet_is_authoritative_not_ambiguous(self):
-        # Must never be flagged just for lacking hyperlinks - it was never
-        # trying to be a listings table in the first place (see
-        # _looks_like_flat_data_table's own docstring).
+        # Must never be flagged just for lacking hyperlinks - a flat table
+        # with no download/brochure line carries no staleness signal on its
+        # own (see classify_sheet_for_extraction's own docstring).
         ws = self._sheet(self._incentives_rows(), title="Incentives", state="visible")
         text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
 
@@ -1357,9 +1313,9 @@ class ClassifySheetForExtractionTests(unittest.TestCase):
         self.assertNotEqual(result["outcome"], "auto_skip")
 
     def test_no_download_links_alone_never_reaches_auto_skip(self):
-        # Visible + no download lines + a flat-table shape (so the
-        # ambiguity signal itself CAN fire) - still must never auto-skip
-        # without the hidden/veryHidden half of the confident pair.
+        # Visible + no download lines - still must never auto-skip without
+        # the hidden/veryHidden half of the confident pair (is_non_
+        # authoritative_rollup_sheet's own two-signal intersection).
         ws = self._sheet(self._portfolio_rows(), title="Portfolio", state="visible")
         text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
 

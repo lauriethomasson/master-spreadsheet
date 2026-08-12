@@ -266,6 +266,32 @@ class DataframeToListingRowsTests(IsolatedCwdTestCase):
 
         self.assertEqual(len(rows), 1)
 
+    def test_a_raw_number_in_a_string_field_is_coerced_not_a_crash(self):
+        # Real confirmed case: a beem Live Flex Availability.xlsx row's own
+        # Floor cell held the raw number 2.3, not text like "2nd" - this
+        # previously failed ListingRow's own str validation and aborted the
+        # WHOLE file's extraction over that one cell.
+        df = pd.DataFrame([{"building": "City Tower", "floor_unit": 2.3}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertEqual(rows[0].floor_unit, "2.3")
+
+    def test_a_whole_number_float_in_a_string_field_drops_the_trailing_zero(self):
+        df = pd.DataFrame([{"building": "City Tower", "floor_unit": 2.0}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertEqual(rows[0].floor_unit, "2")
+
+    def test_numeric_fields_are_never_coerced_to_strings(self):
+        df = pd.DataFrame([{"building": "City Tower", "size_sqft": 1000.0}])
+
+        rows = file_store.dataframe_to_listing_rows(df)
+
+        self.assertEqual(rows[0].size_sqft, 1000.0)
+        self.assertIsInstance(rows[0].size_sqft, float)
+
     def test_tbc_placeholder_brochure_link_becomes_blank(self):
         # Real confirmed case: a UNION row's own Brochure cell reads "TBC"
         # (the provider's own way of saying "no brochure yet") - this must

@@ -794,45 +794,6 @@ def extract_update_date(raw_text: str):
     return None
 
 
-def _is_numeric_cell(text: str) -> bool:
-    try:
-        float(text.replace(",", "").strip())
-        return True
-    except ValueError:
-        return False
-
-
-def _looks_like_flat_data_table(raw_text: str) -> bool:
-    """
-    True if raw_text contains several rows shaped like genuine tabular
-    per-property data - at least 5 pipe-separated cells AND at least 2 of
-    them numeric-looking (a size/price/rent-shaped column) - repeated across
-    at least 5 rows anywhere in the sheet. Confirmed against the real
-    Copthall Portfolio sheet (an Area/Station/Building/Office/Sq.Ft/Price
-    Per Sq.Ft/... table, ~20 such rows) versus the real Incentives sheet
-    (mostly single-cell prose/commission-structure paragraphs and a
-    name/phone-number column far to the right of mostly-blank cells - wide
-    after render_sheet_as_text's own trailing-blank trim, but never with 2+
-    genuinely numeric cells on the same row).
-
-    This exists ONLY to tell apart "a sheet that's at least trying to state
-    per-property data in a flat table, just not one the header-mapping
-    column-name matching recognizes" from "a sheet with no per-unit
-    availability data at all" (PROMPT's own commission/incentive-
-    explanation case) - the latter must never be flagged ambiguous just for
-    lacking hyperlinks, since it was never a listings sheet to begin with.
-    """
-    lines = [_ROW_PREFIX_RE.sub("", line) for line in raw_text.splitlines()]
-    wide_numeric_rows = 0
-    for line in lines:
-        cells = [c.strip() for c in line.split("|")]
-        if len(cells) < 5:
-            continue
-        if sum(1 for c in cells if _is_numeric_cell(c)) >= 2:
-            wide_numeric_rows += 1
-    return wide_numeric_rows >= 5
-
-
 def classify_sheet_for_extraction(ws, raw_text: str, sibling_dates: dict = None) -> dict:
     """
     Classifies a Gemini-fallback-eligible sheet (one header-mapping has
@@ -853,17 +814,20 @@ def classify_sheet_for_extraction(ws, raw_text: str, sibling_dates: dict = None)
           present (a hidden sheet is always at least worth asking about -
           why would a genuinely current listings sheet be hidden? - even
           when it isn't confidently skippable on structure alone);
-        - no "download" line anywhere, but ONLY when the sheet also looks
-          like it's at least trying to state flat per-property data (see
-          _looks_like_flat_data_table) - never for a sheet with no per-unit
-          data at all (e.g. a commission/incentive explanation), which was
-          never a listings candidate to begin with;
         - its own name is one of SUSPICIOUS_SHEET_NAMES;
         - its own "Updated" date (see extract_update_date) is
           STALE_UPDATE_DATE_THRESHOLD_DAYS+ older than the newest sibling
           sheet's own date in the same upload (sibling_dates) - never
           guessed from a single data point, so this never fires without at
           least one comparably-dated sibling.
+      A flat data table with no "download"/brochure line by itself is
+      deliberately NOT one of these signals (removed after a real confirmed
+      false positive: beem Live Flex Availability.xlsx's own Sheet1 - a
+      completely ordinary, current, flat per-unit availability table that
+      simply never had a brochure/download column at all) - a provider is
+      allowed to have a current availability spreadsheet with no brochures,
+      and the mere shape of a flat table carries no staleness signal on its
+      own; only the stronger, more specific signals above do.
     - "authoritative": none of the above - process automatically, exactly
       as every sheet did before this function existed.
 
@@ -885,14 +849,11 @@ def classify_sheet_for_extraction(ws, raw_text: str, sibling_dates: dict = None)
         }
 
     hidden = ws.sheet_state in ("hidden", "veryHidden")
-    has_download_lines = any("download" in line.lower() for line in raw_text.splitlines())
     name_key = str(ws.title or "").strip().lower()
 
     reasons = []
     if hidden:
         reasons.append("hidden")
-    if not has_download_lines and _looks_like_flat_data_table(raw_text):
-        reasons.append("flat_summary_table_with_no_brochure_links")
     if name_key in SUSPICIOUS_SHEET_NAMES:
         reasons.append("suspicious_sheet_name")
 

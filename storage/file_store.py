@@ -18,6 +18,7 @@ strings either way, e.g. "staging/20260101_120000_brochure.xlsx".
 """
 
 import json
+import typing
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -586,6 +587,42 @@ def _sanitize_url_like_fields(cleaned: dict) -> dict:
     return cleaned
 
 
+def _is_string_field(field_name: str) -> bool:
+    """True for a ListingRow field declared Optional[str] - derived from the
+    schema's own type hints (same approach as master_merge.field_kind, not
+    importable here - master_merge already imports FROM this module, so
+    importing it back would be circular), never a hardcoded field list."""
+    if field_name not in ListingRow.model_fields:
+        return False
+    annotation = ListingRow.model_fields[field_name].annotation
+    args = typing.get_args(annotation)
+    base = next((a for a in args if a is not type(None)), annotation)
+    return base is str
+
+
+def _coerce_string_fields(cleaned: dict) -> dict:
+    """
+    Coerces a raw number sitting in a str-typed field to its own genuine
+    text (e.g. 2.3 -> "2.3", a whole-number float like 2.0 -> "2", matching
+    how the number itself would actually read) rather than letting it reach
+    ListingRow(**cleaned) as-is - confirmed real failure this guards
+    against: a real beem Live Flex Availability.xlsx row's own Floor cell
+    held the raw number 2.3 (not text like "2nd"), which previously failed
+    ListingRow's own str validation and aborted the WHOLE file's extraction
+    over that one cell - the exact same "one bad cell must never take down
+    every other row" principle this module's own dataframe_to_listing_rows
+    already applies to a blank building value.
+    """
+    for field, value in cleaned.items():
+        if value is None or isinstance(value, str) or not _is_string_field(field):
+            continue
+        if isinstance(value, float) and value.is_integer():
+            cleaned[field] = str(int(value))
+        else:
+            cleaned[field] = str(value)
+    return cleaned
+
+
 def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
     """
     Skips any row with no building name, rather than only a row that's
@@ -609,6 +646,7 @@ def dataframe_to_listing_rows(df: pd.DataFrame) -> list[ListingRow]:
         building = cleaned.get("building")
         if building is None or (isinstance(building, str) and not building.strip()):
             continue
+        cleaned = _coerce_string_fields(cleaned)
         cleaned = _sanitize_url_like_fields(cleaned)
         rows.append(ListingRow(**cleaned))
     return rows
