@@ -37,6 +37,22 @@ different street), confirmed against the real API to sometimes return zero
 results entirely and sometimes a confident but genuinely wrong match
 hundreds of meters to over a kilometer away - silently, since a wrong-but-
 plausible match has no error signal at all, unlike a zero-results failure.
+
+Before accepting any Tier 2 candidate, also cross-checks it against a UK
+postcode-district hint parsed out of whatever location evidence the SOURCE
+already provided (row.postcode, row.address_1, or a trailing token on
+row.building - see _source_location_hint/extract_postcode_hint) and rejects
+a candidate that contradicts it, leaving the row's fields blank rather than
+writing a confident-but-wrong result. within_london_bbox alone only rejects
+a match outside Greater London entirely - it cannot and was never meant to
+catch a wrong-but-plausible match to a DIFFERENT real place within that same
+box. Confirmed real failure this exists for: a real beem Live Flex
+Availability.xlsx row's own building text ("New Derwent House WC1") was
+geocoded via Places Text Search to "25 Savile Row, London W1S 2ER" - a
+different postcode area entirely, still comfortably inside the bbox. The
+parsing is purely the UK postcode's own outward/inward code grammar, never a
+hardcoded list of specific areas, buildings, or providers - the same check
+applies identically to any other UK postcode district a future file states.
 """
 
 import json
@@ -89,6 +105,126 @@ def within_london_bbox(lat: float, lng: float) -> bool:
         LONDON_BBOX["lat_min"] <= lat <= LONDON_BBOX["lat_max"]
         and LONDON_BBOX["lng_min"] <= lng <= LONDON_BBOX["lng_max"]
     )
+
+
+# --- Generic UK postcode-district evidence -----------------------------
+#
+# within_london_bbox is a coarse ~30x50km rectangle covering the whole of
+# Greater London - necessary (rejects a match in a different city entirely)
+# but not sufficient to catch a wrong-but-plausible match to a DIFFERENT
+# real place within that same box (confirmed real case: source building
+# text "New Derwent House WC1" resolved via Places Text Search to a
+# same/similarly-named place at "25 Savile Row, London W1S 2ER" - a
+# different postcode AREA, nowhere near WC1, still comfortably inside the
+# bbox). The functions below parse a UK postcode's own "outward code"
+# grammar (1-2 area letters + 1-2 district digits + an optional finer-
+# subdivision letter, e.g. "SE1", "EC1V", "W1S") to pull a location hint out
+# of whatever free text the SOURCE already provided (row.postcode,
+# row.address_1, or a trailing token on row.building - see
+# _source_location_hint) and use it to reject a geocoder candidate that
+# contradicts it. This is the country-wide postal FORMAT, never a lookup of
+# specific area/place names - the same check works identically for a future
+# file naming any other UK postcode district, with nothing London-specific
+# or provider-specific hardcoded.
+_OUTWARD_CODE_RE = re.compile(r"^([A-Za-z]{1,2})(\d{1,2})([A-Za-z]?)$")
+_INWARD_CODE_RE = re.compile(r"^\d[A-Za-z]{2}$")
+
+
+def _district_parts(outward_code: str):
+    """
+    (area, district_number) for an outward code, ignoring its optional
+    finer-subdivision letter - "EC1A" and "EC1" both -> ("EC", "1"), since
+    that letter marks a subdivision WITHIN the same numbered district, not a
+    genuinely different one. Comparing on this tuple (rather than the raw
+    string) avoids a false conflict between a source's plain "EC1" hint and
+    a candidate's more specific "EC1A", while still catching a genuine
+    disagreement in area letters or district number (WC1 vs W1S, SE1 vs
+    EC1V, WC1 vs SW7 - the exact shape of every confirmed real/illustrative
+    failure this exists for).
+    """
+    match = _OUTWARD_CODE_RE.match(outward_code.upper())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def extract_postcode_hint(text: str):
+    """
+    Parses a UK postcode-district hint from the trailing token(s) of free
+    text ("New Derwent House WC1" -> district ("WC", "1"); "22 Newman
+    Street W1T 4PX" -> full postcode plus district ("W1", "T")->("W","1")),
+    purely via the outward/inward code grammar - never a lookup of specific
+    area/place names, so this works identically for any UK postcode.
+    Returns None when the trailing token doesn't structurally look like a
+    postcode/district at all, which is the common case for a plain building
+    name with nothing appended.
+
+    Deliberately only looks at the trailing token(s), never scans the whole
+    string: every real example confirmed against actual provider data
+    (beem Live Flex Availability.xlsx) states its postcode-district as the
+    very last word of the building/address text, and anchoring there avoids
+    a false hit on some unrelated mid-string token that happens to fit the
+    same short letter+digit pattern.
+    """
+    if not text:
+        return None
+    tokens = [t for t in re.split(r"\s+", text.strip()) if t]
+    if not tokens:
+        return None
+
+    last = tokens[-1]
+    if len(tokens) >= 2 and _INWARD_CODE_RE.match(last):
+        district = _district_parts(tokens[-2])
+        if district:
+            return {"full": f"{tokens[-2].upper()} {last.upper()}", "district": district}
+
+    district = _district_parts(last)
+    if district:
+        return {"full": None, "district": district}
+    return None
+
+
+def _source_location_hint(row: ListingRow):
+    """
+    The strongest postcode-district hint already stated by the SOURCE,
+    checked in the same priority this module's own tiering already trusts
+    (an explicit row.postcode outranks one merely embedded in address_1/
+    building text) - row.postcode/address_1 are trusted verbatim; building
+    is checked last since it's only ever a byproduct of a provider's own
+    naming convention (e.g. Beem's "Property" column), not a dedicated
+    location field. Returns None when nothing postcode-shaped is found
+    anywhere, which leaves geocode_row's own acceptance check exactly as
+    permissive as it always was for a row with no such evidence at all -
+    this is additive validation, never a new requirement to have evidence.
+    """
+    for text in (row.postcode, row.address_1, row.building):
+        hint = extract_postcode_hint(text)
+        if hint:
+            return hint
+    return None
+
+
+def _postcode_hint_conflicts(source_hint: dict, candidate_postcode: str) -> bool:
+    """
+    True only when both sides parse to a district and genuinely disagree
+    (see _district_parts) - never true when either side has nothing to
+    compare. An absent/unparseable candidate postcode is a reason to accept
+    on trust (no evidence either way), not a reason to reject - only an
+    actual, parseable contradiction between two real signals counts.
+    """
+    if not source_hint or not candidate_postcode:
+        return False
+    candidate_hint = extract_postcode_hint(candidate_postcode)
+    if not candidate_hint:
+        return False
+    return source_hint["district"] != candidate_hint["district"]
+
+
+def _hint_label(hint: dict) -> str:
+    """Human-readable form of a hint dict for a log/failure message - the
+    full postcode when known, else just the district's own two parts
+    stitched back together (("WC", "1") -> "WC1")."""
+    return hint["full"] or "".join(hint["district"])
 
 
 def call_geocoding_api(address: str) -> dict:
@@ -312,7 +448,9 @@ def geocode_row(row: ListingRow) -> ListingRow:
         # FIRST (see split_compound_building/this module's own
         # docstring) - the full building value is always tried too, but
         # only as a fallback if the address-only attempt doesn't produce
-        # an in-bbox match, never as the first/preferred query.
+        # an in-bbox, non-conflicting match, never as the first/preferred
+        # query.
+        source_hint = _source_location_hint(row)
         compound = split_compound_building(row.building)
         candidates = ([compound[1]] if compound else []) + [row.building]
 
@@ -324,9 +462,27 @@ def geocode_row(row: ListingRow) -> ListingRow:
             query_parts.append("London, UK")
             query = ", ".join(query_parts)
 
-            result = call_places_text_search(query)
-            if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
-                break
+            candidate_result = call_places_text_search(query)
+            if candidate_result["status"] != "OK" or not within_london_bbox(
+                candidate_result.get("lat"), candidate_result.get("lng")
+            ):
+                result = candidate_result
+                continue
+
+            # Validate BEFORE accepting - never write a candidate's lat/lng
+            # and then discover the conflict afterwards (see this module's
+            # own docstring on the confirmed "New Derwent House WC1" ->
+            # "25 Savile Row W1S 2ER" real failure). A candidate with no
+            # postal_code component at all has nothing to check against, so
+            # it's accepted on trust the same as before this validation
+            # existed - only a genuine, parseable contradiction rejects it.
+            _, candidate_postcode = _address_line1_and_postcode(candidate_result.get("address_components", []))
+            if _postcode_hint_conflicts(source_hint, candidate_postcode):
+                result = {**candidate_result, "status": "LOCATION_CONFLICT", "postcode": candidate_postcode}
+                continue
+
+            result = candidate_result
+            break
 
         if result["status"] == "OK" and within_london_bbox(result["lat"], result["lng"]):
             row.lat = result["lat"]
@@ -354,10 +510,26 @@ def geocode_row(row: ListingRow) -> ListingRow:
                     address_1, postcode = _address_line1_and_postcode(
                         reverse.get("address_components", []), name_key="long_name"
                     )
-                    if not row.address_1 and address_1:
-                        row.address_1 = address_1
-                    if not row.postcode and postcode:
-                        row.postcode = postcode
+                    # Same validation as the forward-search candidate above -
+                    # a reverse-geocode of an already-accepted coordinate can
+                    # still surface a postcode that contradicts the source's
+                    # own evidence (the accepted candidate had no postal_code
+                    # component of its own to check at accept time). Leave
+                    # address_1/postcode blank rather than write a
+                    # confident-but-wrong value; lat/lng are left as-is since
+                    # they already passed the bbox/no-evidence-to-contradict
+                    # check above.
+                    if postcode and _postcode_hint_conflicts(source_hint, postcode):
+                        log_geocode_failure(
+                            row,
+                            f"reverse-geocode postcode {postcode!r} contradicts source location "
+                            f"evidence ({_hint_label(source_hint)!r}) - address_1/postcode left blank",
+                        )
+                    else:
+                        if not row.address_1 and address_1:
+                            row.address_1 = address_1
+                        if not row.postcode and postcode:
+                            row.postcode = postcode
                     if not row.submarket:
                         submarket = _submarket_from_components(reverse.get("address_components", []))
                         if submarket:
@@ -370,6 +542,16 @@ def geocode_row(row: ListingRow) -> ListingRow:
                         "address/postcode found there, even after a reverse-geocode fallback",
                     )
 
+            return row
+
+        if result["status"] == "LOCATION_CONFLICT":
+            log_geocode_failure(
+                row,
+                f"Places candidate (postcode={result.get('postcode')!r}, lat={result.get('lat')}, "
+                f"lng={result.get('lng')}) contradicts the source's own location evidence "
+                f"({_hint_label(source_hint)!r}) - rejected rather than accepted on a weak "
+                "building-name-only match",
+            )
             return row
 
         if result["status"] == "OK":
