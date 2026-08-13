@@ -166,11 +166,11 @@ ISSUE_STATUSES = (
 # and hardcoding one host's name here would be exactly the kind of
 # provider-specific special case this whole module avoids elsewhere.
 _ISSUE_LABELS = {
-    STATUS_UNSUPPORTED_LINK_TYPE: "unsupported link type",
-    STATUS_FETCH_FAILED: "could not be accessed",
-    STATUS_RENDER_FAILED: "could not be read",
-    STATUS_EXTRACTION_FAILED: "could not be read",
-    STATUS_EXTRACTED_BUT_AMBIGUOUS: "read, but could not be safely matched to this property",
+    STATUS_UNSUPPORTED_LINK_TYPE: "This type of link can't currently be read",
+    STATUS_FETCH_FAILED: "The document couldn't be opened",
+    STATUS_RENDER_FAILED: "The document couldn't be read",
+    STATUS_EXTRACTION_FAILED: "Information couldn't be extracted from this document",
+    STATUS_EXTRACTED_BUT_AMBIGUOUS: "The document was read, but couldn't be safely matched to this property",
 }
 
 
@@ -239,14 +239,29 @@ def _ineligible_link_issues(rows: list, needs_fn, url_attr: str, reject_floorpla
     (nothing wrong, nothing to report) and STATUS_NO_DOCUMENT/STATUS_
     INVALID_PLACEHOLDER (see ISSUE_STATUSES's own docstring - a genuinely
     blank/placeholder link is completely normal, never an "issue").
+
+    An entry whose STATUS_UNSUPPORTED_LINK_TYPE reason is specifically a
+    Canva public "view" link (see is_canva_view_link) also carries an
+    additive "unsupported_reason": "canva" key - not a new status, just an
+    extra fact the Review page's own compact summary uses to say "most of
+    these are Canva links" ONLY when that's actually true (see pages/2_
+    Review_and_Master.py's own document-issues summary), never guessed or
+    assumed. Every OTHER unsupported-link-type cause (a bare homepage, a
+    known social-profile domain, a video link) omits this key entirely, so
+    a caller that only ever checked "status" before this is completely
+    unaffected.
     """
     issues = []
     for row in rows:
         if not needs_fn(row):
             continue
-        status = classify_link_eligibility(getattr(row, url_attr), reject_floorplan_shaped=reject_floorplan_shaped)
+        url = getattr(row, url_attr)
+        status = classify_link_eligibility(url, reject_floorplan_shaped=reject_floorplan_shaped)
         if status in ISSUE_STATUSES:
-            issues.append({"building": row.building, "floor_unit": row.floor_unit, "status": status})
+            issue = {"building": row.building, "floor_unit": row.floor_unit, "status": status}
+            if status == STATUS_UNSUPPORTED_LINK_TYPE and is_canva_view_link(url):
+                issue["unsupported_reason"] = "canva"
+            issues.append(issue)
     return issues
 
 

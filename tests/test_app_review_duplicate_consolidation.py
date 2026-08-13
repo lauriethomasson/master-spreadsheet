@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import master_writer
 from schema import ListingRow
-from storage.file_store import save_staging_file
+from storage.file_store import save_staging_file, update_staging_rows
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -301,6 +301,45 @@ class OliverYardListingIdentityTests(IsolatedCwdTestCase):
         ])
         # Never the old per-field "Keep value from:" radio for this identity question.
         self.assertEqual([r for r in at.radio if r.label == "Keep value from:"], [])
+
+    def test_reprocessed_staging_rows_are_reclassified_on_the_very_next_render(self):
+        # Part 4's own "stale staging/cache" question: build_merge_plan is
+        # called fresh from this file's CURRENT staged rows on every Review
+        # render (pages/2_Review_and_Master.py's own _render_pending_review)
+        # - there is no separate cached "these two rows are a duplicate"
+        # decision stored anywhere. Confirms that directly: a batch that
+        # starts with genuinely insufficient evidence (needs a manual
+        # decision) is immediately, correctly reclassified as two separate
+        # listings on the NEXT render once the SAME staging entry's rows are
+        # rewritten with fuller evidence - simulating a corrected re-
+        # extraction of the same upload - with no leftover/stuck state from
+        # the first render.
+        path = save_staging_file(
+            [
+                ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=7282.0),
+                ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=42892.0),
+            ],
+            "The Workplace Company Availability (1).xlsx", content_hash="oliver-reprocessed-hash",
+        )
+
+        at = _run_review_page()
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+
+        update_staging_rows(path, [
+            ListingRow(
+                building="1 Oliver's Yard", provider="The Workplace Company",
+                size_sqft=7282.0, desks_min=52, desks_max=68, rent_pcm=45512.0,
+            ),
+            ListingRow(
+                building="1 Oliver's Yard", provider="The Workplace Company",
+                size_sqft=42892.0, desks_min=200, desks_max=400, rent_pcm=230811.0,
+            ),
+        ])
+
+        at = _run_review_page()
+
+        self.assertNotIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+        self.assertEqual([e for e in at.expander if "Possible duplicate" in (e.label or "")], [])
 
 
 if __name__ == "__main__":

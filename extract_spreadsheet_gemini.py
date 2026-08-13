@@ -92,12 +92,21 @@ Then extract EVERY SEPARATE AVAILABLE UNIT:
   Copthall Avenue" must stay "14-18 Copthall Avenue", never become "18 Copthall Avenue").
 - postcode: the UK postcode, if given (often part of the same address text, or its own column).
 - floor_unit: the unit's own label (e.g. "4th Floor", "G/LG East", "4th & 5th (Private Terrace)").
-- size_sqft: the square footage figure for that row.
+- size_sqft: the square footage figure for that row. There is only one size_sqft field (no min/max
+  pair) - if the source states a range (e.g. "5,515 - 7,282"), use the UPPER end of the range
+  (7282), the same convention desks_max already uses for a plain desk range below. Never leave this
+  null merely because a range was given instead of one plain number.
 - desks_min / desks_max: an explicit desk count if one is stated as a number (a plain number is
-  desks_max; a range like "10-15" is desks_min=10, desks_max=15); otherwise null - never guess one
-  from square footage.
-- rent_psf: a per-square-foot rate column/value if present.
-- rent_pcm: a monthly rent total column/value if present.
+  desks_max; a range like "10-15" is desks_min=10, desks_max=15). A row combining more than one
+  sub-unit's own desk count (e.g. "52 + 5 MR (Unit A) & 68 + 5 MR (Unit B)") is also a range for
+  this purpose: use the smallest and largest of the sub-units' own MAIN desk counts (52 and 68
+  here) as desks_min/desks_max, ignoring a separately-labeled meeting-room/ancillary add-on (the
+  "+5 MR" here) - never leave both null merely because the count wasn't a single plain "X-15"-style
+  range. Otherwise null - never guess one from square footage.
+- rent_psf: a per-square-foot rate column/value if present. Same range rule as size_sqft above if a
+  range is stated - use the upper end, never leave this null merely because a range was given.
+- rent_pcm: a monthly rent total column/value if present. Same range rule as size_sqft above if a
+  range is stated - use the upper end, never leave this null merely because a range was given.
 - special_features: the unit's own description/features text, plus a commission/incentive column's
   text appended after a semicolon if one is given for that row.
 - state_of_space: the physical fit-out state ONLY if the text EXPLICITLY states one (e.g. "Fitted",

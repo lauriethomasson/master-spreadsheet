@@ -122,7 +122,7 @@ class PendingStagingManagementTests(unittest.TestCase):
         warning_text = "".join(w.value for w in at.warning)
         self.assertIn("30/126", warning_text)
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("126/126", caption_text)
+        self.assertIn("✓ Documents checked", caption_text)  # the complete copy's own distinct status
         discard_buttons = [b for b in at.button if b.label == "Discard this upload"]
         self.assertEqual(len(discard_buttons), 2)
 

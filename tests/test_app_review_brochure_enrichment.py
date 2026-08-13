@@ -92,8 +92,7 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
         self.assertFalse(at.exception)
 
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("Brochure enrichment", caption_text)
-        self.assertIn("1 row(s) enriched", caption_text)
+        self.assertIn("✓ Documents checked", caption_text)
 
     def test_completed_run_never_shows_a_continue_button(self):
         # Continue enrichment exists ONLY as recovery for an interrupted
@@ -131,7 +130,8 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
         self.assertFalse(at.exception)
 
         caption_text = "".join(c.value for c in at.caption)
-        self.assertNotIn("Brochure enrichment", caption_text)
+        self.assertNotIn("✓ Documents checked", caption_text)
+        self.assertNotIn("couldn't be read", caption_text)
 
     def test_summary_mentions_unavailable_brochures_when_present(self):
         path = save_staging_file(
@@ -141,13 +141,16 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
         processed = {f"https://example.com/{i}.pdf": ("ok" if i < 3 else "unavailable") for i in range(5)}
         set_staging_enrichment_summary(
             path, {"unique_brochures_considered": 5, "rows_eligible": 5, "rows_enriched": 3}, processed,
+            document_issues=[
+                {"building": f"Building {i}", "floor_unit": None, "status": "fetch_failed"} for i in range(3, 5)
+            ],
         )
 
         at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
         at.run()
 
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("2 brochure(s) could not be processed", caption_text)
+        self.assertIn("2 documents couldn't be read", caption_text)
 
     def test_interrupted_run_shows_a_warning_not_a_normal_caption(self):
         # A run that never reached its own final set_staging_enrichment_
@@ -304,13 +307,17 @@ class MasterUntouchedBeforeApprovalTests(unittest.TestCase):
         self.assertFalse(at.exception)
 
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("1 document(s) need a look", caption_text)
+        self.assertIn("1 document couldn't be read", caption_text)
+        # Never the raw internal status constant/old technical wording.
+        self.assertNotIn("fetch_failed", caption_text)
+        self.assertNotIn("could not be accessed", caption_text)
 
         expanders = [e for e in at.expander if e.label == "View document issues"]
         self.assertEqual(len(expanders), 1)
         markdown_text = "".join(m.value for m in expanders[0].markdown)
         self.assertIn("Clove", markdown_text)
-        self.assertIn("could not be accessed", markdown_text)
+        self.assertIn("The document couldn't be opened", markdown_text)
+        self.assertNotIn("fetch_failed", markdown_text)
 
     def test_no_issues_expander_when_nothing_wrong(self):
         path = save_staging_file(
@@ -328,6 +335,118 @@ class MasterUntouchedBeforeApprovalTests(unittest.TestCase):
         self.assertFalse(at.exception)
 
         self.assertEqual([e for e in at.expander if e.label == "View document issues"], [])
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("✓ Documents checked", caption_text)
+
+    def test_stray_bullet_formatting_never_appears_for_a_multiline_building_name(self):
+        # Real, confirmed report: a raw source cell's own building/address
+        # text sometimes carries an embedded newline (e.g. "1 Oliver's
+        # Yard, London, EC1Y 1DT\n") - rendering that verbatim inside a
+        # markdown bullet line broke the list into stray "-"/"*" fragments.
+        # Whitespace (including embedded newlines) is now collapsed before
+        # rendering, so the location always stays on one line.
+        path = save_staging_file(
+            [ListingRow(
+                building="1 Oliver's Yard, London, EC1Y 1DT\n", floor_unit="1st\nFloor",
+                brochure_link="https://example.com/broken.pdf", special_features=None,
+            )],
+            "Union.xlsx", content_hash="hash-multiline",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 0},
+            {"https://example.com/broken.pdf": "unavailable"},
+            document_issues=[
+                {"building": "1 Oliver's Yard, London, EC1Y 1DT\n", "floor_unit": "1st\nFloor", "status": "fetch_failed"}
+            ],
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        expanders = [e for e in at.expander if e.label == "View document issues"]
+        markdown_lines = [m.value for m in expanders[0].markdown]
+        # No stray line consisting of just a bullet/emphasis marker.
+        for line in markdown_lines:
+            for fragment in line.split("\n"):
+                self.assertNotIn(fragment.strip(), ("-", "*"))
+        self.assertIn("1 Oliver's Yard, London, EC1Y 1DT — 1st Floor", "".join(markdown_lines))
+
+    def test_majority_canva_issues_are_named_compactly(self):
+        issues = [
+            {"building": f"Canva Building {i}", "floor_unit": None,
+             "status": "unsupported_link_type", "unsupported_reason": "canva"}
+            for i in range(4)
+        ] + [{"building": "Other Building", "floor_unit": None, "status": "fetch_failed"}]
+        path = save_staging_file(
+            [ListingRow(building="Canva Building 0", brochure_link="https://example.com/a.pdf", special_features=None)],
+            "Union.xlsx", content_hash="hash-canva-majority",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 0},
+            {"https://example.com/a.pdf": "unavailable"}, document_issues=issues,
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("5 documents couldn't be read", caption_text)
+        self.assertIn("Most are Canva links, which aren't currently supported.", caption_text)
+        self.assertEqual([e for e in at.expander if e.label == "View affected properties"][0].label, "View affected properties")
+
+    def test_minority_canva_issues_are_not_named(self):
+        issues = [
+            {"building": "Canva Building", "floor_unit": None,
+             "status": "unsupported_link_type", "unsupported_reason": "canva"},
+            {"building": "Other Building A", "floor_unit": None, "status": "fetch_failed"},
+            {"building": "Other Building B", "floor_unit": None, "status": "fetch_failed"},
+        ]
+        path = save_staging_file(
+            [ListingRow(building="Canva Building", brochure_link="https://example.com/a.pdf", special_features=None)],
+            "Union.xlsx", content_hash="hash-canva-minority",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 0},
+            {"https://example.com/a.pdf": "unavailable"}, document_issues=issues,
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertNotIn("Most are Canva", caption_text)
+        self.assertEqual([e for e in at.expander if e.label == "View affected properties"], [])
+        self.assertEqual(len([e for e in at.expander if e.label == "View document issues"]), 1)
+
+    def test_document_issues_never_appear_under_needs_your_decision(self):
+        # Document warnings are a separate, compact informational section -
+        # "Needs your decision" must contain only genuine manual decisions
+        # (a real duplicate/collision/near-miss/let-status choice), never a
+        # document-processing warning.
+        path = save_staging_file(
+            [ListingRow(building="Broken Co", brochure_link="https://example.com/broken.pdf", special_features=None)],
+            "Union.xlsx", content_hash="hash-decision-purity",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 0},
+            {"https://example.com/broken.pdf": "unavailable"},
+            document_issues=[{"building": "Broken Co", "floor_unit": None, "status": "fetch_failed"}],
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        # No genuine decision exists for this single, non-conflicting new
+        # row, so the subheader must not appear at all - proving the
+        # document-issue warning (which DOES appear, in its own section)
+        # was never rendered under it.
+        self.assertNotIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("couldn't be read", caption_text)
 
 
 if __name__ == "__main__":

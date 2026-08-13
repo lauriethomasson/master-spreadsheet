@@ -13,6 +13,7 @@ Run with:
 
 import contextlib
 import io
+import os
 import sys
 import unittest
 from datetime import date
@@ -20,11 +21,12 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import extract_spreadsheet_gemini
+import master_merge
 
 
 class RenderSheetAsTextTests(unittest.TestCase):
@@ -1353,6 +1355,45 @@ class ClassifySheetForExtractionTests(unittest.TestCase):
         result = extract_spreadsheet_gemini.classify_sheet_for_extraction(ws, text, sibling_dates={})
 
         self.assertEqual(result["outcome"], "authoritative")
+
+
+_HAS_GEMINI_KEY = bool(os.environ.get("GEMINI_API_KEY"))
+# The real "1 Oliver's Yard" (The Workplace Company) report: two rows in
+# the same real sheet state their own size/desks/rent as RANGES ("5,515 -
+# 7,282", "52 + 5 MR (Unit A) & 68 + 5 MR (Unit B)", "£34,468 - £45,512")
+# rather than a single plain number. The real, confirmed root cause of
+# that report staying stuck on "Needs your decision" was traced to the
+# PROMPT giving no explicit range-handling rule for size_sqft/rent_pcm/
+# rent_psf (unlike desks_min/desks_max and address_1, which already had
+# one) - risking a null/inconsistent extraction of exactly the fields
+# master_merge._listing_evidence_conflicts needs to confidently tell two
+# dramatically different listings apart. This is a real file outside the
+# repo tree (same convention as test_brochure_enrichment.py's own real
+# Nash House brochure test) - skipped automatically when GEMINI_API_KEY
+# isn't configured or the file isn't present in this environment.
+REAL_TWC_AVAILABILITY = Path(r"C:\Users\julie\OneDrive\Documents\The Workplace Company Availability (1).xlsx")
+
+
+@unittest.skipUnless(_HAS_GEMINI_KEY, "GEMINI_API_KEY not configured")
+@unittest.skipUnless(REAL_TWC_AVAILABILITY.exists(), "real Workplace Company Availability file not present")
+class RealOliversYardRangeExtractionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        wb = load_workbook(str(REAL_TWC_AVAILABILITY), data_only=True)
+        rows = extract_spreadsheet_gemini.extract_sheet(wb["Sheet1"], "Sheet1", REAL_TWC_AVAILABILITY.name)
+        cls.units = [r for r in rows if r.building and "Oliver" in r.building]
+
+    def test_both_oliver_s_yard_units_were_found(self):
+        self.assertEqual(len(self.units), 2)
+
+    def test_size_and_rent_are_never_null_merely_because_a_range_was_stated(self):
+        for row in self.units:
+            self.assertIsNotNone(row.size_sqft)
+            self.assertIsNotNone(row.rent_pcm)
+
+    def test_extracted_evidence_is_sufficient_to_confidently_separate_the_listings(self):
+        a, b = self.units[0].model_dump(), self.units[1].model_dump()
+        self.assertTrue(master_merge._listing_evidence_conflicts(a, b))
 
 
 if __name__ == "__main__":

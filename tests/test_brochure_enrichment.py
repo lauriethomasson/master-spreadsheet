@@ -2941,6 +2941,48 @@ class ClassifyLinkEligibilityTests(unittest.TestCase):
         self.assertIsNone(brochure_enrichment.classify_link_eligibility("https://example.com/brochure.pdf"))
 
 
+class IneligibleLinkIssuesCanvaReasonTests(unittest.TestCase):
+    """
+    _ineligible_link_issues' own additive "unsupported_reason": "canva" key
+    (see its docstring) - lets the Review page's compact summary correctly
+    say "most of these are Canva links" ONLY when the data actually
+    establishes that, without inventing a new status or touching Canva's
+    own safe, pre-fetch-rejected behavior from commit a67e337 at all.
+    """
+
+    def test_canva_view_link_is_tagged_with_the_canva_reason(self):
+        rows = [ListingRow(
+            building="Canva House",
+            brochure_link="https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view",
+            special_features=None,
+        )]
+        issues = brochure_enrichment._ineligible_link_issues(
+            rows, brochure_enrichment.needs_enrichment, "brochure_link", reject_floorplan_shaped=True,
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["unsupported_reason"], "canva")
+
+    def test_a_non_canva_unsupported_link_has_no_reason_key(self):
+        rows = [ListingRow(
+            building="Example House", brochure_link="https://www.workspace.co.uk/", special_features=None,
+        )]
+        issues = brochure_enrichment._ineligible_link_issues(
+            rows, brochure_enrichment.needs_enrichment, "brochure_link", reject_floorplan_shaped=True,
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertNotIn("unsupported_reason", issues[0])
+
+    def test_a_fetch_failure_status_never_gets_a_canva_reason_key(self):
+        # unsupported_reason is only ever attached to STATUS_UNSUPPORTED_
+        # LINK_TYPE - a different issue status (e.g. a blank/placeholder,
+        # not an issue at all here) must never carry it.
+        rows = [ListingRow(building="A", brochure_link="TBC", special_features=None)]
+        issues = brochure_enrichment._ineligible_link_issues(
+            rows, brochure_enrichment.needs_enrichment, "brochure_link", reject_floorplan_shaped=True,
+        )
+        self.assertEqual(issues, [])  # TBC is a placeholder, not an issue at all
+
+
 class RowHadAmbiguousMatchTests(unittest.TestCase):
     def test_two_candidate_units_with_no_disambiguator_is_ambiguous(self):
         row = ListingRow(building="Nash House", floor_unit=None, size_sqft=None)
@@ -3040,7 +3082,10 @@ class DocumentStatusIntegrationTests(EnrichmentTestCase):
             "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view?utm_content=x#7",
         )
         self.assertEqual(stats["document_issues"], [
-            {"building": "Canva House", "floor_unit": None, "status": brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE},
+            {
+                "building": "Canva House", "floor_unit": None,
+                "status": brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE, "unsupported_reason": "canva",
+            },
         ])
 
     def test_canva_failure_does_not_stop_other_documents_from_processing(self):

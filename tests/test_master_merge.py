@@ -3328,6 +3328,44 @@ class ListingIdentityConflictTests(unittest.TestCase):
         self.assertEqual(len(plan.matched_changed), 1)
         self.assertEqual(len(plan.unmatched), 0)
 
+    def test_large_single_field_rent_change_still_stays_the_same_listing(self):
+        # Part 3's own explicit example: rent moving from £10,000 to
+        # £12,000 (a real, large 20% change) must remain a normal update -
+        # a single differing field is never enough on its own, no matter
+        # how large the change, since _MIN_INDEPENDENT_SIGNALS_FOR_
+        # SEPARATE_LISTINGS requires 3+ independent signals.
+        master_df = _master_df([{
+            "building": "1 Oliver's Yard", "provider": "The Workplace Company",
+            "size_sqft": 7282.0, "desks_min": 52, "desks_max": 68, "rent_pcm": 10000.0,
+        }])
+        new_row = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company",
+            size_sqft=7282.0, desks_min=52, desks_max=68, rent_pcm=12000.0,
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_single_corrected_desk_field_still_stays_the_same_listing(self):
+        # A provider correcting just its own desk count (e.g. a typo fix)
+        # must never be treated as a second, separate listing either - same
+        # single-signal-is-never-enough rule as the rent case above.
+        master_df = _master_df([{
+            "building": "1 Oliver's Yard", "provider": "The Workplace Company",
+            "size_sqft": 7282.0, "desks_min": 52, "desks_max": 68, "rent_pcm": 45512.0,
+        }])
+        new_row = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company",
+            size_sqft=7282.0, desks_min=52, desks_max=90, rent_pcm=45512.0,
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
     def test_richer_duplicate_of_the_same_listing_still_consolidates(self):
         # Two rows with essentially the SAME numeric evidence (no material
         # difference at all) but one carries extra descriptive text - must

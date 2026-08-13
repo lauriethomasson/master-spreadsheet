@@ -1157,27 +1157,73 @@ def _render_single_file_discard(path: str, label: str = "Discard this upload") -
             st.rerun()
 
 
-def _render_document_issues(issues: list) -> None:
+# Fraction of a file's own document issues that must share the Canva
+# unsupported-link reason (see brochure_enrichment._ineligible_link_issues'
+# own "unsupported_reason" docstring) before the summary names Canva by
+# type - a real, data-established majority, never a guess merely because
+# SOME of a file's issues happen to be Canva links.
+_CANVA_MAJORITY_THRESHOLD = 0.5
+
+
+def _render_document_issues(any_links_checked: bool, issues: list) -> None:
     """
-    Compact "N document(s) need a look" caption plus a collapsed expander
-    naming each one, sourced from stats["document_issues"] (see brochure_
-    enrichment.enrich_rows_grouped's own docstring) - a no-op for a file
-    with no issues at all (nothing to draw, matching "do not show a huge
-    warning for every successful document"). Every line uses brochure_
-    enrichment.issue_label's own friendly wording, never a raw status
-    constant, exception message, HTTP status code, or URL (which may carry
-    a signed/tokenized query string) - this is the one place a reviewer
-    sees this, and it must stay simple and non-technical.
+    Plain-English summary of this file's own discovered brochure/floorplan
+    links - a reviewer only needs to know what worked, what couldn't be
+    read, and whether they need to do anything; internal status constants
+    (unsupported_link_type, fetch_failed, extraction_failed, ...) are never
+    shown directly, only brochure_enrichment.issue_label's own friendly
+    wording - this is the one place a reviewer sees this, and it must stay
+    simple and non-technical.
+
+    Deliberately never claims a combined "N found — X read, Y couldn't be
+    read" total: unique_brochures_considered/unique_floorplans_considered
+    (real fetch attempts) are counted per unique URL, while `issues` is
+    counted per AFFECTED ROW (see brochure_enrichment._ineligible_link_
+    issues/enrich_rows_grouped's own docstrings) - two rows sharing one
+    failed brochure_link each get their own issue entry, so a combined
+    total mixing both granularities could overstate or understate "how
+    many documents" were involved. The one count this DOES show - `len(
+    issues)` - is unambiguous and always accurate on its own terms: exactly
+    how many rows have a document that couldn't be read, never a
+    reconciled figure that might not add up (see this task's own real
+    report: a stray "3/3 checked" beside "50 need a look" read as
+    contradictory for exactly this reason).
+
+    A file with nothing checked at all (any_links_checked=False) and no
+    issues draws nothing - there's nothing to report. A file that checked
+    at least one link and had no issues draws a single "✓ Documents
+    checked" with no further statistics - "3/3 checked, 0 enriched" is
+    exactly the kind of processing-internal detail a normal user doesn't
+    need.
+
+    When most (see _CANVA_MAJORITY_THRESHOLD) of this file's own issues
+    share the Canva-specific reason (see _ineligible_link_issues'
+    "unsupported_reason" key, itself derived from brochure_link_resolver.
+    is_canva_view_link - never guessed), an extra line names Canva
+    specifically rather than reading like the whole upload failed for an
+    unknown reason. This is purely a wording choice made from a fact this
+    module already has - it never changes which links are attempted,
+    retried, or fetched (Canva's own safe, pre-fetch-rejected behavior from
+    commit a67e337 is completely unchanged).
     """
     if not issues:
+        if any_links_checked:
+            st.caption("✓ Documents checked")
         return
-    st.caption(f"⚠️ {len(issues)} document(s) need a look.")
-    with st.expander("View document issues"):
+
+    n_issues = len(issues)
+    st.caption(f"⚠️ {n_issues} document{'s' if n_issues != 1 else ''} couldn't be read.")
+    canva_count = sum(1 for i in issues if i.get("unsupported_reason") == "canva")
+    mostly_canva = bool(canva_count) and canva_count / n_issues >= _CANVA_MAJORITY_THRESHOLD
+    if mostly_canva:
+        st.caption("Most are Canva links, which aren't currently supported.")
+
+    with st.expander("View affected properties" if mostly_canva else "View document issues"):
         for issue in issues:
-            location = issue["building"] or "(no building)"
+            location = " ".join((issue["building"] or "(no building)").split())
             if issue.get("floor_unit"):
-                location += f" — {issue['floor_unit']}"
-            st.markdown(f"- **{location}** — {brochure_enrichment.issue_label(issue['status'])}")
+                location += f" — {' '.join(issue['floor_unit'].split())}"
+            st.markdown(f"**{location}**  \n{brochure_enrichment.issue_label(issue['status'])}.")
 
 
 def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) -> None:
@@ -1279,18 +1325,10 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
                         )
                     st.rerun()
             elif stats:
-                summary = (
-                    f"Brochure enrichment: Complete — {stats['unique_brochures_considered']}/"
-                    f"{stats['unique_brochures_considered']} checked, {stats['rows_enriched']} row(s) enriched."
+                any_links_checked = bool(
+                    stats["unique_brochures_considered"] or stats.get("unique_floorplans_considered")
                 )
-                if stats["brochures_unavailable"]:
-                    summary += f" {stats['brochures_unavailable']} brochure(s) could not be processed."
-                if stats.get("unique_floorplans_considered"):
-                    summary += (
-                        f" {stats['unique_floorplans_considered']} unique floor plan(s) also checked."
-                    )
-                st.caption(summary)
-                _render_document_issues(stats.get("document_issues"))
+                _render_document_issues(any_links_checked, stats.get("document_issues") or [])
 
             # Exactly one pending upload: _render_discard_pending renders
             # nothing at all (see its own docstring) - this per-file button
