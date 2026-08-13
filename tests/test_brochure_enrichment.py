@@ -671,6 +671,42 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
         self.assertIn("private design", sink["detail"])
 
+    def test_401_from_renderer_is_distinguished_as_an_auth_failure(self):
+        # Real, confirmed diagnostic gap this closes: a 401/403 from the
+        # renderer (Cloud Run's own IAM check rejecting the call BEFORE it
+        # ever reaches the renderer's own code) previously looked
+        # identical to "the renderer just couldn't render this page" -
+        # this is distinguished so a real production auth problem (a
+        # missing Cloud Run Invoker binding, a wrong audience) is never
+        # masked as a generic render failure.
+        response = MagicMock(status_code=401, headers={"content-type": "text/html"})
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+        self.assertIn("authentication failed", sink["detail"])
+
+    def test_403_from_renderer_is_also_distinguished_as_an_auth_failure(self):
+        response = MagicMock(status_code=403, headers={"content-type": "text/html"})
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIn("authentication failed", sink["detail"])
+
+    def test_auth_header_minting_failure_is_logged_not_silent(self):
+        with patch("google.oauth2.id_token.fetch_id_token", side_effect=Exception("no credentials")), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            headers = brochure_enrichment._canva_renderer_auth_headers("https://canva-renderer.example.run.app")
+
+        self.assertEqual(headers, {})
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Could not mint an ID token", logged)
+
     def test_auth_headers_included_in_request(self):
         response = MagicMock(status_code=200, content=b"\x89PNG", headers={"content-type": "image/png"})
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \

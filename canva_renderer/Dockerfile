@@ -12,6 +12,16 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Belt-and-suspenders: the base image's own tag (v1.61.0-jammy above) is
+# already supposed to ship Chromium pre-installed at that exact version,
+# matching requirements.txt's own pinned playwright==1.61.0 - but a
+# mismatch here (wrong tag, base image changed upstream) would otherwise
+# fail SILENTLY at first real render with an unhelpful "executable doesn't
+# exist" error. This is a no-op (fast, already-satisfied check) when the
+# browser is already present, so it costs nothing when everything already
+# lines up correctly.
+RUN playwright install --with-deps chromium
+
 COPY app.py .
 
 ENV PORT=8080

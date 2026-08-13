@@ -1673,16 +1673,36 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
         master_idx, tier = None, None
 
         pk = _primary_key(new_dict)
-        if pk and len(primary_index.get(pk, [])) == 1:
-            master_idx, tier = primary_index[pk][0], "postcode"
-        else:
+        primary_candidates = primary_index.get(pk, []) if pk else []
+        if len(primary_candidates) == 1:
+            master_idx, tier = primary_candidates[0], "postcode"
+        elif len(primary_candidates) > 1:
+            # 2+ existing master rows already share this exact identity key -
+            # the real, confirmed "1 Oliver's Yard" shape (two genuinely
+            # separate listings, same building/provider/postcode, both
+            # floor_unit blank - see master_merge's own listing-identity
+            # rule). An ambiguous key match alone is exactly as unsafe to
+            # auto-apply as no match at all, UNLESS this row's own size/
+            # desks/rent evidence (see _best_listing_evidence_match) picks
+            # out exactly one of them with real confidence - e.g. a re-
+            # upload of that same source now stating fuller data than
+            # whichever version is already on file for THAT specific
+            # listing. Never guessed when two candidates fit equally well.
+            best = _best_listing_evidence_match(new_dict, [master_records[i] for i in primary_candidates])
+            if best is not None:
+                master_idx, tier = primary_candidates[best], "postcode"
+
+        if master_idx is None:
             candidates = fallback_index.get(_fallback_key(new_dict), [])
             if len(candidates) == 1:
                 master_idx, tier = candidates[0], "fallback"
-            # 0 or >1 candidates both fall through as unmatched - an
-            # ambiguous fallback match is exactly as unsafe to auto-apply as
-            # no match at all.
-            else:
+            elif len(candidates) > 1:
+                best = _best_listing_evidence_match(new_dict, [master_records[i] for i in candidates])
+                if best is not None:
+                    master_idx, tier = candidates[best], "fallback"
+            # Still nothing - an ambiguous fallback match is exactly as
+            # unsafe to auto-apply as no match at all.
+            if master_idx is None:
                 # Last resort: same provider+floor_unit exactly, building
                 # name close enough to be the same real property reworded
                 # by extraction non-determinism (e.g. Gemini spelling a
@@ -1891,6 +1911,16 @@ def _materially_different(a, b) -> bool:
     return hi / lo >= _MATERIAL_DIFFERENCE_RATIO
 
 
+def _listing_evidence_signal_count(a: dict, b: dict) -> int:
+    """How many of _LISTING_DIFFERENCE_FIELDS materially differ (see
+    _materially_different) between `a` and `b` - the raw count
+    _listing_evidence_conflicts itself thresholds; exposed separately so a
+    caller comparing against several candidates at once (see
+    _partition_by_listing_evidence/_best_listing_evidence_match) can rank
+    them by closeness of fit, not just a yes/no per candidate."""
+    return sum(1 for f in _LISTING_DIFFERENCE_FIELDS if _materially_different(a.get(f), b.get(f)))
+
+
 def _listing_evidence_conflicts(a: dict, b: dict) -> bool:
     """
     True when `a` and `b` (two ListingRow dicts that already agree on
@@ -1900,8 +1930,44 @@ def _listing_evidence_conflicts(a: dict, b: dict) -> bool:
     module-level comment above this function's own docstring for the real
     Oliver's Yard case and why a single field is never enough alone.
     """
-    signals = sum(1 for f in _LISTING_DIFFERENCE_FIELDS if _materially_different(a.get(f), b.get(f)))
-    return signals >= _MIN_INDEPENDENT_SIGNALS_FOR_SEPARATE_LISTINGS
+    return _listing_evidence_signal_count(a, b) >= _MIN_INDEPENDENT_SIGNALS_FOR_SEPARATE_LISTINGS
+
+
+def _listing_evidence_richness(d: dict) -> int:
+    """How many of _LISTING_DIFFERENCE_FIELDS are non-blank on `d` - used
+    only to decide processing ORDER for clustering (see _partition_by_
+    listing_evidence), never as evidence of anything by itself. A richer
+    row (more of these fields actually stated) makes a more reliable
+    cluster anchor than a sparser one - see that function's own docstring
+    for the real, confirmed gap this closes: a pre-enrichment "desks only"
+    row and a fully-enriched "desks+size+rent" row of the SAME listing
+    both existing at once (e.g. an old, not-yet-superseded pending upload
+    alongside a freshly re-uploaded one)."""
+    return sum(1 for f in _LISTING_DIFFERENCE_FIELDS if not _is_blank(d.get(f)))
+
+
+def _best_listing_evidence_match(new_dict: dict, candidates: list) -> int:
+    """
+    Index into `candidates` (a list of dicts) of the single candidate
+    whose own listing evidence most closely matches new_dict, or None when
+    there isn't a clear single best match - either every candidate already
+    conflicts outright (see _listing_evidence_conflicts), or two or more
+    tie for the fewest conflicting signals. Both "no match" cases are
+    treated identically to genuine ambiguity - never guessed (see this
+    module's own "incorrect enrichment is worse than a blank field"
+    principle, applied here to picking among several same-identity-key
+    candidates rather than to a single pairwise comparison).
+    """
+    scored = sorted(
+        ((i, _listing_evidence_signal_count(new_dict, c)) for i, c in enumerate(candidates)),
+        key=lambda pair: pair[1],
+    )
+    in_range = [pair for pair in scored if pair[1] < _MIN_INDEPENDENT_SIGNALS_FOR_SEPARATE_LISTINGS]
+    if not in_range:
+        return None
+    if len(in_range) > 1 and in_range[0][1] == in_range[1][1]:
+        return None
+    return in_range[0][0]
 
 
 def _partition_by_listing_evidence(indices: list, unmatched: list) -> list:
@@ -1911,22 +1977,44 @@ def _partition_by_listing_evidence(indices: list, unmatched: list) -> list:
     _partition_by_source_submarket) into sub-groups such that two rows with
     strong, multi-signal evidence of being genuinely DIFFERENT listings
     (see _listing_evidence_conflicts) are never placed in the same sub-
-    group. Greedy first-fit, same shape as _partition_by_source_submarket:
-    a row joins the first sub-group whose own representative it does NOT
-    strongly conflict with. Conservative by construction (see _listing_
-    evidence_conflicts' own multi-signal requirement) - an ordinary same-
-    listing update (a rent increase, a size correction) never triggers a
-    split, so this is a pure no-op for every case that isn't a genuine,
-    strongly-evidenced separate listing, exactly like _partition_by_
-    source_submarket already is for a shared/blank submarket.
+    group. Conservative by construction (see _listing_evidence_conflicts'
+    own multi-signal requirement) - an ordinary same-listing update (a
+    rent increase, a size correction) never triggers a split, so this is a
+    pure no-op for every case that isn't a genuine, strongly-evidenced
+    separate listing, exactly like _partition_by_source_submarket already
+    is for a shared/blank submarket.
+
+    Processes `indices` in DESCENDING evidence-richness order (see
+    _listing_evidence_richness), not their original/upload order, and
+    joins each row to the BEST-fitting existing cluster (fewest
+    conflicting signals - see _best_listing_evidence_match), not just the
+    first non-conflicting one. Both changes together fix a real, confirmed
+    gap: a re-upload leaving an old, sparse "desks only" pending copy of
+    Oliver's Yard sitting alongside a freshly re-uploaded, fully-enriched
+    copy (four rows total: two old, two new, all sharing one identity key)
+    used to collapse into a single messy 4-way group - comparing a sparse
+    row only against whichever OTHER sparse row happened to be seen first
+    (itself lacking the size/rent evidence needed to tell the two real
+    listings apart) let a completely unrelated pair of rows bridge
+    together transitively. Processing the two fully-evidenced rows FIRST
+    lets them form their own correct, clearly-conflicting clusters right
+    away; each sparse row is then compared against BOTH of those already-
+    formed clusters and correctly joins whichever one it has genuinely
+    fewer (here, zero) conflicting signals with, rather than whichever
+    cluster simply happened to exist first.
     """
+    ordered = sorted(
+        indices, key=lambda i: _listing_evidence_richness(unmatched[i].new_row.model_dump()), reverse=True,
+    )
     clusters = []  # each: [representative_dict, [indices...]]
-    for i in indices:
+    for i in ordered:
         row_dict = unmatched[i].new_row.model_dump()
-        for cluster in clusters:
-            if not _listing_evidence_conflicts(cluster[0], row_dict):
-                cluster[1].append(i)
-                break
+        if clusters:
+            best = _best_listing_evidence_match(row_dict, [rep for rep, _ in clusters])
+        else:
+            best = None
+        if best is not None:
+            clusters[best][1].append(i)
         else:
             clusters.append([row_dict, [i]])
     return [members for _, members in clusters]

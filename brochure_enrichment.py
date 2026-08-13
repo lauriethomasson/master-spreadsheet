@@ -947,6 +947,17 @@ def _canva_renderer_auth_headers(renderer_url: str) -> dict:
     other environment, an empty headers dict here simply means Cloud Run
     itself rejects the call with 401/403 before it ever reaches the
     renderer's own code, which is the safe direction to fail in.
+
+    The mint failure itself is still logged to stderr (never silently
+    swallowed) - a real, confirmed diagnostic gap: without this, a genuine
+    production auth problem (a missing IAM binding, a metadata-server
+    hiccup, credentials not available for whatever reason) looked
+    IDENTICAL to every other Canva render failure - the same generic
+    "documents couldn't be read" - with no way for whoever operates this
+    deployment to tell "the renderer is fine but we're not even sending it
+    a valid token" apart from "the renderer itself couldn't render this
+    particular page". This print is operator-facing only (Cloud Run's own
+    logs), never shown to a reviewer in the UI.
     """
     try:
         import google.auth.transport.requests
@@ -954,7 +965,12 @@ def _canva_renderer_auth_headers(renderer_url: str) -> dict:
 
         token = google.oauth2.id_token.fetch_id_token(google.auth.transport.requests.Request(), renderer_url)
         return {"Authorization": f"Bearer {token}"}
-    except Exception:
+    except Exception as e:
+        print(
+            f"[brochure_enrichment] Could not mint an ID token for the Canva renderer ({renderer_url!r}): "
+            f"{e!r} — calling it without one, which will fail if it requires authentication.",
+            file=sys.stderr,
+        )
         return {}
 
 
@@ -1001,6 +1017,25 @@ def _fetch_canva_rendered_page(url: str):
     except Exception as e:
         print(f"[brochure_enrichment] Canva renderer unreachable for {url!r} ({e!r}) — skipping enrichment.", file=sys.stderr)
         _record_status(STATUS_FETCH_FAILED, f"Canva renderer unreachable ({e!r})")
+        return None
+
+    if response.status_code in (401, 403):
+        # Distinguished from every other failure shape (see this function's
+        # own docstring) - the renderer's own code never even ran; Cloud
+        # Run's platform-level IAM check rejected the call before it got
+        # there. Confirmed real risk this guards against: _canva_renderer_
+        # auth_headers already logs its OWN mint failures, but a token that
+        # mints fine yet still gets rejected (wrong audience, a missing/not-
+        # yet-propagated Cloud Run Invoker binding) would otherwise look
+        # identical to "the renderer just couldn't render this page".
+        print(
+            f"[brochure_enrichment] Canva renderer rejected the request for {url!r} with "
+            f"HTTP {response.status_code} (authentication failed - check the main app's service account has "
+            f"the Cloud Run Invoker role on the renderer, and that CANVA_RENDERER_URL exactly matches its "
+            f"own URL) — skipping enrichment.",
+            file=sys.stderr,
+        )
+        _record_status(STATUS_FETCH_FAILED, "Canva renderer authentication failed")
         return None
 
     if response.status_code != 200 or "image/" not in response.headers.get("content-type", ""):

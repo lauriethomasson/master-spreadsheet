@@ -123,16 +123,37 @@ _CANVA_VIEW_URL_RE = re.compile(
     r"^https?://(?:[\w-]+\.)*canva\.com/design/[^/\s]+/[^/\s]+/view(?:[/?#].*)?$", re.IGNORECASE
 )
 
+# Canva's own short-link redirector for a shared design (e.g.
+# "https://canva.link/45k34aansogxr2a") - confirmed a REAL, common shape
+# across dozens of real links in this project's own Workplace Company
+# fixture, every one of which redirects straight to a real canva.com/
+# design/{id}/{token}/view URL (the exact shape _CANVA_VIEW_URL_RE
+# matches). Missing this shape was a real, confirmed gap: is_canva_view_
+# link previously only matched the fully-expanded canva.com URL, so a
+# short link never even got detected as Canva at all - it fell through to
+# the ordinary generic fetch/landing-page-scan path (see resolve_brochure_
+# link), which follows the redirect via a plain httpx GET and hits the
+# exact same "Unsupported client" shell _CANVA_VIEW_URL_RE's own docstring
+# describes, just reported as a generic fetch failure rather than being
+# routed to the Canva renderer (see canva_renderer/) when one is
+# configured. The renderer's own app.py recognizes this exact shape too
+# (see its own _CANVA_SHORT_LINK_RE) - a real headless browser follows the
+# redirect itself and lands on the real design, same as any other
+# navigation.
+_CANVA_SHORT_LINK_RE = re.compile(r"^https?://canva\.link/[^/\s?#]+(?:[/?#].*)?$", re.IGNORECASE)
+
 
 def is_canva_view_link(url: str) -> bool:
-    """True for a real Canva public-share "view" link shape - see
-    _CANVA_VIEW_URL_RE's own docstring for why this is unsupported by
-    default, and how canva_renderer/ opts a deployment into real support.
-    Never a fetch - matched against the URL's own text only, same as is_
-    floorplan_not_brochure_url's other use sites."""
+    """True for a real Canva public-share "view" link, OR a Canva short
+    link that redirects to one (see _CANVA_SHORT_LINK_RE's own docstring)
+    - see _CANVA_VIEW_URL_RE's own docstring for why either shape is
+    unsupported by default, and how canva_renderer/ opts a deployment into
+    real support. Never a fetch - matched against the URL's own text only,
+    same as is_floorplan_not_brochure_url's other use sites."""
     if not url:
         return False
-    return bool(_CANVA_VIEW_URL_RE.match(url.strip()))
+    url = url.strip()
+    return bool(_CANVA_VIEW_URL_RE.match(url)) or bool(_CANVA_SHORT_LINK_RE.match(url))
 
 
 def looks_like_url(value) -> bool:

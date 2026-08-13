@@ -3410,5 +3410,161 @@ class ListingIdentityConflictTests(unittest.TestCase):
         self.assertEqual(plan.unmatched_collisions, [])
 
 
+class ReuploadDuplicationRegressionTests(unittest.TestCase):
+    """
+    The real confirmed report: re-uploading "The Workplace Company
+    Availability" produced FOUR Oliver's Yard rows instead of two. Root
+    cause traced to _partition_by_listing_evidence's own greedy first-fit
+    clustering: comparing every candidate only against whichever row
+    happened to be encountered FIRST let a pre-enrichment "desks only"
+    pending copy (blank size/rent - insufficient evidence on its own to
+    tell the two real listings apart, only 2 of the 3 required signals
+    available) bridge two genuinely different, fully-evidenced listings
+    together into one messy 4-row group. Fixed by processing candidates in
+    DESCENDING evidence-richness order and joining the BEST-fitting
+    existing cluster (fewest conflicting signals), not just the first
+    non-conflicting one - see _partition_by_listing_evidence/_best_
+    listing_evidence_match's own docstrings. The analogous fix also
+    applies to build_merge_plan's own master-matching tiers, for the case
+    where the two listings are already IN master from an earlier approval.
+    """
+
+    def _oliver_a(self, size=None, rent=None):
+        return ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company", postcode="EC1Y 1DT",
+            address_1="1 Oliver's Yard", submarket="City Fringe",
+            size_sqft=size, desks_min=52, desks_max=68, rent_pcm=rent,
+        )
+
+    def _oliver_b(self, size=None, rent=None):
+        return ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company", postcode="EC1Y 1DT",
+            address_1="1 Oliver's Yard", submarket="City Fringe",
+            size_sqft=size, desks_min=200, desks_max=400, rent_pcm=rent,
+        )
+
+    def test_first_upload_of_two_distinct_same_building_listings_yields_two_rows(self):
+        row_a = self._oliver_a(7282.0, 45512.0)
+        row_b = self._oliver_b(42892.0, 230811.0)
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _master_df([]))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(plan.unmatched_collisions, [])
+
+    def test_stale_sparse_pending_copy_alongside_a_fresh_fully_enriched_one_still_yields_two_rows(self):
+        # The exact real shape: an old, not-yet-superseded pending upload
+        # (blank size/rent - e.g. never brochure-enriched, or staged under
+        # an earlier code fingerprint) combined into the SAME merge plan
+        # as a freshly re-uploaded, fully-enriched copy of the same file -
+        # four rows total, sharing one identity key, must still resolve to
+        # exactly two, correctly paired, richly-populated listings.
+        old_a = self._oliver_a()
+        old_b = self._oliver_b()
+        new_a = self._oliver_a(7282.0, 45512.0)
+        new_b = self._oliver_b(42892.0, 230811.0)
+
+        unmatched = [master_merge.UnmatchedRow(r) for r in [old_a, old_b, new_a, new_b]]
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(len(groups), 2)
+        sizes = sorted(
+            {u.new_row.size_sqft for u in group if u.new_row.size_sqft is not None}
+            for group in groups
+        )
+        self.assertEqual(sizes, [{7282.0}, {42892.0}])
+
+    def test_stale_and_fresh_copies_consolidate_with_no_manual_decision_needed(self):
+        old_a = self._oliver_a()
+        old_b = self._oliver_b()
+        new_a = self._oliver_a(7282.0, 45512.0)
+        new_b = self._oliver_b(42892.0, 230811.0)
+
+        plan = master_merge.build_merge_plan([old_a, old_b, new_a, new_b], _master_df([]))
+        plan = master_merge.consolidate_unmatched_duplicates(plan)
+
+        self.assertEqual(plan.unmatched_collisions, [])
+        self.assertEqual(len(plan.unmatched), 2)
+        final_sizes = sorted(u.new_row.size_sqft for u in plan.unmatched)
+        final_rents = sorted(u.new_row.rent_pcm for u in plan.unmatched)
+        self.assertEqual(final_sizes, [7282.0, 42892.0])
+        self.assertEqual(final_rents, [45512.0, 230811.0])
+
+    def test_reupload_against_an_already_approved_master_updates_the_matching_listing_not_a_new_one(self):
+        # Both listings already exist in master (a prior approval), each
+        # with sparse (blank size/rent) data - a re-upload with fuller
+        # data for both must UPDATE each corresponding master row, never
+        # create additional properties, and must never merge the two
+        # distinct listings into one.
+        master_df = _master_df([self._oliver_a().model_dump(), self._oliver_b().model_dump()])
+        new_a = self._oliver_a(7282.0, 45512.0)
+        new_b = self._oliver_b(42892.0, 230811.0)
+
+        plan = master_merge.build_merge_plan([new_a, new_b], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 2)
+        self.assertEqual(plan.unmatched, [])
+        self.assertEqual(plan.collisions, [])
+        matched_sizes = sorted(m.new_row.size_sqft for m in plan.matched_changed)
+        self.assertEqual(matched_sizes, [7282.0, 42892.0])
+
+    def test_reupload_against_an_already_populated_master_still_keeps_listings_separate(self):
+        # Both master rows ALREADY have their own distinguishing size/
+        # rent (a normal, non-sparse case) - re-uploading the same two
+        # listings again (e.g. an ordinary refresh, values unchanged) must
+        # still update each correctly and never merge A into B or vice
+        # versa.
+        master_df = _master_df([
+            self._oliver_a(7282.0, 45512.0).model_dump(), self._oliver_b(42892.0, 230811.0).model_dump(),
+        ])
+        new_a = self._oliver_a(7282.0, 46000.0)  # a small, ordinary rent revision
+        new_b = self._oliver_b(42892.0, 230811.0)
+
+        plan = master_merge.build_merge_plan([new_a, new_b], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        self.assertEqual(plan.matched_changed[0].new_row.size_sqft, 7282.0)
+        self.assertEqual(len(plan.matched_unchanged), 1)
+        self.assertEqual(plan.unmatched, [])
+        self.assertEqual(plan.collisions, [])
+
+    def test_one_changed_rent_alone_does_not_create_a_new_listing(self):
+        # A single-field update against an UNAMBIGUOUS (only one master
+        # candidate at all) match was already safe before this task - this
+        # confirms the new multi-candidate disambiguation logic doesn't
+        # accidentally make an ordinary single-listing update any less
+        # safe or any more likely to be treated as ambiguous.
+        master_df = _master_df([self._oliver_a(7282.0, 45512.0).model_dump()])
+        new_a = self._oliver_a(7282.0, 46000.0)
+
+        plan = master_merge.build_merge_plan([new_a], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        self.assertEqual(plan.unmatched, [])
+
+
+class BestListingEvidenceMatchTests(unittest.TestCase):
+    def test_uniquely_closest_candidate_is_selected(self):
+        new_dict = {"size_sqft": 7282.0, "desks_min": 52, "desks_max": 68, "rent_pcm": 45512.0, "rent_psf": None}
+        candidates = [
+            {"size_sqft": None, "desks_min": 52, "desks_max": 68, "rent_pcm": None, "rent_psf": None},
+            {"size_sqft": 42892.0, "desks_min": 200, "desks_max": 400, "rent_pcm": 230811.0, "rent_psf": None},
+        ]
+        self.assertEqual(master_merge._best_listing_evidence_match(new_dict, candidates), 0)
+
+    def test_no_candidate_within_range_returns_none(self):
+        new_dict = {"size_sqft": 7282.0, "desks_min": 52, "desks_max": 68, "rent_pcm": 45512.0, "rent_psf": None}
+        candidates = [{"size_sqft": 42892.0, "desks_min": 200, "desks_max": 400, "rent_pcm": 230811.0, "rent_psf": None}]
+        self.assertIsNone(master_merge._best_listing_evidence_match(new_dict, candidates))
+
+    def test_a_tie_for_best_returns_none_rather_than_guessing(self):
+        new_dict = {"size_sqft": None, "desks_min": 52, "desks_max": 68, "rent_pcm": None, "rent_psf": None}
+        candidates = [
+            {"size_sqft": None, "desks_min": 52, "desks_max": 68, "rent_pcm": None, "rent_psf": None},
+            {"size_sqft": None, "desks_min": 52, "desks_max": 68, "rent_pcm": None, "rent_psf": None},
+        ]
+        self.assertIsNone(master_merge._best_listing_evidence_match(new_dict, candidates))
+
+
 if __name__ == "__main__":
     unittest.main()

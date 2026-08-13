@@ -288,6 +288,20 @@ class IsCanvaViewLinkTests(unittest.TestCase):
         self.assertFalse(is_canva_view_link(None))
         self.assertFalse(is_canva_view_link(""))
 
+    def test_a_canva_short_link_is_recognised(self):
+        # Real, confirmed shape (dozens of real links in this project's own
+        # Workplace Company fixture) - every one redirects to a real
+        # canva.com/design/{id}/{token}/view URL. Previously NOT
+        # recognized at all, so it silently fell through to the ordinary
+        # generic fetch path instead of being routed to the Canva renderer.
+        self.assertTrue(is_canva_view_link("https://canva.link/45k34aansogxr2a"))
+
+    def test_a_canva_short_link_with_a_query_string_is_still_recognised(self):
+        self.assertTrue(is_canva_view_link("https://canva.link/45k34aansogxr2a?utm_source=x"))
+
+    def test_an_unrelated_dot_link_domain_is_not_matched(self):
+        self.assertFalse(is_canva_view_link("https://example.link/45k34aansogxr2a"))
+
 
 class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):
     def test_unambiguous_floorplan_link_is_discarded(self):
