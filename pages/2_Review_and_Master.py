@@ -1007,12 +1007,27 @@ def _render_discard_pending(pending: list, new_rows: list):
     previously the ONLY discard option at all, with no way to remove just
     one without losing every other pending upload too.
 
+    A no-op with exactly one (or zero) pending upload: with only one entry
+    pending, this whole-batch action and the per-file "Discard this upload"
+    button already target the exact same single staging entry - a second,
+    real production report confirmed showing BOTH controls in that case is
+    confusing, two near-identical buttons for one effective action. The
+    per-file button alone (relabeled "Discard upload" for this specific
+    case - see _render_brochure_enrichment_summary) is the only discard
+    control shown then; this function draws nothing at all, not even its
+    own leftover confirmation prompt (see the state-clearing below) if a
+    reviewer had it open from a moment when 2+ uploads were still pending.
+
     Two-click confirm, same pattern as "Restore this version" in the
     Version history section below - this is a real, permanent deletion
     with no undo (unlike a master.xlsx change, which is always versioned),
     so a single click isn't enough.
     """
-    if st.button("Discard this pending upload" if len(pending) == 1 else "Discard all pending uploads", key="discard_pending"):
+    if len(pending) <= 1:
+        st.session_state.pop("discard_pending_confirm", None)
+        return
+
+    if st.button("Discard all pending uploads", key="discard_pending"):
         st.session_state["discard_pending_confirm"] = True
 
     if st.session_state.get("discard_pending_confirm"):
@@ -1090,7 +1105,7 @@ def _render_master_lookup(master_df: pd.DataFrame) -> None:
         st.caption(f"{len(df)} of {len(master_df)} row(s) shown.")
 
 
-def _render_single_file_discard(path: str) -> None:
+def _render_single_file_discard(path: str, label: str = "Discard this upload") -> None:
     """
     A "Discard this upload" button (two-click confirm, same pattern as
     _render_discard_pending's own whole-batch action and "Restore this
@@ -1104,6 +1119,15 @@ def _render_single_file_discard(path: str) -> None:
     completed run of the SAME source file, both pending, and clicking the
     only discard button available would have deleted both).
 
+    label defaults to "Discard this upload" (the 2+ pending case, where
+    _render_discard_pending's own separate "Discard all pending uploads"
+    button also exists and the "this" distinguishes the two) - the caller
+    passes "Discard upload" instead for the exactly-one-pending case (see
+    _render_brochure_enrichment_summary), where _render_discard_pending
+    renders nothing at all, so this is the ONLY discard control on the
+    page and doesn't need to distinguish itself from a sibling bulk button
+    that isn't there.
+
     Session-state keys are suffixed with `path` itself (a real, unique
     staging path, e.g. "staging/20260811_..._UNION.xlsx") - never the
     filename, which two entries here can share - so confirming discard on
@@ -1112,7 +1136,7 @@ def _render_single_file_discard(path: str) -> None:
     path this specific render call was for.
     """
     confirm_key = f"discard_single_confirm_{path}"
-    if st.button("Discard this upload", key=f"discard_single_{path}"):
+    if st.button(label, key=f"discard_single_{path}"):
         st.session_state[confirm_key] = True
 
     if st.session_state.get(confirm_key):
@@ -1268,7 +1292,14 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
                 st.caption(summary)
                 _render_document_issues(stats.get("document_issues"))
 
-            _render_single_file_discard(path)
+            # Exactly one pending upload: _render_discard_pending renders
+            # nothing at all (see its own docstring) - this per-file button
+            # is the ONLY discard control on the page, so it doesn't need
+            # "this" to distinguish itself from a sibling bulk button that
+            # isn't there. 2+ pending: unchanged "Discard this upload",
+            # since "Discard all pending uploads" also exists below.
+            discard_label = "Discard upload" if len(pending) == 1 else "Discard this upload"
+            _render_single_file_discard(path, label=discard_label)
 
 
 def _render_pending_review(pending: list):

@@ -244,5 +244,186 @@ class PendingStagingManagementTests(unittest.TestCase):
         self.assertEqual(master_writer.list_versions(), versions_before)
 
 
+class SinglePendingUploadDiscardControlTests(unittest.TestCase):
+    """
+    Regression tests for a second, separate real production report: with
+    EXACTLY ONE pending upload, the page showed two near-identical discard
+    buttons for the same effective action - the per-file "Discard this
+    upload" (_render_single_file_discard) AND the whole-batch "Discard this
+    pending upload" (the old len==1 label branch of _render_discard_pending).
+
+    Fix: with exactly one pending upload, _render_discard_pending now
+    renders nothing at all, and the per-file button is relabeled "Discard
+    upload" (see _render_brochure_enrichment_summary) so it stands alone as
+    the ONE discard control on the page. With 2+ pending uploads, nothing
+    changes: each file's own "Discard this upload" button plus a single
+    "Discard all pending uploads" bulk button, as already covered by
+    PendingStagingManagementTests above.
+    """
+
+    def setUp(self):
+        self._original_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        os.chdir(self._tmp.name)
+        self._counter = 0
+
+    def tearDown(self):
+        os.chdir(self._original_cwd)
+        self._tmp.cleanup()
+
+    def _rows(self, n, building_prefix="Building"):
+        return [
+            ListingRow(
+                building=f"{building_prefix} {i}", provider="UNION", floor_unit=f"{i}th",
+                property_id=f"{building_prefix}-{i}",
+            )
+            for i in range(n)
+        ]
+
+    def _staged(self, rows, content_hash, status=None, processed_urls=None, unique=1, filename="UNION.xlsx"):
+        self._counter += 1
+        stem, suffix = Path(filename).stem, Path(filename).suffix
+        path = file_store.save_staging_file(rows, f"{stem}__{self._counter}{suffix}", content_hash=content_hash)
+        meta = file_store._read_meta(path)
+        meta["filename"] = filename
+        file_store._write_meta(path, meta)
+        if status == "complete":
+            file_store.set_staging_enrichment_summary(
+                path, {"unique_brochures_considered": unique, "rows_eligible": len(rows), "rows_enriched": 0},
+                processed_urls or {f"https://{i}.pdf": "ok" for i in range(unique)},
+            )
+        elif status == "in_progress":
+            file_store.set_staging_enrichment_progress(path, processed_urls or {}, unique)
+        return path
+
+    def _open_review(self):
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+        return at
+
+    def test_one_pending_upload_shows_exactly_one_discard_button_labeled_discard_upload(self):
+        self._staged(self._rows(5), "hash-solo", status="complete", unique=1)
+
+        at = self._open_review()
+
+        discard_buttons = [
+            b for b in at.button
+            if b.label in ("Discard upload", "Discard this upload", "Discard all pending uploads")
+        ]
+        self.assertEqual(len(discard_buttons), 1)
+        self.assertEqual(discard_buttons[0].label, "Discard upload")
+
+    def test_one_pending_upload_confirming_discard_deletes_only_that_staging_entry(self):
+        solo = self._staged(self._rows(5), "hash-solo", status="complete", unique=1)
+
+        at = self._open_review()
+        discard_btn = next(b for b in at.button if b.key == f"discard_single_{solo}")
+        discard_btn.click().run()
+        confirm_btn = next(b for b in at.button if b.key == f"discard_single_confirm_btn_{solo}")
+        confirm_btn.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(file_store.list_pending_staging_files(), [])
+
+    def test_one_pending_upload_cancel_deletes_nothing(self):
+        solo = self._staged(self._rows(5), "hash-solo", status="complete", unique=1)
+
+        at = self._open_review()
+        discard_btn = next(b for b in at.button if b.key == f"discard_single_{solo}")
+        discard_btn.click().run()
+        cancel_btn = next(b for b in at.button if b.key == f"discard_single_cancel_{solo}")
+        cancel_btn.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(file_store.list_pending_staging_files(), [solo])
+        self.assertIsNotNone(file_store.get_staging_enrichment_summary(solo))
+
+    def test_two_pending_uploads_show_per_file_and_bulk_buttons_unchanged(self):
+        self._staged(self._rows(5, "June Building"), "hash-june", status="complete", unique=1, filename="June.xlsx")
+        self._staged(self._rows(5, "July Building"), "hash-july", status="complete", unique=1, filename="July.xlsx")
+
+        at = self._open_review()
+
+        per_file = [b for b in at.button if b.label == "Discard this upload"]
+        bulk = [b for b in at.button if b.label == "Discard all pending uploads"]
+        solo_label = [b for b in at.button if b.label == "Discard upload"]
+        self.assertEqual(len(per_file), 2)
+        self.assertEqual(len(bulk), 1)
+        self.assertEqual(len(solo_label), 0)
+
+    def test_two_pending_uploads_individual_discard_removes_only_that_one(self):
+        june = self._staged(self._rows(5, "June Building"), "hash-june", status="complete", unique=1, filename="June.xlsx")
+        july = self._staged(self._rows(5, "July Building"), "hash-july", status="complete", unique=1, filename="July.xlsx")
+
+        at = self._open_review()
+        discard_btn = next(b for b in at.button if b.key == f"discard_single_{june}")
+        discard_btn.click().run()
+        confirm_btn = next(b for b in at.button if b.key == f"discard_single_confirm_btn_{june}")
+        confirm_btn.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(file_store.list_pending_staging_files(), [july])
+
+    def test_two_pending_uploads_bulk_discard_removes_both(self):
+        self._staged(self._rows(5, "June Building"), "hash-june", status="complete", unique=1, filename="June.xlsx")
+        self._staged(self._rows(5, "July Building"), "hash-july", status="complete", unique=1, filename="July.xlsx")
+
+        at = self._open_review()
+        discard_btn = next(b for b in at.button if b.key == "discard_pending")
+        discard_btn.click().run()
+        confirm_btn = next(b for b in at.button if b.key == "discard_pending_confirm_btn")
+        confirm_btn.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(file_store.list_pending_staging_files(), [])
+
+    def test_rerun_after_dropping_from_two_to_one_pending_does_not_leak_bulk_confirm_state(self):
+        # A reviewer opens the confirm prompt on the (now-removed) bulk
+        # "Discard all pending uploads" control while 2 uploads are still
+        # pending, then - via any path - ends up back on a rerun where only
+        # one upload remains pending. _render_discard_pending must not
+        # leave discard_pending_confirm=True armed against a control that
+        # no longer renders, which could otherwise surface stale state if a
+        # future rerun ever brought the bulk control back.
+        june = self._staged(self._rows(5, "June Building"), "hash-june", status="complete", unique=1, filename="June.xlsx")
+        self._staged(self._rows(5, "July Building"), "hash-july", status="complete", unique=1, filename="July.xlsx")
+
+        at = self._open_review()
+        bulk_btn = next(b for b in at.button if b.key == "discard_pending")
+        at = bulk_btn.click().run()
+        self.assertTrue(at.session_state["discard_pending_confirm"])
+
+        # Now collapse to a single pending upload behind the scenes (as if
+        # the other upload were discarded via its own per-file control in a
+        # separate browser tab/session) and rerun.
+        file_store.discard_pending_staging_files(
+            [p for p in file_store.list_pending_staging_files() if p != june]
+        )
+        at.run()
+
+        self.assertFalse(at.exception)
+        self.assertNotIn("discard_pending_confirm", at.session_state)
+        bulk_buttons = [b for b in at.button if b.label == "Discard all pending uploads"]
+        self.assertEqual(len(bulk_buttons), 0)
+        solo_buttons = [b for b in at.button if b.label == "Discard upload"]
+        self.assertEqual(len(solo_buttons), 1)
+
+    def test_approval_flow_unaffected_by_single_upload_discard_relabeling(self):
+        self._staged(self._rows(3), "hash-solo", status="complete", unique=1)
+
+        at = self._open_review()
+        approve_buttons = [b for b in at.button if "master" in b.label.lower() or "approve" in b.label.lower()]
+        self.assertTrue(approve_buttons, "expected an approve/apply-to-master button to still be present")
+
+    def test_existing_staging_display_unaffected_by_single_upload_relabeling(self):
+        self._staged(self._rows(5), "hash-solo", status="complete", unique=1)
+
+        at = self._open_review()
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("1 upload pending", caption_text)
+        self.assertIn("5", caption_text)
+
+
 if __name__ == "__main__":
     unittest.main()
