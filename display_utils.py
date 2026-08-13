@@ -17,6 +17,95 @@ from staging_writer import LINK_DISPLAY_TEXT, title_case_label
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
+# Friendly display labels for the fields a reviewer sees most often in a
+# before/after diff - overrides title_case_label's own generic mechanical
+# conversion only where that would read awkwardly ("Address 1", "Rent
+# Pcm", "Desks Min") or is genuinely ambiguous out of context ("Size").
+# Every other field (postcode, submarket, special_features, ...) already
+# reads fine via title_case_label and has no entry here. The underlying
+# schema field name is never changed - purely cosmetic (see this module's
+# own docstring).
+_FRIENDLY_FIELD_LABELS = {
+    "address_1": "Address",
+    "size_sqft": "Size",
+    "rent_pcm": "Rent PCM",
+    "rent_psf": "Rent PSF",
+    "floor_unit": "Floor / Unit",
+    "desks_min": "Minimum desks",
+    "desks_max": "Maximum desks",
+}
+
+
+def friendly_field_label(field: str) -> str:
+    """The display label for `field` in a before/after diff - see
+    _FRIENDLY_FIELD_LABELS for the specific overrides; title_case_label's
+    own generic conversion otherwise."""
+    return _FRIENDLY_FIELD_LABELS.get(field, title_case_label(field))
+
+
+def coerced_new_value(new_val, kind: str):
+    """
+    `new_val` coerced exactly the way render_new_value_input's own widget
+    would return it if a reviewer never touched it - int()/float() per
+    kind (falling back to 0/0.0 for a None new_val, mirroring that
+    widget's own st.number_input default), or the string unchanged (empty
+    string normalized to None, matching st.text_input's own "blank means
+    nothing entered" convention there). Used ONLY for a field that's safe
+    enough to skip rendering its own widget entirely (see pages/2_Review_
+    and_Master.py's _render_field_rows) - this guarantees the value
+    actually applied is byte-identical to what the always-rendered widget
+    would have applied by default, never a shortcut that silently changes
+    behavior.
+    """
+    if kind == "int":
+        return int(new_val) if new_val is not None else 0
+    if kind == "float":
+        return float(new_val) if new_val is not None else 0.0
+    return new_val if new_val != "" else None
+
+
+def format_field_value_for_display(field: str, value) -> str:
+    """
+    Plain-English formatting for `field`'s own `value` in a compact
+    before/after row - a comma-grouped desk count, a "sq ft" suffix for
+    size, a "£" prefix for rent - purely cosmetic (see this module's own
+    docstring: never changes what's actually stored/applied). "—" for a
+    blank value, matching this page's existing before/after convention
+    elsewhere. Falls back to a plain str() for any field/value shape this
+    doesn't specifically know how to format (including a value that
+    doesn't parse as a number despite the field normally being numeric -
+    never raises just because a display nicety doesn't apply).
+    """
+    if value is None or value == "":
+        return "—"
+    try:
+        if field == "size_sqft":
+            return f"{float(value):,.0f} sq ft"
+        if field in ("rent_pcm", "rent_psf"):
+            amount = float(value)
+            return f"£{amount:,.0f}" if amount == int(amount) else f"£{amount:,.2f}"
+        if field in ("desks_min", "desks_max"):
+            return f"{int(value):,}"
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def render_compact_before_after_row(field: str, old_val, new_val) -> None:
+    """
+    One compact, read-only "Field: before → after" line - the non-
+    editable counterpart to render_new_value_input's own compact row (see
+    pages/2_Review_and_Master.py's _render_field_rows), used wherever a
+    diff is shown purely for confirmation (already-
+    applied automatic updates, a post-approval summary, a manual cell-edit
+    confirmation) rather than a decision still to be made. Deliberately no
+    bordered box/bare caption pair - see render_before_after's own
+    docstring for the large-card layout this replaces.
+    """
+    old_display = format_field_value_for_display(field, old_val)
+    new_display = format_field_value_for_display(field, new_val)
+    st.write(f"{friendly_field_label(field)}: {old_display} → {new_display}")
+
 
 def render_before_after(old_val, new_val) -> None:
     """
@@ -27,8 +116,9 @@ def render_before_after(old_val, new_val) -> None:
     Streamlit - no custom CSS/HTML needed) so long free-text values
     (special_features, contacts) wrap onto as many lines as needed rather
     than being squished onto one, and old vs new stay directly comparable
-    at a glance. Read-only - see render_before_after_editable for the
-    manual per-field review UI, where "After" is an input, not static text.
+    at a glance. Read-only - see render_new_value_input for the manual
+    per-field review UI's own editable "After" input, and render_compact_
+    before_after_row for a compact read-only alternative to this function.
     """
     old_col, after_col = st.columns(2, border=True)
     with old_col:
@@ -39,45 +129,44 @@ def render_before_after(old_val, new_val) -> None:
         st.write("—" if new_val in (None, "") else new_val)
 
 
-def render_before_after_editable(old_val, new_val, kind: str, key: str, multiline: bool = False):
+def render_new_value_input(new_val, kind: str, key: str, multiline: bool = False):
     """
-    Like render_before_after, but "After" is an editable input
-    (st.number_input for an int/float field, st.text_area/st.text_input
-    otherwise) rather than static text - used by the manual per-field
-    review UI, where a reviewer can correct the incoming value, not just
-    accept/reject it verbatim. Returns the input's current value (int/float
-    per kind, or the text - None if left blank - for a str field).
+    The editable "new value" widget alone for one field's manual review
+    row - st.number_input for an int/float field, st.text_area/st.
+    text_input otherwise - used by the Review page's own compact field-row
+    layout (see pages/2_Review_and_Master.py's _render_field_rows, which
+    lays out the field's own label/reason, formatted "before" value, and
+    Apply checkbox as sibling columns around this one) - never wrapped in
+    its own bordered box/column pair (see render_before_after's own
+    docstring for the large-card layout this widget-only helper replaces).
+    A reviewer can correct the incoming value here, not just accept/reject
+    it verbatim - returns the input's current value (int/float per kind,
+    or the text - None if left blank - for a str field).
 
     multiline should be True for long free-text fields (see
     display_utils.WIDE_TEXT_COLUMNS) - st.text_input is a single-line box
     that truncates rather than wraps, which would defeat the whole point of
-    the side-by-side Before/After layout for exactly the fields (special_
-    features, contacts) where comparing full text at a glance matters most.
+    comparing full text at a glance for exactly the fields (special_
+    features, contacts) where that matters most.
     """
-    old_col, after_col = st.columns(2, border=True)
-    with old_col:
-        st.caption("BEFORE")
-        st.write("—" if old_val in (None, "") else old_val)
-    with after_col:
-        st.caption(":red[AFTER]")
-        if kind in ("int", "float"):
-            default = float(new_val) if new_val is not None else 0.0
-            edited = st.number_input(
-                "New value", value=default, step=(1.0 if kind == "int" else 0.01),
-                key=key, label_visibility="collapsed",
-            )
-            return int(edited) if kind == "int" else edited
-        if multiline:
-            edited = st.text_area(
-                "New value", value="" if new_val is None else str(new_val),
-                key=key, label_visibility="collapsed",
-            )
-            return edited if edited != "" else None
-        edited = st.text_input(
+    if kind in ("int", "float"):
+        default = float(new_val) if new_val is not None else 0.0
+        edited = st.number_input(
+            "New value", value=default, step=(1.0 if kind == "int" else 0.01),
+            key=key, label_visibility="collapsed",
+        )
+        return int(edited) if kind == "int" else edited
+    if multiline:
+        edited = st.text_area(
             "New value", value="" if new_val is None else str(new_val),
             key=key, label_visibility="collapsed",
         )
         return edited if edited != "" else None
+    edited = st.text_input(
+        "New value", value="" if new_val is None else str(new_val),
+        key=key, label_visibility="collapsed",
+    )
+    return edited if edited != "" else None
 
 # Columns holding a URL - rendered as a clickable link with a fixed label
 # instead of the raw URL (which would otherwise make the table unreadable).

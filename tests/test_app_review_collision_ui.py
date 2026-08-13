@@ -96,16 +96,19 @@ class CollisionGroupRendersAsOneDecisionTests(unittest.TestCase):
         # at.markdown already reflects this expander's full contents with
         # no need to simulate opening it.
         self.assertTrue(any(e.label == "View changes" for e in at.expander))
-        copthall_markdowns = [
-            m for m in at.markdown if "Copthall House" in (m.value or "") and "field(s)" not in (m.value or "")
-        ]
-        # One markdown header per changed FIELD for this one property (not
-        # per source) - confirms the group was consolidated into a single
-        # property's worth of changes, not double-counted. address_1 isn't
-        # here - it's identical to what master already had, so it's not a
-        # change at all.
-        changed_fields = {"submarket", "lat", "lng", "special_features", "contacts"}
-        self.assertEqual(len(copthall_markdowns), len(changed_fields))
+        markdown_text = "".join(m.value or "" for m in at.markdown)
+        # The property name appears exactly ONCE as its own compact-table
+        # group header (see _render_compact_diff_table) - confirms the
+        # group was consolidated into a single property's worth of
+        # changes, not double-counted, rather than counting one repeated
+        # "**Copthall House** — field" header per field as the old
+        # one-big-card-per-field layout did.
+        self.assertEqual(markdown_text.count("**Copthall House — Copthall Estates — 4th Floor**"), 1)
+        # Every changed field appears as its own compact "Field: before ->
+        # after" line. address_1 isn't here - it's identical to what
+        # master already had, so it's not a change at all.
+        for label in ("Submarket", "Lat", "Lng", "Special Features", "Contacts"):
+            self.assertIn(f"{label}:", markdown_text)
 
     def test_one_field_disagreement_still_forces_only_that_one_choice(self):
         master_writer.write_master([

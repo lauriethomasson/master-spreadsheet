@@ -160,12 +160,98 @@ class PentonvilleStyleAutomaticUpdateTests(IsolatedCwdTestCase):
         self.assertEqual(len(view_changes), 1)
         expander_text = "".join(m.value for m in view_changes[0].markdown)
         self.assertIn("44 Pentonville Road", expander_text)
-        self.assertIn("brochure_link", expander_text)
-        self.assertIn("special_features", expander_text)
+        self.assertIn("Brochure Link", expander_text)  # friendly display label, not the raw field name
+        self.assertIn("Special Features", expander_text)
 
         markdown_text = "".join(m.value for m in at.markdown)
         # No duplicated "4 MR + 3 PB" in whatever gets rendered as the new value.
         self.assertNotIn("4 MR + 3 PB; Available: December; 4 MR + 3 PB", markdown_text)
+
+
+class UncommonLiverpoolStStyleCompactDecisionTests(IsolatedCwdTestCase):
+    """
+    The real reported case: an address change (house_number_changed - see
+    master_merge.HOUSE_NUMBER_FIELDS) forces a property into manual review,
+    but three other ordinary blank-field additions on that SAME property
+    (size_sqft/rent_pcm/desks_max) are not themselves risky - they must
+    never get their own full before/after card + checkbox; only the
+    genuinely risky field does, with a plain-English reason, and the rest
+    are bundled into a single "N other safe changes" line while STILL
+    being applied automatically on Approve.
+    """
+
+    def _staged_uncommon_liverpool_st(self):
+        # building/provider/floor_unit stay IDENTICAL between master and
+        # the upload (a genuine matched-row update, not a new property) -
+        # only address_1 changes, from a value with no leading house
+        # number to one with a real, different leading number ("34"),
+        # which is exactly the shape master_merge.house_number_changed
+        # flags as risky.
+        master_writer.write_master([
+            ListingRow(
+                building="Uncommon Liverpool St", provider="Uncommon", floor_unit="5th Floor",
+                address_1="Uncommon Liverpool St", property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="Uncommon Liverpool St", provider="Uncommon", floor_unit="5th Floor",
+                address_1="34-37 Liverpool Street", size_sqft=1638.0, rent_pcm=49500.0, desks_max=30,
+            )],
+            "uncommon.xlsx", content_hash="uncommon-liverpool-st-hash",
+        )
+        return _run_review_page()
+
+    def test_only_one_decision_needed_for_the_risky_field(self):
+        at = self._staged_uncommon_liverpool_st()
+        self.assertFalse(at.exception)
+
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+        expanders = [e for e in at.expander if "1 decision needed" in (e.label or "")]
+        self.assertEqual(len(expanders), 1)
+
+    def test_reason_and_friendly_label_shown_for_the_risky_field(self):
+        at = self._staged_uncommon_liverpool_st()
+        markdown_text = "".join(m.value for m in at.markdown)
+        self.assertIn("Address", markdown_text)  # friendly label, not "address_1"
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("Existing address would be replaced", caption_text)
+
+    def test_safe_fields_are_bundled_not_individually_rendered(self):
+        at = self._staged_uncommon_liverpool_st()
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("3 other safe changes will be applied automatically.", caption_text)
+        # No individual "Apply" checkbox for the 3 safe fields - only the
+        # one risky field (address) gets a checkbox at all.
+        apply_checkboxes = [c for c in at.checkbox if c.label == "Apply"]
+        self.assertEqual(len(apply_checkboxes), 1)
+
+    def test_leaving_the_risky_checkbox_unchecked_still_applies_the_safe_fields(self):
+        at = self._staged_uncommon_liverpool_st()
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+
+        master_df = master_writer.load_master_as_dataframe()
+        row = master_df.iloc[0]
+        self.assertEqual(row["address_1"], "Uncommon Liverpool St")  # unchanged - the risky field was never approved
+        self.assertEqual(row["size_sqft"], 1638.0)
+        self.assertEqual(row["rent_pcm"], 49500.0)
+        self.assertEqual(row["desks_max"], 30)
+
+    def test_checking_the_risky_checkbox_also_applies_the_address_change(self):
+        at = self._staged_uncommon_liverpool_st()
+        apply_checkboxes = [c for c in at.checkbox if c.label == "Apply"]
+        apply_checkboxes[0].set_value(True).run()
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+
+        master_df = master_writer.load_master_as_dataframe()
+        row = master_df.iloc[0]
+        self.assertEqual(row["address_1"], "34-37 Liverpool Street")
+        self.assertEqual(row["size_sqft"], 1638.0)
+        self.assertEqual(row["rent_pcm"], 49500.0)
+        self.assertEqual(row["desks_max"], 30)
 
 
 class LetStatusThreeChoiceTests(IsolatedCwdTestCase):

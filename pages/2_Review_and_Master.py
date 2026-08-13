@@ -32,40 +32,113 @@ def _empty_master_df() -> pd.DataFrame:
     return pd.DataFrame(columns=list(ListingRow.model_fields.keys()))
 
 
+def _risky_field_reason(field: str) -> str:
+    """
+    Short, plain-English reason ONE specific risky field needs a manual
+    decision - derived directly from WHICH of master_merge's own risk
+    categories that field belongs to (see MatchedRow.risky_fields' own
+    computation in build_merge_plan), never invented independently of
+    that existing logic and never exposing an internal name/function.
+    """
+    if field in master_merge.HOUSE_NUMBER_FIELDS:
+        return "Existing address would be replaced"
+    if field in master_merge.GEOCODE_RISK_FIELDS:
+        return "Existing location would be replaced"
+    return "Existing value differs from the new upload"
+
+
 def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset()) -> dict:
     """
-    Renders one line per changed field: name, old value, editable new value,
-    and its OWN apply/skip checkbox - field-level, not row-level, so a
+    Renders one compact row per field that genuinely needs a reviewer's
+    own attention: field name (+ a short reason when risky - see
+    _risky_field_reason), formatted "before" value, an editable "after"
+    input, and its own Apply checkbox - field-level, not row-level, so a
     reviewer can accept some of a row's changes and reject others rather
-    than an all-or-nothing choice for the whole row. Returns only the
-    fields whose checkbox is checked, using whatever value is currently
-    entered (letting a reviewer correct a value, not just accept/reject it).
+    than an all-or-nothing choice for the whole row.
 
-    risky_fields (see master_merge.is_detail_loss) starts unchecked
-    regardless of default_checked, and gets an explicit warning - the point
-    is a reviewer has to notice and opt in, not just uncheck something that
-    would otherwise apply silently.
+    A field NOT in risky_fields is only ever rendered this way when
+    default_checked is False (the "every field here needs a deliberate
+    look" case - e.g. a same-batch collision that collapsed to one row,
+    see _render_matched_row's own docstring) - matches this function's
+    OLD behavior exactly for that case. When default_checked is True, a
+    non-risky field is instead bundled into a single "N other safe
+    change(s) will be applied automatically" summary line rather than
+    getting its own full row: master_merge's own risky_fields computation
+    has ALREADY decided that field is safe (it would default to checked/
+    applied here regardless, with no interaction expected), so giving it
+    the same full before/after/checkbox treatment as a genuinely risky
+    field only adds visual bulk with no real decision behind it. The
+    bundled value applied is display_utils.coerced_new_value(new_val,
+    kind) - byte-identical to what the always-rendered, left-untouched
+    widget would have applied by default, so this is a pure display
+    simplification, never a behavior change.
+
+    risky_fields (see master_merge.is_detail_loss/house_number_changed)
+    starts unchecked regardless of default_checked, and gets its own
+    reason caption - the point is a reviewer has to notice and opt in, not
+    just uncheck something that would otherwise apply silently.
+
+    Returns only the fields whose checkbox is checked (or bundled as
+    safe), using whatever value is currently entered - letting a reviewer
+    correct a value, not just accept/reject it verbatim.
     """
     approved = {}
-    for f, (old_val, new_val) in diffs.items():
+    bundle_safe_fields = default_checked
+    individually_rendered = [f for f in diffs if f in risky_fields or not bundle_safe_fields]
+    bundled_fields = [f for f in diffs if f not in risky_fields and bundle_safe_fields]
+
+    for f in individually_rendered:
+        old_val, new_val = diffs[f]
         is_risky = f in risky_fields
-        st.markdown(f"**{f}**")
         kind = master_merge.field_kind(f)
-        value = display_utils.render_before_after_editable(
-            old_val, new_val, kind, key=f"{key_prefix}_{f}_value", multiline=f in display_utils.WIDE_TEXT_COLUMNS,
-        )
-        apply_field = st.checkbox(
-            "Apply this change", value=default_checked and not is_risky, key=f"{key_prefix}_{f}_apply",
-        )
-        if is_risky:
-            st.caption(
-                "⚠️ This update looks like it may be missing information from the current record — "
-                "review carefully before applying."
+        label_col, before_col, after_col, apply_col = st.columns([2, 2, 3, 1])
+        with label_col:
+            st.markdown(f"**{display_utils.friendly_field_label(f)}**")
+            if is_risky:
+                st.caption(f"⚠️ {_risky_field_reason(f)}")
+        with before_col:
+            st.caption(display_utils.format_field_value_for_display(f, old_val))
+        with after_col:
+            value = display_utils.render_new_value_input(
+                new_val, kind, key=f"{key_prefix}_{f}_value", multiline=f in display_utils.WIDE_TEXT_COLUMNS,
+            )
+        with apply_col:
+            apply_field = st.checkbox(
+                "Apply", value=default_checked and not is_risky, key=f"{key_prefix}_{f}_apply",
             )
         if apply_field:
             approved[f] = value
-        st.divider()
+
+    if bundled_fields:
+        for f in bundled_fields:
+            kind = master_merge.field_kind(f)
+            approved[f] = display_utils.coerced_new_value(diffs[f][1], kind)
+        n = len(bundled_fields)
+        st.caption(f"✓ {n} other safe change{'s' if n != 1 else ''} will be applied automatically.")
+
     return approved
+
+
+def _render_compact_diff_table(diff_rows: list) -> None:
+    """
+    Compact, read-only rendering of a list of {"property", "field", "old",
+    "new"} dicts (see master_merge.build_approval_summary's own return
+    shape) - the property name is shown once per group (consecutive rows
+    for the same property, exactly how build_approval_summary already
+    produces them - one master_index's fields appended together, never
+    interleaved with another's), followed by one compact "Field: before →
+    after" line per field (see display_utils.render_compact_before_after_
+    row) instead of a large bordered box per field. Used for every purely-
+    confirmatory diff display on this page (automatic updates, a post-
+    approval summary, a manual cell-edit confirmation) - never a decision
+    UI, so there is nothing to check/apply here, only to read.
+    """
+    last_property = None
+    for d in diff_rows:
+        if d["property"] != last_property:
+            st.markdown(f"**{d['property']}**")
+            last_property = d["property"]
+        display_utils.render_compact_before_after_row(d["field"], d["old"], d["new"])
 
 
 def _render_merge_field_choice(field_name: str, values: list, labels: list, key: str):
@@ -164,8 +237,19 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
     - see the matched_changed loop below) matched-row diff - factored out
     of that loop so the rare group-of-one edge case can reuse it instead of
     duplicating the expander/checkbox rendering.
+
+    The expander's own label counts DECISIONS, not changed fields: when
+    m.risky_fields is non-empty, that's exactly how many fields
+    _render_field_rows renders individually (everything else is bundled
+    into its own "N other safe changes" line - see that function's own
+    docstring); when there's no risky field at all (default_checked=False,
+    a same-batch collision forcing a deliberate look at every field), every
+    changed field still needs its own decision, matching _render_field_
+    rows' behavior for that case exactly.
     """
-    label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {len(m.diffs)} field(s) changed"
+    decisions_needed = len(m.risky_fields) if m.risky_fields else len(m.diffs)
+    noun = "decision" if decisions_needed == 1 else "decisions"
+    label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {decisions_needed} {noun} needed"
     with st.expander(label, key=f"{key_prefix}_expander"):
         approved_fields = _render_field_rows(
             m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields
@@ -227,8 +311,14 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
         entry["source_file"] = " + ".join(labels)
         return
 
-    total_fields = len(agree_diffs) + len(choice_fields)
-    label = f"⚠️ {display_utils.row_label(old_rec)} — {total_fields} field(s) changed ({len(group)} sources)"
+    # Decisions needed: every genuine disagreement (choice_fields) plus any
+    # agreed field that's ALSO risky - _render_field_rows renders those
+    # individually too (see its own docstring), everything else in
+    # agree_diffs gets bundled into a single "N other safe changes" line.
+    risky_agree_count = sum(1 for f in agree_diffs if f in risky_fields)
+    decisions_needed = len(choice_fields) + risky_agree_count
+    noun = "decision" if decisions_needed == 1 else "decisions"
+    label = f"⚠️ {display_utils.row_label(old_rec)} — {decisions_needed} {noun} needed ({len(group)} sources)"
     key_prefix = f"collision_{idx}_{master_index}"
     approved = {}
     with st.expander(label, key=f"{key_prefix}_expander"):
@@ -908,9 +998,7 @@ def _render_approval_confirmation(approval: dict):
         new_labels = approval["new_labels"]
         removed_labels = approval.get("removed_labels", [])
         if diff_rows or new_labels or removed_labels:
-            for d in diff_rows:
-                st.markdown(f"**{d['property']}** — {d['field']}")
-                display_utils.render_before_after(d["old"], d["new"])
+            _render_compact_diff_table(diff_rows)
             for label in new_labels:
                 st.write(f"🆕 {label} — new property")
             for label in removed_labels:
@@ -938,9 +1026,7 @@ def _render_manual_edit_confirmation(edit: dict):
             st.session_state["just_restored"] = edit["version_path"]
             st.rerun()
 
-    for d in edit["diff_rows"]:
-        st.markdown(f"**{d['property']}** — {d['field']}")
-        display_utils.render_before_after(d["old"], d["new"])
+    _render_compact_diff_table(edit["diff_rows"])
 
 
 def _render_full_master_view():
@@ -1650,9 +1736,7 @@ def _render_pending_review(pending: list):
         st.info(f"{n} existing propert{'y' if n == 1 else 'ies'} will be updated automatically.")
         with st.expander("View changes"):
             auto_diff_rows, _, _ = master_merge.build_approval_summary(plan, auto_updates, [], frozenset())
-            for d in auto_diff_rows:
-                st.markdown(f"**{d['property']}** — {d['field']}")
-                display_utils.render_before_after(d["old"], d["new"])
+            _render_compact_diff_table(auto_diff_rows)
 
     # ==== 3. New properties ====
     if plain_new:
