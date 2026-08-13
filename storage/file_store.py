@@ -165,7 +165,7 @@ def _derive_floorplan_counts(floorplan_processed_urls: dict, unique_floorplans_c
 
 def set_staging_enrichment_summary(
     path: str, stats: dict, processed_urls: dict,
-    floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0,
+    floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0, document_issues: list = None,
 ) -> None:
     """
     Persists brochure enrichment's own FINAL summary stats into this
@@ -202,6 +202,17 @@ def set_staging_enrichment_summary(
     place, or an upload predating this feature) - a caller should treat a
     missing key as "nothing to show", not as "zero rows enriched" (see
     get_staging_enrichment_summary).
+
+    document_issues (see brochure_enrichment.enrich_rows_grouped's own
+    stats["document_issues"] docstring) is ADDITIVE diagnostics, purely for
+    a compact "these need a look" UI list - never used for resume/retry
+    logic, unlike processed_urls. Always the CALLER'S current, complete
+    picture (enrich_rows_grouped recomputes ineligible-link issues fresh on
+    every call, and retries any URL not already "ok" - see its own
+    urls_to_fetch filter - so this run's own document_issues already
+    reflects everything still genuinely outstanding, with no separate merge
+    against a prior run's stale list needed). Defaults to [] so every
+    existing caller that predates this stays unaffected.
     """
     meta = _read_meta(path)
     meta["brochure_enrichment"] = {
@@ -212,13 +223,14 @@ def set_staging_enrichment_summary(
         **_derive_enrichment_counts(processed_urls, stats["unique_brochures_considered"]),
         "floorplan_processed_urls": dict(floorplan_processed_urls or {}),
         **_derive_floorplan_counts(floorplan_processed_urls, unique_floorplans_considered),
+        "document_issues": list(document_issues or []),
     }
     _write_meta(path, meta)
 
 
 def set_staging_enrichment_progress(
     path: str, processed_urls: dict, unique_brochures_considered: int,
-    floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0,
+    floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0, document_issues: list = None,
 ) -> None:
     """
     Persists an INTERIM brochure-enrichment marker - status="in_progress"
@@ -269,6 +281,7 @@ def set_staging_enrichment_progress(
         **_derive_enrichment_counts(processed_urls, unique_brochures_considered),
         "floorplan_processed_urls": dict(floorplan_processed_urls or {}),
         **_derive_floorplan_counts(floorplan_processed_urls, unique_floorplans_considered),
+        "document_issues": list(document_issues or []),
     }
     _write_meta(path, meta)
 

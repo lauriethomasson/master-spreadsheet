@@ -2668,7 +2668,7 @@ class EnrichRowsFromFloorplansCheckpointTests(unittest.TestCase):
         self.assertEqual(checkpoints, [])
         self.assertEqual(stats, {
             "unique_floorplans_considered": 0, "floorplans_read_ok": 0,
-            "floorplans_unavailable": 0, "processed_urls": {},
+            "floorplans_unavailable": 0, "processed_urls": {}, "document_issues": [],
         })
 
 
@@ -2752,6 +2752,310 @@ class EnrichRowsGroupedFloorplanParamsTests(EnrichmentTestCase):
         self.assertEqual(len(brochure_checkpoints), 1)
         self.assertEqual(len(floorplan_checkpoints), 1)
         self.assertEqual(floorplan_url_checkpoints, [({"https://example.com/fp.pdf": "ok"}, 1)])
+
+
+class ClassifyLinkEligibilityTests(unittest.TestCase):
+    """Pure classification, no network activity - the pre-fetch status."""
+
+    def test_blank_is_no_document(self):
+        self.assertEqual(brochure_enrichment.classify_link_eligibility(None), brochure_enrichment.STATUS_NO_DOCUMENT)
+        self.assertEqual(brochure_enrichment.classify_link_eligibility(""), brochure_enrichment.STATUS_NO_DOCUMENT)
+
+    def test_placeholder_text_is_invalid_placeholder(self):
+        for placeholder in ("TBC", "N/A", "-", "Coming Soon", "None"):
+            self.assertEqual(
+                brochure_enrichment.classify_link_eligibility(placeholder),
+                brochure_enrichment.STATUS_INVALID_PLACEHOLDER,
+                placeholder,
+            )
+
+    def test_generic_homepage_is_unsupported_link_type(self):
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility("https://www.workspace.co.uk/"),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+
+    def test_floorplan_shaped_link_is_unsupported_for_a_brochure(self):
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility("https://app.box.com/s/my-floorplan"),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+
+    def test_floorplan_shaped_link_is_eligible_for_a_floorplan(self):
+        self.assertIsNone(
+            brochure_enrichment.classify_link_eligibility(
+                "https://app.box.com/s/my-floorplan", reject_floorplan_shaped=False,
+            )
+        )
+
+    def test_canva_view_link_is_not_pre_emptively_rejected(self):
+        # A Canva "view" link is a real, well-formed https:// URL with a
+        # genuine path - nothing about its own text is unsupported the way
+        # a bare homepage or a floor-plan-labeled link is, so this pipeline
+        # never special-cases it by name (see this module's own ISSUE_
+        # LABELS docstring on why) - it's only classified as an actual
+        # ISSUE once a real fetch attempt shows it doesn't expose a
+        # readable document (see DocumentStatusIntegrationTests below).
+        self.assertIsNone(
+            brochure_enrichment.classify_link_eligibility("https://www.canva.com/design/ABC123/view")
+        )
+
+    def test_a_normal_pdf_link_is_eligible(self):
+        self.assertIsNone(brochure_enrichment.classify_link_eligibility("https://example.com/brochure.pdf"))
+
+
+class RowHadAmbiguousMatchTests(unittest.TestCase):
+    def test_two_candidate_units_with_no_disambiguator_is_ambiguous(self):
+        row = ListingRow(building="Nash House", floor_unit=None, size_sqft=None)
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000},
+            {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500},
+        ])
+        self.assertTrue(brochure_enrichment._row_had_ambiguous_match(row, units))
+
+    def test_a_single_matching_unit_is_never_ambiguous(self):
+        row = ListingRow(building="Nash House", floor_unit=None)
+        units = _brochure_units([{"building": "Nash House", "floor_unit": "2nd Floor"}])
+        self.assertFalse(brochure_enrichment._row_had_ambiguous_match(row, units))
+
+    def test_zero_matching_units_is_never_ambiguous(self):
+        row = ListingRow(building="A Building Not In This Document")
+        units = _brochure_units([{"building": "Nash House", "floor_unit": "2nd Floor"}])
+        self.assertFalse(brochure_enrichment._row_had_ambiguous_match(row, units))
+
+    def test_a_disambiguated_match_is_never_ambiguous(self):
+        row = ListingRow(building="Nash House", floor_unit="2nd Floor")
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor"},
+            {"building": "Nash House", "floor_unit": "2nd Floor"},
+        ])
+        self.assertFalse(brochure_enrichment._row_had_ambiguous_match(row, units))
+
+
+class DocumentStatusIntegrationTests(EnrichmentTestCase):
+    """
+    End-to-end status classification through enrich_rows_grouped's real
+    fetch/render/extract path - only httpx.get and extract.render_pages/
+    render_and_extract are mocked (never brochure_enrichment's own
+    fetch/extract functions), so this exercises the REAL _record_status
+    call sites, not a shortcut around them.
+    """
+
+    def test_valid_pdf_extracts_successfully(self):
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch(
+                 "brochure_enrichment.extract.render_and_extract",
+                 return_value={"units": [{"building": "A", "special_features": "Nice"}]},
+             ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "Nice")
+        self.assertEqual(stats["document_issues"], [])
+
+    def test_placeholder_link_produces_no_fake_extraction_and_no_issue(self):
+        rows = [ListingRow(building="A", brochure_link="TBC", special_features=None)]
+        with patch("brochure_enrichment.httpx.get") as mock_get:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_get.assert_not_called()
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"], [])
+        self.assertEqual(enriched[0].brochure_link, "TBC")
+
+    def test_unsupported_link_is_recorded_as_an_issue_and_link_is_preserved(self):
+        rows = [ListingRow(
+            building="Example House", brochure_link="https://www.workspace.co.uk/", special_features=None,
+        )]
+        with patch("brochure_enrichment.httpx.get") as mock_get:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_get.assert_not_called()
+        self.assertEqual(enriched[0].brochure_link, "https://www.workspace.co.uk/")
+        self.assertEqual(stats["document_issues"], [
+            {"building": "Example House", "floor_unit": None, "status": brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE},
+        ])
+
+    def test_canva_style_view_link_that_returns_html_is_recorded_as_an_issue_and_preserved(self):
+        # The one focused Canva scenario this task asks for - a real,
+        # well-formed public "view" URL that this pipeline cannot obtain
+        # extractable document bytes from (it returns an HTML page, not a
+        # PDF) - preserved, marked as a failure, never crashes, never
+        # fabricates a brochure. No Canva-specific code is involved at all
+        # (see classify_link_eligibility's own test above) - this is
+        # exactly the same generic path a broken link on any other site
+        # would take.
+        rows = [ListingRow(
+            building="Canva House", brochure_link="https://www.canva.com/design/ABC123/view",
+            special_features=None,
+        )]
+        html_response = _response(content=b"<html><body>Canva</body></html>", content_type="text/html")
+        # resolve_brochure_link's own one-hop landing-page-scan logic isn't
+        # what this test is about (see brochure_link_resolver.py's own
+        # dedicated tests for that) - bypassed here so this test
+        # deterministically exercises exactly one thing: a URL whose
+        # eventual response is HTML, not a document, is rejected safely.
+        with patch("brochure_enrichment.httpx.get", return_value=html_response), \
+             patch("brochure_enrichment.resolve_brochure_link", side_effect=lambda u: u):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[0].brochure_link, "https://www.canva.com/design/ABC123/view")
+        self.assertEqual(stats["document_issues"], [
+            {"building": "Canva House", "floor_unit": None, "status": brochure_enrichment.STATUS_FETCH_FAILED},
+        ])
+
+    def test_404_is_recorded_as_fetch_failed_and_upload_continues(self):
+        rows = [
+            ListingRow(building="Broken", brochure_link="https://example.com/broken.pdf", special_features=None),
+            ListingRow(building="Good", brochure_link="https://example.com/good.pdf", special_features=None),
+        ]
+
+        def fake_get(url, **kwargs):
+            if "broken" in url:
+                return _response(status_code=404, content=b"Not Found", content_type="text/plain")
+            return _response()
+
+        with patch("brochure_enrichment.httpx.get", side_effect=fake_get), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch(
+                 "brochure_enrichment.extract.render_and_extract",
+                 return_value={"units": [{"building": "Good", "special_features": "Nice"}]},
+             ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[1].special_features, "Nice")
+        self.assertEqual(enriched[0].brochure_link, "https://example.com/broken.pdf")
+        self.assertEqual(len(stats["document_issues"]), 1)
+        self.assertEqual(stats["document_issues"][0]["building"], "Broken")
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_403_private_link_is_recorded_as_fetch_failed(self):
+        rows = [ListingRow(building="Private Co", brochure_link="https://example.com/private.pdf", special_features=None)]
+        with patch(
+            "brochure_enrichment.httpx.get",
+            return_value=_response(status_code=403, content=b"Forbidden", content_type="text/plain"),
+        ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_timeout_exception_is_recorded_and_upload_continues(self):
+        rows = [
+            ListingRow(building="Slow Co", brochure_link="https://example.com/slow.pdf", special_features=None),
+            ListingRow(building="Good Co", brochure_link="https://example.com/good.pdf", special_features=None),
+        ]
+
+        def fake_get(url, **kwargs):
+            if "slow" in url:
+                raise httpx.TimeoutException("timed out")
+            return _response()
+
+        with patch("brochure_enrichment.httpx.get", side_effect=fake_get), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch(
+                 "brochure_enrichment.extract.render_and_extract",
+                 return_value={"units": [{"building": "Good Co", "special_features": "Nice"}]},
+             ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[1].special_features, "Nice")
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_html_returned_instead_of_a_document_is_rejected_safely(self):
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+        with patch(
+            "brochure_enrichment.httpx.get",
+            return_value=_response(content=b"<html>not a pdf</html>", content_type="text/html"),
+        ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_corrupt_document_is_recorded_as_render_failed(self):
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", side_effect=RuntimeError("cannot render")):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+
+    def test_gemini_failure_is_recorded_as_extraction_failed(self):
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch("brochure_enrichment.extract.render_and_extract", side_effect=RuntimeError("gemini boom")):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_EXTRACTION_FAILED)
+
+    def test_ambiguous_unit_match_is_a_distinct_status(self):
+        rows = [ListingRow(
+            building="Nash House", brochure_link="https://example.com/a.pdf",
+            floor_unit=None, size_sqft=None, special_features=None,
+        )]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch(
+                 "brochure_enrichment.extract.render_and_extract",
+                 return_value={"units": [
+                     {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000},
+                     {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500},
+                 ]},
+             ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_EXTRACTED_BUT_AMBIGUOUS)
+
+    def test_extraction_with_no_useful_data_is_not_reported_as_an_issue(self):
+        rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value={"units": []}):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(stats["document_issues"], [])
+
+    def test_box_share_success_is_still_recorded_as_extracted_successfully(self):
+        # Box resolver behaviour itself must keep working - see
+        # FetchBoxSharedPdfTests for its own dedicated coverage; this just
+        # confirms status tracking doesn't regress that path.
+        rows = [ListingRow(building="A", brochure_link="https://app.box.com/s/abc123", special_features=None)]
+        share_html = _box_share_html(shared_name="xyz", extension="pdf")
+        with patch(
+            "brochure_enrichment.httpx.get",
+            side_effect=[_html_response(share_html), _response()],
+        ), patch("brochure_enrichment.extract.render_pages", return_value=["img"]), patch(
+            "brochure_enrichment.extract.render_and_extract",
+            return_value={"units": [{"building": "A", "special_features": "Nice"}]},
+        ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "Nice")
+        self.assertEqual(stats["document_issues"], [])
+
+    def test_checkpoint_and_summary_reach_a_completed_state_despite_a_failure(self):
+        rows = [ListingRow(building="Broken", brochure_link="https://example.com/broken.pdf", special_features=None)]
+        with patch(
+            "brochure_enrichment.httpx.get",
+            return_value=_response(status_code=500, content=b"error", content_type="text/plain"),
+        ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        # A failed document must still end in a KNOWN terminal outcome for
+        # this run - never left looking like it's still "in progress".
+        self.assertEqual(stats["brochures_done"] if "brochures_done" in stats else len(stats["processed_urls"]), 1)
+        self.assertEqual(stats["processed_urls"], {"https://example.com/broken.pdf": "unavailable"})
+        self.assertEqual(len(stats["document_issues"]), 1)
 
 
 # --- Real-brochure integration test for the widened field scope ---

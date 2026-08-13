@@ -1124,6 +1124,29 @@ def _render_single_file_discard(path: str) -> None:
             st.rerun()
 
 
+def _render_document_issues(issues: list) -> None:
+    """
+    Compact "N document(s) need a look" caption plus a collapsed expander
+    naming each one, sourced from stats["document_issues"] (see brochure_
+    enrichment.enrich_rows_grouped's own docstring) - a no-op for a file
+    with no issues at all (nothing to draw, matching "do not show a huge
+    warning for every successful document"). Every line uses brochure_
+    enrichment.issue_label's own friendly wording, never a raw status
+    constant, exception message, HTTP status code, or URL (which may carry
+    a signed/tokenized query string) - this is the one place a reviewer
+    sees this, and it must stay simple and non-technical.
+    """
+    if not issues:
+        return
+    st.caption(f"⚠️ {len(issues)} document(s) need a look.")
+    with st.expander("View document issues"):
+        for issue in issues:
+            location = issue["building"] or "(no building)"
+            if issue.get("floor_unit"):
+                location += f" — {issue['floor_unit']}"
+            st.markdown(f"- **{location}** — {brochure_enrichment.issue_label(issue['status'])}")
+
+
 def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) -> None:
     """
     Staging management: one block per pending upload - filename, its OWN
@@ -1234,6 +1257,7 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
                         f" {stats['unique_floorplans_considered']} unique floor plan(s) also checked."
                     )
                 st.caption(summary)
+                _render_document_issues(stats.get("document_issues"))
 
             _render_single_file_discard(path)
 

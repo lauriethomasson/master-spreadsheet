@@ -288,6 +288,47 @@ class MasterUntouchedBeforeApprovalTests(unittest.TestCase):
         master_df = master_writer.load_master_as_dataframe()
         self.assertEqual(master_df.iloc[0]["special_features"], "Roof terrace")
 
+    def test_document_issues_expander_shown_when_issues_exist(self):
+        path = save_staging_file(
+            [ListingRow(building="Clove", brochure_link="https://example.com/broken.pdf", special_features=None)],
+            "Union.xlsx", content_hash="hash-issues",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 0},
+            {"https://example.com/broken.pdf": "unavailable"},
+            document_issues=[{"building": "Clove", "floor_unit": None, "status": "fetch_failed"}],
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("1 document(s) need a look", caption_text)
+
+        expanders = [e for e in at.expander if e.label == "View document issues"]
+        self.assertEqual(len(expanders), 1)
+        markdown_text = "".join(m.value for m in expanders[0].markdown)
+        self.assertIn("Clove", markdown_text)
+        self.assertIn("could not be accessed", markdown_text)
+
+    def test_no_issues_expander_when_nothing_wrong(self):
+        path = save_staging_file(
+            [ListingRow(building="Good Co", brochure_link="https://example.com/good.pdf", special_features="Nice")],
+            "Union.xlsx", content_hash="hash-no-issues",
+        )
+        set_staging_enrichment_summary(
+            path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 1},
+            {"https://example.com/good.pdf": "ok"},
+            document_issues=[],
+        )
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual([e for e in at.expander if e.label == "View document issues"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

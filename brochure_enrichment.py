@@ -106,6 +106,7 @@ import functools
 import platform
 import re
 import sys
+import threading
 from urllib.parse import urlparse
 
 import httpx
@@ -113,13 +114,208 @@ import streamlit as st
 
 import extract
 from brochure_link_resolver import (
-    REQUEST_TIMEOUT, USER_AGENT, is_floorplan_not_brochure_url, is_generic_link, resolve_brochure_link,
+    REQUEST_TIMEOUT, USER_AGENT, is_floorplan_not_brochure_url, is_generic_link, looks_like_url,
+    resolve_brochure_link,
 )
 import geocode
 from house_number import leading_house_number
 from master_merge import normalize_key
 from schema import ListingRow
 from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
+
+# --- Document processing status vocabulary ---------------------------------
+#
+# Distinguishes WHY a brochure/floorplan document produced no enrichment -
+# previously collapsed into a single "unavailable" (see processed_urls
+# elsewhere in this module), which could mean a 404, a corrupt PDF, a
+# Gemini failure, or a document that read fine but had nothing usable, with
+# no way for a user to tell which. A constant-style status string (never a
+# raised exception, never surfaced as a stack trace) is attached per
+# document (see _StatusCapture/_record_status) and, for a specific row,
+# possibly refined further (extracted_but_ambiguous - see
+# _row_had_ambiguous_match) purely for diagnostics; it never changes
+# whether/what gets enriched, only what the caller can report about why.
+STATUS_NO_DOCUMENT = "no_document"
+STATUS_INVALID_PLACEHOLDER = "invalid_placeholder"
+STATUS_UNSUPPORTED_LINK_TYPE = "unsupported_link_type"
+STATUS_FETCH_FAILED = "fetch_failed"
+STATUS_RENDER_FAILED = "render_failed"
+STATUS_EXTRACTION_FAILED = "extraction_failed"
+STATUS_EXTRACTED_NO_USEFUL_DATA = "extracted_no_useful_data"
+STATUS_EXTRACTED_BUT_AMBIGUOUS = "extracted_but_ambiguous"
+STATUS_EXTRACTED_SUCCESSFULLY = "extracted_successfully"
+
+# The subset of statuses worth surfacing to a user as a "document issue" -
+# no_document/invalid_placeholder are completely normal (this property
+# simply has no brochure/floorplan - not a failure of anything), and
+# extracted_no_useful_data/extracted_successfully both mean the document
+# itself was read without any error at all. Only a genuine failure or
+# unresolved ambiguity belongs in a "these need a look" list.
+ISSUE_STATUSES = (
+    STATUS_UNSUPPORTED_LINK_TYPE, STATUS_FETCH_FAILED, STATUS_RENDER_FAILED,
+    STATUS_EXTRACTION_FAILED, STATUS_EXTRACTED_BUT_AMBIGUOUS,
+)
+
+# Friendly, user-facing wording per issue status - never a raw exception
+# message, HTTP status code, stack trace, or URL (which may carry a
+# signed/tokenized query string - see this module's own point on never
+# logging sensitive query parameters to a user-facing surface). Kept
+# deliberately generic rather than naming a specific website/provider (e.g.
+# never "Canva" by name) - a webpage that doesn't expose a downloadable
+# document reads the same to this pipeline regardless of which site it is,
+# and hardcoding one host's name here would be exactly the kind of
+# provider-specific special case this whole module avoids elsewhere.
+_ISSUE_LABELS = {
+    STATUS_UNSUPPORTED_LINK_TYPE: "unsupported link type",
+    STATUS_FETCH_FAILED: "could not be accessed",
+    STATUS_RENDER_FAILED: "could not be read",
+    STATUS_EXTRACTION_FAILED: "could not be read",
+    STATUS_EXTRACTED_BUT_AMBIGUOUS: "read, but could not be safely matched to this property",
+}
+
+
+def issue_label(status: str) -> str:
+    """User-facing wording for `status` - see _ISSUE_LABELS. Falls back to
+    the raw status string (never raises) for any status not in that map,
+    which should only ever happen for a non-issue status a caller mistakenly
+    passed here."""
+    return _ISSUE_LABELS.get(status, status)
+
+
+def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
+    """
+    None if `url` is eligible for a real fetch attempt (the existing
+    _is_eligible_brochure_url/_is_eligible_floorplan_url gate - both share
+    this same underlying logic, see _is_eligible_brochure_url's own
+    docstring) - otherwise the STATUS_* constant explaining why not, purely
+    from the URL's own text, no network activity:
+    - STATUS_NO_DOCUMENT: blank/nothing stated at all;
+    - STATUS_INVALID_PLACEHOLDER: non-blank but not genuinely URL-shaped
+      (see brochure_link_resolver.looks_like_url) - "TBC"/"N/A"/"-"/
+      "Coming Soon" and similar provider placeholders meaning "none yet";
+    - STATUS_UNSUPPORTED_LINK_TYPE: a real URL, but one of the shapes this
+      pipeline already knows it can't use (a bare generic homepage/known
+      social-profile domain, a video link, or - only when
+      reject_floorplan_shaped, brochure_link's own rule, see _is_eligible_
+      brochure_url - a floor-plan-labeled link where a brochure was
+      expected; floorplan_link's own check, _is_eligible_floorplan_url,
+      passes reject_floorplan_shaped=False since that shape is exactly
+      what's expected there, never a rejection reason).
+    """
+    if _is_blank(url):
+        return STATUS_NO_DOCUMENT
+    if not looks_like_url(url):
+        return STATUS_INVALID_PLACEHOLDER
+    if urlparse(url).scheme not in ("http", "https"):
+        return STATUS_UNSUPPORTED_LINK_TYPE
+    if is_generic_link(url):
+        return STATUS_UNSUPPORTED_LINK_TYPE
+    if reject_floorplan_shaped and is_floorplan_not_brochure_url(url):
+        return STATUS_UNSUPPORTED_LINK_TYPE
+    lowered = url.lower()
+    if any(bad in lowered for bad in _REJECTED_URL_KEYWORDS):
+        return STATUS_UNSUPPORTED_LINK_TYPE
+    return None
+
+
+def _ineligible_link_issues(rows: list, needs_fn, url_attr: str, reject_floorplan_shaped: bool) -> list:
+    """
+    One {"building", "floor_unit", "status"} entry per row that needs_fn(row)
+    (needs_enrichment/needs_floorplan_enrichment) but whose own url_attr
+    link ("brochure_link"/"floorplan_link") isn't even eligible for a fetch
+    attempt (see classify_link_eligibility) - these rows never reach
+    enrich_rows_grouped's/_enrich_rows_from_floorplans' own real fetch loop
+    at all (see eligible_rows_and_brochures/eligible_rows_and_floorplans),
+    so without this they'd be silently, indistinguishably absent from any
+    diagnostic - previously "no brochure worked" and "no brochure existed"
+    looked identical to a caller.
+
+    Deliberately excludes a row that doesn't need enrichment at all
+    (nothing wrong, nothing to report) and STATUS_NO_DOCUMENT/STATUS_
+    INVALID_PLACEHOLDER (see ISSUE_STATUSES's own docstring - a genuinely
+    blank/placeholder link is completely normal, never an "issue").
+    """
+    issues = []
+    for row in rows:
+        if not needs_fn(row):
+            continue
+        status = classify_link_eligibility(getattr(row, url_attr), reject_floorplan_shaped=reject_floorplan_shaped)
+        if status in ISSUE_STATUSES:
+            issues.append({"building": row.building, "floor_unit": row.floor_unit, "status": status})
+    return issues
+
+
+# Thread-local so concurrent enrich_rows_grouped workers (see that
+# function's own bounded ThreadPoolExecutor) never cross-contaminate each
+# other's status - each worker thread calls _fetch_one, which sets up its
+# OWN sink via _StatusCapture before calling _extract_brochure_units, so
+# whichever thread actually executes a given fetch/render/Gemini call is
+# also the one whose sink _record_status writes into.
+_status_sink_local = threading.local()
+
+
+def _record_status(status: str, detail: str = None) -> None:
+    """
+    Records `status` (plus an optional short, non-sensitive `detail`
+    string) into whatever sink the CURRENT thread's innermost active
+    _StatusCapture set up - a complete no-op when no capture is active,
+    which is the case for every existing caller/test that never opts into
+    this (see _StatusCapture's own docstring) - so adding this call
+    anywhere in the existing fetch/render/extract functions changes
+    NOTHING about their behavior or return value for any caller that
+    doesn't use _StatusCapture. Only the FIRST call for a given capture
+    wins - a function that fails at an early stage (e.g. fetch) never has
+    a later, unrelated call (there shouldn't be one, but this stays
+    defensive) overwrite that with a less specific status.
+    """
+    sink = getattr(_status_sink_local, "sink", None)
+    if sink is not None and "status" not in sink:
+        sink["status"] = status
+        if detail:
+            sink["detail"] = detail
+
+
+class _StatusCapture:
+    """
+    Context manager - while active on the CURRENT thread, any _record_status
+    call (from _fetch_pdf_bytes/_fetch_box_shared_pdf/_extract_brochure_
+    units/_extract_floorplan_units - none of which take a new parameter or
+    change their return value for this) writes into `sink` (a plain dict
+    the caller owns and reads afterward) instead of being a no-op. Restores
+    whatever capture (if any) was active before, so nesting is safe even
+    though nothing in this module currently nests captures.
+
+    Deliberately NOT a new parameter threaded through _extract_brochure_
+    units/_extract_floorplan_units - both are @functools.lru_cache'd on
+    `url` alone, and a mutable dict argument would break that (dicts aren't
+    hashable) - and NOT a change to _fetch_pdf_bytes's own signature either,
+    so every existing call site/test/mock of any of these functions is
+    completely unaffected by this existing.
+
+    On a CROSS-RUN cache hit (see _extract_brochure_units's own docstring -
+    the SAME url was already fetched in an earlier, different enrichment
+    run and is still in the 64-slot cache), the real function body does not
+    execute this time, so no status is recorded for this particular call -
+    the caller (see enrich_rows_grouped) falls back to a generic status
+    derived from the returned units alone in that case. This is an
+    accepted, pre-existing limitation of that cache (already documented as
+    "a cross-run optimization only... nothing within one run depends on it
+    still holding an old entry") - the original detailed reason was already
+    printed to stderr the first time it happened; this only affects how
+    much CAN be re-surfaced for a stale cache hit days later, never
+    behavior.
+    """
+
+    def __init__(self, sink: dict):
+        self.sink = sink
+
+    def __enter__(self):
+        self._previous = getattr(_status_sink_local, "sink", None)
+        _status_sink_local.sink = self.sink
+        return self.sink
+
+    def __exit__(self, *exc_info):
+        _status_sink_local.sink = self._previous
 
 
 def _trim_memory() -> None:
@@ -557,6 +753,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             f"[brochure_enrichment] Could not load Box share page {share_url!r} ({e!r}) — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, f"could not load Box share page ({e!r})")
         return None
 
     html = page.text
@@ -568,6 +765,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             f"[brochure_enrichment] Could not read Box share metadata for {share_url!r} — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, "could not read Box share metadata")
         return None
 
     if can_download_match.group(1) != "true":
@@ -575,6 +773,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             f"[brochure_enrichment] Box share {share_url!r} has downloads disabled — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, "Box share has downloads disabled")
         return None
 
     extension = extension_match.group(1).lower()
@@ -585,6 +784,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, f"Box share is a .{extension or '?'} file, not a supported document")
         return None
 
     name_match = _BOX_FILE_NAME_RE.search(html)
@@ -595,6 +795,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             "skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, f"Box share file name looks like a floor plan ({file_name!r})")
         return None
 
     static_url = f"https://app.box.com/shared/static/{shared_name_match.group(1)}.{extension}"
@@ -608,6 +809,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             f"[brochure_enrichment] Could not download Box file at {static_url!r} ({e!r}) — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, f"could not download Box file ({e!r})")
         return None
 
     if not _looks_like_fetchable_document(
@@ -618,6 +820,7 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
             f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_FETCH_FAILED, "Box static download was not a readable document")
         return None
     return response.content
 
@@ -664,6 +867,7 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
         response.raise_for_status()
     except Exception as e:
         print(f"[brochure_enrichment] Could not fetch {url!r} ({e!r}) — skipping enrichment.", file=sys.stderr)
+        _record_status(STATUS_FETCH_FAILED, f"{e!r}")
         return None
 
     if not _looks_like_fetchable_document(
@@ -673,6 +877,10 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
             f"[brochure_enrichment] {url!r} did not resolve to a "
             f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
             file=sys.stderr,
+        )
+        _record_status(
+            STATUS_FETCH_FAILED,
+            f"response was not a readable document (content-type: {response.headers.get('content-type')!r})",
         )
         return None
     return response.content
@@ -742,6 +950,7 @@ def _extract_brochure_units(url: str):
     """
     data = _fetch_pdf_bytes(url)
     if data is None:
+        _record_status(STATUS_FETCH_FAILED, "no document bytes obtained")
         return None
 
     try:
@@ -752,20 +961,30 @@ def _extract_brochure_units(url: str):
         # itself, a real doubling of a payload that can be up to ~32MB).
         with extract._RENDER_LOCK:
             images = extract.render_pages(data)
-        # Dropped HERE, between the two calls - not in a finally at the end
-        # of this function - specifically so it's freed BEFORE the slower
-        # Gemini call below runs, not merely before this function returns.
-        # A caller-side reference to an argument stays alive for a callee's
-        # entire execution regardless of what that callee does internally,
-        # so this only works because the render step and the Gemini call
-        # are two SEPARATE calls with this line in between, not one.
-        data = None
+    except Exception as e:
+        print(
+            f"[brochure_enrichment] Could not render {url!r} as a document ({e!r}) — skipping enrichment.",
+            file=sys.stderr,
+        )
+        _record_status(STATUS_RENDER_FAILED, f"{e!r}")
+        return None
+
+    # Dropped HERE, between the two calls - not in a finally at the end
+    # of this function - specifically so it's freed BEFORE the slower
+    # Gemini call below runs, not merely before this function returns.
+    # A caller-side reference to an argument stays alive for a callee's
+    # entire execution regardless of what that callee does internally,
+    # so this only works because the render step and the Gemini call
+    # are two SEPARATE calls with this line in between, not one.
+    data = None
+    try:
         raw = extract.render_and_extract(images)
     except Exception as e:
         print(
             f"[brochure_enrichment] Could not read {url!r} as a brochure ({e!r}) — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_EXTRACTION_FAILED, f"{e!r}")
         return None
 
     units = _BrochureUnits(raw.get("units", []))
@@ -782,6 +1001,8 @@ def _extract_brochure_units(url: str):
         if isinstance(bf, dict) and isinstance(bf.get("building"), str) and isinstance(bf.get("features"), str)
         and not _is_blank(bf.get("building")) and not _is_blank(bf.get("features"))
     ]
+    has_data = bool(units) or bool(units.property_features) or bool(units.contacts) or bool(units.building_features)
+    _record_status(STATUS_EXTRACTED_SUCCESSFULLY if has_data else STATUS_EXTRACTED_NO_USEFUL_DATA)
     return units
 
 
@@ -867,6 +1088,33 @@ def _match_unit(row: ListingRow, units: list):
             return size_matches[0]
 
     return None
+
+
+def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
+    """
+    True when `row`'s own building genuinely identifies 2+ candidate
+    brochure units (see _building_identity_matches) that _match_unit still
+    couldn't narrow down to exactly one - i.e. this row's blank fields
+    stayed blank because of a real, irreducible ambiguity IN THIS DOCUMENT
+    (a schedule of areas with several floors, none of which floor_unit/
+    size_sqft could disambiguate), not because the document simply had
+    nothing relevant to offer at all. Purely a diagnostic signal (see
+    STATUS_EXTRACTED_BUT_AMBIGUOUS) - never changes what gets enriched;
+    _match_unit's own conservative "unresolved tie stays None" behavior is
+    completely unaffected by this function existing.
+
+    False whenever there's 0 or exactly 1 building match - 0 means the
+    document simply doesn't describe this row's building at all (not
+    ambiguous, just inapplicable); 1 means _match_unit would have already
+    returned it as a confident match (see its own "single match" rule), so
+    a still-blank field there means the SINGLE matched unit genuinely
+    didn't state that field, not that matching itself was ambiguous.
+    """
+    if not units:
+        return False
+    plain_units = [u for u in units if isinstance(u, dict)]
+    match_indices = _building_identity_matches(row.building, [u.get("building") for u in plain_units])
+    return len(match_indices) >= 2 and _match_unit(row, units) is None
 
 
 def _match_building_feature(row: ListingRow, units):
@@ -1225,22 +1473,35 @@ def _extract_floorplan_units(url: str):
     """
     data = _fetch_pdf_bytes(url, reject_floorplan_filename=False, accept_image_formats=True)
     if data is None:
+        _record_status(STATUS_FETCH_FAILED, "no document bytes obtained")
         return None
 
     try:
         with extract._RENDER_LOCK:
             images = extract.render_pages(data)
-        data = None
+    except Exception as e:
+        print(
+            f"[brochure_enrichment] Could not render {url!r} as a floor plan ({e!r}) — skipping enrichment.",
+            file=sys.stderr,
+        )
+        _record_status(STATUS_RENDER_FAILED, f"{e!r}")
+        return None
+
+    data = None
+    try:
         raw = extract.render_and_extract(images, prompt=FLOORPLAN_PROMPT)
     except Exception as e:
         print(
             f"[brochure_enrichment] Could not read {url!r} as a floor plan ({e!r}) — skipping enrichment.",
             file=sys.stderr,
         )
+        _record_status(STATUS_EXTRACTION_FAILED, f"{e!r}")
         return None
 
     units = raw.get("units")
-    return [u for u in units if isinstance(u, dict)] if isinstance(units, list) else []
+    result = [u for u in units if isinstance(u, dict)] if isinstance(units, list) else []
+    _record_status(STATUS_EXTRACTED_SUCCESSFULLY if result else STATUS_EXTRACTED_NO_USEFUL_DATA)
+    return result
 
 
 def _match_floorplan_unit(row: ListingRow, units: list):
@@ -1368,9 +1629,14 @@ def _enrich_rows_from_floorplans(
     floorplans_read_ok = 0
     floorplans_unavailable = 0
     processed_urls = {}
+    # See enrich_rows_grouped's own document_issues docstring - additive
+    # diagnostics alongside processed_urls, never replacing it.
+    document_issues = _ineligible_link_issues(
+        rows, needs_floorplan_enrichment, "floorplan_link", reject_floorplan_shaped=False,
+    )
     stats = {
         "unique_floorplans_considered": len(unique_urls), "floorplans_read_ok": 0,
-        "floorplans_unavailable": 0, "processed_urls": processed_urls,
+        "floorplans_unavailable": 0, "processed_urls": processed_urls, "document_issues": document_issues,
     }
     if not urls_to_fetch:
         return current, log, stats
@@ -1381,14 +1647,17 @@ def _enrich_rows_from_floorplans(
             indices_by_url.setdefault(row.floorplan_link, []).append(i)
 
     for url in urls_to_fetch:
+        sink = {}
         try:
-            units = _extract_floorplan_units(url)
+            with _StatusCapture(sink):
+                units = _extract_floorplan_units(url)
         except Exception as e:
             print(
                 f"[brochure_enrichment] Unexpected error reading {url!r} as a floor plan ({e!r}) — skipping.",
                 file=sys.stderr,
             )
             units = None
+            sink.setdefault("status", STATUS_EXTRACTION_FAILED)
 
         if units is not None:
             floorplans_read_ok += 1
@@ -1396,6 +1665,17 @@ def _enrich_rows_from_floorplans(
         else:
             floorplans_unavailable += 1
             processed_urls[url] = "unavailable"
+
+        # Falls back to a generic status when the real fetch/render/extract
+        # body didn't run this call (a cross-run cache hit - see
+        # _StatusCapture's own docstring) rather than leaving this
+        # document unrepresented in diagnostics at all.
+        status = sink.get("status") or (STATUS_EXTRACTED_SUCCESSFULLY if units else STATUS_FETCH_FAILED)
+        if status in ISSUE_STATUSES:
+            for i in indices_by_url[url]:
+                document_issues.append({
+                    "building": current[i].building, "floor_unit": current[i].floor_unit, "status": status,
+                })
 
         for i in indices_by_url[url]:
             try:
@@ -1657,6 +1937,18 @@ def enrich_rows_grouped(
     second argument added to checkpoint_callback, so every existing caller
     that only ever passes checkpoint_callback is completely unaffected.
 
+    stats["document_issues"] (list of {"building", "floor_unit", "status"})
+    is ADDITIVE diagnostics alongside processed_urls, never a replacement
+    for it - one entry per row with a genuine problem (see ISSUE_STATUSES):
+    an ineligible link (unsupported_link_type - detected before any fetch,
+    see _ineligible_link_issues), a fetch/render/extraction failure for
+    that row's own brochure/floorplan, or a document that read fine overall
+    but couldn't be safely matched to THIS row specifically (extracted_but_
+    ambiguous - see _row_had_ambiguous_match). A row with nothing wrong (no
+    document at all, a placeholder, or a document that simply had nothing
+    relevant) is never in this list - see storage.file_store's own
+    persistence of this same list for how a caller renders it.
+
     floorplan_already_processed/floorplan_checkpoint_callback/floorplan_
     url_checkpoint_callback are the SAME resume/checkpoint contract as
     already_processed/checkpoint_callback/url_checkpoint_callback above,
@@ -1689,6 +1981,17 @@ def enrich_rows_grouped(
     brochures_read_ok = 0
     brochures_unavailable = 0
     processed_urls = {}
+    # Additive diagnostics, alongside (never replacing) processed_urls -
+    # see this function's own docstring on why processed_urls itself keeps
+    # its existing "ok"/"unavailable" vocabulary unchanged (35+ existing
+    # tests and the on-disk checkpoint format already depend on those exact
+    # two strings for resume/retry logic - see storage.file_store's own
+    # _derive_enrichment_counts). One {"building", "floor_unit", "status"}
+    # entry per row with a genuine document ISSUE (see ISSUE_STATUSES) -
+    # never one for a row with nothing wrong, and never one per URL when
+    # many rows share it (a row-level line, matching what a reviewer
+    # actually needs to go check: WHICH property, not which raw link).
+    document_issues = _ineligible_link_issues(rows, needs_enrichment, "brochure_link", reject_floorplan_shaped=True)
 
     if not unique_urls or not urls_to_fetch:
         progress_callback(0, 0, None)
@@ -1702,6 +2005,7 @@ def enrich_rows_grouped(
             "unique_brochures_considered": len(unique_urls), "brochures_read_ok": 0,
             "brochures_unavailable": 0, "rows_eligible": len(eligible), "rows_enriched": len(log),
             "processed_urls": processed_urls,
+            "document_issues": document_issues + floorplan_stats["document_issues"],
             "unique_floorplans_considered": floorplan_stats["unique_floorplans_considered"],
             "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
             "floorplans_unavailable": floorplan_stats["floorplans_unavailable"],
@@ -1709,20 +2013,28 @@ def enrich_rows_grouped(
         }
 
     def _fetch_one(url):
-        # Runs in a worker thread - deliberately returns its result rather
-        # than touching any shared state itself (see the function's own
-        # docstring on why that's what makes this safe without a lock).
+        # Runs in a worker thread - deliberately returns its result (now
+        # including the status this call's own _StatusCapture recorded, if
+        # any) rather than touching any shared state itself (see the
+        # function's own docstring on why that's what makes this safe
+        # without a lock) - status_sink is thread-local (see _StatusCapture
+        # itself), so this is safe regardless of how many workers run
+        # concurrently.
+        sink = {}
         try:
-            return url, _extract_brochure_units(url)
+            with _StatusCapture(sink):
+                units = _extract_brochure_units(url)
+            return url, units, sink
         except Exception as e:
             print(f"[brochure_enrichment] Unexpected error reading {url!r} ({e!r}) — skipping.", file=sys.stderr)
-            return url, None
+            sink.setdefault("status", STATUS_EXTRACTION_FAILED)
+            return url, None, sink
 
     since_checkpoint = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         futures = [executor.submit(_fetch_one, url) for url in urls_to_fetch]
         for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-            url, units = future.result()
+            url, units, sink = future.result()
             _trim_memory()
 
             # is not None, not plain truthiness - _extract_brochure_units
@@ -1742,6 +2054,17 @@ def enrich_rows_grouped(
             else:
                 brochures_unavailable += 1
                 processed_urls[url] = "unavailable"
+
+            # Falls back to a generic status when the real fetch/render/
+            # extract body didn't run for THIS call (a cross-run cache hit
+            # - see _StatusCapture's own docstring) rather than leaving
+            # this document unrepresented in diagnostics at all.
+            document_status = sink.get("status") or (STATUS_EXTRACTED_SUCCESSFULLY if units else STATUS_FETCH_FAILED)
+            if document_status in ISSUE_STATUSES:
+                for i in indices_by_url[url]:
+                    document_issues.append({
+                        "building": rows[i].building, "floor_unit": rows[i].floor_unit, "status": document_status,
+                    })
 
             for i in indices_by_url[url]:
                 # Confirmed real, reproducible bug this guards against: raw
@@ -1775,6 +2098,25 @@ def enrich_rows_grouped(
                         "fields": fields,
                         "brochure_link": new_row.brochure_link,
                     })
+                elif document_status == STATUS_EXTRACTED_SUCCESSFULLY and needs_enrichment(new_row):
+                    # The document itself read fine and DID have content,
+                    # but this specific row got nothing from it - only
+                    # worth flagging as an issue if that's because THIS
+                    # row's own building genuinely had multiple candidate
+                    # units this document couldn't disambiguate (see
+                    # _row_had_ambiguous_match's own docstring) - never
+                    # merely because the document had nothing relevant to
+                    # this row at all, which is a completely normal, silent
+                    # outcome, not an issue.
+                    try:
+                        ambiguous = _row_had_ambiguous_match(rows[i], units)
+                    except Exception:
+                        ambiguous = False
+                    if ambiguous:
+                        document_issues.append({
+                            "building": new_row.building, "floor_unit": new_row.floor_unit,
+                            "status": STATUS_EXTRACTED_BUT_AMBIGUOUS,
+                        })
 
             progress_callback(done, len(urls_to_fetch), first_label.get(url))
 
@@ -1806,6 +2148,7 @@ def enrich_rows_grouped(
         "rows_eligible": len(eligible),
         "rows_enriched": len(log),
         "processed_urls": processed_urls,
+        "document_issues": document_issues + floorplan_stats["document_issues"],
         "unique_floorplans_considered": floorplan_stats["unique_floorplans_considered"],
         "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
         "floorplans_unavailable": floorplan_stats["floorplans_unavailable"],
@@ -1942,6 +2285,7 @@ def run_brochure_enrichment(
         staging_path, stats, cumulative_processed_urls,
         floorplan_processed_urls=cumulative_floorplan_processed_urls,
         unique_floorplans_considered=stats["unique_floorplans_considered"],
+        document_issues=stats["document_issues"],
     )
 
     counts = _derive_cumulative_counts(cumulative_processed_urls)
