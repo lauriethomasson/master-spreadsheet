@@ -107,7 +107,7 @@ import platform
 import re
 import sys
 import threading
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 import streamlit as st
@@ -699,6 +699,57 @@ def _box_share_token(url: str):
     return match.group(1) if match else None
 
 
+# Dropbox's own documented "force download" mechanism (see Dropbox's help
+# center: sharing a file normally serves an HTML preview page, but forcing
+# dl=1 in the share link's query string switches it to a direct, byte-for-
+# byte download of exactly what the owner shared) - no OAuth/app
+# credentials, no reverse engineering, just the public query parameter
+# Dropbox itself designed for this. Covers both the older "/s/{id}/..." and
+# current "/scl/fi/{id}/..." share-link path shapes; declined for any other
+# dropbox.com path (a login page, the folder-browser UI, a team admin page)
+# this mechanism was never meant for and isn't confirmed to work on.
+def _is_dropbox_share_url(url: str) -> bool:
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+    if netloc != "dropbox.com" and not netloc.endswith(".dropbox.com"):
+        return False
+    return parsed.path.startswith("/s/") or parsed.path.startswith("/scl/fi/")
+
+
+def _dropbox_direct_download_url(url: str) -> str:
+    """`url` (already confirmed by _is_dropbox_share_url) with dl forced to
+    1 - see the comment above for why this is Dropbox's own documented
+    mechanism, not a hack."""
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query))
+    query["dl"] = "1"
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+# Google Drive's own long-standing "uc?export=download" endpoint for a
+# PUBLICLY shared file's direct bytes - not Drive's authenticated REST API
+# (no OAuth/app credentials) and not a reverse-engineered internal
+# endpoint (this exact URL shape has been documented and relied upon
+# externally for over a decade). Deliberately does NOT attempt Drive's
+# separate "Google can't scan this file for viruses" HTML interstitial/
+# confirmation-token flow that appears for large files - extracting a
+# token out of that HTML would be exactly the kind of brittle,
+# undocumented scraping this task explicitly avoids. A file that triggers
+# that interstitial instead of a direct download simply fails
+# _looks_like_fetchable_document below (an HTML page, not a PDF) and is
+# skipped exactly like any other unreadable source - never mis-extracted,
+# just not one this pipeline can reach.
+_GOOGLE_DRIVE_FILE_ID_RE = re.compile(r"^https?://drive\.google\.com/file/d/([\w-]+)", re.IGNORECASE)
+
+
+def _google_drive_file_id(url: str):
+    """The file ID from a "drive.google.com/file/d/{id}/..." share URL, or
+    None if `url` isn't shaped like one - a pure URL-shape check, no fetch,
+    mirroring _box_share_token's own convention."""
+    match = _GOOGLE_DRIVE_FILE_ID_RE.match(url)
+    return match.group(1) if match else None
+
+
 _BOX_PDF_ONLY_EXTENSIONS = ("pdf",)
 # Only ever used for the floorplan fetch path (accept_image_formats=True -
 # see _fetch_box_shared_pdf's own docstring) - a real, confirmed shape: two
@@ -860,6 +911,15 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     _extract_floorplan_units), where a floorplan-shaped Box file name is
     the expected content, not a mislabeling to guard against, and a raster
     image is a real, confirmed document shape, not a fetch failure.
+
+    A Dropbox share link (see _is_dropbox_share_url) or a Google Drive
+    "file/d/{id}" share link (see _google_drive_file_id) is turned into
+    that host's own direct-download URL before fetching, same idea as the
+    Box branch above but via a simple, documented URL transform rather
+    than a second metadata fetch - neither host requires one. Anything
+    else keeps the exact same behavior as before: a direct document
+    extension is fetched as-is, otherwise resolve_brochure_link's one-hop
+    landing-page scan is tried first.
     """
     if _box_share_token(url):
         return _fetch_box_shared_pdf(
@@ -869,7 +929,13 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     direct_extensions = (".pdf", ".png", ".jpg", ".jpeg") if accept_image_formats else (".pdf",)
     try:
         clean_path = url.lower().split("?")[0]
-        target = url if clean_path.endswith(direct_extensions) else resolve_brochure_link(url)
+        drive_file_id = _google_drive_file_id(url)
+        if _is_dropbox_share_url(url):
+            target = _dropbox_direct_download_url(url)
+        elif drive_file_id:
+            target = f"https://drive.google.com/uc?export=download&id={drive_file_id}"
+        else:
+            target = url if clean_path.endswith(direct_extensions) else resolve_brochure_link(url)
         response = httpx.get(
             target, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}, follow_redirects=True,
         )

@@ -478,6 +478,138 @@ class FetchBoxSharedPdfTests(EnrichmentTestCase):
         self.assertIsNone(result)
 
 
+class DropboxAndGoogleDriveShareUrlTests(unittest.TestCase):
+    def test_dropbox_s_share_url_matches(self):
+        self.assertTrue(brochure_enrichment._is_dropbox_share_url("https://www.dropbox.com/s/abc123/Brochure.pdf?dl=0"))
+
+    def test_dropbox_scl_fi_share_url_matches(self):
+        self.assertTrue(
+            brochure_enrichment._is_dropbox_share_url(
+                "https://www.dropbox.com/scl/fi/abc123/Brochure.pdf?rlkey=xyz&dl=0"
+            )
+        )
+
+    def test_bare_dropbox_com_without_www_matches(self):
+        self.assertTrue(brochure_enrichment._is_dropbox_share_url("https://dropbox.com/s/abc123/Brochure.pdf"))
+
+    def test_dropbox_non_share_path_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_dropbox_share_url("https://www.dropbox.com/home"))
+
+    def test_non_dropbox_url_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_dropbox_share_url("https://example.com/s/abc123"))
+
+    def test_dropbox_direct_download_url_forces_dl_1(self):
+        result = brochure_enrichment._dropbox_direct_download_url(
+            "https://www.dropbox.com/s/abc123/Brochure.pdf?dl=0"
+        )
+        self.assertEqual(result, "https://www.dropbox.com/s/abc123/Brochure.pdf?dl=1")
+
+    def test_dropbox_direct_download_url_adds_dl_when_missing(self):
+        result = brochure_enrichment._dropbox_direct_download_url("https://www.dropbox.com/s/abc123/Brochure.pdf")
+        self.assertEqual(result, "https://www.dropbox.com/s/abc123/Brochure.pdf?dl=1")
+
+    def test_google_drive_file_id_extracted_from_view_link(self):
+        result = brochure_enrichment._google_drive_file_id(
+            "https://drive.google.com/file/d/1AbCdEfGh_IJK-lmno/view?usp=sharing"
+        )
+        self.assertEqual(result, "1AbCdEfGh_IJK-lmno")
+
+    def test_non_drive_url_returns_none(self):
+        self.assertIsNone(
+            brochure_enrichment._google_drive_file_id("https://example.com/file/d/1AbCdEfGh_IJK-lmno/view")
+        )
+
+    def test_drive_url_of_a_different_shape_returns_none(self):
+        # docs.google.com (Sheets/Docs), or drive.google.com/drive/folders/...
+        # are deliberately NOT handled - only the common "share a file"
+        # /file/d/{id}/ shape, to stay small and avoid guessing at shapes
+        # never confirmed against a real example.
+        self.assertIsNone(brochure_enrichment._google_drive_file_id("https://drive.google.com/drive/folders/abc123"))
+
+
+class FetchPdfBytesDropboxAndGoogleDriveTests(EnrichmentTestCase):
+    def test_dropbox_share_link_is_fetched_via_its_direct_download_url(self):
+        with patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
+                patch("brochure_enrichment.resolve_brochure_link") as mock_resolve:
+            result = brochure_enrichment._fetch_pdf_bytes("https://www.dropbox.com/s/abc123/Brochure.pdf?dl=0")
+
+        self.assertEqual(result, b"%PDF-1.4 fake pdf bytes")
+        mock_resolve.assert_not_called()
+        mock_get.assert_called_once_with(
+            "https://www.dropbox.com/s/abc123/Brochure.pdf?dl=1", timeout=brochure_enrichment.REQUEST_TIMEOUT,
+            headers={"User-Agent": brochure_enrichment.USER_AGENT}, follow_redirects=True,
+        )
+
+    def test_google_drive_share_link_is_fetched_via_its_direct_download_url(self):
+        with patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
+                patch("brochure_enrichment.resolve_brochure_link") as mock_resolve:
+            result = brochure_enrichment._fetch_pdf_bytes(
+                "https://drive.google.com/file/d/1AbCdEfGh_IJK-lmno/view?usp=sharing"
+            )
+
+        self.assertEqual(result, b"%PDF-1.4 fake pdf bytes")
+        mock_resolve.assert_not_called()
+        mock_get.assert_called_once_with(
+            "https://drive.google.com/uc?export=download&id=1AbCdEfGh_IJK-lmno",
+            timeout=brochure_enrichment.REQUEST_TIMEOUT,
+            headers={"User-Agent": brochure_enrichment.USER_AGENT}, follow_redirects=True,
+        )
+
+    def test_google_drive_large_file_virus_scan_interstitial_fails_safe(self):
+        # A file that triggers Drive's "can't scan this file for viruses"
+        # confirmation page returns HTML, not the PDF - this must be
+        # treated exactly like any other unreadable source (None), never
+        # mis-extracted from the interstitial's own HTML content.
+        interstitial = _response(
+            content=b"<html>Google Drive can't scan this file for viruses...</html>", content_type="text/html",
+        )
+        with patch("brochure_enrichment.httpx.get", return_value=interstitial):
+            result = brochure_enrichment._fetch_pdf_bytes(
+                "https://drive.google.com/file/d/1AbCdEfGh_IJK-lmno/view?usp=sharing"
+            )
+
+        self.assertIsNone(result)
+
+    def test_dropbox_fetch_failure_returns_none_and_is_recorded(self):
+        with patch("brochure_enrichment.httpx.get", side_effect=httpx.ConnectError("dns failure")):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_pdf_bytes("https://www.dropbox.com/s/abc123/Brochure.pdf?dl=0")
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_a_failed_dropbox_document_does_not_prevent_a_later_box_document_from_succeeding(self):
+        # One resolver failing must never affect an unrelated document
+        # handled by a different resolver in the same run.
+        with patch("brochure_enrichment.httpx.get", side_effect=httpx.ConnectError("dns failure")):
+            dropbox_result = brochure_enrichment._fetch_pdf_bytes(
+                "https://www.dropbox.com/s/abc123/Brochure.pdf?dl=0"
+            )
+        self.assertIsNone(dropbox_result)
+
+        share_html = _box_share_html(shared_name="abc123", extension="pdf")
+        with patch(
+            "brochure_enrichment.httpx.get", side_effect=[_html_response(share_html), _response()],
+        ):
+            box_result = brochure_enrichment._fetch_pdf_bytes("https://app.box.com/s/abc123")
+        self.assertIsNotNone(box_result)
+
+    def test_canva_view_link_is_still_never_attempted_as_dropbox_or_drive(self):
+        # Regression guard for commit a67e337's Canva-unsupported behavior -
+        # a Canva view link must stay rejected pre-fetch by classify_link_
+        # eligibility/the _is_eligible_* checks, never reach _fetch_pdf_
+        # bytes's own resolver dispatch at all. Confirmed here at the
+        # eligibility layer, since a Canva URL's own shape would never
+        # match the Dropbox/Drive checks anyway - this only guards against
+        # a future change accidentally routing it through _fetch_pdf_bytes.
+        canva_url = "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(canva_url),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+        self.assertFalse(brochure_enrichment._is_eligible_brochure_url(canva_url))
+
+
 class LooksLikeFetchableDocumentTests(unittest.TestCase):
     def test_pdf_content_type_always_accepted(self):
         self.assertTrue(brochure_enrichment._looks_like_fetchable_document("application/pdf", b"anything"))
