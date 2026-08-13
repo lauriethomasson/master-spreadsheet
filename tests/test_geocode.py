@@ -131,6 +131,100 @@ class SubmarketBackfillTests(unittest.TestCase):
         self.assertEqual(row.submarket, "Fitzrovia")
 
 
+class SourceAreaHintSubmarketTests(unittest.TestCase):
+    """
+    Regression tests for the confirmed Part C gap: submarket previously
+    only ever came from Google's reverse-geocode sublocality/neighborhood
+    component, even when the source's own text already stated a locality
+    (e.g. "Nutmeg House \\nLondon Bridge SE1", the same real newline
+    convention extract_postcode_hint already trusts) that Google's own
+    coverage simply doesn't reach for every real address.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_explicit_source_submarket_survives_unchanged(self):
+        row = ListingRow(
+            building="Nutmeg House \nLondon Bridge SE1", provider="beem",
+            lat=51.505, lng=-0.087, submarket="Bermondsey",
+        )
+
+        with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.submarket, "Bermondsey")
+
+    def test_source_locality_hint_backfills_blank_submarket_with_no_api_call(self):
+        row = ListingRow(building="Nutmeg House \nLondon Bridge SE1", provider="beem", lat=51.505, lng=-0.087)
+
+        with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.submarket, "London Bridge")
+
+    def test_google_neighbourhood_still_backfills_when_source_has_no_locality_hint(self):
+        # "City Tower" has no separator/locality hint at all - unaffected,
+        # Google's own reverse-geocode result is still used exactly as
+        # before this change.
+        row = ListingRow(building="City Tower", provider="Breezblok", lat=51.5188, lng=-0.1381)
+        components = [{"long_name": "Fitzrovia", "types": ["political", "sublocality", "sublocality_level_1"]}]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_called_once()
+        self.assertEqual(row.submarket, "Fitzrovia")
+
+    def test_a_source_locality_hint_outranks_a_blank_google_sublocality(self):
+        # Confirmed real shape: valid lat/lng, but Google's own reverse-
+        # geocode simply has no sublocality/neighborhood component for this
+        # address - the source's own locality text must still win, and the
+        # (would-be-empty) Google call is never even made.
+        row = ListingRow(building="Nutmeg House \nLondon Bridge SE1", provider="beem", lat=51.505, lng=-0.087)
+
+        with patch(
+            "geocode.call_reverse_geocoding_api",
+            return_value={"status": "OK", "address_components": [{"long_name": "London", "types": ["postal_town"]}]},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.submarket, "London Bridge")
+
+    def test_ambiguous_free_text_with_no_separator_never_becomes_a_guessed_submarket(self):
+        # "New Derwent House WC1" has no comma/newline - extract_area_hint
+        # stays conservative and returns nothing, so this must fall through
+        # to Google's own reverse-geocode exactly as before, never guess a
+        # word out of the unbroken building text.
+        row = ListingRow(building="New Derwent House WC1", provider="beem", lat=51.52, lng=-0.12)
+        components = [{"long_name": "Holborn", "types": ["political", "sublocality", "sublocality_level_1"]}]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_called_once()
+        self.assertEqual(row.submarket, "Holborn")
+
+    def test_no_provider_specific_code_is_involved(self):
+        # Same locality-hint backfill for a provider never seen before -
+        # extract_area_hint/_source_area_hint have no provider branching at
+        # all (see geocode.py's own module docstring on this).
+        row = ListingRow(building="Any Building \nSoho W1", provider="A Brand New Agent", lat=51.51, lng=-0.13)
+
+        with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.submarket, "Soho")
+
+
 class SplitCompoundBuildingTests(unittest.TestCase):
     def test_name_comma_address_is_compound(self):
         # The real Kitt's Availability building whose compound value

@@ -887,5 +887,166 @@ class ReadSpreadsheetSheetNameTests(unittest.TestCase):
         self.assertEqual(df.iloc[0]["Building"], "89 Charterhouse Street")
 
 
+class ClassifyLinkLabelTests(unittest.TestCase):
+    """classify_link_label - the pure text->type classifier, no I/O."""
+
+    def test_floor_plan_label_variants_classify_as_floorplan(self):
+        for text in ("Floor Plan", "Floorplan", "FLOOR PLAN", "View Floor Plan", "Download Floorplan"):
+            self.assertEqual(extract_spreadsheet.classify_link_label(text), "floorplan", text)
+
+    def test_brochure_label_variants_classify_as_brochure(self):
+        for text in ("Brochure", "BROCHURE", "View Brochure", "Download Brochure"):
+            self.assertEqual(extract_spreadsheet.classify_link_label(text), "brochure", text)
+
+    def test_combined_document_label_classifies_as_brochure_only(self):
+        # A single document that's both stays brochure - never floorplan,
+        # never both (see the module's own docstring).
+        self.assertEqual(
+            extract_spreadsheet.classify_link_label("Download Brochure and Floorplans"), "brochure",
+        )
+
+    def test_uninformative_label_is_unclassified(self):
+        for text in ("Click Here", "View", "Open", "", None):
+            self.assertIsNone(extract_spreadsheet.classify_link_label(text))
+
+
+class BrochureFloorplanLinkClassificationTests(unittest.TestCase):
+    """
+    End-to-end regression tests for the confirmed real gap: extract_
+    spreadsheet.py's header-mapped fast path (build_rows) previously copied
+    every row's link straight through to whatever field the COLUMN header
+    mapped to, discarding the per-row hyperlink label's own, stronger
+    evidence of that specific cell's real document type - e.g. a column
+    headered "Brochure" (or another brochure_link synonym) whose individual
+    rows are actually a mix of real brochure and floor-plan links,
+    distinguished only by each cell's own visible hyperlink text (a real,
+    confirmed shape: floor plans delivered as a Box.com link visibly
+    labeled "FLOOR PLAN" sitting in an otherwise brochure-headed column).
+    """
+
+    def _xlsx_bytes(self, headers: list, rows: list) -> bytes:
+        """
+        rows: list of lists, one per data row, each entry either a plain
+        value or a (display_text, url) tuple - the tuple becomes a real
+        openpyxl hyperlink whose OWN cell text is display_text (never the
+        URL itself), exactly the shape read_spreadsheet's own hyperlink_
+        display_text capture is for.
+        """
+        wb = Workbook()
+        ws = wb.active
+        ws.append(headers)
+        for row in rows:
+            ws.append([v[0] if isinstance(v, tuple) else v for v in row])
+            row_idx = ws.max_row
+            for col_idx, value in enumerate(row, start=1):
+                if isinstance(value, tuple):
+                    display_text, url = value
+                    ws.cell(row=row_idx, column=col_idx).hyperlink = url
+                    ws.cell(row=row_idx, column=col_idx).value = display_text
+        buffer = BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    def _build_rows(self, headers: list, rows: list) -> list:
+        data = self._xlsx_bytes(headers, rows)
+        df = extract_spreadsheet.read_spreadsheet(data, ".xlsx")
+        mapping = extract_spreadsheet.suggest_mapping(list(df.columns))
+        return extract_spreadsheet.build_rows(df, mapping, source_file="test.xlsx")
+
+    def test_floor_plan_label_with_box_url_lands_in_floorplan_link(self):
+        rows = self._build_rows(
+            ["Building", "Brochure"],
+            [["Nutmeg House", ("FLOOR PLAN", "https://app.box.com/s/floorplan123")]],
+        )
+        self.assertEqual(rows[0].floorplan_link, "https://app.box.com/s/floorplan123")
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_brochure_label_with_box_url_stays_brochure_link(self):
+        rows = self._build_rows(
+            ["Building", "Brochure"],
+            [["Kent House", ("BROCHURE", "https://app.box.com/s/brochure456")]],
+        )
+        self.assertEqual(rows[0].brochure_link, "https://app.box.com/s/brochure456")
+        self.assertIsNone(rows[0].floorplan_link)
+
+    def test_hyperlink_display_text_is_preserved_alongside_target(self):
+        data = self._xlsx_bytes(
+            ["Building", "Brochure"],
+            [["Nutmeg House", ("FLOOR PLAN", "https://app.box.com/s/floorplan123")]],
+        )
+        df = extract_spreadsheet.read_spreadsheet(data, ".xlsx")
+        self.assertEqual(df.iloc[0]["Brochure"], "https://app.box.com/s/floorplan123")
+        self.assertEqual(df.attrs["hyperlink_display_text"]["Brochure"][0], "FLOOR PLAN")
+
+    def test_explicit_floorplan_label_outranks_a_generic_synonym_column(self):
+        # "Link to File" is a real brochure_link synonym (see EXTRA_
+        # SYNONYMS) with no wording of its own suggesting either document
+        # type - a genuinely generic column header, unlike "Brochure"
+        # itself. The per-row label must still win.
+        rows = self._build_rows(
+            ["Building", "Link to File"],
+            [["Nutmeg House", ("Download Floorplan", "https://app.box.com/s/fp789")]],
+        )
+        self.assertEqual(rows[0].floorplan_link, "https://app.box.com/s/fp789")
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_brochure_containing_floorplan_pages_remains_brochure(self):
+        rows = self._build_rows(
+            ["Building", "Brochure"],
+            [["Nutmeg House", ("Download Brochure and Floorplans", "https://app.box.com/s/combined")]],
+        )
+        self.assertEqual(rows[0].brochure_link, "https://app.box.com/s/combined")
+        self.assertIsNone(rows[0].floorplan_link)
+
+    def test_separate_brochure_and_floorplan_columns_both_survive(self):
+        rows = self._build_rows(
+            ["Building", "Brochure", "Floor Plan"],
+            [[
+                "Nutmeg House",
+                ("BROCHURE", "https://app.box.com/s/brochure1"),
+                ("FLOOR PLAN", "https://app.box.com/s/floorplan1"),
+            ]],
+        )
+        self.assertEqual(rows[0].brochure_link, "https://app.box.com/s/brochure1")
+        self.assertEqual(rows[0].floorplan_link, "https://app.box.com/s/floorplan1")
+
+    def test_pdf_floorplan_link_classifies_as_floorplan_not_brochure(self):
+        # The real, confirmed VERSE Building case: a floor plan can itself
+        # be a PDF, so extension alone is never a safe signal either way.
+        rows = self._build_rows(
+            ["Building", "Brochure"],
+            [["Verse Building", ("FLOOR PLAN", "https://app.box.com/s/verse-1st-floor.pdf")]],
+        )
+        self.assertEqual(rows[0].floorplan_link, "https://app.box.com/s/verse-1st-floor.pdf")
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_png_floorplan_link_classifies_as_floorplan_not_brochure(self):
+        rows = self._build_rows(
+            ["Building", "Brochure"],
+            [["Nutmeg House", ("FLOOR PLAN", "https://app.box.com/s/floorplan.png")]],
+        )
+        self.assertEqual(rows[0].floorplan_link, "https://app.box.com/s/floorplan.png")
+        self.assertIsNone(rows[0].brochure_link)
+
+    def test_placeholder_value_produces_neither_link(self):
+        rows = self._build_rows(["Building", "Brochure"], [["Nutmeg House", "TBC"]])
+        self.assertIsNone(rows[0].brochure_link)
+        self.assertIsNone(rows[0].floorplan_link)
+
+    def test_provider_name_does_not_affect_classification(self):
+        rows = self._build_rows(
+            ["Building", "Provider", "Brochure"],
+            [["Nutmeg House", "UNION", ("FLOOR PLAN", "https://app.box.com/s/floorplan123")]],
+        )
+        self.assertEqual(rows[0].floorplan_link, "https://app.box.com/s/floorplan123")
+        self.assertIsNone(rows[0].brochure_link)
+
+        rows_other_provider = self._build_rows(
+            ["Building", "Provider", "Brochure"],
+            [["Nutmeg House", "Some Other Agent", ("FLOOR PLAN", "https://app.box.com/s/floorplan123")]],
+        )
+        self.assertEqual(rows_other_provider[0].floorplan_link, "https://app.box.com/s/floorplan123")
+
+
 if __name__ == "__main__":
     unittest.main()

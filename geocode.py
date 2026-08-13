@@ -184,6 +184,63 @@ def extract_postcode_hint(text: str):
     return None
 
 
+_LEADING_DIGIT_RE = re.compile(r"^\d")
+
+
+def extract_area_hint(text: str):
+    """
+    A safe, conservative source-area/locality hint (e.g. "London Bridge")
+    immediately adjacent to a postcode hint (see extract_postcode_hint) -
+    trusted ONLY when the source text itself already marks the boundary
+    between building identity and locality with a real separator already
+    established elsewhere in this codebase (a newline - the real, confirmed
+    Beem convention, see extract_postcode_hint's own "Clove \\nLondon Bridge
+    SE1" example - or a comma, the same separator split_compound_building
+    already trusts for "Name, Address"), never by guessing where an
+    unbroken run of words splits. Returns None for a single unbroken line
+    with no such separator (e.g. "New Derwent House WC1") - there is no
+    safe, generic way to tell where a building name ends and a locality
+    begins in that shape, and guessing would risk exactly the "ambiguous
+    free text becomes a guessed submarket" failure this must avoid. Never a
+    hardcoded gazetteer of place names, and never provider-specific.
+
+    Splits `text` into segments on every newline/comma, then looks at
+    whichever segment the postcode hint (see extract_postcode_hint) is
+    found in:
+    - if that segment has leftover text once the hint's own trailing
+      token(s) are removed (e.g. "London Bridge SE1" -> "London Bridge"),
+      that leftover IS the area - unless it starts with a digit (a street
+      address, e.g. "22 Newman Street WC1" -> "22 Newman Street", never
+      mistaken for a locality name);
+    - if the hint's own segment is nothing BUT the postcode itself (e.g.
+      "Nutmeg House, London Bridge, SE1"), the PRECEDING segment is the
+      area - again unless it starts with a digit.
+    """
+    if not text:
+        return None
+    segments = [s.strip() for s in re.split(r"[\n,]", text) if s.strip()]
+    if len(segments) < 2:
+        return None  # no real separator present at all - too ambiguous to safely split
+
+    hint = extract_postcode_hint(segments[-1])
+    if not hint:
+        return None  # the postcode hint isn't where this parser expects it - stay conservative, no guess
+
+    tokens = [t for t in re.split(r"\s+", segments[-1]) if t]
+    consumed = 2 if hint["full"] else 1
+    leftover_tokens = tokens[:-consumed]
+
+    if leftover_tokens:
+        if _LEADING_DIGIT_RE.match(leftover_tokens[0]):
+            return None  # looks like a street address, not a locality name
+        return " ".join(leftover_tokens)
+
+    candidate = segments[-2]
+    if _LEADING_DIGIT_RE.match(candidate):
+        return None  # looks like a street address, not a locality name
+    return candidate
+
+
 def _source_location_hint(row: ListingRow):
     """
     The strongest postcode-district hint already stated by the SOURCE,
@@ -201,6 +258,22 @@ def _source_location_hint(row: ListingRow):
         hint = extract_postcode_hint(text)
         if hint:
             return hint
+    return None
+
+
+def _source_area_hint(row: ListingRow):
+    """
+    extract_area_hint's own row-level counterpart to _source_location_hint,
+    checked in the same field priority (row.postcode, then address_1, then
+    building) - used both to backfill submarket (see _fill_submarket) and as
+    an extra Places query-disambiguation variant (see geocode_row's own
+    Tier 2). Returns None when no field has a safely-separated locality hint
+    to offer, same as _source_location_hint's own "nothing found" case.
+    """
+    for text in (row.postcode, row.address_1, row.building):
+        area = extract_area_hint(text)
+        if area:
+            return area
     return None
 
 
@@ -295,15 +368,22 @@ def call_places_text_search(query: str) -> dict:
     if not places:
         return {"status": "ZERO_RESULTS"}
 
-    top = places[0]
-    location = top.get("location", {})
-    return {
-        "status": "OK",
-        "lat": location.get("latitude"),
-        "lng": location.get("longitude"),
-        "formatted_address": top.get("formattedAddress"),
-        "address_components": top.get("addressComponents", []),
-    }
+    candidates = []
+    for place in places:
+        location = place.get("location", {})
+        candidates.append({
+            "lat": location.get("latitude"),
+            "lng": location.get("longitude"),
+            "formatted_address": place.get("formattedAddress"),
+            "address_components": place.get("addressComponents", []),
+        })
+
+    # "candidates" is additive - every existing caller/test that only reads
+    # the flattened top-level lat/lng/formatted_address/address_components
+    # (unpacked from candidates[0] below) keeps working completely
+    # unchanged; only a caller that actually wants to consider more than the
+    # top result (see _best_places_result) reads "candidates" itself.
+    return {"status": "OK", "candidates": candidates, **candidates[0]}
 
 
 def _address_line1_and_postcode(address_components: list, name_key: str = "longText") -> tuple:
@@ -361,23 +441,58 @@ def _submarket_from_components(address_components: list, name_key: str = "long_n
     return None
 
 
+def _fill_submarket(row: ListingRow, address_components: list = None) -> None:
+    """
+    Fills row.submarket using this module's own priority order: (1) never
+    overwrites a genuinely-extracted value (the row.submarket guard below -
+    unchanged from before); (2) a safe source-text locality hint (see
+    _source_area_hint/extract_area_hint) - preferred over Google's own
+    reverse-geocoded neighbourhood since the source already said so
+    explicitly, and confirmed real gap: Google's sublocality/neighborhood
+    coverage is patchy (reliable for Mayfair/Fitzrovia/Soho, but genuinely
+    blank for other real addresses this exists for), so a source that
+    already states its own locality must never stay blank just because
+    Google's reverse-geocode happens not to cover it; (3) address_components
+    already fetched from a reverse-geocode (see _submarket_from_components) -
+    checked only when the source itself had nothing safe to offer, and only
+    if the caller already has a reverse-geocode result in hand (never
+    fetches one itself - see _backfill_submarket_from_coords, the only
+    caller that decides whether a reverse-geocode call is worth making at
+    all). Idempotent/safe to call more than once for the same row - every
+    branch is a no-op once row.submarket is set.
+    """
+    if row.submarket:
+        return
+    area_hint = _source_area_hint(row)
+    if area_hint:
+        row.submarket = area_hint
+        return
+    if address_components:
+        submarket = _submarket_from_components(address_components)
+        if submarket:
+            row.submarket = submarket
+
+
 def _backfill_submarket_from_coords(row: ListingRow, lat: float, lng: float) -> None:
     """
-    Fills row.submarket from a reverse-geocode of coordinates already
-    trusted (either source-provided or just resolved a few lines above) -
-    never overwrites a genuinely-extracted value (the row.submarket guard
-    below). Applies regardless of source type (spreadsheet/PDF/email),
-    since geocode_row is the one shared code path for all of them - no
-    per-source-type wiring needed. This is purely an additional read at
+    Fills row.submarket for coordinates already trusted (either source-
+    provided or just resolved a few lines above) - see _fill_submarket for
+    the actual priority order. Only calls out to the reverse-geocode API
+    when a safe source-text hint isn't already enough, saving the call
+    entirely for a row whose source text already states its own locality.
+    Applies regardless of source type (spreadsheet/PDF/email), since
+    geocode_row is the one shared code path for all of them - no per-
+    source-type wiring needed. This is purely an additional read at
     coordinates already known, with no risk to lat/lng itself.
     """
     if row.submarket:
         return
+    _fill_submarket(row)
+    if row.submarket:
+        return
     reverse = call_reverse_geocoding_api(lat, lng)
     if reverse["status"] == "OK":
-        submarket = _submarket_from_components(reverse.get("address_components", []))
-        if submarket:
-            row.submarket = submarket
+        _fill_submarket(row, reverse.get("address_components", []))
 
 
 def split_compound_building(building: str) -> tuple:
@@ -422,6 +537,70 @@ def log_geocode_failure(row: ListingRow, reason: str):
     print(f"[geocode] FAILED: {row.building!r} ({row.source_file}) — {reason}", file=sys.stderr)
 
 
+def _best_places_result(query: str, source_hint: dict) -> dict:
+    """
+    Sends ONE query to Places Text Search and returns the first candidate
+    (see call_places_text_search's own "candidates" list, not just its
+    top result) that passes bbox + source-postcode-evidence validation -
+    confirmed real gap this closes: call_places_text_search previously
+    exposed only the top Places result, so a source with strong location
+    evidence (e.g. "SE1") had no way to fall through to a DIFFERENT
+    candidate the same search already returned, even when that candidate
+    was sitting right there in the same response.
+
+    If every candidate this query returns fails validation, returns the
+    LAST one's own conflict/failure info (for log_geocode_failure's own
+    message) - never a candidate this function itself hasn't checked, and
+    never blindly "the next one" without the exact same bbox/postcode
+    checks geocode_row's own single-candidate path always applied.
+    """
+    search = call_places_text_search(query)
+    if search["status"] != "OK":
+        return search
+
+    candidates = search.get("candidates") or [search]
+    last = search
+    for place in candidates:
+        if not within_london_bbox(place.get("lat"), place.get("lng")):
+            last = {**place, "status": "OK"}
+            continue
+        _, candidate_postcode = _address_line1_and_postcode(place.get("address_components", []))
+        if _postcode_hint_conflicts(source_hint, candidate_postcode):
+            last = {**place, "status": "LOCATION_CONFLICT", "postcode": candidate_postcode}
+            continue
+        return {**place, "status": "OK"}
+    return last
+
+
+def _fallback_query_texts(row: ListingRow, source_hint: dict) -> list:
+    """
+    Additional building-text variants to try in Places Text Search if every
+    candidate from the existing compound-address/full-building attempts
+    (see geocode_row's own Tier 2) still conflicts or fails - built from the
+    same source evidence source_hint/_source_area_hint already extract,
+    phrased as its OWN explicit, comma-separated segment rather than left
+    mashed into the free-text building value (e.g. "New Derwent House, WC1"
+    instead of relying on "New Derwent House WC1" as one run-on string) -
+    a differently-phrased query can lead Places to surface a different (and
+    possibly correct) candidate for the exact same real building, per this
+    module's own priority order: postcode/district hint before area/
+    submarket text, building name alone last (already covered by the
+    caller's own existing candidates).
+
+    Never replaces the existing attempts; only ever appended after them,
+    and only actually queried at all if they didn't already resolve - see
+    geocode_row's own loop, which stops at the first accepted candidate
+    regardless of how many variants exist here.
+    """
+    variants = []
+    if source_hint:
+        variants.append(f"{row.building}, {_hint_label(source_hint)}")
+    area_hint = _source_area_hint(row)
+    if area_hint:
+        variants.append(f"{row.building}, {area_hint}")
+    return variants
+
+
 def geocode_row(row: ListingRow) -> ListingRow:
     # Already has real coordinates (e.g. a provider spreadsheet's own Lat/Lng
     # columns, mapped straight through by extract_spreadsheet.py) - calling
@@ -452,37 +631,36 @@ def geocode_row(row: ListingRow) -> ListingRow:
         # query.
         source_hint = _source_location_hint(row)
         compound = split_compound_building(row.building)
-        candidates = ([compound[1]] if compound else []) + [row.building]
+        base_candidates = ([compound[1]] if compound else []) + [row.building]
+        query_variants = []
+        for candidate in base_candidates + _fallback_query_texts(row, source_hint):
+            if candidate not in query_variants:
+                query_variants.append(candidate)
 
+        # Validate BEFORE accepting - never write a candidate's lat/lng and
+        # then discover the conflict afterwards (see this module's own
+        # docstring on the confirmed "New Derwent House WC1" -> "25 Savile
+        # Row W1S 2ER" real failure). A candidate with no postal_code
+        # component at all has nothing to check against, so it's accepted
+        # on trust the same as before this validation existed - only a
+        # genuine, parseable contradiction rejects it. Every candidate a
+        # given query itself returns is checked (see _best_places_result),
+        # not just that query's own top result; if all of them conflict or
+        # fail, the NEXT query_variant (a differently-phrased query built
+        # from stronger source evidence - see _fallback_query_texts) is
+        # tried before giving up - never "candidate 1 conflicts -> blank"
+        # while a safer variant remains untried.
         result = {"status": "ZERO_RESULTS"}
-        for candidate in candidates:
+        for candidate in query_variants:
             query_parts = [candidate]
             if row.submarket:
                 query_parts.append(row.submarket)
             query_parts.append("London, UK")
             query = ", ".join(query_parts)
 
-            candidate_result = call_places_text_search(query)
-            if candidate_result["status"] != "OK" or not within_london_bbox(
-                candidate_result.get("lat"), candidate_result.get("lng")
-            ):
-                result = candidate_result
-                continue
-
-            # Validate BEFORE accepting - never write a candidate's lat/lng
-            # and then discover the conflict afterwards (see this module's
-            # own docstring on the confirmed "New Derwent House WC1" ->
-            # "25 Savile Row W1S 2ER" real failure). A candidate with no
-            # postal_code component at all has nothing to check against, so
-            # it's accepted on trust the same as before this validation
-            # existed - only a genuine, parseable contradiction rejects it.
-            _, candidate_postcode = _address_line1_and_postcode(candidate_result.get("address_components", []))
-            if _postcode_hint_conflicts(source_hint, candidate_postcode):
-                result = {**candidate_result, "status": "LOCATION_CONFLICT", "postcode": candidate_postcode}
-                continue
-
-            result = candidate_result
-            break
+            result = _best_places_result(query, source_hint)
+            if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
+                break
 
         if result["status"] == "OK" and within_london_bbox(result["lat"], result["lng"]):
             row.lat = result["lat"]
@@ -496,6 +674,13 @@ def geocode_row(row: ListingRow) -> ListingRow:
                     row.address_1 = address_1
                 if not row.postcode and postcode:
                     row.postcode = postcode
+
+            # A safe source-text locality hint (see _fill_submarket) never
+            # needs an API call - tried first so a row whose address_1/
+            # postcode are already resolved (from the candidate above) can
+            # skip the reverse-geocode call below entirely once this alone
+            # is enough.
+            _fill_submarket(row)
 
             if not row.address_1 or not row.postcode or not row.submarket:
                 # Places matched real coordinates but its own record is missing
@@ -530,10 +715,7 @@ def geocode_row(row: ListingRow) -> ListingRow:
                             row.address_1 = address_1
                         if not row.postcode and postcode:
                             row.postcode = postcode
-                    if not row.submarket:
-                        submarket = _submarket_from_components(reverse.get("address_components", []))
-                        if submarket:
-                            row.submarket = submarket
+                    _fill_submarket(row, reverse.get("address_components", []))
 
                 if not row.address_1 or not row.postcode:
                     log_geocode_failure(

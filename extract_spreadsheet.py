@@ -354,18 +354,41 @@ def read_spreadsheet(data: bytes, suffix: str, sheet_name: str = None) -> pd.Dat
         for vcell, fcell in zip(ws_values[header_row], ws_formulas[header_row])
     ]
     records = []
-    for value_row, formula_row in zip(
-        ws_values.iter_rows(min_row=header_row + 1), ws_formulas.iter_rows(min_row=header_row + 1)
+    # {header: {row_index: display_text}} - the cell's own VISIBLE text for
+    # every hyperlinked cell, keyed by the same 0-based row_index this
+    # DataFrame's default RangeIndex uses (records list order, matching
+    # ws_values.iter_rows' own order) - see classify_link_label/build_rows,
+    # which reclassify a brochure_link/floorplan_link value using this text
+    # rather than the bare URL alone (record[header] below), since the URL
+    # itself carries no document-type signal a hostname/filename heuristic
+    # can't already get wrong (see this module's own module docstring on the
+    # real Box.com "FLOOR PLAN" case this exists for). Stored on df.attrs
+    # (confirmed to survive pandas' own column-selection + rename - see
+    # build_rows) rather than a second return value, so every existing
+    # caller of read_spreadsheet keeps working unchanged.
+    hyperlink_display_text = {}
+    for row_idx, (value_row, formula_row) in enumerate(
+        zip(ws_values.iter_rows(min_row=header_row + 1), ws_formulas.iter_rows(min_row=header_row + 1))
     ):
         record = {}
         for col_idx, (vcell, fcell) in enumerate(zip(value_row, formula_row)):
             header = headers[col_idx]
             if vcell.hyperlink is not None:
-                record[header] = vcell.hyperlink.target
+                target = vcell.hyperlink.target
+                record[header] = target
+                display_text = _resolve_cell_value(vcell, fcell)
+                if (
+                    display_text is not None
+                    and str(display_text).strip()
+                    and str(display_text).strip() != target
+                ):
+                    hyperlink_display_text.setdefault(header, {})[row_idx] = str(display_text).strip()
             else:
                 record[header] = _resolve_cell_value(vcell, fcell)
         records.append(record)
-    return pd.DataFrame(records, columns=headers)
+    df = pd.DataFrame(records, columns=headers)
+    df.attrs["hyperlink_display_text"] = hyperlink_display_text
+    return df
 
 
 # Words that carry no field-identifying meaning on their own - dropped
@@ -853,6 +876,102 @@ def _coerce_numeric(value, kind: str):
     return numeric
 
 
+# Checked against a hyperlink's own VISIBLE cell text (see read_spreadsheet's
+# hyperlink_display_text) - never the URL, and never document contents/
+# extension. "brochure" wins whenever both words appear (e.g. "Download
+# Brochure and Floorplans") - a combined document stays classified as a
+# brochure only, mirroring extract_spreadsheet_gemini.py's own _floorplan_
+# url_from_cell_text (never duplicated into both fields there either).
+_FLOORPLAN_LABEL_KEYWORDS = ("floorplan", "floor plan")
+
+
+def classify_link_label(display_text: str):
+    """
+    "brochure", "floorplan", or None for a hyperlink's own visible cell text
+    - the strongest available evidence for which document TYPE a link
+    genuinely is, since a provider's own column header can be a shared,
+    generic umbrella (e.g. "Brochure", "Documents", "Link") for a per-row
+    link that's actually a different document type per row - see
+    _reclassify_brochure_and_floorplan_links, the only caller. None for
+    text that names neither (e.g. "Click Here", "View", "Open" - or no
+    hyperlink at all) - callers must fall back to whatever the column's own
+    header/mapping already decided, never force a guess from an
+    uninformative label.
+    """
+    if not display_text or not isinstance(display_text, str):
+        return None
+    lowered = display_text.lower()
+    if "brochure" in lowered:
+        return "brochure"
+    if any(kw in lowered for kw in _FLOORPLAN_LABEL_KEYWORDS):
+        return "floorplan"
+    return None
+
+
+_LINK_FIELDS = ("brochure_link", "floorplan_link")
+
+
+def _reclassify_brochure_and_floorplan_links(mapped_df: pd.DataFrame, df: pd.DataFrame, renamed: dict):
+    """
+    Reroutes a brochure_link/floorplan_link cell to the OTHER field, per
+    row, when that specific cell's own hyperlink label (see read_spreadsheet's
+    hyperlink_display_text, keyed by the ORIGINAL header - looked up here
+    before mapped_df's own rename has discarded which original column each
+    value came from) unambiguously says otherwise (see classify_link_label) -
+    the fix for a real, confirmed gap: a column whose HEADER matched
+    brochure_link's own synonyms (e.g. a generic "Brochure"/"Documents"
+    column used as one shared slot for mixed link types) previously kept
+    every row's link under brochure_link regardless of what that row's own
+    label said, discarding the strongest per-row evidence there is that a
+    specific cell is actually a floor plan.
+
+    Never touches a row whose OTHER field already holds its own genuine,
+    independent value (see the "Both links" rule this preserves - a source
+    row with a real, separate brochure AND floorplan column must keep both,
+    never have one silently overwritten by a reroute meant for the other
+    column). Never invoked at all for a mapping with no hyperlink_display_
+    text recorded (the overwhelmingly common case for a plain provider
+    spreadsheet with no real hyperlinks) - a pure no-op pass-through then.
+    """
+    link_labels = df.attrs.get("hyperlink_display_text") or {}
+    if not link_labels:
+        return mapped_df
+
+    header_for_field = {field: header for header, field in renamed.items() if field in _LINK_FIELDS}
+    if not header_for_field:
+        return mapped_df
+
+    for field, header in header_for_field.items():
+        labels = link_labels.get(header)
+        if not labels:
+            continue
+        other_field = "floorplan_link" if field == "brochure_link" else "brochure_link"
+        for row_idx, display_text in labels.items():
+            if row_idx not in mapped_df.index:
+                continue
+            classified = classify_link_label(display_text)
+            if classified is None or field.startswith(classified):
+                continue  # matches the column's own current field already, or too ambiguous to override
+
+            current_value = mapped_df.at[row_idx, field] if field in mapped_df.columns else None
+            if current_value is None or (isinstance(current_value, float) and math.isnan(current_value)):
+                continue
+
+            if other_field in mapped_df.columns:
+                existing_other = mapped_df.at[row_idx, other_field]
+                if existing_other is not None and not (
+                    isinstance(existing_other, float) and math.isnan(existing_other)
+                ):
+                    continue  # the other field already has its OWN genuine value for this row - never clobber it
+            else:
+                mapped_df[other_field] = None
+
+            mapped_df.at[row_idx, field] = None
+            mapped_df.at[row_idx, other_field] = current_value
+
+    return mapped_df
+
+
 def build_rows(df: pd.DataFrame, mapping: dict, source_file: str) -> list:
     """
     Applies a confirmed {header: field_name_or_None} mapping and converts
@@ -872,6 +991,7 @@ def build_rows(df: pd.DataFrame, mapping: dict, source_file: str) -> list:
     """
     renamed = {header: field_name for header, field_name in mapping.items() if field_name}
     mapped_df = df[[h for h in df.columns if h in renamed]].rename(columns=renamed)
+    mapped_df = _reclassify_brochure_and_floorplan_links(mapped_df, df, renamed)
     for field_name in mapped_df.columns:
         kind = field_kind(field_name)
         if kind in ("int", "float"):

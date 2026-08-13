@@ -72,6 +72,36 @@ class ExtractPostcodeHintTests(unittest.TestCase):
         self.assertIsNone(geocode.extract_postcode_hint(None))
 
 
+class ExtractAreaHintTests(unittest.TestCase):
+    """extract_area_hint - pure parsing, no API calls involved."""
+
+    def test_newline_separated_locality_before_a_district_hint(self):
+        # The real Beem convention (see ExtractPostcodeHintTests above).
+        self.assertEqual(geocode.extract_area_hint("Clove \nLondon Bridge SE1"), "London Bridge")
+
+    def test_comma_separated_locality_before_a_full_postcode(self):
+        self.assertEqual(geocode.extract_area_hint("Nutmeg House, London Bridge, SE1 2AA"), "London Bridge")
+
+    def test_comma_separated_locality_before_a_bare_district(self):
+        self.assertEqual(geocode.extract_area_hint("Nutmeg House, London Bridge, SE1"), "London Bridge")
+
+    def test_a_single_unbroken_line_has_no_safe_area_hint(self):
+        # No separator at all - too ambiguous to guess where the building
+        # name ends and a locality would begin.
+        self.assertIsNone(geocode.extract_area_hint("New Derwent House WC1"))
+
+    def test_a_street_address_segment_is_never_mistaken_for_a_locality(self):
+        self.assertIsNone(geocode.extract_area_hint("Bridge House, 22 Newman Street WC1"))
+        self.assertIsNone(geocode.extract_area_hint("22 Newman Street, WC1"))
+
+    def test_no_postcode_hint_at_all_has_no_area_hint_either(self):
+        self.assertIsNone(geocode.extract_area_hint("Nutmeg House, London Bridge"))
+
+    def test_blank_text_has_no_area_hint(self):
+        self.assertIsNone(geocode.extract_area_hint(""))
+        self.assertIsNone(geocode.extract_area_hint(None))
+
+
 class DistrictConflictTests(unittest.TestCase):
     """_postcode_hint_conflicts - the actual accept/reject decision."""
 
@@ -129,7 +159,15 @@ class GeocodeRowLocationValidationTests(unittest.TestCase):
 
     def test_the_confirmed_real_failure_is_now_rejected_not_accepted(self):
         # Real building text from beem Live Flex Availability.xlsx, real
-        # (previously-observed) Places response shape.
+        # (previously-observed) Places response shape. Now also exercises
+        # the fallback-retry this module adds (see geocode.py's own
+        # _fallback_query_texts): "New Derwent House WC1" has no comma/
+        # newline separator, so the ONLY extra variant available is the
+        # postcode-hint-as-its-own-segment one ("New Derwent House WC1,
+        # WC1") - genuinely a different, differently-phrased query, tried
+        # here since the first one conflicts, and correctly rejected too
+        # (the mock returns the same wrong place for every query) rather
+        # than ever accepting it just because it's a later attempt.
         row = ListingRow(building="New Derwent House WC1", provider="beem")
 
         with patch(
@@ -141,7 +179,7 @@ class GeocodeRowLocationValidationTests(unittest.TestCase):
         ) as mock_places:
             geocode.geocode_row(row)
 
-        mock_places.assert_called_once()
+        self.assertEqual(mock_places.call_count, 2)
         self.assertIsNone(row.lat)
         self.assertIsNone(row.lng)
         self.assertIsNone(row.address_1)
@@ -345,6 +383,116 @@ class GeocodeRowsGroupingIdentityTests(unittest.TestCase):
 
         self.assertEqual(mock_places.call_count, 2)
         self.assertNotEqual((row_a.lat, row_a.lng), (row_b.lat, row_b.lng))
+
+
+class MultiCandidateFallbackTests(unittest.TestCase):
+    """
+    Regression tests for the confirmed Part B gap: geocode_row's Tier 2
+    previously gave up the moment its one candidate conflicted, even when a
+    differently-phrased query (see geocode.py's own _fallback_query_texts)
+    or a different candidate from the SAME Places response (see
+    call_places_text_search's own "candidates" list / _best_places_result)
+    would have found a safe, non-conflicting match.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    _WRONG_PLACE = {
+        "lat": 51.5118097, "lng": -0.1414146,
+        "address_components": [{"longText": "W1S 2ER", "types": ["postal_code"]}],
+    }
+    _RIGHT_PLACE = {
+        "lat": 51.5230, "lng": -0.1130,
+        "address_components": [{"longText": "WC1X 8NP", "types": ["postal_code"]}],
+    }
+
+    def test_a_conflicting_candidate_causes_a_differently_phrased_fallback_query(self):
+        # "New Derwent House WC1" has no comma/newline, so the only base
+        # candidate is the mashed full-text query - the fallback variant
+        # (postcode hint as its own explicit segment) must still be tried
+        # once that one conflicts.
+        row = ListingRow(building="New Derwent House WC1", provider="beem")
+        queried = []
+
+        def fake_places(query):
+            queried.append(query)
+            if query == "New Derwent House WC1, London, UK":
+                return {"status": "OK", **self._WRONG_PLACE}
+            return {"status": "OK", **self._RIGHT_PLACE}
+
+        with patch("geocode.call_places_text_search", side_effect=fake_places):
+            geocode.geocode_row(row)
+
+        self.assertEqual(queried, ["New Derwent House WC1, London, UK", "New Derwent House WC1, WC1, London, UK"])
+        self.assertEqual(row.postcode, "WC1X 8NP")
+        self.assertEqual(geocode.FAILURES, [])
+
+    def test_a_source_area_hint_also_produces_a_fallback_query(self):
+        # "Nutmeg House \nLondon Bridge SE1" - the newline-separated area
+        # hint (see extract_area_hint) becomes its own explicit query
+        # variant, tried after the plain building-text attempt conflicts.
+        row = ListingRow(building="Nutmeg House \nLondon Bridge SE1", provider="beem")
+        queried = []
+        area_hint_query = "Nutmeg House \nLondon Bridge SE1, London Bridge, London, UK"
+
+        def fake_places(query):
+            queried.append(query)
+            if query == area_hint_query:
+                return {
+                    "status": "OK", "lat": 51.505, "lng": -0.087,
+                    "address_components": [{"longText": "SE1 2AA", "types": ["postal_code"]}],
+                }
+            return {
+                "status": "OK", "lat": 51.5118097, "lng": -0.1414146,
+                "address_components": [{"longText": "EC1V 4NJ", "types": ["postal_code"]}],
+            }
+
+        with patch("geocode.call_places_text_search", side_effect=fake_places):
+            geocode.geocode_row(row)
+
+        self.assertEqual(
+            queried,
+            [
+                "Nutmeg House \nLondon Bridge SE1, London, UK",
+                "Nutmeg House \nLondon Bridge SE1, SE1, London, UK",
+                area_hint_query,
+            ],
+        )
+        self.assertEqual(row.postcode, "SE1 2AA")
+
+    def test_a_second_candidate_from_the_same_places_response_is_accepted(self):
+        # call_places_text_search now exposes every candidate a search
+        # returns, not just the top one - a conflicting FIRST candidate
+        # must not block a SECOND, non-conflicting candidate from the exact
+        # same query/response.
+        row = ListingRow(building="New Derwent House WC1", provider="beem")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK",
+                "candidates": [self._WRONG_PLACE, self._RIGHT_PLACE],
+                **self._WRONG_PLACE,
+            },
+        ) as mock_places:
+            geocode.geocode_row(row)
+
+        mock_places.assert_called_once()
+        self.assertEqual(row.postcode, "WC1X 8NP")
+        self.assertEqual(geocode.FAILURES, [])
+
+    def test_lat_lng_are_never_written_before_a_candidate_passes_validation(self):
+        row = ListingRow(building="New Derwent House WC1", provider="beem")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", **self._WRONG_PLACE},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
 
 
 if __name__ == "__main__":

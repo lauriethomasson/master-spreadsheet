@@ -150,7 +150,14 @@ class UploadReuseAcrossAFingerprintChangeTests(unittest.TestCase):
         _clear_pending()
 
     def test_same_bytes_same_fingerprint_reuses_and_skips_geocoding(self):
-        file_bytes = _workbook()
+        # "Kent House" (no postcode/district hint of its own) rather than
+        # this file's default "New Derwent House WC1" - deliberately a
+        # building geocode.py's own multi-candidate fallback (see its own
+        # module docstring) never adds extra Places attempts for, so this
+        # test's call-count assertions stay a pure "did geocoding run at
+        # all" check, decoupled from however many fallback tiers that
+        # module happens to try internally.
+        file_bytes = _workbook(building="Kent House")
 
         with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
             at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
@@ -187,7 +194,7 @@ class UploadReuseAcrossAFingerprintChangeTests(unittest.TestCase):
         # Path(geocode.__file__).read_bytes() call just as it would a real
         # source change to geocode.py on disk - without touching the real
         # file.
-        file_bytes = _workbook()
+        file_bytes = _workbook(building="Kent House")
         real_read_bytes = Path.read_bytes
         geocode_path = Path(geocode.__file__).resolve()
 
@@ -225,7 +232,7 @@ class UploadReuseAcrossAFingerprintChangeTests(unittest.TestCase):
         for path in pending:
             df = load_staging_as_dataframe(path)
             self.assertEqual(len(df), 1)
-            self.assertEqual(df.iloc[0]["building"], "New Derwent House WC1")
+            self.assertEqual(df.iloc[0]["building"], "Kent House")
 
 
 if __name__ == "__main__":
