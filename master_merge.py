@@ -1269,6 +1269,36 @@ def default_merge_choice_index(values: list) -> int:
     return non_blank[0] if len(non_blank) == 1 else 0
 
 
+def listing_summary_lines(row_dict: dict) -> list:
+    """
+    A few short, human-readable lines summarizing a row's own key listing
+    facts (floor/unit, size, desks, rent, fit-out state) - used by the
+    Review UI's ambiguous-duplicate-listing prompt (see pages/2_Review_
+    and_Master.py's own _render_intra_batch_duplicate_group) so a reviewer
+    sees the actual evidence that makes two candidate listings look
+    different (or alike), rather than an opaque source filename. Skips any
+    field that's blank entirely - never a placeholder "—" line for a fact
+    this row simply doesn't state.
+    """
+    lines = []
+    if not _is_blank(row_dict.get("floor_unit")):
+        lines.append(f"Floor/unit: {row_dict['floor_unit']}")
+    if not _is_blank(row_dict.get("size_sqft")):
+        lines.append(f"Size: {row_dict['size_sqft']:,.0f} sq ft")
+    desks_min, desks_max = row_dict.get("desks_min"), row_dict.get("desks_max")
+    if not _is_blank(desks_min) and not _is_blank(desks_max) and desks_min != desks_max:
+        lines.append(f"Desks: {desks_min:,.0f}–{desks_max:,.0f}")
+    elif not _is_blank(desks_max):
+        lines.append(f"Desks: {desks_max:,.0f}")
+    elif not _is_blank(desks_min):
+        lines.append(f"Desks: {desks_min:,.0f}")
+    if not _is_blank(row_dict.get("rent_pcm")):
+        lines.append(f"Rent: £{row_dict['rent_pcm']:,.0f} pcm")
+    if not _is_blank(row_dict.get("state_of_space")):
+        lines.append(f"State: {row_dict['state_of_space']}")
+    return lines
+
+
 def row_label(row_dict: dict) -> str:
     parts = [row_dict.get("building") if not _is_blank(row_dict.get("building")) else "(no building)"]
     if not _is_blank(row_dict.get("provider")):
@@ -1754,6 +1784,19 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
         else:
             unmatched.append(UnmatchedRow(new_row, _suggest_similar(new_dict, master_records)))
 
+    # Two incoming rows can independently match the SAME master row via
+    # building/provider/floor identity alone (the matching tiers above have
+    # no unit-level evidence to go further once floor_unit itself is blank
+    # on both sides) while their own size/desks/rent prove they're actually
+    # different listings - see _resolve_listing_evidence_conflicts' own
+    # docstring for the real confirmed "1 Oliver's Yard" case. Splitting
+    # this BEFORE collisions are computed means such a pair is never even
+    # offered as a "pick a value per field" collision at all - the closer-
+    # matching one keeps updating master, the other becomes a fresh,
+    # independent new property. A no-op for every ordinary collision (two
+    # sources genuinely re-extracting the same listing).
+    matched_changed, unmatched = _resolve_listing_evidence_conflicts(matched_changed, unmatched, master_records)
+
     by_master_idx = {}
     for m in matched_changed:
         by_master_idx.setdefault(m.master_index, []).append(m)
@@ -1787,6 +1830,160 @@ def _brochure_link_identity_override(dicts: list) -> bool:
     """
     links = {d.get("brochure_link") for d in dicts if not _is_blank(d.get("brochure_link"))}
     return len(links) == 1
+
+
+# --- Listing-level identity: SAME BUILDING is not SAME LISTING -------------
+#
+# building+provider+floor_unit (see _fallback_key/_dedup_key) is necessary
+# but not sufficient evidence that two rows describe the same LISTING once
+# floor_unit itself carries no real discriminating information (blank on
+# both sides - a provider's own sheet may simply have no floor/unit concept
+# at all). Real confirmed case: "1 Oliver's Yard" (The Workplace Company) -
+# two rows sharing (building, provider, blank floor_unit) but genuinely
+# separate suites: 5,515-7,282 sqft / 52-68 desks / £34,468-45,512 rent vs
+# 18,118-42,892 sqft / ~200-400 desks / £168,799-230,811 rent. Forcing
+# these into one identity (a same-batch duplicate group, or a master-row
+# collision) produced a field-by-field "7282 or 42892?" prompt for
+# something that was never actually ambiguous - the numbers themselves
+# already prove these are two different listings.
+#
+# Conservative by construction: no SINGLE field difference is ever treated
+# as evidence on its own - a provider legitimately revises rent/size over
+# time, and one field alone can't distinguish that from a genuinely
+# different listing. Only agreement across several INDEPENDENT numeric
+# signals, each far beyond ordinary revision noise, counts.
+_LISTING_DIFFERENCE_FIELDS = ("size_sqft", "desks_min", "desks_max", "rent_pcm", "rent_psf")
+
+# How much bigger the larger value must be than the smaller before a single
+# field counts as a "signal" at all - validated against the real Oliver's
+# Yard ratios (size ~5.8x, desks ~3.8x, rent ~4.9x, all comfortably clear)
+# while staying well above an ordinary revision (e.g. a rent increase from
+# £10,000 to £11,000 is only 1.1x - nowhere near this).
+_MATERIAL_DIFFERENCE_RATIO = 1.4
+
+# How many of _LISTING_DIFFERENCE_FIELDS must each independently clear
+# _MATERIAL_DIFFERENCE_RATIO before two rows are treated as confidently
+# DIFFERENT listings - deliberately more than one, so a single outlier
+# field (a genuine typo, or a provider correcting just one number) can
+# never trigger this alone; Oliver's Yard clears all 4 available numeric
+# fields (size, desks_min substitute via desks_max, rent_pcm), comfortably
+# clearing this bar with real margin to spare.
+_MIN_INDEPENDENT_SIGNALS_FOR_SEPARATE_LISTINGS = 3
+
+
+def _materially_different(a, b) -> bool:
+    """
+    True only when both a and b are genuine positive numbers and the
+    larger is at least _MATERIAL_DIFFERENCE_RATIO times the smaller. Never
+    true when either side is blank/non-numeric - nothing to compare there,
+    never evidence of anything (same "blank is not evidence" principle
+    _postcode_hint_conflicts-style checks use throughout this codebase).
+    """
+    if _is_blank(a) or _is_blank(b):
+        return False
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    if a <= 0 or b <= 0:
+        return False
+    hi, lo = (a, b) if a >= b else (b, a)
+    return hi / lo >= _MATERIAL_DIFFERENCE_RATIO
+
+
+def _listing_evidence_conflicts(a: dict, b: dict) -> bool:
+    """
+    True when `a` and `b` (two ListingRow dicts that already agree on
+    building/provider/floor identity) show strong, independent, multi-
+    signal evidence of being genuinely DIFFERENT listings rather than one
+    listing whose values have simply drifted between sources - see the
+    module-level comment above this function's own docstring for the real
+    Oliver's Yard case and why a single field is never enough alone.
+    """
+    signals = sum(1 for f in _LISTING_DIFFERENCE_FIELDS if _materially_different(a.get(f), b.get(f)))
+    return signals >= _MIN_INDEPENDENT_SIGNALS_FOR_SEPARATE_LISTINGS
+
+
+def _partition_by_listing_evidence(indices: list, unmatched: list) -> list:
+    """
+    Splits `indices` (candidates already sharing a building/provider/floor
+    identity key, and already partitioned by source submarket - see
+    _partition_by_source_submarket) into sub-groups such that two rows with
+    strong, multi-signal evidence of being genuinely DIFFERENT listings
+    (see _listing_evidence_conflicts) are never placed in the same sub-
+    group. Greedy first-fit, same shape as _partition_by_source_submarket:
+    a row joins the first sub-group whose own representative it does NOT
+    strongly conflict with. Conservative by construction (see _listing_
+    evidence_conflicts' own multi-signal requirement) - an ordinary same-
+    listing update (a rent increase, a size correction) never triggers a
+    split, so this is a pure no-op for every case that isn't a genuine,
+    strongly-evidenced separate listing, exactly like _partition_by_
+    source_submarket already is for a shared/blank submarket.
+    """
+    clusters = []  # each: [representative_dict, [indices...]]
+    for i in indices:
+        row_dict = unmatched[i].new_row.model_dump()
+        for cluster in clusters:
+            if not _listing_evidence_conflicts(cluster[0], row_dict):
+                cluster[1].append(i)
+                break
+        else:
+            clusters.append([row_dict, [i]])
+    return [members for _, members in clusters]
+
+
+def _resolve_listing_evidence_conflicts(matched_changed: list, unmatched: list, master_records: list) -> tuple:
+    """
+    (matched_changed, unmatched) - splits any matched_changed group that
+    shares a master_index but shows strong, multi-signal listing-evidence
+    conflict between its own members (see _listing_evidence_conflicts):
+    two genuinely different listings must never be forced to update the
+    SAME existing master property just because they both independently
+    matched it via building/provider/floor identity (the matching tiers in
+    build_merge_plan have no unit-level evidence to disambiguate a blank-
+    floor building any further than that). The member with the FEWEST
+    diffs from master (the closest existing match) keeps updating that
+    master row exactly as before; every other conflicting member is
+    demoted to a fresh, independent unmatched row instead (master_index=
+    None) - it becomes an entirely new property on approval (going through
+    the same unmatched/near-miss/same-batch-duplicate pipeline as any
+    other new row, via _suggest_similar below), never silently forced into
+    the wrong existing property, and never a field-by-field "pick one"
+    collision prompt either, since the two are already confidently known
+    to be different, not merely disagreeing.
+
+    A group with no evidence conflict (the overwhelming common case - an
+    ordinary shared-identity collision, e.g. two sheets both re-extracting
+    the same real listing) is returned completely untouched, byte-for-byte
+    identical to the input - this function is a pure no-op for it.
+    """
+    by_master_idx = {}
+    for m in matched_changed:
+        by_master_idx.setdefault(m.master_index, []).append(m)
+
+    kept, demoted = [], []
+    for master_idx, members in by_master_idx.items():
+        if len(members) < 2:
+            kept.extend(members)
+            continue
+        dicts = [m.new_row.model_dump() for m in members]
+        conflict = any(
+            _listing_evidence_conflicts(dicts[i], dicts[j])
+            for i in range(len(dicts)) for j in range(i + 1, len(dicts))
+        )
+        if not conflict:
+            kept.extend(members)
+            continue
+        members_by_closeness = sorted(members, key=lambda m: len(m.diffs))
+        kept.append(members_by_closeness[0])
+        demoted.extend(members_by_closeness[1:])
+
+    kept_ids = {id(m) for m in kept}  # identity, not dataclass equality - avoids comparing diffs dicts wholesale
+    new_matched_changed = [m for m in matched_changed if id(m) in kept_ids]
+    new_unmatched = list(unmatched) + [
+        UnmatchedRow(m.new_row, _suggest_similar(m.new_row.model_dump(), master_records)) for m in demoted
+    ]
+    return new_matched_changed, new_unmatched
 
 
 def _partition_by_source_submarket(indices: list, unmatched: list) -> list:
@@ -1909,18 +2106,24 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
        genuinely strong evidence (an identical, provider-issued brochure
        document link) never even consulted.
 
-    BOTH passes are further split by _partition_by_source_submarket BEFORE
-    either one ever unions anything - a genuinely different, non-blank
-    submarket/area between two otherwise-identical candidates means the
-    ORIGINAL provider workbook intentionally represented them as separate
-    listings (see that function's own docstring), which must never be
-    collapsed into a merge OR a manual duplicate prompt merely because
-    building/provider/floor/postcode/brochure_link happen to agree - source-
-    listing identity and physical-property identity are two different
-    questions, and this function only ever answers the first. A shared
-    brochure_link is real evidence the same PHYSICAL property is involved,
-    but it is not evidence the provider intended one listing row, so it
-    never overrides a genuine submarket split, unlike the narrower
+    BOTH passes are further split by _partition_by_source_submarket, THEN
+    _partition_by_listing_evidence, BEFORE either one ever unions anything:
+    a genuinely different, non-blank submarket/area between two otherwise-
+    identical candidates means the ORIGINAL provider workbook intentionally
+    represented them as separate listings (see that function's own
+    docstring); strong, multi-signal evidence that two rows' own size/
+    desks/rent are dramatically different (see _partition_by_listing_
+    evidence/_listing_evidence_conflicts - the real confirmed "1 Oliver's
+    Yard" case) means the same thing even when submarket itself doesn't
+    distinguish them (a provider's own sheet may have no submarket/area
+    column at all). Neither must ever be collapsed into a merge OR a
+    manual duplicate prompt merely because building/provider/floor/
+    postcode/brochure_link happen to agree - source-listing identity and
+    physical-property identity are two different questions, and this
+    function only ever answers the first. A shared brochure_link is real
+    evidence the same PHYSICAL property is involved, but it is not
+    evidence the provider intended one listing row, so it never overrides
+    a genuine submarket or listing-evidence split, unlike the narrower
     postcode-only override above.
 
     Returns groups of size > 1 only, exactly like the single-pass version
@@ -1944,8 +2147,9 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
         by_key.setdefault(_dedup_key(u.new_row.model_dump()), []).append(i)
     for indices in by_key.values():
         for cluster in _partition_by_source_submarket(indices, unmatched):
-            for i in cluster[1:]:
-                union(cluster[0], i)
+            for sub in _partition_by_listing_evidence(cluster, unmatched):
+                for i in sub[1:]:
+                    union(sub[0], i)
 
     address_groups = {}
     for i, u in enumerate(unmatched):
@@ -1989,8 +2193,11 @@ def _group_unmatched_duplicates(unmatched: list) -> list:
                 group_dicts = [unmatched[i].new_row.model_dump() for i in cluster]
                 if not _brochure_link_identity_override(group_dicts):
                     continue
-            for i in cluster[1:]:
-                union(cluster[0], i)
+            for sub in _partition_by_listing_evidence(cluster, unmatched):
+                if len(sub) < 2:
+                    continue
+                for i in sub[1:]:
+                    union(sub[0], i)
 
     components = {}
     for i in range(len(unmatched)):

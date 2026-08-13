@@ -96,55 +96,64 @@ def _render_merge_field_choice(field_name: str, values: list, labels: list, key:
 def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_final: list) -> None:
     """
     group: list[master_merge.UnmatchedRow] sharing the same dedup key (see
-    master_merge._dedup_key) - the same real property uploaded more than
-    once in this batch, each copy independently failing to match master.
-    Defaults to treating them as the same property (merge), since that's
-    what a shared match key means by construction - but never silently
-    forces it: an explicit "these are different" escape hatch stays
-    available in case the match key coincidentally collided.
+    master_merge._dedup_key) - rows that only reach here at all because
+    master_merge itself (see _partition_by_listing_evidence) already found
+    no strong, confident evidence one way or the other; a pair with
+    dramatically different size/desks/rent (the confirmed real "1 Oliver's
+    Yard" case) never reaches this UI in the first place - it's already
+    kept as two separate properties automatically, with no prompt at all.
+    So the real open question here is genuinely "are these the same
+    listing, or two different ones sharing an ambiguous, under-specified
+    identity (e.g. both floor_unit blank)?" - never "which value is
+    correct for field X", which is why this shows each candidate LISTING's
+    own summary and asks ONE question about identity, rather than a
+    per-field radio for every disagreeing value (see master_merge.
+    listing_summary_lines - reused so a reviewer sees the actual evidence,
+    not an opaque source filename).
 
-    On merge, every field where the sources agree (see merge_field_choice)
-    carries straight through with no choice needed; a field where they
-    genuinely differ gets its own radio (see _render_merge_field_choice).
-    Confirming produces exactly ONE new ListingRow with a fresh property_id
-    - never two, and never a value silently discarded without the reviewer
-    seeing it was an option.
+    Three outcomes, one radio, matching the identity question directly:
+    - "Keep {all/both} — separate listings" (the safe DEFAULT - selected
+      with no interaction needed) - each row becomes its own new property.
+    - "Same listing — use Listing X" - exactly ONE of the group's own rows
+      is kept, wholesale, as the single new property; the others are
+      discarded entirely, deliberately no per-field cherry-picking here -
+      if the reviewer can tell these are the same listing, they can also
+      tell which one is the correct/more complete row to keep.
     """
     dicts = [u.new_row.model_dump() for u in group]
-    labels = [d.get("source_file") or f"Row {i + 1}" for i, d in enumerate(dicts)]
+    listing_labels = [f"Listing {chr(65 + i)}" for i in range(len(dicts))]
+    combined_source = " + ".join(d.get("source_file") or label for d, label in zip(dicts, listing_labels))
 
     with st.expander(
-        f"⚠️ Possible duplicate — {len(group)} rows look like the same property: "
-        f"{display_utils.row_label(dicts[0])}",
+        f"⚠️ Possible duplicate listings — {display_utils.row_label(dicts[0])}",
         key=f"{key_prefix}_expander",
     ):
-        same_property = st.radio(
-            "Are these the same property?",
-            ["Yes — merge into one property", "No — these are genuinely different properties"],
-            key=f"{key_prefix}_same",
+        st.caption(
+            "These rows share the same provider/building, but the app cannot safely tell whether "
+            "they're the same listing or genuinely different ones."
         )
+        cols = st.columns(len(dicts), border=True)
+        for col, label, d in zip(cols, listing_labels, dicts):
+            with col:
+                st.markdown(f"**{label}**")
+                lines = master_merge.listing_summary_lines(d)
+                for line in lines:
+                    st.write(line)
+                if not lines:
+                    st.write("—")
 
-        if same_property.startswith("Yes"):
-            merged = {}
-            for f in master_merge.DIFF_FIELDS:
-                values = [d.get(f) for d in dicts]
-                needs_choice, resolved = master_merge.merge_field_choice(values)
-                merged[f] = (
-                    _render_merge_field_choice(f, values, labels, f"{key_prefix}_{f}") if needs_choice else resolved
-                )
+        keep_separate_label = "Keep both — separate listings" if len(dicts) == 2 else "Keep all — separate listings"
+        options = [keep_separate_label] + [f"Same listing — use {label}" for label in listing_labels]
+        choice = st.radio("What are these?", options, key=f"{key_prefix}_choice")
 
-            confirm_merge = st.checkbox(
-                "Confirm — add as one merged property", value=True, key=f"{key_prefix}_confirm"
-            )
-            if confirm_merge:
-                merged["property_id"] = str(uuid.uuid4())
-                merged["source_file"] = " + ".join(labels)
-                new_rows_final.append(ListingRow(**merged))
-        else:
-            for d in dicts:
-                st.write(display_utils.row_label(d))
+        if choice == keep_separate_label:
             new_rows_final.extend(
                 u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in group
+            )
+        else:
+            chosen = group[options.index(choice) - 1]
+            new_rows_final.append(
+                chosen.new_row.model_copy(update={"property_id": str(uuid.uuid4()), "source_file": combined_source})
             )
 
 

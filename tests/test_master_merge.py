@@ -3207,5 +3207,170 @@ class AmbiguousIdentityStillManualTests(unittest.TestCase):
         self.assertEqual(len(plan.unmatched_collisions), 0)
 
 
+class ListingIdentityConflictTests(unittest.TestCase):
+    """
+    The real confirmed "1 Oliver's Yard" (The Workplace Company) report:
+    two rows sharing (building, provider, blank floor_unit) - the same
+    identity key _dedup_key/_fallback_key already used - but with
+    dramatically different size/desks/rent, previously forced into a
+    field-by-field "7282 or 42892?" manual decision merely because
+    building+provider+blank-floor happened to agree. See master_merge's
+    own _listing_evidence_conflicts/_partition_by_listing_evidence/
+    _resolve_listing_evidence_conflicts docstrings for the full rule.
+    """
+
+    def _oliver_rows(self):
+        row_a = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company", address_1="1 Oliver's Yard, London",
+            postcode="EC1Y 1DT", size_sqft=7282, desks_min=52, desks_max=68, rent_pcm=45512,
+            brochure_link="https://www.canva.com/design/shared-brochure/view",
+            source_file="The Workplace Company Availability (1).xlsx — Sheet1",
+        )
+        row_b = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company", address_1="1 Oliver's Yard, London",
+            postcode="EC1Y 1DT", size_sqft=42892, desks_min=200, desks_max=400, rent_pcm=230811,
+            brochure_link="https://www.canva.com/design/shared-brochure/view",
+            source_file="The Workplace Company Availability (1).xlsx — Sheet1",
+        )
+        return row_a, row_b
+
+    def test_materially_different_requires_a_real_ratio_not_just_inequality(self):
+        self.assertTrue(master_merge._materially_different(7282, 42892))
+        self.assertFalse(master_merge._materially_different(45000, 46000))  # ordinary rent revision
+        self.assertFalse(master_merge._materially_different(None, 42892))  # blank is never evidence
+        self.assertFalse(master_merge._materially_different(0, 42892))  # non-positive is never evidence
+
+    def test_single_signal_alone_never_counts_as_a_listing_conflict(self):
+        # "size differs" alone must never mean different listing - a
+        # provider may simply have corrected/updated one field.
+        a = {"size_sqft": 4500.0, "desks_min": None, "desks_max": None, "rent_pcm": None, "rent_psf": None}
+        b = {"size_sqft": 9000.0, "desks_min": None, "desks_max": None, "rent_pcm": None, "rent_psf": None}
+        self.assertFalse(master_merge._listing_evidence_conflicts(a, b))
+
+    def test_oliver_s_yard_size_desks_rent_together_is_a_confident_conflict(self):
+        row_a, row_b = self._oliver_rows()
+        self.assertTrue(master_merge._listing_evidence_conflicts(row_a.model_dump(), row_b.model_dump()))
+
+    def test_oliver_s_yard_fresh_upload_needs_no_manual_decision(self):
+        # Same building/provider/blank floor_unit, no existing master row -
+        # both must become independent new properties automatically, with
+        # NO unmatched_collisions group and no unmatched_collisions prompt.
+        row_a, row_b = self._oliver_rows()
+        plan = master_merge.build_merge_plan([row_a, row_b], _master_df([]))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(plan.unmatched_collisions, [])
+        self.assertEqual(plan.collisions, [])
+        sizes = sorted(u.new_row.size_sqft for u in plan.unmatched)
+        self.assertEqual(sizes, [7282.0, 42892.0])
+
+    def test_oliver_s_yard_shared_brochure_link_does_not_force_a_merge(self):
+        # Part 6: a shared brochure_link is building-level evidence, never
+        # listing-level - both rows here already share one identical
+        # brochure_link (see _oliver_rows) and are still kept separate.
+        row_a, row_b = self._oliver_rows()
+        self.assertEqual(row_a.brochure_link, row_b.brochure_link)
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _master_df([]))
+
+        self.assertEqual(plan.unmatched_collisions, [])
+        self.assertEqual(len(plan.unmatched), 2)
+
+    def test_oliver_s_yard_against_an_existing_master_row_splits_rather_than_collides(self):
+        # One existing master row already matches BOTH incoming rows via
+        # building+provider+blank-floor - closer one (row_a, size 7282 vs
+        # master's 7000) keeps updating master automatically; row_b is
+        # demoted to a fresh, independent new property instead of forcing
+        # a "7282 or 42892?" collision prompt.
+        row_a, row_b = self._oliver_rows()
+        master_df = _master_df([{
+            "building": "1 Oliver's Yard", "provider": "The Workplace Company",
+            "address_1": "1 Oliver's Yard, London", "postcode": "EC1Y 1DT",
+            "size_sqft": 7000.0, "desks_min": 50, "desks_max": 65, "rent_pcm": 44000.0,
+        }])
+
+        plan = master_merge.build_merge_plan([row_a, row_b], master_df)
+
+        self.assertEqual(plan.collisions, [])
+        self.assertEqual(len(plan.matched_changed), 1)
+        self.assertEqual(plan.matched_changed[0].new_row.size_sqft, 7282.0)
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(plan.unmatched[0].new_row.size_sqft, 42892.0)
+
+    def test_different_floor_unit_already_separates_listings_with_no_new_logic_needed(self):
+        # Confirms the pre-existing floor_unit-based identity split (not
+        # this task's own new logic) still keeps genuinely different
+        # floors apart - never grouped, regardless of listing-evidence.
+        row_a = ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", floor_unit="1st Floor")
+        row_b = ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", floor_unit="2nd Floor")
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _master_df([]))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(plan.unmatched_collisions, [])
+
+    def test_minor_update_does_not_get_split_into_a_new_listing(self):
+        # A genuine, ordinary update to an existing listing (rent revised
+        # upward, same size/desks) must still auto-apply as one property,
+        # never split into "separate listings" just because SOME field
+        # moved.
+        master_df = _master_df([{
+            "building": "1 Oliver's Yard", "provider": "The Workplace Company",
+            "size_sqft": 7282.0, "desks_min": 52, "desks_max": 68, "rent_pcm": 44000.0,
+        }])
+        new_row = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company",
+            size_sqft=7282.0, desks_min=52, desks_max=68, rent_pcm=45512.0,
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_richer_duplicate_of_the_same_listing_still_consolidates(self):
+        # Two rows with essentially the SAME numeric evidence (no material
+        # difference at all) but one carries extra descriptive text - must
+        # still consolidate as one property, never split.
+        row_a = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company",
+            size_sqft=7282.0, desks_min=52, desks_max=68, rent_pcm=45512.0, special_features=None,
+        )
+        row_b = ListingRow(
+            building="1 Oliver's Yard", provider="The Workplace Company",
+            size_sqft=7282.0, desks_min=52, desks_max=68, rent_pcm=45512.0,
+            special_features="Roof terrace; showers",
+        )
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 2)
+
+    def test_genuinely_ambiguous_same_building_rows_still_need_manual_review(self):
+        # Only ONE signal differs materially (size) - below the multi-
+        # signal bar - so this must still resolve exactly as before this
+        # task: a genuine field conflict needing a human decision, never
+        # silently merged and never silently split.
+        row_a = ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=4500.0)
+        row_b = ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=9000.0)
+        unmatched = [master_merge.UnmatchedRow(row_a), master_merge.UnmatchedRow(row_b)]
+
+        groups = master_merge._group_unmatched_duplicates(unmatched)
+
+        self.assertEqual(len(groups), 1)
+        self.assertTrue(master_merge._group_has_genuine_conflict([row_a.model_dump(), row_b.model_dump()]))
+
+    def test_different_providers_at_the_same_building_remain_separate(self):
+        row_a = ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=7282.0)
+        row_b = ListingRow(building="1 Oliver's Yard", provider="A Different Agent", size_sqft=42892.0)
+
+        plan = master_merge.build_merge_plan([row_a, row_b], _master_df([]))
+
+        self.assertEqual(len(plan.unmatched), 2)
+        self.assertEqual(plan.unmatched_collisions, [])
+
+
 if __name__ == "__main__":
     unittest.main()

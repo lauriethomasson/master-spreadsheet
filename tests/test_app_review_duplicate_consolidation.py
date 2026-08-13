@@ -232,5 +232,76 @@ class SummaryBannerTests(IsolatedCwdTestCase):
         self.assertIn("1 conflict(s) need your review", summary_text)
 
 
+class OliverYardListingIdentityTests(IsolatedCwdTestCase):
+    """
+    The real confirmed report: "1 Oliver's Yard" (The Workplace Company) -
+    two rows sharing building/provider/blank floor_unit from the same
+    upload, but with dramatically different size/desks/rent, previously
+    forced a field-by-field "7282 or 42892?" manual decision. See
+    master_merge.ListingIdentityConflictTests for the underlying logic
+    tests - this confirms the same fix end-to-end through the real page.
+    """
+
+    def test_oliver_s_yard_style_rows_need_no_manual_decision(self):
+        save_staging_file(
+            [
+                ListingRow(
+                    building="1 Oliver's Yard", provider="The Workplace Company",
+                    address_1="1 Oliver's Yard, London", postcode="EC1Y 1DT",
+                    size_sqft=7282.0, desks_min=52, desks_max=68, rent_pcm=45512.0,
+                    brochure_link="https://www.canva.com/design/shared-brochure/view",
+                ),
+                ListingRow(
+                    building="1 Oliver's Yard", provider="The Workplace Company",
+                    address_1="1 Oliver's Yard, London", postcode="EC1Y 1DT",
+                    size_sqft=42892.0, desks_min=200, desks_max=400, rent_pcm=230811.0,
+                    brochure_link="https://www.canva.com/design/shared-brochure/view",
+                ),
+            ],
+            "The Workplace Company Availability (1).xlsx", content_hash="oliver-hash",
+        )
+
+        at = _run_review_page()
+
+        self.assertNotIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+        self.assertEqual([e for e in at.expander if "Possible duplicate" in (e.label or "")], [])
+        self.assertEqual([r for r in at.radio if r.label == "Keep value from:"], [])
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 2)
+        self.assertEqual(sorted(master_df["size_sqft"]), [7282.0, 42892.0])
+
+    def test_genuinely_ambiguous_duplicate_shows_listing_a_b_with_context(self):
+        # Only ONE signal differs (size) - genuinely ambiguous, still needs
+        # review, but the UI must show "Listing A"/"Listing B" with their
+        # own summarized facts and a single 3-way identity question, never
+        # per-field radios with identical source labels.
+        save_staging_file(
+            [
+                ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=7282.0),
+                ListingRow(building="1 Oliver's Yard", provider="The Workplace Company", size_sqft=42892.0),
+            ],
+            "The Workplace Company Availability (1).xlsx", content_hash="oliver-ambiguous-hash",
+        )
+
+        at = _run_review_page()
+
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+        markdown_text = "".join(m.value for m in at.markdown)
+        self.assertIn("Listing A", markdown_text)
+        self.assertIn("Listing B", markdown_text)
+        self.assertIn("Size: 7,282 sq ft", markdown_text)  # st.write(str) renders via markdown in AppTest
+
+        radios = [r for r in at.radio if r.label == "What are these?"]
+        self.assertEqual(len(radios), 1)
+        self.assertEqual(radios[0].options, [
+            "Keep both — separate listings", "Same listing — use Listing A", "Same listing — use Listing B",
+        ])
+        # Never the old per-field "Keep value from:" radio for this identity question.
+        self.assertEqual([r for r in at.radio if r.label == "Keep value from:"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
