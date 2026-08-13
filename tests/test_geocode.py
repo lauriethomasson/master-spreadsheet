@@ -225,6 +225,201 @@ class SourceAreaHintSubmarketTests(unittest.TestCase):
         self.assertEqual(row.submarket, "Soho")
 
 
+class IsBarePostcodeDistrictTests(unittest.TestCase):
+    def test_bare_district_is_recognized(self):
+        for value in ("SE1", "EC2", "W1S", "ec1v", " NW3 "):
+            self.assertTrue(geocode._is_bare_postcode_district(value), value)
+
+    def test_real_place_names_are_not_postcode_districts(self):
+        for value in ("Shoreditch", "Clerkenwell", "City", "Mayfair", "London Bridge", "Borough", "City Fringe"):
+            self.assertFalse(geocode._is_bare_postcode_district(value), value)
+
+    def test_full_postcode_is_not_a_bare_district(self):
+        self.assertFalse(geocode._is_bare_postcode_district("SE1 8QH"))
+
+    def test_blank_is_not_a_bare_district(self):
+        self.assertFalse(geocode._is_bare_postcode_district(""))
+        self.assertFalse(geocode._is_bare_postcode_district(None))
+
+
+class PostcodeDistrictSubmarketFallbackTests(unittest.TestCase):
+    """
+    The real confirmed report: a provider's own "SE1" section heading
+    (grouping several buildings under one postcode-district label) gets
+    faithfully extracted as submarket="SE1" - a real, non-blank value, but
+    not a useful named locality the way "Shoreditch"/"Mayfair" already
+    are. Only a value shaped exactly like a bare postcode district (see
+    IsBarePostcodeDistrictTests) is ever reconsidered - a genuine named
+    submarket is never touched (see test_good_named_submarket_survives_
+    unchanged), and only sufficiently specific, confident evidence (a
+    source-text locality hint, or Google's own sublocality/neighborhood
+    reverse-geocode component) is ever used to replace it - never a
+    guessed or broad value (see the "do not guess" tests below).
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_good_named_submarket_survives_unchanged(self):
+        for value in ("Shoreditch", "Clerkenwell", "City", "Mayfair", "London Bridge", "Borough", "City Fringe"):
+            row = ListingRow(building="Some Building", lat=51.5, lng=-0.1, submarket=value)
+            with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+                geocode.geocode_row(row)
+            mock_reverse.assert_not_called()
+            self.assertEqual(row.submarket, value)
+
+    def test_postcode_like_submarket_is_replaced_by_a_confident_google_sublocality(self):
+        # The real "1 Valentine Place" shape: Google's reverse-geocode of
+        # the ALREADY-resolved coordinates genuinely has a sublocality
+        # component (confirmed directly against the real address).
+        row = ListingRow(
+            building="1 Valentine Place", address_1="1 Valentine Place, London", postcode="SE1 8QH",
+            lat=51.5016158, lng=-0.1049473, submarket="SE1",
+        )
+        components = [
+            {"long_name": "South Bank", "types": ["political", "sublocality", "sublocality_level_1"]},
+            {"long_name": "London", "types": ["locality", "political"]},
+        ]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_called_once_with(51.5016158, -0.1049473)
+        self.assertEqual(row.submarket, "South Bank")
+
+    def test_postcode_like_submarket_is_replaced_by_a_confident_source_text_hint_with_no_api_call(self):
+        # A source-text locality hint (see extract_area_hint) is preferred
+        # over a Google API call, same priority as the existing blank-
+        # submarket case - never a provider/postcode-specific rule, the
+        # exact same generic newline/comma-adjacent-to-postcode parsing
+        # already used elsewhere in this module.
+        row = ListingRow(
+            building="Nutmeg House \nLondon Bridge SE1", provider="beem", lat=51.505, lng=-0.087, submarket="SE1",
+        )
+
+        with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.submarket, "London Bridge")
+
+    def test_blank_submarket_with_a_confident_locality_is_filled(self):
+        row = ListingRow(building="Some Building", lat=51.5016158, lng=-0.1049473)
+        components = [{"long_name": "South Bank", "types": ["political", "sublocality", "sublocality_level_1"]}]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.submarket, "South Bank")
+
+    def test_only_broad_locality_never_replaces_the_postcode_like_value(self):
+        # The real "44 Copperfield Street" shape: Google's reverse-geocode
+        # has NO sublocality/neighborhood component at all - only the
+        # broad locality="London"/administrative_area="Greater London"/
+        # "England" and borough-level "London Borough of Southwark" - none
+        # of which _submarket_from_components ever treats as a useful
+        # submarket. "SE1" must survive unchanged rather than being
+        # replaced with something no more useful than what it already had.
+        row = ListingRow(
+            building="44 Copperfield Street", address_1="44 Copperfield Street, London", postcode="SE1 0DY",
+            lat=51.5031582, lng=-0.1001583, submarket="SE1",
+        )
+        components = [
+            {"long_name": "London", "types": ["postal_town"]},
+            {"long_name": "Greater London", "types": ["administrative_area_level_2", "political"]},
+            {"long_name": "England", "types": ["administrative_area_level_1", "political"]},
+            {"long_name": "London Borough of Southwark", "types": ["administrative_area_level_3", "political"]},
+            {"long_name": "London", "types": ["locality", "political"]},
+        ]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_reverse.assert_called_once()
+        self.assertEqual(row.submarket, "SE1")
+
+    def test_ambiguous_locality_does_not_guess(self):
+        # No sublocality/neighborhood AND no source-text hint at all -
+        # nothing confident to replace "SE1" with, so it stays exactly as
+        # extracted rather than being guessed at.
+        row = ListingRow(building="Some Building", lat=51.5, lng=-0.1, submarket="EC2")
+
+        with patch(
+            "geocode.call_reverse_geocoding_api",
+            return_value={"status": "OK", "address_components": [{"long_name": "London", "types": ["locality"]}]},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.submarket, "EC2")
+
+    def test_reverse_geocode_failure_leaves_postcode_like_value_unchanged(self):
+        row = ListingRow(building="Some Building", lat=51.5, lng=-0.1, submarket="SE1")
+
+        with patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.submarket, "SE1")
+
+    def test_postcode_conflict_protection_still_applies_with_a_postcode_like_submarket(self):
+        # This feature only ever runs AFTER a location has already been
+        # safely resolved - it must never weaken the existing postcode-
+        # conflict rejection for an UNRESOLVED building-only row. The
+        # confirmed real "New Derwent House WC1" failure (Places matches
+        # a different, wrong postcode area) must still be rejected exactly
+        # as before, regardless of what row.submarket happens to be.
+        row = ListingRow(building="New Derwent House WC1", submarket="SE1")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.5118097, "lng": -0.1414146,
+                "address_components": [{"longText": "W1S 2ER", "types": ["postal_code"]}],
+            },
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertEqual(row.submarket, "SE1")  # left exactly as it was - never guessed from a rejected candidate
+
+    def test_existing_lat_lng_address_postcode_are_never_altered_by_this_feature(self):
+        row = ListingRow(
+            building="1 Valentine Place", address_1="1 Valentine Place, London", postcode="SE1 8QH",
+            lat=51.5016158, lng=-0.1049473, submarket="SE1",
+        )
+        components = [{"long_name": "South Bank", "types": ["political", "sublocality", "sublocality_level_1"]}]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5016158)
+        self.assertEqual(row.lng, -0.1049473)
+        self.assertEqual(row.address_1, "1 Valentine Place, London")
+        self.assertEqual(row.postcode, "SE1 8QH")
+        self.assertEqual(row.submarket, "South Bank")  # only submarket itself changes
+
+    def test_behavior_is_generic_across_different_postcode_districts_not_just_se1(self):
+        # No provider/property/postcode-specific rule - "EC2" (a totally
+        # different real district) gets the exact same treatment as "SE1".
+        row = ListingRow(building="Some City Building", lat=51.5155, lng=-0.0922, submarket="EC2")
+        components = [{"long_name": "Broadgate", "types": ["political", "sublocality", "sublocality_level_1"]}]
+
+        with patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.submarket, "Broadgate")
+
+
 class SplitCompoundBuildingTests(unittest.TestCase):
     def test_name_comma_address_is_compound(self):
         # The real Kitt's Availability building whose compound value

@@ -148,6 +148,35 @@ def _district_parts(outward_code: str):
     return match.group(1), match.group(2)
 
 
+def _is_bare_postcode_district(value: str) -> bool:
+    """
+    True only when `value`, once trimmed, IS a bare UK postcode outward
+    code/district (e.g. "SE1", "EC2", "W1S") and nothing else - reuses the
+    exact same outward-code grammar _district_parts already uses, never a
+    lookup of specific area names. False for a genuine place name
+    ("Shoreditch", "Mayfair", "London Bridge", "Borough"), which never
+    matches this short letter+digit[+letter] shape, and false for a full
+    postcode ("SE1 8QH", with its own inward code) - only the bare-
+    district shape a provider sometimes uses as an area/section label on
+    its own (e.g. a "SE1" section heading grouping several buildings) is
+    targeted here.
+    """
+    if not value:
+        return False
+    return _district_parts(value.strip()) is not None
+
+
+def _submarket_needs_improvement(value) -> bool:
+    """
+    True when `value` is blank OR is itself just a bare postcode district
+    (see _is_bare_postcode_district) - i.e. not yet a genuinely useful
+    named locality a reviewer would recognize. False for any real,
+    already-useful submarket value ("Shoreditch", "Clerkenwell", "City",
+    "Mayfair", "London Bridge", "Borough", ...), which is never touched.
+    """
+    return not value or _is_bare_postcode_district(value)
+
+
 def extract_postcode_hint(text: str):
     """
     Parses a UK postcode-district hint from the trailing token(s) of free
@@ -444,24 +473,30 @@ def _submarket_from_components(address_components: list, name_key: str = "long_n
 def _fill_submarket(row: ListingRow, address_components: list = None) -> None:
     """
     Fills row.submarket using this module's own priority order: (1) never
-    overwrites a genuinely-extracted value (the row.submarket guard below -
-    unchanged from before); (2) a safe source-text locality hint (see
-    _source_area_hint/extract_area_hint) - preferred over Google's own
-    reverse-geocoded neighbourhood since the source already said so
-    explicitly, and confirmed real gap: Google's sublocality/neighborhood
-    coverage is patchy (reliable for Mayfair/Fitzrovia/Soho, but genuinely
-    blank for other real addresses this exists for), so a source that
-    already states its own locality must never stay blank just because
-    Google's reverse-geocode happens not to cover it; (3) address_components
+    overwrites a genuinely-extracted, already-useful value (the row.
+    submarket guard below - now also lets a bare postcode-district value
+    like "SE1" through, see _submarket_needs_improvement's own docstring
+    for why: a provider's own "SE1" section heading is a real, faithfully-
+    extracted value, but it is not a useful named submarket the way
+    "Shoreditch"/"Mayfair" already are, so it gets the same one-time
+    improvement attempt as a genuinely blank value, never a real place
+    name); (2) a safe source-text locality hint (see _source_area_hint/
+    extract_area_hint) - preferred over Google's own reverse-geocoded
+    neighbourhood since the source already said so explicitly, and
+    confirmed real gap: Google's sublocality/neighborhood coverage is
+    patchy (reliable for Mayfair/Fitzrovia/Soho, but genuinely blank for
+    other real addresses this exists for), so a source that already
+    states its own locality must never stay blank just because Google's
+    reverse-geocode happens not to cover it; (3) address_components
     already fetched from a reverse-geocode (see _submarket_from_components) -
     checked only when the source itself had nothing safe to offer, and only
     if the caller already has a reverse-geocode result in hand (never
     fetches one itself - see _backfill_submarket_from_coords, the only
     caller that decides whether a reverse-geocode call is worth making at
     all). Idempotent/safe to call more than once for the same row - every
-    branch is a no-op once row.submarket is set.
+    branch is a no-op once row.submarket holds a genuinely useful value.
     """
-    if row.submarket:
+    if not _submarket_needs_improvement(row.submarket):
         return
     area_hint = _source_area_hint(row)
     if area_hint:
@@ -477,18 +512,20 @@ def _backfill_submarket_from_coords(row: ListingRow, lat: float, lng: float) -> 
     """
     Fills row.submarket for coordinates already trusted (either source-
     provided or just resolved a few lines above) - see _fill_submarket for
-    the actual priority order. Only calls out to the reverse-geocode API
-    when a safe source-text hint isn't already enough, saving the call
-    entirely for a row whose source text already states its own locality.
-    Applies regardless of source type (spreadsheet/PDF/email), since
-    geocode_row is the one shared code path for all of them - no per-
-    source-type wiring needed. This is purely an additional read at
-    coordinates already known, with no risk to lat/lng itself.
+    the actual priority order (which now also applies when row.submarket
+    is merely a bare postcode district like "SE1" - see _submarket_needs_
+    improvement). Only calls out to the reverse-geocode API when a safe
+    source-text hint isn't already enough, saving the call entirely for a
+    row whose source text already states its own locality. Applies
+    regardless of source type (spreadsheet/PDF/email), since geocode_row
+    is the one shared code path for all of them - no per-source-type
+    wiring needed. This is purely an additional read at coordinates
+    already known, with no risk to lat/lng itself.
     """
-    if row.submarket:
+    if not _submarket_needs_improvement(row.submarket):
         return
     _fill_submarket(row)
-    if row.submarket:
+    if not _submarket_needs_improvement(row.submarket):
         return
     reverse = call_reverse_geocoding_api(lat, lng)
     if reverse["status"] == "OK":
@@ -682,13 +719,14 @@ def geocode_row(row: ListingRow) -> ListingRow:
             # is enough.
             _fill_submarket(row)
 
-            if not row.address_1 or not row.postcode or not row.submarket:
+            if not row.address_1 or not row.postcode or _submarket_needs_improvement(row.submarket):
                 # Places matched real coordinates but its own record is missing
                 # something (no street address on file at all - e.g. Kent House, a
                 # correct, well-disambiguated match with a "premise"-only record -
-                # and/or no submarket, see _submarket_from_components) -
-                # reverse-geocode the coordinates we already trust as a second
-                # attempt to fill in whichever of these is still missing. One call
+                # and/or no useful submarket, see _submarket_from_components/
+                # _submarket_needs_improvement) - reverse-geocode the
+                # coordinates we already trust as a second attempt to fill in
+                # whichever of these is still missing/unimproved. One call
                 # covers both, since both read the exact same pooled components.
                 reverse = call_reverse_geocoding_api(row.lat, row.lng)
                 if reverse["status"] == "OK":
