@@ -10,7 +10,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link
-from gemini_client import call_gemini, compute_rent, get_client
+from gemini_client import ResponseTruncatedError, call_gemini, compute_rent, get_client
 from schema import ExtractedFields, ListingRow
 
 RENDER_DPI = 72
@@ -625,6 +625,8 @@ def main():
         rows = extract(pdf_path)
     except ValidationError as e:
         raise SystemExit(f"Gemini output did not match schema:\n{e}")
+    except ResponseTruncatedError as e:
+        raise SystemExit(str(e))
     except json.JSONDecodeError as e:
         raise SystemExit(f"Gemini did not return valid JSON after retry:\n{e}")
 
