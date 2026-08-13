@@ -9,6 +9,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_brochure_enrichment -v
 """
 
+import os
 import sys
 import threading
 import time
@@ -608,6 +609,174 @@ class FetchPdfBytesDropboxAndGoogleDriveTests(EnrichmentTestCase):
             brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
         )
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url(canva_url))
+
+
+_CANVA_URL = "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
+
+
+class CanvaRendererConfiguredEligibilityTests(EnrichmentTestCase):
+    """
+    With CANVA_RENDERER_URL configured, a Canva view link becomes eligible
+    again - the opposite of CanvaViewLinkRejectedTests' own unconfigured-
+    environment behavior above (every existing test, including that one,
+    runs with no such env var set, so none of them are affected by this).
+    """
+
+    def test_canva_becomes_eligible_when_renderer_is_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}):
+            self.assertIsNone(brochure_enrichment.classify_link_eligibility(_CANVA_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_brochure_url(_CANVA_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_CANVA_URL))
+
+    def test_canva_stays_ineligible_without_the_env_var(self):
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(_CANVA_URL), brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+        self.assertFalse(brochure_enrichment._is_eligible_brochure_url(_CANVA_URL))
+
+
+class FetchCanvaRenderedPageTests(EnrichmentTestCase):
+    def test_successful_render_returns_png_bytes(self):
+        response = MagicMock(status_code=200, content=b"\x89PNG real bytes", headers={"content-type": "image/png"})
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertEqual(result, b"\x89PNG real bytes")
+        mock_post.assert_called_once()
+        self.assertEqual(mock_post.call_args.args[0], "https://canva-renderer.example.run.app/render")
+        self.assertEqual(mock_post.call_args.kwargs["json"], {"url": _CANVA_URL})
+
+    def test_renderer_unreachable_returns_none_and_records_fetch_failed(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", side_effect=httpx.ConnectError("dns failure")):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_renderer_reports_safe_failure_returns_none_and_records_render_failed(self):
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"error": "render_failed", "reason": "private design"}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIn("private design", sink["detail"])
+
+    def test_auth_headers_included_in_request(self):
+        response = MagicMock(status_code=200, content=b"\x89PNG", headers={"content-type": "image/png"})
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={"Authorization": "Bearer tok"}):
+            brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertEqual(mock_post.call_args.kwargs["headers"], {"Authorization": "Bearer tok"})
+
+    def test_auth_header_minting_failure_falls_back_to_no_header(self):
+        # google.oauth2.id_token.fetch_id_token raising (e.g. no ADC
+        # available - local dev outside GCP) must never crash the call.
+        with patch("google.oauth2.id_token.fetch_id_token", side_effect=Exception("no credentials")):
+            headers = brochure_enrichment._canva_renderer_auth_headers("https://canva-renderer.example.run.app")
+        self.assertEqual(headers, {})
+
+
+class FetchPdfBytesCanvaRoutingTests(EnrichmentTestCase):
+    def test_fetch_pdf_bytes_routes_canva_urls_through_the_renderer(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG bytes") as mock_render:
+            result = brochure_enrichment._fetch_pdf_bytes(_CANVA_URL)
+
+        self.assertEqual(result, b"\x89PNG bytes")
+        mock_render.assert_called_once_with(_CANVA_URL)
+
+    def test_non_canva_url_never_calls_the_canva_renderer(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page") as mock_render, \
+                patch("brochure_enrichment.httpx.get", return_value=_response()):
+            brochure_enrichment._fetch_pdf_bytes("https://example.com/brochure.pdf")
+
+        mock_render.assert_not_called()
+
+
+class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
+    """
+    End-to-end through enrich_rows_grouped with the renderer configured -
+    confirms a rendered Canva page feeds the EXISTING extraction pipeline
+    (extract.render_pages/render_and_extract), never a separate Canva-only
+    extraction path, and that existing blank-only/source-first rules and
+    document-issue handling still apply exactly as for any other document.
+    """
+
+    def test_successful_canva_render_feeds_the_existing_extraction_pipeline(self):
+        rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]) as mock_render_pages, \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Roof terrace"}]},
+                ) as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "Roof terrace")
+        mock_render_pages.assert_called_once_with(b"\x89PNG fake render")
+        mock_extract.assert_called_once()
+        self.assertEqual(stats["document_issues"], [])
+
+    def test_renderer_failure_leaves_row_unchanged_and_records_an_issue(self):
+        rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", side_effect=httpx.ConnectError("renderer down")):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[0].brochure_link, _CANVA_URL)  # original link preserved
+        self.assertEqual(len(stats["document_issues"]), 1)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_canva_failure_does_not_block_other_documents_in_the_same_run(self):
+        rows = [
+            ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None),
+            ListingRow(building="Good Co", brochure_link="https://example.com/good.pdf", special_features=None),
+        ]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=None), \
+                patch("brochure_enrichment.httpx.get", return_value=_response()), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Good Co", "special_features": "Nice"}]},
+                ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[1].special_features, "Nice")
+
+    def test_duplicate_canva_url_across_rows_is_only_rendered_once(self):
+        rows = [
+            ListingRow(building="Metropolitan Wharf", floor_unit="1st", brochure_link=_CANVA_URL, special_features=None),
+            ListingRow(building="Metropolitan Wharf", floor_unit="2nd", brochure_link=_CANVA_URL, special_features=None),
+        ]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake",
+                ) as mock_render, \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Nice"}]},
+                ):
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_render.assert_called_once()  # one unique URL shared by 2 rows -> rendered once, not twice
 
 
 class LooksLikeFetchableDocumentTests(unittest.TestCase):

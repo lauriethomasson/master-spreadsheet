@@ -108,12 +108,17 @@ def is_floorplan_not_brochure_url(url: str) -> bool:
 # real design - i.e. Canva actively distinguishes a real browser from a
 # plain HTTP client and never serves usable content to the latter, for a
 # genuinely public design or otherwise. There is no stable, documented,
-# unauthenticated mechanism this pipeline could use to obtain real PDF/page
-# content from a link shaped like this - real browser rendering (explicitly
-# out of scope: no Playwright/Selenium) is the only path that would work,
-# so a URL matching this shape is treated as a known-unsupported link type,
-# never attempted as a fetchable document at all (see is_canva_view_link's
-# own call sites in brochure_enrichment.py's classify_link_eligibility).
+# unauthenticated mechanism a plain HTTP client could use to obtain real
+# PDF/page content from a link shaped like this. A URL matching this shape
+# is still treated as a known-unsupported link type by default (never
+# attempted as a fetchable document at all - see is_canva_view_link's own
+# call sites in brochure_enrichment.py's classify_link_eligibility) UNLESS
+# a separate, isolated browser-rendering service has been deployed and
+# configured (see canva_renderer/README.md and brochure_enrichment.
+# _canva_renderer_configured) - real headless Chromium rendering DOES
+# obtain the actual design content correctly (confirmed directly), it is
+# just never run inside THIS app's own process/container, for the reasons
+# that service's own README explains.
 _CANVA_VIEW_URL_RE = re.compile(
     r"^https?://(?:[\w-]+\.)*canva\.com/design/[^/\s]+/[^/\s]+/view(?:[/?#].*)?$", re.IGNORECASE
 )
@@ -121,9 +126,10 @@ _CANVA_VIEW_URL_RE = re.compile(
 
 def is_canva_view_link(url: str) -> bool:
     """True for a real Canva public-share "view" link shape - see
-    _CANVA_VIEW_URL_RE's own docstring for why this is never attempted as a
-    fetchable document. Never a fetch - matched against the URL's own text
-    only, same as is_floorplan_not_brochure_url's other use sites."""
+    _CANVA_VIEW_URL_RE's own docstring for why this is unsupported by
+    default, and how canva_renderer/ opts a deployment into real support.
+    Never a fetch - matched against the URL's own text only, same as is_
+    floorplan_not_brochure_url's other use sites."""
     if not url:
         return False
     return bool(_CANVA_VIEW_URL_RE.match(url.strip()))

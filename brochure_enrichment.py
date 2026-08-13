@@ -103,6 +103,7 @@ on.
 import concurrent.futures
 import ctypes
 import functools
+import os
 import platform
 import re
 import sys
@@ -182,6 +183,25 @@ def issue_label(status: str) -> str:
     return _ISSUE_LABELS.get(status, status)
 
 
+# Name of the env var pointing at the separate Canva-rendering service
+# (see canva_renderer/README.md) - e.g. "https://canva-renderer-xyz.run.
+# app". Unset (the default for any environment that hasn't deployed that
+# service) means Canva support stays exactly as it was under commit
+# a67e337: a public Canva "view" link is still recognized on sight, but
+# still never fetched at all - see _canva_renderer_configured's own call
+# sites in classify_link_eligibility/_is_eligible_brochure_url/_is_
+# eligible_floorplan_url. Deliberately a plain env var check, not a
+# network call - these three functions are all documented as "purely from
+# the URL's own text, no network activity", and checking whether a
+# separate service has been deployed at all is a local, static fact, not
+# a probe of that service's own health.
+CANVA_RENDERER_URL_ENV_VAR = "CANVA_RENDERER_URL"
+
+
+def _canva_renderer_configured() -> bool:
+    return bool(os.environ.get(CANVA_RENDERER_URL_ENV_VAR))
+
+
 def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
     """
     None if `url` is eligible for a real fetch attempt (the existing
@@ -213,7 +233,7 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if is_generic_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
-    if is_canva_view_link(url):
+    if is_canva_view_link(url) and not _canva_renderer_configured():
         return STATUS_UNSUPPORTED_LINK_TYPE
     if reject_floorplan_shaped and is_floorplan_not_brochure_url(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
@@ -621,7 +641,7 @@ def _is_eligible_brochure_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
-    if is_canva_view_link(url):
+    if is_canva_view_link(url) and not _canva_renderer_configured():
         return False
     if is_floorplan_not_brochure_url(url):
         return False
@@ -900,6 +920,101 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
     return response.content
 
 
+# Generous over the separate renderer's OWN internal navigation timeout
+# (see canva_renderer/app.py's NAV_TIMEOUT_MS) - this is the ceiling for
+# the WHOLE round trip (network + browser launch/render), so it must stay
+# comfortably above that service's own budget rather than racing it.
+_CANVA_RENDERER_TIMEOUT = 30
+
+
+def _canva_renderer_auth_headers(renderer_url: str) -> dict:
+    """
+    Cloud Run's own native service-to-service auth: mints a Google-signed
+    ID token scoped to the renderer's own URL (the "audience"), so a
+    renderer deployed WITHOUT --allow-unauthenticated only ever accepts a
+    call from a caller this project's own IAM policy has explicitly
+    granted the Cloud Run Invoker role to - never a static shared secret
+    this codebase would need to store, rotate, or risk leaking. google-
+    auth is already a transitive dependency of google-cloud-storage/
+    google-genai (both already in requirements.txt), so this adds no new
+    dependency.
+
+    Returns {} (never raises) whenever ID-token minting isn't available in
+    the current environment - e.g. local development outside GCP, with no
+    Application Default Credentials configured. The renderer's own
+    deployment is expected to allow unauthenticated calls ONLY for that
+    specific local-dev scenario (see canva_renderer/README.md) - in every
+    other environment, an empty headers dict here simply means Cloud Run
+    itself rejects the call with 401/403 before it ever reaches the
+    renderer's own code, which is the safe direction to fail in.
+    """
+    try:
+        import google.auth.transport.requests
+        import google.oauth2.id_token
+
+        token = google.oauth2.id_token.fetch_id_token(google.auth.transport.requests.Request(), renderer_url)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        return {}
+
+
+def _fetch_canva_rendered_page(url: str):
+    """
+    PNG bytes for the single page `url` (a public Canva "view" link)
+    renders to, obtained from the separate Canva-rendering service (see
+    canva_renderer/README.md) - never attempted at all unless
+    CANVA_RENDERER_URL is configured (see _canva_renderer_configured's own
+    docstring); classify_link_eligibility/_is_eligible_brochure_url/_is_
+    eligible_floorplan_url already reject a Canva URL before it ever
+    reaches this function in that case, exactly like before this feature
+    existed. Chromium itself never runs in this app's own process/
+    container - see that service's own README for why this separation
+    exists (a stuck/misbehaving Canva page or a Chromium OOM must never be
+    able to affect this app's own memory budget or uptime).
+
+    Returns None (never raises) whenever:
+    - the renderer service is unreachable, times out, or returns a non-
+      2xx/malformed response - recorded as STATUS_FETCH_FAILED, the same
+      status a real network failure gets for any other document host;
+    - the renderer itself reports a clean, safe failure - a malformed
+      Canva URL, a private/login-required design, a page that never
+      finished loading - recorded as STATUS_RENDER_FAILED with the
+      renderer's own short, non-sensitive reason string (never a raw
+      exception, stack trace, or URL with a query string).
+
+    Only ever returns a SINGLE page's bytes - a genuinely multi-page Canva
+    brochure's other pages are not currently reachable (see canva_
+    renderer.app.render_canva_page's own "KNOWN LIMITATION" docstring) -
+    the returned PNG feeds into extract.render_pages/render_and_extract
+    exactly like any other document's bytes (see _fetch_pdf_bytes' own
+    Canva branch below and _looks_like_fetchable_document's own docstring
+    on PyMuPDF already opening genuine PNG bytes correctly regardless of
+    its own advisory filetype="pdf" hint) - no separate Canva extraction
+    system, no change to matching/enrichment rules.
+    """
+    renderer_url = os.environ.get(CANVA_RENDERER_URL_ENV_VAR, "").rstrip("/")
+    try:
+        response = httpx.post(
+            f"{renderer_url}/render", json={"url": url},
+            headers=_canva_renderer_auth_headers(renderer_url), timeout=_CANVA_RENDERER_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"[brochure_enrichment] Canva renderer unreachable for {url!r} ({e!r}) — skipping enrichment.", file=sys.stderr)
+        _record_status(STATUS_FETCH_FAILED, f"Canva renderer unreachable ({e!r})")
+        return None
+
+    if response.status_code != 200 or "image/" not in response.headers.get("content-type", ""):
+        try:
+            reason = response.json().get("reason", f"HTTP {response.status_code}")
+        except Exception:
+            reason = f"HTTP {response.status_code}"
+        print(f"[brochure_enrichment] Canva renderer could not render {url!r} ({reason}) — skipping enrichment.", file=sys.stderr)
+        _record_status(STATUS_RENDER_FAILED, f"Canva render failed: {reason}")
+        return None
+
+    return response.content
+
+
 def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_image_formats: bool = False):
     """
     PDF bytes fetched from `url`, or None on ANY failure - a network error,
@@ -935,11 +1050,28 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     else keeps the exact same behavior as before: a direct document
     extension is fetched as-is, otherwise resolve_brochure_link's one-hop
     landing-page scan is tried first.
+
+    A Canva "view" link (see is_canva_view_link) is read via the separate
+    Canva-rendering service instead (see _fetch_canva_rendered_page), but
+    ONLY when CANVA_RENDERER_URL is actually configured (see
+    _canva_renderer_configured) - classify_link_eligibility/_is_eligible_
+    brochure_url/_is_eligible_floorplan_url already reject a Canva URL
+    before it gets here at all in that case, so this check is normally
+    redundant, but this function's own direct callers (e.g. a diagnostic
+    script, or a test exercising this layer directly) don't necessarily
+    go through that eligibility gate first - falling through to the exact
+    same generic fetch path as any other URL when unconfigured, rather
+    than attempting a renderer call this deployment was never told about,
+    keeps this function's own behavior correct independent of whether a
+    caller already checked eligibility.
     """
     if _box_share_token(url):
         return _fetch_box_shared_pdf(
             url, reject_floorplan_filename=reject_floorplan_filename, accept_image_formats=accept_image_formats,
         )
+
+    if is_canva_view_link(url) and _canva_renderer_configured():
+        return _fetch_canva_rendered_page(url)
 
     direct_extensions = (".pdf", ".png", ".jpg", ".jpeg") if accept_image_formats else (".pdf",)
     try:
@@ -1514,7 +1646,7 @@ def _is_eligible_floorplan_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
-    if is_canva_view_link(url):
+    if is_canva_view_link(url) and not _canva_renderer_configured():
         return False
     lowered = url.lower()
     return not any(bad in lowered for bad in ("youtube.com", "youtu.be"))
