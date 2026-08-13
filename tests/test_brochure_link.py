@@ -19,7 +19,9 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brochure_link_resolver import finalize_brochure_link, is_floorplan_not_brochure_url, is_generic_link, looks_like_url
+from brochure_link_resolver import (
+    finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, looks_like_url,
+)
 from storage import blob_store, file_store
 
 
@@ -255,6 +257,36 @@ class IsFloorplanNotBrochureUrlTests(unittest.TestCase):
     def test_blank_is_not_flagged(self):
         self.assertFalse(is_floorplan_not_brochure_url(None))
         self.assertFalse(is_floorplan_not_brochure_url(""))
+
+
+class IsCanvaViewLinkTests(unittest.TestCase):
+    def test_the_real_public_example_link_is_recognised(self):
+        self.assertTrue(is_canva_view_link(
+            "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
+            "?utm_content=DAGzsWW-Yp8&utm_campaign=designshare#7"
+        ))
+
+    def test_a_view_link_with_no_query_or_fragment_is_recognised(self):
+        self.assertTrue(is_canva_view_link("https://canva.com/design/abc123/def456/view"))
+
+    def test_a_bare_canva_homepage_is_not_a_view_link(self):
+        self.assertFalse(is_canva_view_link("https://www.canva.com/"))
+
+    def test_a_canva_template_gallery_page_is_not_a_view_link(self):
+        self.assertFalse(is_canva_view_link("https://www.canva.com/templates/"))
+
+    def test_a_canva_edit_link_is_not_a_view_link(self):
+        # Requires an owner's own editor session - never a public link this
+        # pipeline could read regardless, but deliberately a DIFFERENT shape
+        # from /view, so this stays a narrow, structural match only.
+        self.assertFalse(is_canva_view_link("https://www.canva.com/design/DAGzsWW-Yp8/edit"))
+
+    def test_an_unrelated_domain_is_never_matched(self):
+        self.assertFalse(is_canva_view_link("https://example.com/design/abc/def/view"))
+
+    def test_blank_is_not_a_view_link(self):
+        self.assertFalse(is_canva_view_link(None))
+        self.assertFalse(is_canva_view_link(""))
 
 
 class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):

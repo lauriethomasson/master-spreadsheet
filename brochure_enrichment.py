@@ -114,8 +114,8 @@ import streamlit as st
 
 import extract
 from brochure_link_resolver import (
-    REQUEST_TIMEOUT, USER_AGENT, is_floorplan_not_brochure_url, is_generic_link, looks_like_url,
-    resolve_brochure_link,
+    REQUEST_TIMEOUT, USER_AGENT, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link,
+    looks_like_url, resolve_brochure_link,
 )
 import geocode
 from house_number import leading_house_number
@@ -195,7 +195,10 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
       "Coming Soon" and similar provider placeholders meaning "none yet";
     - STATUS_UNSUPPORTED_LINK_TYPE: a real URL, but one of the shapes this
       pipeline already knows it can't use (a bare generic homepage/known
-      social-profile domain, a video link, or - only when
+      social-profile domain, a video link, a Canva public "view" link - see
+      brochure_link_resolver.is_canva_view_link's own docstring on why a
+      plain HTTP fetch can never retrieve real content from one, confirmed
+      directly against a real example rather than assumed - or, only when
       reject_floorplan_shaped, brochure_link's own rule, see _is_eligible_
       brochure_url - a floor-plan-labeled link where a brochure was
       expected; floorplan_link's own check, _is_eligible_floorplan_url,
@@ -209,6 +212,8 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
     if urlparse(url).scheme not in ("http", "https"):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if is_generic_link(url):
+        return STATUS_UNSUPPORTED_LINK_TYPE
+    if is_canva_view_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if reject_floorplan_shaped and is_floorplan_not_brochure_url(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
@@ -588,16 +593,20 @@ def _is_eligible_brochure_url(url) -> bool:
     fetchable_document for the one made after fetching). Rejects: blank/
     non-URL text, a bare
     company homepage or known social/professional profile domain (see
-    brochure_link_resolver.is_generic_link), and a URL whose own text
-    already identifies it as a floor plan or a video rather than a
-    document - never a fetch-then-guess; these are excluded by the URL
-    alone, exactly like a human skimming a link list would.
+    brochure_link_resolver.is_generic_link), a Canva public "view" link
+    (see is_canva_view_link's own docstring - confirmed, not assumed, that
+    a plain fetch can never retrieve real content from one), and a URL
+    whose own text already identifies it as a floor plan or a video rather
+    than a document - never a fetch-then-guess; these are excluded by the
+    URL alone, exactly like a human skimming a link list would.
     """
     if _is_blank(url):
         return False
     if urlparse(url).scheme not in ("http", "https"):
         return False
     if is_generic_link(url):
+        return False
+    if is_canva_view_link(url):
         return False
     if is_floorplan_not_brochure_url(url):
         return False
@@ -1413,14 +1422,18 @@ def _is_eligible_floorplan_url(url) -> bool:
     that shape is exactly what's EXPECTED here, unlike for brochure_link
     where it's a rejection reason. Still requires an explicit http(s)
     scheme and rejects a bare company homepage/known social-profile domain
-    (see is_generic_link) and a video link - a floor plan is never hosted
-    at either of those either.
+    (see is_generic_link), a Canva public "view" link (see is_canva_view_
+    link's own docstring - a floor plan is never retrievable from one
+    either, for the same reason a brochure isn't), and a video link - a
+    floor plan is never hosted at either of those either.
     """
     if _is_blank(url):
         return False
     if urlparse(url).scheme not in ("http", "https"):
         return False
     if is_generic_link(url):
+        return False
+    if is_canva_view_link(url):
         return False
     lowered = url.lower()
     return not any(bad in lowered for bad in ("youtube.com", "youtu.be"))

@@ -2788,16 +2788,21 @@ class ClassifyLinkEligibilityTests(unittest.TestCase):
             )
         )
 
-    def test_canva_view_link_is_not_pre_emptively_rejected(self):
-        # A Canva "view" link is a real, well-formed https:// URL with a
-        # genuine path - nothing about its own text is unsupported the way
-        # a bare homepage or a floor-plan-labeled link is, so this pipeline
-        # never special-cases it by name (see this module's own ISSUE_
-        # LABELS docstring on why) - it's only classified as an actual
-        # ISSUE once a real fetch attempt shows it doesn't expose a
-        # readable document (see DocumentStatusIntegrationTests below).
-        self.assertIsNone(
-            brochure_enrichment.classify_link_eligibility("https://www.canva.com/design/ABC123/view")
+    def test_canva_view_link_is_pre_emptively_rejected(self):
+        # Confirmed directly (see brochure_link_resolver.is_canva_view_
+        # link's own docstring) - a plain, unauthenticated fetch of a real
+        # public Canva "view" link never returns usable document content,
+        # for ANY such link, not just this one example - so it's excluded
+        # here, before ever wasting a real fetch attempt, exactly like a
+        # placeholder or a known generic homepage already are. This is
+        # evidence-based, not a guess: the alternative (only discovering
+        # this after a real fetch) is still safe (see
+        # DocumentStatusIntegrationTests), just wasteful.
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(
+                "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
+            ),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
         )
 
     def test_a_normal_pdf_link_is_eligible(self):
@@ -2877,34 +2882,56 @@ class DocumentStatusIntegrationTests(EnrichmentTestCase):
             {"building": "Example House", "floor_unit": None, "status": brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE},
         ])
 
-    def test_canva_style_view_link_that_returns_html_is_recorded_as_an_issue_and_preserved(self):
-        # The one focused Canva scenario this task asks for - a real,
-        # well-formed public "view" URL that this pipeline cannot obtain
-        # extractable document bytes from (it returns an HTML page, not a
-        # PDF) - preserved, marked as a failure, never crashes, never
-        # fabricates a brochure. No Canva-specific code is involved at all
-        # (see classify_link_eligibility's own test above) - this is
-        # exactly the same generic path a broken link on any other site
-        # would take.
+    def test_canva_view_link_is_rejected_before_any_fetch_and_link_is_preserved(self):
+        # The one focused Canva scenario this task asks for - confirmed
+        # directly (see is_canva_view_link's own docstring) that a plain,
+        # unauthenticated fetch of a real public Canva "view" link never
+        # returns usable document content (Canva's own server returns an
+        # "Unsupported client" HTML shell to any non-browser client) - so
+        # this link is rejected at the SAME pre-fetch stage as a placeholder
+        # or a generic homepage, never wasting a real network round trip.
+        # No separate Canva extraction system exists; this is the same
+        # existing unsupported-link-type outcome any other unreadable link
+        # shape already gets.
         rows = [ListingRow(
-            building="Canva House", brochure_link="https://www.canva.com/design/ABC123/view",
+            building="Canva House",
+            brochure_link="https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view?utm_content=x#7",
             special_features=None,
         )]
-        html_response = _response(content=b"<html><body>Canva</body></html>", content_type="text/html")
-        # resolve_brochure_link's own one-hop landing-page-scan logic isn't
-        # what this test is about (see brochure_link_resolver.py's own
-        # dedicated tests for that) - bypassed here so this test
-        # deterministically exercises exactly one thing: a URL whose
-        # eventual response is HTML, not a document, is rejected safely.
-        with patch("brochure_enrichment.httpx.get", return_value=html_response), \
-             patch("brochure_enrichment.resolve_brochure_link", side_effect=lambda u: u):
+        with patch("brochure_enrichment.httpx.get") as mock_get:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_get.assert_not_called()
+        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(
+            enriched[0].brochure_link,
+            "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view?utm_content=x#7",
+        )
+        self.assertEqual(stats["document_issues"], [
+            {"building": "Canva House", "floor_unit": None, "status": brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE},
+        ])
+
+    def test_canva_failure_does_not_stop_other_documents_from_processing(self):
+        rows = [
+            ListingRow(
+                building="Canva House",
+                brochure_link="https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view",
+                special_features=None,
+            ),
+            ListingRow(building="Good Co", brochure_link="https://example.com/good.pdf", special_features=None),
+        ]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch(
+                 "brochure_enrichment.extract.render_and_extract",
+                 return_value={"units": [{"building": "Good Co", "special_features": "Nice"}]},
+             ):
             enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
 
         self.assertIsNone(enriched[0].special_features)
-        self.assertEqual(enriched[0].brochure_link, "https://www.canva.com/design/ABC123/view")
-        self.assertEqual(stats["document_issues"], [
-            {"building": "Canva House", "floor_unit": None, "status": brochure_enrichment.STATUS_FETCH_FAILED},
-        ])
+        self.assertEqual(enriched[1].special_features, "Nice")
+        self.assertEqual(len(stats["document_issues"]), 1)
+        self.assertEqual(stats["document_issues"][0]["building"], "Canva House")
 
     def test_404_is_recorded_as_fetch_failed_and_upload_continues(self):
         rows = [
@@ -3056,6 +3083,45 @@ class DocumentStatusIntegrationTests(EnrichmentTestCase):
         self.assertEqual(stats["brochures_done"] if "brochures_done" in stats else len(stats["processed_urls"]), 1)
         self.assertEqual(stats["processed_urls"], {"https://example.com/broken.pdf": "unavailable"})
         self.assertEqual(len(stats["document_issues"]), 1)
+
+
+REAL_CANVA_VIEW_URL = (
+    "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
+    "?utm_content=DAGzsWW-Yp8&utm_campaign=designshare&utm_medium=link&utm_source=publishsharelink#7"
+)
+
+
+class RealCanvaLiveIntegrationTests(unittest.TestCase):
+    """
+    ONE optional live test (no mocking at all) against the real public
+    Canva example URL this task was built for - makes a genuine, real
+    network request. Skipped automatically when the network/Canva itself
+    is unreachable, so it never breaks the suite for someone offline.
+
+    Deliberately calls _fetch_pdf_bytes directly rather than going through
+    enrich_rows_grouped - the pre-fetch is_canva_view_link gate (see
+    ClassifyLinkEligibilityTests) means the real pipeline never even
+    attempts a fetch for this URL at all now, so a live test THROUGH that
+    path would make no real request and prove nothing. This one instead
+    directly re-verifies the underlying, evidence-based premise that
+    classification itself is built on: a plain, unauthenticated fetch of
+    this exact real link genuinely does not yield usable document bytes.
+    If Canva ever changes this (starts serving real content to a non-
+    browser client), THIS test starts failing - a deliberate regression
+    guard on the assumption, not just on this module's own code.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import httpx as _httpx
+            _httpx.get(REAL_CANVA_VIEW_URL, timeout=10)
+        except Exception as e:
+            raise unittest.SkipTest(f"network/Canva unreachable in this environment: {e!r}")
+
+    def test_real_canva_view_link_still_does_not_yield_a_fetchable_document(self):
+        result = brochure_enrichment._fetch_pdf_bytes(REAL_CANVA_VIEW_URL)
+        self.assertIsNone(result)
 
 
 # --- Real-brochure integration test for the widened field scope ---
