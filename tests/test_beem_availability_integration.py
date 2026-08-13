@@ -48,8 +48,12 @@ from streamlit.testing.v1 import AppTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from unittest.mock import patch
+
 import extract_spreadsheet
 import extract_spreadsheet_gemini
+import geocode
+from schema import ListingRow
 from storage.file_store import list_pending_staging_files, load_staging_as_dataframe
 
 BASE = Path(__file__).resolve().parent.parent
@@ -251,6 +255,122 @@ class BeemFullUploadIntegrationTests(unittest.TestCase):
         self.assertEqual(first["desks_min"], 32)
         self.assertEqual(first["desks_max"], 34)
         self.assertEqual(first["rent_psf"], 130.0)
+
+
+@unittest.skipUnless(_HAS_FIXTURE, "real Beem fixture not present in this environment")
+class BeemGeocodingAndSubmarketTests(unittest.TestCase):
+    """
+    Regression tests against the real Beem file's own Property column text -
+    a real, confirmed report: several rows have valid postcode/lat/lng but a
+    blank submarket, and two rows (New Derwent House WC1, Clove London
+    Bridge SE1) never resolve a postcode/lat/lng at all after a conflicting
+    Google Places candidate is correctly rejected. call_places_text_search/
+    call_reverse_geocoding_api are mocked (no live network/API-key
+    dependency, matching every other geocode test in this suite) - only the
+    BUILDING TEXT itself comes from the real file, read directly rather than
+    retyped, so a future real-file edit can never let this drift out of sync
+    with what the source actually says.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wb = load_workbook(BEEM_PATH, data_only=True)
+        ws = wb["Sheet1"]
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        cls.buildings = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            record = dict(zip(headers, row))
+            building = record.get("Property")
+            if building:
+                cls.buildings.setdefault(building.strip(), building)
+
+    def _building(self, needle: str) -> str:
+        match = next((b for b in self.buildings if needle in b), None)
+        self.assertIsNotNone(match, f"expected a real Beem building containing {needle!r}")
+        return self.buildings[match]
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_new_derwent_house_rejects_the_conflicting_top_candidate_then_finds_a_safe_one(self):
+        building = self._building("New Derwent House")
+        row = ListingRow(building=building, provider="beem")
+        wrong_result = {
+            "status": "OK", "lat": 51.5118097, "lng": -0.1414146,
+            "address_components": [{"longText": "W1S 2ER", "types": ["postal_code"]}],
+        }
+        right_result = {
+            "status": "OK", "lat": 51.5223, "lng": -0.1214,
+            "address_components": [{"longText": "WC1X 8NP", "types": ["postal_code"]}],
+        }
+
+        def fake_places(query):
+            return wrong_result if query == f"{building}, London, UK" else right_result
+
+        with patch("geocode.call_places_text_search", side_effect=fake_places):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.postcode, "WC1X 8NP")
+        self.assertEqual(geocode.FAILURES, [])
+
+    def test_all_conflicting_candidates_leave_new_derwent_house_unresolved(self):
+        # The pre-fix real symptom - and still the CORRECT outcome when
+        # every candidate genuinely conflicts (never silently accept a
+        # wrong location just to avoid a blank).
+        building = self._building("New Derwent House")
+        row = ListingRow(building=building, provider="beem")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.5118097, "lng": -0.1414146,
+                "address_components": [{"longText": "W1S 2ER", "types": ["postal_code"]}],
+            },
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.postcode)
+        self.assertEqual(len(geocode.FAILURES), 1)
+
+    def test_source_locality_hints_backfill_blank_submarkets_with_no_google_call(self):
+        # Every one of these real rows was reported with valid postcode/
+        # lat/lng but blank submarket - source text already states the
+        # locality, so it must be used instead of depending on Google's
+        # own (confirmed patchy) reverse-geocode neighbourhood coverage.
+        cases = [
+            ("Orange Street", "Covent Garden"),
+            ("Bayswater Road", "Paddington"),
+            ("Nutmeg", "London Bridge"),
+            ("Southwark Street", "London Bridge"),
+        ]
+        for needle, expected_area in cases:
+            with self.subTest(building=needle):
+                building = self._building(needle)
+                row = ListingRow(building=building, provider="beem", lat=51.51, lng=-0.1)
+
+                with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+                    geocode.geocode_row(row)
+
+                mock_reverse.assert_not_called()
+                self.assertEqual(row.submarket, expected_area)
+
+    def test_working_controls_still_resolve_the_same_submarket_as_before(self):
+        # These two were already correct pre-fix (via Google's own
+        # neighbourhood coverage) - confirms the new source-hint-first
+        # priority produces the SAME answer, not a regression, for a
+        # locality Google already handled well.
+        cases = [("Red Lion Studios", "Clerkenwell"), ("Fashion Street", "Spitalfields")]
+        for needle, expected_area in cases:
+            with self.subTest(building=needle):
+                building = self._building(needle)
+                row = ListingRow(building=building, provider="beem", lat=51.52, lng=-0.1)
+
+                with patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+                    geocode.geocode_row(row)
+
+                mock_reverse.assert_not_called()  # now resolved from source text alone
+                self.assertEqual(row.submarket, expected_area)
 
 
 if __name__ == "__main__":
