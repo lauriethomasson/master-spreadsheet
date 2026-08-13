@@ -14,35 +14,57 @@ Deliberately scoped to spreadsheet rows only - a PDF upload is already
 extracted from the actual brochure (enriching it from itself would be
 circular and pointless), and email rows are left for a later change.
 
-Field scope is deliberately narrow: ENRICHABLE_FIELDS below is the ONLY set
-of fields this module ever assigns to. Every other ListingRow field
-(provider, internal_ref, building, floor_unit, size_sqft, rent_pcm,
-rent_psf, brochure_link, postcode, address_1, desks_min, desks_max) is
+Field scope is deliberately explicit and categorized (see PROPERTY_LEVEL_
+FIELDS/BUILDING_LEVEL_FIELDS/UNIT_LEVEL_FIELDS/HIGH_RISK_UNIT_LEVEL_FIELDS
+below, together forming ENRICHABLE_FIELDS) rather than one unrestricted
+list - different fields need different confidence requirements before a
+blank one may be filled, not just "is it currently blank". Every field
+NOT in one of those categories (provider, internal_ref, building,
+brochure_link, floorplan_link, lat, lng, property_id, source_file) is
 never touched by this module at all - not "protected by a priority rule
 that could have a bug", genuinely absent from any code path here, which is
 safer than a runtime overwrite-guard for the same reason
 finalize_brochure_link's own rules are enforced in code rather than left to
-a model to decide (see that module's own docstring).
+a model to decide (see that module's own docstring). lat/lng in particular
+are NEVER read from brochure text - even when a brochure enrichment run
+supplies a trustworthy blank address_1/postcode, coordinates are still only
+ever produced by the existing geocoder (geocode.py), never invented or
+read from a document here; this module has no second geocoding path.
 
 Brochure information is applied at the WIDEST level the brochure itself
-clearly supports, never wider - three levels, each narrower than the last,
-each overwriting the same field when a narrower one is also available (see
-_apply_units_to_row's own docstring for the exact precedence):
-1. Property/document-wide (property_features, contacts - see
-   _extract_brochure_units) - genuinely true of every row sharing this
-   brochure_link, applied regardless of whether a specific building or
-   floor/unit can be matched at all.
-2. Building-wide (building_features - see _match_building_feature) -
-   applied whenever the row's own building exactly (normalize_key) matches
-   one brochure building with its own distinct building-level text, again
-   regardless of whether a specific floor/unit within it can be matched.
-3. Floor/unit-specific (a matched unit's own special_features/
-   state_of_space - see _match_unit) - only ever applied to the one row a
+clearly supports, never wider - three scopes, each narrower than the last
+(see _apply_units_to_row's own docstring for the exact precedence):
+1. Property/document-wide (PROPERTY_LEVEL_FIELDS: property_features,
+   contacts - see _extract_brochure_units) - genuinely true of every row
+   sharing this brochure_link, applied regardless of whether a specific
+   building or floor/unit can be matched at all.
+2. Building-wide (BUILDING_LEVEL_FIELDS: special_features's building_
+   features fallback - see _match_building_feature - plus address_1/
+   postcode/submarket - see _match_building_value) - applied whenever the
+   row's own building exactly (normalize_key, see _building_identity_
+   matches) matches brochure content with its own distinct building-level
+   value, again regardless of whether a specific floor/unit within it can
+   be matched. address_1/postcode/submarket are building-wide facts, never
+   floor-specific, so they deliberately never require a unit match either -
+   see point 8 in the task this was built for: an ambiguous/unresolved
+   floor must never block a building-level fact this confident from filling.
+3. Floor/unit-specific (UNIT_LEVEL_FIELDS: special_features/state_of_space/
+   floor_unit/size_sqft/desks_max, plus HIGH_RISK_UNIT_LEVEL_FIELDS: rent_
+   pcm/rent_psf - see _match_unit) - only ever applied to the one row a
    specific floor/unit was confidently matched to; never leaks to a
    different floor in the same building, because it only ever comes from
    _match_unit's own conservative, exact-match-only building+floor
    identification (see that function's own docstring) - there is no fuzzy/
-   similarity matching anywhere in this module, at any of the three levels.
+   similarity matching anywhere in this module, at any of these scopes.
+   HIGH_RISK_UNIT_LEVEL_FIELDS uses the exact same matching mechanism as
+   UNIT_LEVEL_FIELDS (never a stricter/different one - there is no fuzzy
+   matching to strengthen it with) but is kept in its own category since a
+   wrong rent value is materially costlier than a wrong amenity note - see
+   that constant's own docstring. desks_min is deliberately never included
+   in either unit-level category - the brochure-extraction PROMPT (extract.
+   py) only ever asks for desks_max, the same existing project convention
+   already used for the direct-PDF-upload path; there is no per-unit
+   desks_min in a raw brochure unit dict to backfill from at all.
 
 No new ListingRow field is added for provenance - enrich_rows/enrich_rows_
 grouped return a separate log (see their own docstrings) instead, so a
@@ -93,6 +115,7 @@ import extract
 from brochure_link_resolver import (
     REQUEST_TIMEOUT, USER_AGENT, is_floorplan_not_brochure_url, is_generic_link, resolve_brochure_link,
 )
+import geocode
 from house_number import leading_house_number
 from master_merge import normalize_key
 from schema import ListingRow
@@ -133,15 +156,60 @@ def _trim_memory() -> None:
     except Exception:
         pass
 
-# The only fields enrich_row ever assigns to, and only when the row's own
-# value is blank - see the module docstring for why this list alone is the
-# safety mechanism, not a separate overwrite-guard. Deliberately narrow for
-# this first version: desks_min/desks_max/address_1/postcode are all
-# plausible future candidates (see brochure_link_resolver.py's own "start
-# conservative" precedent) but are not attempted here. contacts IS included -
-# see _apply_units_to_row's own docstring for why it's sourced differently
-# from the other two (a document-level value, never a per-unit one).
-ENRICHABLE_FIELDS = ("special_features", "state_of_space", "contacts")
+# Property/document-wide fields - see _apply_units_to_row's DOCUMENT-level
+# step. Genuinely true of every row sharing this brochure_link; contacts is
+# ALWAYS sourced this way (a document-level value, never a per-unit one -
+# see _apply_units_to_row's own docstring). special_features also has a
+# building-level and unit-level source (see BUILDING_LEVEL_FIELDS/UNIT_
+# LEVEL_FIELDS below) - property_features is only its widest, weakest one.
+PROPERTY_LEVEL_FIELDS = ("special_features", "contacts")
+
+# Building-wide fallback fields - see _apply_units_to_row's BUILDING-level
+# step / _match_building_value. Filled only when row.building confidently
+# identifies exactly one brochure building (_building_identity_matches) AND
+# every one of that building's own raw units agrees on a single, non-blank
+# value for the field - two or more conflicting values (or zero) leaves it
+# blank, same "incorrect enrichment is worse than missing" philosophy as
+# every other tier. Deliberately never requires a floor/unit match - an
+# address/postcode/submarket is true of the whole building regardless of
+# which floor a row describes (see the module docstring's own point 8).
+# special_features's own building-level source (_match_building_feature,
+# reading units.building_features - a SEPARATE, dedicated per-building text
+# list the extraction prompt already produces) is handled inline in
+# _apply_units_to_row, not via _match_building_value - kept out of this
+# tuple's own per-field loop for that reason, but still a genuine building-
+# level fallback for that field.
+BUILDING_LEVEL_FIELDS = ("address_1", "postcode", "submarket")
+
+# Unit-level fallback fields - see _apply_units_to_row's UNIT-level step /
+# _match_unit. Only ever applied to the one row a specific floor/unit was
+# confidently matched to - never a building- or property-wide fallback,
+# since none of these is safe to assume applies beyond the one unit it was
+# actually stated for. contacts is deliberately excluded here even though
+# it's in ENRICHABLE_FIELDS overall - see PROPERTY_LEVEL_FIELDS above.
+UNIT_LEVEL_FIELDS = ("special_features", "state_of_space", "floor_unit", "size_sqft", "desks_max")
+
+# Same exact-unit-match mechanism and confidence bar as UNIT_LEVEL_FIELDS
+# (there is no fuzzy matching in this module to make a field "even more
+# confident" with) - kept as its own category purely for auditability: a
+# wrong rent value quoted from a stale brochure is materially costlier than
+# a wrong amenity note, so this list exists as the one place to tighten
+# further later if a real failure ever motivates it, without touching the
+# lower-risk fields' own rule. Never derives one from the other (e.g. via
+# gemini_client.compute_rent) - each raw brochure unit already states its
+# own rent_pcm/rent_psf directly per the extraction PROMPT's "ONLY if
+# explicitly stated... do not calculate this yourself" instruction, so a
+# blank one here is filled only from that same unit's own explicit value,
+# never derived from its sibling field.
+HIGH_RISK_UNIT_LEVEL_FIELDS = ("rent_pcm", "rent_psf")
+
+# The full set of fields this module can ever fill, for the single top-
+# level "is there anything at all worth fetching a brochure for" gate (see
+# needs_enrichment) - dict.fromkeys dedupes special_features (present in
+# both PROPERTY_LEVEL_FIELDS and UNIT_LEVEL_FIELDS) while preserving order.
+ENRICHABLE_FIELDS = tuple(dict.fromkeys(
+    PROPERTY_LEVEL_FIELDS + BUILDING_LEVEL_FIELDS + UNIT_LEVEL_FIELDS + HIGH_RISK_UNIT_LEVEL_FIELDS
+))
 
 # Matched against the URL only (never a fetch) - a video is never a
 # brochure regardless of what it turns out to contain, and fetching one
@@ -831,6 +899,62 @@ def _match_building_feature(row: ListingRow, units):
     return None
 
 
+def _source_postcode_conflict(row: ListingRow, candidate_postcode: str) -> bool:
+    """
+    Reuses geocode.py's own source-postcode-evidence check (see that
+    module's _source_location_hint/_postcode_hint_conflicts) rather than a
+    second, independently-drifting implementation - True only when the row
+    ALREADY has its own postcode-district evidence (in row.postcode/
+    address_1/building) that genuinely disagrees with `candidate_postcode`
+    (e.g. row.building states "...WC1" but the brochure's matched building
+    states an "SE1" postcode) - never true when the row has no such
+    evidence at all, same permissive default as geocode.py's own check.
+    """
+    source_hint = geocode._source_location_hint(row)
+    if not source_hint:
+        return False
+    return geocode._postcode_hint_conflicts(source_hint, candidate_postcode)
+
+
+def _match_building_value(row: ListingRow, units, field: str):
+    """
+    The single, unambiguous value for `field` (one of BUILDING_LEVEL_FIELDS
+    - address_1/postcode/submarket) among every raw brochure unit whose own
+    "building" confidently identifies the SAME building as row.building
+    (see _building_identity_matches) - None when there's nothing to offer,
+    or when the matching units disagree on this field (two or more distinct
+    non-blank values - ambiguous, "incorrect enrichment is worse than
+    missing" applies here exactly as it does to _match_unit/_match_building_
+    feature), or (postcode only) when the row already has its own
+    conflicting postcode evidence (see _source_postcode_conflict, reusing
+    geocode.py's own validation rather than a parallel implementation).
+
+    Deliberately building-scoped, never floor-specific - correct for a
+    field genuinely true of the whole building regardless of which floor a
+    row describes (see the module docstring's own point 8: an unresolved
+    floor must never block a building-level fact this confident).
+    """
+    if not normalize_key(row.building):
+        return None
+    plain_units = [u for u in units if isinstance(u, dict)]
+    match_indices = _building_identity_matches(row.building, [u.get("building") for u in plain_units])
+    if not match_indices:
+        return None
+
+    values = set()
+    for i in match_indices:
+        value = plain_units[i].get(field)
+        if isinstance(value, str) and not _is_blank(value):
+            values.add(value.strip())
+    if len(values) != 1:
+        return None
+
+    value = next(iter(values))
+    if field == "postcode" and _source_postcode_conflict(row, value):
+        return None
+    return value
+
+
 def _safe_float(value):
     """float(value), or None for anything that isn't genuinely numeric -
     a raw Gemini unit's own size_sqft is supposed to be "a plain number"
@@ -843,6 +967,41 @@ def _safe_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+# ListingRow's own declared numeric type per field (see schema.py) - int
+# for desks_max, float for the other two. Used by _coerced_unit_value so a
+# raw Gemini number lands in `updates` as the SAME type ListingRow itself
+# declares, rather than whatever bare type happened to survive JSON
+# decoding (Gemini's JSON has no int/float distinction the way Python
+# does - a whole-number desk count can decode as either).
+_NUMERIC_UNIT_FIELD_TYPES = {"size_sqft": float, "desks_max": int, "rent_pcm": float, "rent_psf": float}
+
+
+def _coerced_unit_value(field: str, value):
+    """
+    `value` (raw Gemini JSON for one matched unit's own field) coerced to
+    the type ListingRow actually declares for `field`, or None when it
+    isn't a genuine, usable value - never raises, same "one bad value
+    degrades to no match" philosophy as _safe_float/_match_unit throughout
+    this module.
+
+    A string field (floor_unit/state_of_space/special_features) must be a
+    real, non-blank str - see _apply_units_to_row's own docstring on why
+    raw Gemini JSON is never trusted to already be the right type. A
+    numeric field (size_sqft/desks_max/rent_pcm/rent_psf - see
+    _NUMERIC_UNIT_FIELD_TYPES) must parse as a real number (see
+    _safe_float); desks_max is additionally rounded to the nearest int,
+    since ListingRow declares it Optional[int], not float.
+    """
+    if field in _NUMERIC_UNIT_FIELD_TYPES:
+        number = _safe_float(value)
+        if number is None:
+            return None
+        return round(number) if _NUMERIC_UNIT_FIELD_TYPES[field] is int else number
+    if isinstance(value, str) and not _is_blank(value):
+        return value
+    return None
 
 
 def _apply_units_to_row(row: ListingRow, units):
@@ -863,45 +1022,54 @@ def _apply_units_to_row(row: ListingRow, units):
 
     Three independent sources, applied at three different scopes, from
     widest to narrowest - see the module docstring for the full "widest
-    safe level" rationale. Each later, narrower source OVERWRITES the same
-    key in `updates` set by an earlier, wider one when both apply, since a
-    more specific value is always preferred over a less specific one:
+    safe level" rationale and PROPERTY_LEVEL_FIELDS/BUILDING_LEVEL_FIELDS/
+    UNIT_LEVEL_FIELDS/HIGH_RISK_UNIT_LEVEL_FIELDS for exactly which fields
+    each scope covers. Each later, narrower source OVERWRITES the same key
+    in `updates` set by an earlier, wider one when both apply, since a more
+    specific value is always preferred over a less specific one:
 
-    1. DOCUMENT-level (contacts, special_features's property_features
-       fallback - see units.property_features/units.contacts, set by
-       _extract_brochure_units) - genuinely true of every row sharing this
-       brochure_link regardless of which floor/unit or even which building
-       it is, so both are applied even when neither of the two steps below
-       finds anything. contacts is ALWAYS sourced this way, never from a
-       per-unit dict - the extraction prompt only ever asks for contacts
-       once, for the whole document (see extract.py's own PROMPT), so no
-       per-unit dict ever carries its own "contacts" key.
-    2. BUILDING-level (special_features's building_features fallback - see
-       _match_building_feature) - applied whenever the row's own building
-       exactly matches one brochure building with distinct building-wide
-       text, again regardless of whether a specific floor/unit can be
-       matched - a building-wide fact is still true of every floor in that
-       building even when this particular row's own floor can't be pinned
-       down.
-    3. UNIT-level (state_of_space, and special_features's own value when
-       present - see _match_unit) - only ever applied when a SPECIFIC
-       floor/unit is confidently matched, since neither is safe to assume
-       applies beyond the one unit it was actually stated for.
+    1. DOCUMENT-level (PROPERTY_LEVEL_FIELDS - contacts, special_features's
+       property_features fallback - see units.property_features/units.
+       contacts, set by _extract_brochure_units) - genuinely true of every
+       row sharing this brochure_link regardless of which floor/unit or
+       even which building it is, so both are applied even when neither of
+       the two steps below finds anything. contacts is ALWAYS sourced this
+       way, never from a per-unit dict - the extraction prompt only ever
+       asks for contacts once, for the whole document (see extract.py's
+       own PROMPT), so no per-unit dict ever carries its own "contacts" key.
+    2. BUILDING-level (BUILDING_LEVEL_FIELDS - address_1/postcode/submarket,
+       via _match_building_value - plus special_features's building_
+       features fallback, via _match_building_feature) - applied whenever
+       the row's own building exactly matches brochure content with
+       distinct building-wide text/values, again regardless of whether a
+       specific floor/unit can be matched - a building-wide fact is still
+       true of every floor in that building even when this particular
+       row's own floor can't be pinned down (see the module docstring's
+       own point 8).
+    3. UNIT-level (UNIT_LEVEL_FIELDS - state_of_space, floor_unit,
+       size_sqft, desks_max, and special_features's own value when present;
+       HIGH_RISK_UNIT_LEVEL_FIELDS - rent_pcm, rent_psf - see _match_unit)
+       - only ever applied when a SPECIFIC floor/unit is confidently
+       matched, since none of these is safe to assume applies beyond the
+       one unit it was actually stated for.
 
-    Every value taken from `units`/`unit` must be a genuine str - fields
-    are Optional[str] on ListingRow, but `units`/`unit` are raw Gemini JSON
-    that, unlike the primary upload path's own units (validated through
+    Every value taken from `units`/`unit` is coerced to ListingRow's own
+    declared type for that field before being trusted (see _coerced_unit_
+    value for numeric fields, plain isinstance(str) for text ones) - fields
+    are typed on ListingRow, but `units`/`unit` are raw Gemini JSON that,
+    unlike the primary upload path's own units (validated through
     ExtractedFields - see extract.extract()), never passes through any
     schema validation at all before reaching here. model_copy(update=...)
     below does NOT re-validate its update dict (unlike constructing a
     ListingRow directly) - it would otherwise silently accept whatever type
     Gemini's JSON happened to produce (e.g. a list, if a future prompt
     tweak ever led it to return special_features as an array instead of the
-    prompt's own requested semicolon-separated string) directly into a
-    ListingRow field that every other reader (Excel writing, text diffing
-    in master_merge.py) assumes is a plain string. Treated exactly like a
-    blank value in that case - nothing to enrich from this field, not a
-    reason to fail the whole row or the run.
+    prompt's own requested semicolon-separated string, or a numeric string
+    for size_sqft) directly into a ListingRow field that every other reader
+    (Excel writing, text diffing in master_merge.py) assumes is the
+    declared type. Treated exactly like a blank value in that case -
+    nothing to enrich from this field, not a reason to fail the whole row
+    or the run.
     """
     updates = {}
 
@@ -918,14 +1086,21 @@ def _apply_units_to_row(row: ListingRow, units):
         if _is_blank(row.special_features) and isinstance(building_features, str) and not _is_blank(building_features):
             updates["special_features"] = building_features  # more specific than property_features above
 
+        for field in BUILDING_LEVEL_FIELDS:
+            if not _is_blank(getattr(row, field)):
+                continue
+            value = _match_building_value(row, units, field)
+            if value is not None:
+                updates[field] = value
+
     if units:
         unit = _match_unit(row, units)
         if unit is not None:
-            for field in ENRICHABLE_FIELDS:
-                if field == "contacts":
-                    continue  # document-level only - see this function's own docstring
-                value = unit.get(field)
-                if _is_blank(getattr(row, field)) and isinstance(value, str) and not _is_blank(value):
+            for field in UNIT_LEVEL_FIELDS + HIGH_RISK_UNIT_LEVEL_FIELDS:
+                if not _is_blank(getattr(row, field)):
+                    continue
+                value = _coerced_unit_value(field, unit.get(field))
+                if value is not None:
                     updates[field] = value  # a genuine unit match beats both fallbacks above
 
     if not updates:
