@@ -565,7 +565,10 @@ class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
 
     _staged_counter = 0
 
-    def _staged(self, content_hash, status=None, processed_urls=None, unique=1, n_rows=275, filename="UNION.xlsx"):
+    def _staged(
+        self, content_hash, status=None, processed_urls=None, unique=1, n_rows=275, filename="UNION.xlsx",
+        source_identity_hash=None,
+    ):
         # save_staging_file's own path is {second-resolution timestamp}_
         # {filename stem}.xlsx (see its own docstring) - a distinct suffix
         # per call here guarantees a distinct staging path regardless of
@@ -582,6 +585,7 @@ class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
         unique_filename = f"{stem}__{type(self)._staged_counter}{suffix}"
         path = file_store.save_staging_file(
             [ListingRow(building="A")] * n_rows, unique_filename, content_hash=content_hash,
+            source_identity_hash=source_identity_hash,
         )
         meta = file_store._read_meta(path)
         meta["filename"] = filename
@@ -708,6 +712,78 @@ class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
 
         self.assertEqual(active, [c])
         self.assertEqual(set(superseded), {a, b})
+
+    # Real, confirmed SECOND-round production report: re-uploading the same
+    # source file across a real code change (a fix landing between two
+    # uploads of the same real file) still duplicated every real listing,
+    # even after this class's own content_hash-based supersession existed -
+    # because content_hash itself bakes in the CURRENT code's own logic
+    # fingerprint, so the SAME real file re-processed under different code
+    # gets a genuinely different content_hash and was never recognized as
+    # the same upload at all. source_identity_hash (the real bytes alone,
+    # excluding that fingerprint) closes this gap.
+    def test_different_content_hash_but_same_source_identity_hash_is_still_grouped(self):
+        stale = self._staged(
+            "fingerprint-1-bytes", status="complete", unique=1, source_identity_hash="same-real-file",
+        )
+        fresh = self._staged(
+            "fingerprint-2-bytes", status="complete", unique=1, source_identity_hash="same-real-file",
+        )
+
+        groups = file_store.group_pending_by_content_hash([stale, fresh])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(set(next(iter(groups.values()))), {stale, fresh})
+
+        active, superseded = file_store.active_and_superseded_staging_files([stale, fresh])
+        self.assertEqual(len(active), 1)
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(set(active) | set(superseded), {stale, fresh})
+
+    def test_three_reuploads_across_three_fingerprints_still_resolve_to_exactly_one_active(self):
+        # The exact real shape: re-uploading the same source file across
+        # THREE separate code changes (three real fixes shipped in
+        # succession while the same file kept getting re-tested) must
+        # still collapse to exactly one active copy - never accumulate a
+        # growing pile of stale, never-superseded pending entries that all
+        # keep contributing their own rows to every later Review render.
+        first = self._staged(
+            "fingerprint-1", status="in_progress", unique=1, source_identity_hash="same-real-file",
+        )
+        second = self._staged(
+            "fingerprint-2", status="in_progress", unique=1, source_identity_hash="same-real-file",
+        )
+        third = self._staged(
+            "fingerprint-3", status="complete", unique=1, source_identity_hash="same-real-file",
+        )
+
+        active, superseded = file_store.active_and_superseded_staging_files([first, second, third])
+
+        self.assertEqual(active, [third])
+        self.assertEqual(set(superseded), {first, second})
+
+    def test_different_source_identity_hash_is_never_grouped_even_with_shared_content_hash_prefix(self):
+        # Two genuinely different real files must never be treated as the
+        # same upload merely by coincidence - source_identity_hash is the
+        # authoritative identity signal once present.
+        a = self._staged("hash-a", status="complete", unique=1, source_identity_hash="file-a-bytes")
+        b = self._staged("hash-b", status="complete", unique=1, source_identity_hash="file-b-bytes")
+
+        active, superseded = file_store.active_and_superseded_staging_files([a, b])
+
+        self.assertEqual(set(active), {a, b})
+        self.assertEqual(superseded, [])
+
+    def test_legacy_entries_with_no_source_identity_hash_still_fall_back_to_content_hash(self):
+        # A staging entry written before source_identity_hash existed
+        # (None recorded) must keep working exactly as before this change -
+        # grouped by content_hash alone, same as always.
+        a = self._staged("hash-union-legacy", status="complete", unique=1)
+        b = self._staged("hash-union-legacy", status="in_progress", unique=1)
+
+        active, superseded = file_store.active_and_superseded_staging_files([a, b])
+
+        self.assertEqual(active, [a])
+        self.assertEqual(superseded, [b])
 
 
 if __name__ == "__main__":

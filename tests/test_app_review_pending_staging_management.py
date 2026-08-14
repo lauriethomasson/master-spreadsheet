@@ -425,5 +425,174 @@ class SinglePendingUploadDiscardControlTests(unittest.TestCase):
         self.assertIn("5", caption_text)
 
 
+class ReuploadAcrossACodeFingerprintChangeTests(unittest.TestCase):
+    """
+    The real, confirmed second-round report: re-uploading "The Workplace
+    Company Availability" file STILL duplicated Oliver's Yard even after
+    commit c97db78's master_merge.py fix. Traced to a genuinely different
+    stage: content_hash bakes in the CURRENT code's own logic fingerprint
+    (_SPREADSHEET_LOGIC_FINGERPRINT in app.py), so re-uploading the exact
+    same source file across a real code change (a fix landing between two
+    uploads of the same real file during iterative development/testing)
+    produces a DIFFERENT content_hash - active_and_superseded_staging_
+    files' own content_hash-based grouping never recognized the earlier,
+    now-stale pending copy as superseded by the new one, so BOTH stayed
+    "active" and both contributed their own Oliver's Yard rows to the same
+    merge plan indefinitely, regardless of how good master_merge's own
+    listing-evidence clustering is - the duplicate rows were already
+    present in the combined new_rows list BEFORE build_merge_plan ever
+    runs.
+
+    Fixed by save_staging_file also recording source_identity_hash (the
+    real uploaded bytes + decisions ALONE, deliberately excluding the code
+    fingerprint) and having the grouping key prefer it over content_hash
+    (see storage.file_store._grouping_hash). This suite reproduces the
+    real lifecycle directly at the staging layer - two "uploads" of the
+    exact same real Oliver's Yard values, given DIFFERENT content_hash
+    (simulating two different code fingerprints) but the SAME
+    source_identity_hash (the same real file bytes) - through the REAL,
+    unmocked Review & Master page, never a synthetic call straight into
+    master_merge's own clustering function.
+    """
+
+    def setUp(self):
+        self._original_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._original_cwd)
+        self._tmp.cleanup()
+
+    def _oliver_rows(self, enriched: bool) -> list:
+        # Mirrors the real reported values exactly - two genuinely
+        # distinct listings sharing building/provider/postcode/blank
+        # floor_unit. `enriched=False` reproduces the real pre-enrichment/
+        # pre-fix shape (desks only); `enriched=True` reproduces the
+        # fully-enriched shape a later, working extraction produces.
+        size_a, rent_a, psf_a = (7282.0, 45512.0, 75.0) if enriched else (None, None, None)
+        size_b, rent_b, psf_b = (42892.0, 230811.0, 64.57) if enriched else (None, None, None)
+        return [
+            ListingRow(
+                building="1 Oliver's Yard", provider="The Workplace Company", postcode="EC1Y 1DT",
+                address_1="1 Oliver's Yard", submarket="City Fringe",
+                size_sqft=size_a, desks_min=52, desks_max=68, rent_pcm=rent_a, rent_psf=psf_a,
+            ),
+            ListingRow(
+                building="1 Oliver's Yard", provider="The Workplace Company", postcode="EC1Y 1DT",
+                address_1="1 Oliver's Yard", submarket="City Fringe",
+                size_sqft=size_b, desks_min=200, desks_max=400, rent_pcm=rent_b, rent_psf=psf_b,
+            ),
+        ]
+
+    def _staged_upload(self, rows, content_hash, source_identity_hash, filename):
+        return file_store.save_staging_file(
+            rows, filename, content_hash=content_hash, source_identity_hash=source_identity_hash,
+        )
+
+    def _open_review(self):
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+        return at
+
+    def test_single_upload_of_the_two_distinct_listings_yields_exactly_two_rows(self):
+        # Step 1: upload/extract Oliver's Yard.
+        self._staged_upload(
+            self._oliver_rows(enriched=False), content_hash="fingerprint-1-bytes",
+            source_identity_hash="same-real-file-bytes", filename="Workplace Company.xlsx",
+        )
+
+        at = self._open_review()
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("2", caption_text)
+
+    def test_reupload_after_a_code_fingerprint_change_still_yields_exactly_two_rows(self):
+        # Step 1: original upload, staged BEFORE a code fix shipped (blank
+        # size/rent - not yet enriched/fixed).
+        self._staged_upload(
+            self._oliver_rows(enriched=False), content_hash="fingerprint-1-bytes",
+            source_identity_hash="same-real-file-bytes", filename="Workplace Company.xlsx",
+        )
+        # Step 2: same real file re-uploaded AFTER a real code fix shipped
+        # in between (see this class's own docstring) - a DIFFERENT
+        # content_hash (different fingerprint), but the SAME
+        # source_identity_hash (the same real file bytes) - now fully
+        # enriched. The original, now-stale entry above is never discarded
+        # - exactly the real reported scenario.
+        self._staged_upload(
+            self._oliver_rows(enriched=True), content_hash="fingerprint-2-bytes",
+            source_identity_hash="same-real-file-bytes", filename="Workplace Company.xlsx",
+        )
+
+        at = self._open_review()
+
+        # Step 3: build the review/master data and confirm exactly 2
+        # Oliver's Yard listings - never 4.
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        self.assertEqual(len(approve_buttons), 1)
+        approve_buttons[0].click().run()
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 2)
+        self.assertEqual(sorted(master_df["size_sqft"]), [7282.0, 42892.0])
+        self.assertEqual(sorted(master_df["rent_pcm"]), [45512.0, 230811.0])
+
+    def test_a_second_reupload_after_another_fingerprint_change_still_yields_exactly_two(self):
+        # Steps 1-2 as above, PLUS a third "upload" under yet another
+        # fingerprint (simulating a second later code change/re-upload
+        # cycle) - must still resolve to exactly 2, never 4 or 6.
+        self._staged_upload(
+            self._oliver_rows(enriched=False), content_hash="fingerprint-1-bytes",
+            source_identity_hash="same-real-file-bytes", filename="Workplace Company.xlsx",
+        )
+        self._staged_upload(
+            self._oliver_rows(enriched=False), content_hash="fingerprint-2-bytes",
+            source_identity_hash="same-real-file-bytes", filename="Workplace Company.xlsx",
+        )
+        self._staged_upload(
+            self._oliver_rows(enriched=True), content_hash="fingerprint-3-bytes",
+            source_identity_hash="same-real-file-bytes", filename="Workplace Company.xlsx",
+        )
+
+        at = self._open_review()
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 2)
+        self.assertEqual(sorted(master_df["size_sqft"]), [7282.0, 42892.0])
+
+    def test_two_legitimate_units_in_a_different_building_remain_separate(self):
+        # Confirms the fix doesn't over-correct into globally deduplicating
+        # legitimate multiple listings/floors sharing a building.
+        rows = [
+            ListingRow(
+                building="Elsewhere House", provider="Some Provider", floor_unit="1st Floor",
+                postcode="W1A 1AA", size_sqft=1000.0, rent_pcm=5000.0,
+            ),
+            ListingRow(
+                building="Elsewhere House", provider="Some Provider", floor_unit="2nd Floor",
+                postcode="W1A 1AA", size_sqft=2000.0, rent_pcm=8000.0,
+            ),
+        ]
+        self._staged_upload(
+            rows, content_hash="fingerprint-1-elsewhere",
+            source_identity_hash="elsewhere-file-bytes", filename="Elsewhere.xlsx",
+        )
+        self._staged_upload(
+            rows, content_hash="fingerprint-2-elsewhere",
+            source_identity_hash="elsewhere-file-bytes", filename="Elsewhere.xlsx",
+        )
+
+        at = self._open_review()
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 2)
+        self.assertEqual(sorted(master_df["floor_unit"]), ["1st Floor", "2nd Floor"])
+
+
 if __name__ == "__main__":
     unittest.main()

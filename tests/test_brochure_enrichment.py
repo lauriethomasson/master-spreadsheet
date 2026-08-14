@@ -648,6 +648,22 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         self.assertEqual(mock_post.call_args.args[0], "https://canva-renderer.example.run.app/render")
         self.assertEqual(mock_post.call_args.kwargs["json"], {"url": _CANVA_URL})
 
+    def test_successful_render_logs_a_single_unambiguous_success_line(self):
+        # The ONE clear, greppable Cloud Run log line confirming the whole
+        # authenticated round trip worked - distinct from every failure
+        # message (renderer unreachable/auth failed/render failed), so an
+        # operator can tell "rendering itself worked" apart from "Gemini
+        # then found nothing useful" without ambiguity.
+        response = MagicMock(status_code=200, content=b"\x89PNG real bytes", headers={"content-type": "image/png"})
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Canva render succeeded", logged)
+
     def test_renderer_unreachable_returns_none_and_records_fetch_failed(self):
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch("brochure_enrichment.httpx.post", side_effect=httpx.ConnectError("dns failure")):
@@ -766,6 +782,27 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
         mock_render_pages.assert_called_once_with(b"\x89PNG fake render")
         mock_extract.assert_called_once()
         self.assertEqual(stats["document_issues"], [])
+
+    def test_successful_canva_enrichment_logs_exactly_which_fields_were_added(self):
+        # The "brochure enrichment succeeded and which fields were added"
+        # diagnostic - distinct from "Canva render succeeded" (which only
+        # confirms rendering, not that Gemini found anything usable, let
+        # alone that it actually changed a real row).
+        rows = [ListingRow(building="Metropolitan Wharf", floor_unit="3rd", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Roof terrace"}]},
+                ), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Canva enrichment applied", logged)
+        self.assertIn("special_features", logged)
+        self.assertIn("Metropolitan Wharf", logged)
 
     def test_renderer_failure_leaves_row_unchanged_and_records_an_issue(self):
         rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None)]

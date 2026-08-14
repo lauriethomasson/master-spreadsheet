@@ -625,6 +625,19 @@ with page_setup.setup_page("upload"):
                             if p["classification"] and p["classification"]["outcome"] == "ambiguous"
                         }
                         content_hash = _spreadsheet_content_hash(file_bytes, decisions_for_this_file)
+                        # The real bytes + decisions ALONE, no code-logic
+                        # fingerprint - see save_staging_file's own
+                        # source_identity_hash docstring for the real,
+                        # confirmed gap this closes (re-uploading the same
+                        # source across a code change getting a different
+                        # content_hash, so a stale pending copy was never
+                        # recognized as superseded). Reuses file_hash (the
+                        # same raw-bytes hash already computed above) rather
+                        # than hashing file_bytes a second time.
+                        decisions_repr = json.dumps(decisions_for_this_file, sort_keys=True).encode("utf-8")
+                        source_identity_hash = hashlib.sha256(
+                            file_hash.encode("utf-8") + b"\0" + decisions_repr
+                        ).hexdigest()
                     else:
                         # geocode.py's own source is folded in here too, same
                         # as _SPREADSHEET_LOGIC_FINGERPRINT above and for the
@@ -646,6 +659,12 @@ with page_setup.setup_page("upload"):
                             + Path(geocode.__file__).read_bytes()
                         )
                         content_hash = hashlib.sha256(versioned_content).hexdigest()
+                        # Same idea as the spreadsheet branch above - the
+                        # real bytes alone, no EXTRACTION_VERSION/geocode.py
+                        # fingerprint, so a re-upload of the same PDF/email
+                        # across a code change is still recognized as
+                        # superseding an earlier, stale pending copy.
+                        source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
 
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
                     fully_occupied_buildings = []
@@ -895,6 +914,7 @@ with page_setup.setup_page("upload"):
                     staging_path = save_staging_file(
                         rows, uploaded_file.name, content_hash=content_hash,
                         fully_occupied_buildings=fully_occupied_buildings,
+                        source_identity_hash=source_identity_hash,
                     )
 
                     # Shown for every spreadsheet upload, whether or not

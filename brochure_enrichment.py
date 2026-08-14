@@ -1047,6 +1047,20 @@ def _fetch_canva_rendered_page(url: str):
         _record_status(STATUS_RENDER_FAILED, f"Canva render failed: {reason}")
         return None
 
+    # The ONE clear, positive confirmation the whole authenticated round
+    # trip actually worked - main app -> ID token -> Cloud Run IAM ->
+    # renderer -> Chromium -> PNG back. Every failure mode above already
+    # prints its own distinct message; this is deliberately the only
+    # SUCCESS line for Canva specifically, so grepping Cloud Run logs for
+    # "Canva render succeeded" is a single, unambiguous way to confirm
+    # rendering itself worked for a given URL, separate from whether the
+    # subsequent Gemini extraction (see _extract_brochure_units) then
+    # found anything useful in it.
+    print(
+        f"[brochure_enrichment] Canva render succeeded for {url!r} ({len(response.content)} bytes) — "
+        "handing off to the existing extraction pipeline.",
+        file=sys.stderr,
+    )
     return response.content
 
 
@@ -2353,6 +2367,20 @@ def enrich_rows_grouped(
                     new_row, fields = rows[i], []
                 current[i] = new_row
                 if fields:
+                    if is_canva_view_link(url):
+                        # Distinct, greppable confirmation that a Canva-
+                        # sourced render made it all the way through the
+                        # existing extraction pipeline AND actually
+                        # produced usable field values on a real row - the
+                        # final link in the chain _fetch_canva_rendered_
+                        # page's own "Canva render succeeded" log confirms
+                        # only the rendering half of (see this module's own
+                        # "prove Canva end-to-end" verification).
+                        print(
+                            f"[brochure_enrichment] Canva enrichment applied {fields} to "
+                            f"{new_row.building!r} ({new_row.floor_unit!r}).",
+                            file=sys.stderr,
+                        )
                     log.append({
                         "building": new_row.building,
                         "floor_unit": new_row.floor_unit,

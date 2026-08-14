@@ -52,7 +52,7 @@ def _write_meta(xlsx_path: str, meta: dict) -> None:
 
 def save_staging_file(
     rows: list[ListingRow], original_filename: str, content_hash: str = None,
-    fully_occupied_buildings: list = None,
+    fully_occupied_buildings: list = None, source_identity_hash: str = None,
 ) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     stem = Path(original_filename).stem
@@ -69,6 +69,21 @@ def save_staging_file(
             "status": "pending_review",
             "n_rows": len(rows),
             "content_hash": content_hash,
+            # The real uploaded bytes (+ ambiguous-sheet decisions for a
+            # spreadsheet) ALONE - deliberately NOT including content_hash's
+            # own code-logic fingerprint (_SPREADSHEET_LOGIC_FINGERPRINT/
+            # EXTRACTION_VERSION+geocode.py) - see active_and_superseded_
+            # staging_files' own docstring for the real, confirmed gap this
+            # closes: re-uploading the literal same source file across a
+            # code change (a real fix landing between two test uploads of
+            # the same real file) gets a DIFFERENT content_hash purely from
+            # that fingerprint change, so it was never recognized as
+            # superseding the earlier, now-stale pending copy of that exact
+            # same source - both stayed "active" and both contributed rows
+            # to the same merge plan. None for a staging entry written
+            # before this field existed - group_pending_by_content_hash
+            # falls back to content_hash for those, unchanged from before.
+            "source_identity_hash": source_identity_hash,
             # {"provider", "building"} dicts (see extract_spreadsheet_gemini.
             # extract_sheet_with_metadata) - buildings this upload's own
             # source text explicitly states have zero current availability.
@@ -476,34 +491,56 @@ def _enrichment_completeness_rank(path: str) -> tuple:
     return (status_rank, stats.get("brochures_done", 0))
 
 
+def _grouping_hash(meta: dict) -> str:
+    """
+    The hash group_pending_by_content_hash/active_and_superseded_staging_
+    files actually groups by - source_identity_hash (the real uploaded
+    bytes + any ambiguous-sheet decisions, see save_staging_file's own
+    docstring) when present, falling back to content_hash (which also
+    bakes in the current code's own logic fingerprint) for a staging entry
+    written before source_identity_hash existed. Real, confirmed gap this
+    closes: content_hash ALONE means re-uploading the literal same source
+    file across a code change (a real fix landing between two uploads of
+    the same real file, during genuine iterative development/testing) gets
+    a DIFFERENT hash purely from that fingerprint change, so the earlier,
+    now-stale pending copy was never recognized as superseded by the new
+    one - both stayed "active" and both contributed their own rows to the
+    same merge plan, duplicating every real listing in that file. Grouping
+    on the fingerprint-independent identity instead means ANY two uploads
+    of the same real bytes (with the same ambiguous-sheet decisions, for a
+    spreadsheet) are recognized as the same upload regardless of how many
+    code changes happened in between.
+    """
+    return meta.get("source_identity_hash") or meta.get("content_hash")
+
+
 def group_pending_by_content_hash(pending: list) -> dict:
     """
-    {content_hash: [paths...]} for every entry in `pending` that has a
-    genuine, non-blank content_hash of its own - grouping candidate
-    staging files that are BYTE-IDENTICAL uploads of the same source file
-    (see _spreadsheet_content_hash/EXTRACTION_VERSION in app.py), never a
-    fuzzy or extracted-content-based match. An entry with no content_hash
-    at all (a pre-this-feature upload, or any future upload type that
-    doesn't set one) is deliberately EXCLUDED here rather than grouped
-    under some placeholder key - it has nothing reliable to be compared
-    against, so active_and_superseded_staging_files' own caller must
-    treat every path missing from this dict's own values as its own,
-    always-active singleton.
+    {hash: [paths...]} for every entry in `pending` that has a genuine,
+    non-blank grouping hash of its own (see _grouping_hash) - grouping
+    candidate staging files that are uploads of the same real source file,
+    never a fuzzy or extracted-content-based match. An entry with no
+    grouping hash at all (a pre-this-feature upload with neither field
+    set, or any future upload type that doesn't set one) is deliberately
+    EXCLUDED here rather than grouped under some placeholder key - it has
+    nothing reliable to be compared against, so active_and_superseded_
+    staging_files' own caller must treat every path missing from this
+    dict's own values as its own, always-active singleton.
     """
     groups = {}
     for path in pending:
-        content_hash = _read_meta(path).get("content_hash")
-        if content_hash:
-            groups.setdefault(content_hash, []).append(path)
+        grouping_hash = _grouping_hash(_read_meta(path))
+        if grouping_hash:
+            groups.setdefault(grouping_hash, []).append(path)
     return groups
 
 
 def active_and_superseded_staging_files(pending: list) -> tuple:
     """
     (active_paths, superseded_paths), both subsets of `pending`, in `pending`'s
-    own relative order - splits pending staging files by content_hash
-    identity (see group_pending_by_content_hash) so Review & Master's own
-    merge-plan combination (see pages/2_Review_and_Master.py's
+    own relative order - splits pending staging files by SOURCE identity
+    (see group_pending_by_content_hash/_grouping_hash) so Review & Master's
+    own merge-plan combination (see pages/2_Review_and_Master.py's
     _render_pending_review) reads rows from exactly ONE staging file per
     genuinely distinct uploaded document, never once per PROCESSING RUN of
     the same document.
@@ -512,15 +549,25 @@ def active_and_superseded_staging_files(pending: list) -> tuple:
     an earlier run's brochure enrichment was still incomplete (or simply
     re-uploading it again later) creates a SECOND staging entry - by
     design, see save_staging_file's own docstring on per-upload durability
-    - that shares the first one's content_hash. Combining both into one
+    - that shares the first one's source identity. Combining both into one
     Review batch double-counts every real property in that file (275 rows
     -> 550) and forces master_merge's own intra-batch duplicate logic to
     reconcile hundreds of pairs that are really "the same upload, two
     processing runs" rather than genuine duplicates - producing false
     conflicts whenever the two runs' own independent geocoding happened to
-    disagree, on top of just being needless work.
+    disagree, on top of just being needless work. This grouping is
+    deliberately based on source_identity_hash (the real bytes alone), NOT
+    the code-fingerprint-dependent content_hash, for the same reason - a
+    second, real, confirmed report: re-uploading the exact same source file
+    again LATER, after a genuine code fix shipped in between the two
+    uploads, changed content_hash purely from that fingerprint change, so
+    the stale, pre-fix pending copy was never recognized as superseded
+    either - it kept contributing its own (now-outdated) rows to every
+    later Review render indefinitely, silently duplicating every real
+    listing in that file across however many code changes happened while
+    it sat there un-discarded.
 
-    Within a content_hash group of 2+ staging files, exactly ONE is
+    Within a source-identity group of 2+ staging files, exactly ONE is
     "active" (the one whose brochure-enrichment state is most complete -
     see _enrichment_completeness_rank; a genuine tie breaks toward the
     most recently written entry, the LAST resort here, never the primary
