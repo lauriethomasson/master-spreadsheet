@@ -792,6 +792,31 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
             headers = brochure_enrichment._canva_renderer_auth_headers("https://canva-renderer.example.run.app")
         self.assertEqual(headers, {})
 
+    def test_old_format_image_response_is_distinguished_as_a_deployment_skew(self):
+        # Regression guard for the real diagnostic question this was added
+        # to answer: "multi-page support was implemented but production
+        # still shows one page" - one likely cause is the canva-renderer
+        # Cloud Run service simply not having been redeployed yet, still
+        # returning its OLD raw image/png body instead of the new JSON
+        # {"pages": [...]}  format. This must be logged as a DISTINCT,
+        # actionable message - never conflated with a generic render
+        # failure - since a real render failure never returns 200 with
+        # image bytes at all.
+        response = MagicMock(status_code=200, content=b"\x89PNG old format bytes", headers={"content-type": "image/png"})
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIn("outdated", sink["detail"])
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("OLD-FORMAT", logged)
+        self.assertIn("needs redeploying", logged)
+
 
 class FetchPdfBytesCanvaRoutingTests(EnrichmentTestCase):
     def test_fetch_pdf_bytes_routes_canva_urls_through_the_renderer(self):
@@ -1029,6 +1054,66 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
         self.assertEqual(enriched[0].rent_pcm, 7595.5)
         self.assertEqual(enriched[0].rent_psf, 33)
         self.assertEqual(stats["document_issues"], [])
+
+    def test_canva_extraction_summary_is_logged(self):
+        # The "what did Gemini actually return" diagnostic - lets a
+        # production log distinguish "Gemini found nothing useful" from
+        # "Gemini found something but matching/apply rejected it", which
+        # were previously indistinguishable from the logs alone.
+        rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, contacts=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={
+                        "units": [{"building": "Metropolitan Wharf"}],
+                        "contacts": "Harry James - hj@theworkplacecompany.co.uk",
+                    },
+                ), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Canva extraction for", logged)
+        self.assertIn("contacts=present", logged)
+
+    def test_canva_extraction_summary_is_never_logged_for_non_canva_brochures(self):
+        # Scoping guard - this new diagnostic must never add log noise to
+        # the PDF/Box/Dropbox/GDrive paths, which never had it before.
+        rows = [ListingRow(building="Good Co", brochure_link="https://example.com/good.pdf", contacts=None)]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Good Co"}], "contacts": "Someone - x@example.com"},
+                ), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertNotIn("Canva extraction for", logged)
+
+    def test_blank_fields_after_successful_canva_extraction_are_logged_with_a_reason(self):
+        # The "matched/rejected" diagnostic - the document read fine (see
+        # the extraction-summary log) but THIS row still has blank fields
+        # afterward; this names them and says why, rather than staying
+        # silently indistinguishable from "the document had nothing at all".
+        rows = [ListingRow(building="Unrelated Building", floor_unit="9th", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Roof terrace"}]},
+                ), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("left", logged)
+        self.assertIn("special_features", logged)
+        self.assertIn("no confident match for this row", logged)
 
 
 class LooksLikeFetchableDocumentTests(unittest.TestCase):

@@ -1138,7 +1138,31 @@ def _fetch_canva_rendered_page(url: str):
         _record_status(STATUS_FETCH_FAILED, "Canva renderer authentication failed")
         return None
 
-    if response.status_code != 200 or "application/json" not in response.headers.get("content-type", ""):
+    content_type = response.headers.get("content-type", "")
+    if response.status_code == 200 and "application/json" not in content_type and "image/" in content_type:
+        # Distinguished from every other failure shape below - a 200 with
+        # an image/* content-type is exactly what the OLD, single-page-only
+        # renderer returned (see this repo's history before multi-page
+        # capture: canva_renderer/app.py used to respond with a raw PNG
+        # body, not the {"pages": [...]} JSON this app now expects). This
+        # is the one failure shape that means "the two services are on
+        # mismatched versions", not "Canva/the render itself failed" - a
+        # genuine render failure never returns 200 with image bytes at all.
+        # Loud and specific on purpose: this is the single most likely
+        # cause of "Canva enrichment silently does nothing in production
+        # despite the multi-page code being merged" - the canva-renderer
+        # Cloud Run service simply hasn't been redeployed with it yet.
+        print(
+            f"[brochure_enrichment] Canva renderer for {url!r} returned an OLD-FORMAT single-image "
+            f"response (content-type {content_type!r}) instead of the expected JSON {{'pages': [...]}} "
+            "body — the canva-renderer Cloud Run service needs redeploying with the current multi-page "
+            "code (see canva_renderer/README.md) — skipping enrichment.",
+            file=sys.stderr,
+        )
+        _record_status(STATUS_RENDER_FAILED, "Canva renderer is running an outdated single-page image response")
+        return None
+
+    if response.status_code != 200 or "application/json" not in content_type:
         try:
             reason = response.json().get("reason", f"HTTP {response.status_code}")
         except Exception:
@@ -1426,6 +1450,22 @@ def _extract_brochure_units(url: str):
     ]
     has_data = bool(units) or bool(units.property_features) or bool(units.contacts) or bool(units.building_features)
     _record_status(STATUS_EXTRACTED_SUCCESSFULLY if has_data else STATUS_EXTRACTED_NO_USEFUL_DATA)
+    if is_canva_view_link(url):
+        # Canva-specific diagnostic only (never printed for the PDF/Box/
+        # Dropbox/GDrive paths, which already have years of production
+        # history without this) - shows exactly what Gemini's raw JSON
+        # contained for this brochure, one level BEFORE matching/
+        # _apply_units_to_row ever runs, so "Gemini extracted nothing
+        # useful" and "matching/apply rejected what Gemini found" are never
+        # ambiguous with each other in the logs. Field NAMES only, never
+        # the actual extracted text (which could be long/PII-bearing).
+        print(
+            f"[brochure_enrichment] Canva extraction for {url!r}: {len(units)} unit(s), "
+            f"property_features={'present' if units.property_features else 'absent'}, "
+            f"contacts={'present' if units.contacts else 'absent'}, "
+            f"building_features={len(units.building_features)}.",
+            file=sys.stderr,
+        )
     return units
 
 
@@ -2570,6 +2610,21 @@ def enrich_rows_grouped(
                             "building": new_row.building, "floor_unit": new_row.floor_unit,
                             "status": STATUS_EXTRACTED_BUT_AMBIGUOUS,
                         })
+                    if is_canva_view_link(url):
+                        # Canva-specific diagnostic only - the document read
+                        # fine (see the Canva extraction log above) but this
+                        # ROW still has blank fields afterward; names the
+                        # exact fields and whether an ambiguous/rent-conflict
+                        # match was the reason, so "Gemini found nothing for
+                        # this row" and "Gemini found something but matching/
+                        # the rent guard rejected it" are never conflated.
+                        still_blank = [f for f in ENRICHABLE_FIELDS if _is_blank(getattr(new_row, f))]
+                        reason = "ambiguous/rent-conflicting match" if ambiguous else "no confident match for this row"
+                        print(
+                            f"[brochure_enrichment] Canva extraction read fine for {new_row.building!r} "
+                            f"({new_row.floor_unit!r}) but left {still_blank} blank — {reason}.",
+                            file=sys.stderr,
+                        )
 
             progress_callback(done, len(urls_to_fetch), first_label.get(url))
 
