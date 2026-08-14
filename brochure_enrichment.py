@@ -1004,14 +1004,19 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
     return response.content
 
 
-# Generous over the separate renderer's OWN internal RENDER_TIMEOUT_SECONDS
-# backstop (see canva_renderer/app.py - it scales with MAX_CANVA_PAGES,
-# since capturing every page of a real multi-page brochure takes longer
-# than the old single-page-only budget this constant used to just barely
-# cover) - this is the ceiling for the WHOLE round trip (network + browser
-# launch/render of every page), so it must stay comfortably above that
-# service's own worst-case budget rather than racing it.
-_CANVA_RENDERER_TIMEOUT = 150
+# Generous over the separate renderer's OWN internal worst-case budget -
+# RENDER_TIMEOUT_SECONDS (scales with MAX_CANVA_PAGES, since capturing
+# every page of a real multi-page brochure takes longer than a single-
+# page-only budget would) PLUS SEMAPHORE_WAIT_TIMEOUT_SECONDS (a request
+# arriving while MAX_CONCURRENT_RENDERS are already in flight now queues
+# for a free slot rather than being rejected instantly - see that
+# constant's own docstring in canva_renderer/app.py for the real bulk-
+# upload production bug this fixes) - both summed (see that module's own
+# worst-case: 123 + 90 = 213s at current defaults). This is the ceiling
+# for the WHOLE round trip (network + queueing + browser launch/render of
+# every page), so it must stay comfortably above that service's own
+# worst-case combined budget rather than racing it.
+_CANVA_RENDERER_TIMEOUT = 240
 
 # Defense-in-depth cap on how many pages this app will ever accept from ONE
 # Canva-renderer response, independent of that service's OWN MAX_CANVA_

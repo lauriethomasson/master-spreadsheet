@@ -37,6 +37,28 @@ controls aren't found at all (a single-page design, or a future Canva
 frontend change), this service simply returns the one page it always did
 before this feature existed - never a hard failure.
 
+## Concurrency: queueing, not instant-rejection
+
+`MAX_CONCURRENT_RENDERS` (default 2) is a hard cap on simultaneous browser
+renders, but a request arriving while that cap is already reached now
+**queues** for a free slot (up to `SEMAPHORE_WAIT_TIMEOUT_SECONDS`, default
+90s) rather than being rejected with a 503 instantly. A bulk spreadsheet
+upload with many Canva-linked rows genuinely dispatches several brochures
+concurrently (the main app's own worker pool defaults to 5), so with only
+2 render slots it used to take just 3 simultaneous Canva requests for the
+rest to be dropped outright - regardless of whether that specific design
+would have rendered fine. The wait is a firm ceiling, not unbounded: a slot
+that never frees up within the wait budget still fails safely (503), and
+this wait time is kept entirely separate from `RENDER_TIMEOUT_SECONDS` -
+the render clock only starts once a slot is actually acquired, so a
+request queued behind a burst is never penalized for time spent merely
+waiting for capacity.
+
+If the cached Chromium browser itself crashes or is OOM-killed mid-load,
+the very next request detects this (`Browser.is_connected()`) and
+relaunches it automatically - a single crash no longer poisons every
+subsequent render for the rest of this container instance's lifetime.
+
 ## Local development
 
 ```bash
@@ -63,15 +85,20 @@ gcloud run deploy canva-renderer \
   --region <same region as the main app> \
   --memory 1Gi \
   --cpu 1 \
-  --timeout 180 \
+  --timeout 300 \
   --concurrency 4 \
   --no-allow-unauthenticated
 ```
 
-`--timeout 180` is comfortably above this service's own internal
-`RENDER_TIMEOUT_SECONDS` backstop (scales with `MAX_CANVA_PAGES` - see
-`app.py`), which itself is the ceiling for one `/render` call capturing up
-to `MAX_CANVA_PAGES` pages of a single design.
+`--timeout 300` is comfortably above this service's own internal worst
+case: `RENDER_TIMEOUT_SECONDS` (scales with `MAX_CANVA_PAGES` - see
+`app.py`) PLUS `SEMAPHORE_WAIT_TIMEOUT_SECONDS` (a request arriving while
+`MAX_CONCURRENT_RENDERS` are already in flight now queues for a free slot
+rather than being rejected instantly - see that constant's own docstring
+for the real bulk-upload production bug this fixes), summed - 213s at
+current defaults. `--concurrency 4` lets Cloud Run itself route a genuine
+overflow (more requests than even the queue can absorb) to a fresh
+instance rather than piling everything onto one.
 
 `--no-allow-unauthenticated` is the primary access control (see
 "Authentication" below) - do not deploy this publicly.
@@ -99,12 +126,13 @@ check on top of that, never a replacement for `--no-allow-unauthenticated`.
 
 ### Environment variables this service reads
 
-| Variable                  | Default | Purpose                                                   |
-|----------------------------|---------|------------------------------------------------------------|
-| `PORT`                     | `8080`  | Set automatically by Cloud Run.                            |
-| `MAX_CONCURRENT_RENDERS`   | `2`     | Hard cap on simultaneous browser renders.                  |
-| `MAX_CANVA_PAGES`          | `20`    | Hard cap on pages captured per design (see above).          |
-| `RENDERER_SHARED_SECRET`   | (unset) | Optional extra `Authorization: Bearer <secret>` check.     |
+| Variable                       | Default | Purpose                                                   |
+|---------------------------------|---------|------------------------------------------------------------|
+| `PORT`                          | `8080`  | Set automatically by Cloud Run.                            |
+| `MAX_CONCURRENT_RENDERS`        | `2`     | Hard cap on simultaneous browser renders.                  |
+| `SEMAPHORE_WAIT_TIMEOUT_SECONDS`| `90`    | How long a request queues for a free render slot before failing (see `app.py`) - never instant-reject. |
+| `MAX_CANVA_PAGES`               | `20`    | Hard cap on pages captured per design (see above).          |
+| `RENDERER_SHARED_SECRET`        | (unset) | Optional extra `Authorization: Bearer <secret>` check.     |
 
 ### Environment variable the MAIN APP needs
 

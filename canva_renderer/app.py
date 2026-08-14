@@ -130,6 +130,26 @@ RENDER_TIMEOUT_SECONDS = (
     (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10 + (MAX_CANVA_PAGES - 1) * _PER_PAGE_TIMEOUT_BUDGET_S
 )
 
+# How long ONE request will wait for a free render slot (MAX_CONCURRENT_
+# RENDERS already in flight) before giving up - confirmed real production
+# root cause of "some Canva properties render fine, others get an
+# immediate 503 for no visible reason": the semaphore acquire used to be
+# non-blocking (blocking=False), so the (MAX_CONCURRENT_RENDERS + 1)th
+# concurrent /render call was rejected INSTANTLY, even though a slot was
+# often about to free up seconds later. A bulk spreadsheet upload with
+# many Canva-linked rows genuinely dispatches several brochures
+# concurrently (see brochure_enrichment.enrich_rows_grouped's own
+# DEFAULT_MAX_WORKERS=5) - with MAX_CONCURRENT_RENDERS=2 it only takes 3
+# simultaneous Canva requests for the rest to be dropped outright,
+# independent of whether that specific design would have rendered fine
+# (confirmed directly: a real failing production URL rendered perfectly
+# in isolation, with zero contention). This is deliberately a WAIT budget
+# ONLY, kept entirely separate from RENDER_TIMEOUT_SECONDS above - the
+# render clock (see render_canva_page) only starts counting once a slot is
+# actually acquired (see do_POST), so a request queued behind a burst is
+# never penalized for time spent merely waiting for capacity.
+SEMAPHORE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("SEMAPHORE_WAIT_TIMEOUT_SECONDS", "90"))
+
 # Best-effort parse of Canva's own "current / total" page-count text (e.g.
 # "1 / 7") from the accessible "Go to page" button's own inner text -
 # purely a diagnostic ("Canva design detected: N pages" logging), never the
@@ -209,11 +229,32 @@ async def _get_browser_async():
     one) guards the lazy-init check itself, since two render coroutines on
     the SAME loop could otherwise both see _browser as None and each start
     their own browser if either awaited between the check and the launch.
+
+    Also relaunches if the cached `_browser` has DISCONNECTED (a real crash
+    or an OOM kill under load, distinct from a genuinely slow/hanging
+    render - see RENDER_TIMEOUT_SECONDS/SEMAPHORE_WAIT_TIMEOUT_SECONDS for
+    that) - `Browser.is_connected()` is a cheap, synchronous, purely local
+    state check (no I/O), so this costs nothing on the far more common
+    still-healthy path. Without this, a single Chromium crash would leave
+    every SUBSEQUENT request in this process' whole lifetime trying to use
+    the same dead Browser object forever (every render failing the same
+    way until Cloud Run eventually recycles the container) - this recovers
+    within the very next request instead.
     """
     global _playwright_ctx, _browser, _browser_init_lock
     if _browser_init_lock is None:
         _browser_init_lock = asyncio.Lock()
     async with _browser_init_lock:
+        if _browser is not None and not _browser.is_connected():
+            print(
+                "[canva_renderer] Cached browser was disconnected (crashed or OOM-killed) - relaunching.",
+                file=sys.stderr,
+            )
+            try:
+                await _playwright_ctx.stop()
+            except Exception:
+                pass  # already gone - nothing more to clean up
+            _browser = None
         if _browser is None:
             _playwright_ctx = await async_playwright().start()
             _browser = await _playwright_ctx.chromium.launch(headless=True)
@@ -467,14 +508,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid request body"})
             return
 
-        if not _render_semaphore.acquire(blocking=False):
-            # A hard concurrency cap, not a queue - one broken/slow Canva
-            # page must never be able to pile up unbounded work here; the
-            # caller (see brochure_enrichment._fetch_canva_rendered_page)
-            # already treats any non-2xx response as a normal, safe
-            # per-document failure. "reason" alongside "error" here purely
-            # so the main app's own generic reason-extraction (same field,
-            # same shape as the 422/500 bodies below) never needs a special
+        if not _render_semaphore.acquire(timeout=SEMAPHORE_WAIT_TIMEOUT_SECONDS):
+            # A hard concurrency cap, but a QUEUE now, not an instant-reject
+            # - see SEMAPHORE_WAIT_TIMEOUT_SECONDS's own docstring above for
+            # the real production bug this fixes (a burst of Canva requests
+            # during a bulk upload used to drop most of them with an
+            # immediate 503, regardless of whether that specific design
+            # would have rendered fine). Still a firm ceiling: one broken/
+            # slow Canva page must never be able to pile up UNBOUNDED work
+            # here, so a slot that never frees up within this wait budget
+            # still fails safely - the caller (see brochure_enrichment.
+            # _fetch_canva_rendered_page) already treats any non-2xx
+            # response as a normal, safe per-document failure. "reason"
+            # alongside "error" here purely so the main app's own generic
+            # reason-extraction (same field, same shape as the 422/500
+            # bodies below) never needs a special
             # case for this one response - not a caught exception, so
             # nothing to run through _safe_reason.
             self._send_json(503, {"error": "renderer busy, try again", "reason": "renderer busy, try again"})

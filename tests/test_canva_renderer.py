@@ -18,6 +18,8 @@ import concurrent.futures
 import importlib.util
 import json
 import sys
+import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -507,9 +509,14 @@ class RenderHandlerTests(unittest.TestCase):
         handler.send_response.assert_called_with(200)
 
     def test_busy_semaphore_returns_503_without_calling_render(self):
+        # SEMAPHORE_WAIT_TIMEOUT_SECONDS patched down to a few ms - a slot
+        # that's permanently unavailable (Semaphore(0), never released by
+        # anything in this test) must still fail safely well within a real
+        # test run, not block for the real (90s-by-default) wait budget.
         import threading
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(0)):
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(0)), \
+                patch.object(canva_renderer, "SEMAPHORE_WAIT_TIMEOUT_SECONDS", 0.05):
             with patch.object(canva_renderer, "render_canva_page") as mock_render:
                 handler.do_POST()
             mock_render.assert_not_called()
@@ -521,7 +528,8 @@ class RenderHandlerTests(unittest.TestCase):
         # one status code - it carries a "reason" key exactly like 422/500.
         import threading
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(0)):
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(0)), \
+                patch.object(canva_renderer, "SEMAPHORE_WAIT_TIMEOUT_SECONDS", 0.05):
             handler.do_POST()
         payload = json.loads(handler.wfile.getvalue())
         self.assertIn("reason", payload)
@@ -588,6 +596,201 @@ class SafeReasonTests(unittest.TestCase):
         err = canva_renderer.RenderError(long_multiline)
         self.assertNotIn("\n", err.reason)
         self.assertLessEqual(len(err.reason), canva_renderer._MAX_REASON_LENGTH + 1)
+
+
+class SemaphoreQueueingTests(unittest.TestCase):
+    """
+    Regression tests for the real confirmed production bug: MAX_CONCURRENT_
+    RENDERS=2 combined with a non-blocking semaphore acquire meant the 3rd+
+    simultaneous /render request was rejected with an INSTANT 503, even
+    though a slot would free up moments later - independent of whether that
+    specific design would have rendered fine (confirmed directly: a real
+    failing production URL rendered perfectly when tried in isolation, with
+    zero contention). A bulk spreadsheet upload with many Canva-linked rows
+    genuinely dispatches several brochures concurrently (see brochure_
+    enrichment.enrich_rows_grouped's own worker pool), so this was the real
+    mechanism behind "some Canva properties enrich, most don't".
+
+    Exercises Handler.do_POST directly with REAL threads and a REAL
+    threading.Semaphore (never render_canva_page_async, which has no
+    concept of the concurrency cap at all - that lives here, at the HTTP
+    layer) - matching this file's own existing convention for exercising
+    real threading/concurrency behavior rather than mocking it away.
+    """
+
+    def _make_handler(self, url="https://www.canva.com/design/x/y/view"):
+        body = json.dumps({"url": url}).encode()
+        handler = canva_renderer.Handler.__new__(canva_renderer.Handler)
+        handler.path = "/render"
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = BytesIO(body)
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+    def test_a_burst_beyond_max_concurrent_renders_queues_instead_of_instant_503(self):
+        release_first = threading.Event()
+        call_order = []
+        order_lock = threading.Lock()
+
+        def slow_then_fast_render(url):
+            with order_lock:
+                is_first = not call_order
+                call_order.append("started")
+            if is_first:
+                release_first.wait(timeout=5)
+            return ([b"\x89PNG bytes"], 1)
+
+        handler_a = self._make_handler()
+        handler_b = self._make_handler()
+
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(1)), \
+                patch.object(canva_renderer, "SEMAPHORE_WAIT_TIMEOUT_SECONDS", 5), \
+                patch.object(canva_renderer, "render_canva_page", side_effect=slow_then_fast_render):
+            thread_a = threading.Thread(target=handler_a.do_POST)
+            thread_a.start()
+            time.sleep(0.15)  # let A acquire the one slot first
+
+            thread_b = threading.Thread(target=handler_b.do_POST)
+            thread_b.start()
+            time.sleep(0.15)
+            # B must be genuinely BLOCKED waiting for the slot right now,
+            # never already rejected - the real bug returned 503 here
+            # immediately instead of waiting at all.
+            self.assertEqual(len(call_order), 1)
+
+            release_first.set()
+            thread_a.join(timeout=5)
+            thread_b.join(timeout=5)
+
+        handler_a.send_response.assert_called_with(200)
+        handler_b.send_response.assert_called_with(200)  # NOT 503 - it queued and succeeded
+
+    def test_a_request_that_never_gets_a_slot_within_the_wait_budget_still_fails_safely(self):
+        # The wait is a firm ceiling, not unbounded queueing - a slot that
+        # genuinely never frees up must still produce a safe 503, never
+        # hang the caller forever.
+        handler = self._make_handler()
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(0)), \
+                patch.object(canva_renderer, "SEMAPHORE_WAIT_TIMEOUT_SECONDS", 0.2), \
+                patch.object(canva_renderer, "render_canva_page") as mock_render:
+            handler.do_POST()
+
+        mock_render.assert_not_called()
+        handler.send_response.assert_called_with(503)
+
+    def test_render_failure_does_not_poison_the_next_render(self):
+        # "One failed render poisoning subsequent renders" - a RenderError
+        # on request A must still release the semaphore (see do_POST's own
+        # finally block, unchanged by this fix) so request B, right after,
+        # gets its own real chance rather than inheriting A's failure or
+        # finding the slot still held.
+        call_log = []
+
+        def fail_then_succeed(url):
+            call_log.append(url)
+            if len(call_log) == 1:
+                raise canva_renderer.RenderError("navigation timed out")
+            return ([b"\x89PNG bytes"], 1)
+
+        handler_a = self._make_handler()
+        handler_b = self._make_handler()
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(1)), \
+                patch.object(canva_renderer, "render_canva_page", side_effect=fail_then_succeed):
+            handler_a.do_POST()
+            handler_b.do_POST()
+
+        handler_a.send_response.assert_called_with(422)
+        handler_b.send_response.assert_called_with(200)
+        self.assertEqual(len(call_log), 2)
+
+    def test_semaphore_wait_is_not_charged_against_the_actual_render_call(self):
+        # RENDER_TIMEOUT_SECONDS (the render's own budget - see render_
+        # canva_page's own future.result(timeout=RENDER_TIMEOUT_SECONDS))
+        # is only ever applied to the render_canva_page_async call ITSELF,
+        # which do_POST only ever invokes AFTER the semaphore is already
+        # acquired - so a request that spent most of SEMAPHORE_WAIT_
+        # TIMEOUT_SECONDS merely queued for a slot must still succeed
+        # once it gets one, even with a render budget far smaller than
+        # the time it spent waiting. If the two were ever conflated (one
+        # combined clock started at request-arrival), this would fail.
+        handler_a = self._make_handler()
+        handler_b = self._make_handler()
+        release_first = threading.Event()
+
+        def a_holds_the_slot(url):
+            release_first.wait(timeout=5)
+            return ([b"\x89PNG a"], 1)
+
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(1)), \
+                patch.object(canva_renderer, "SEMAPHORE_WAIT_TIMEOUT_SECONDS", 5), \
+                patch.object(canva_renderer, "RENDER_TIMEOUT_SECONDS", 0.05), \
+                patch.object(canva_renderer, "render_canva_page", side_effect=a_holds_the_slot):
+            thread_a = threading.Thread(target=handler_a.do_POST)
+            thread_a.start()
+            time.sleep(0.2)  # A now holds the only slot
+
+            # B queues behind A for ~0.3s - far longer than the 0.05s
+            # RENDER_TIMEOUT_SECONDS patched above - then, once it
+            # acquires, its OWN render_canva_page call (the SAME mock,
+            # which returns instantly once release_first is already set)
+            # must still be allowed to run and succeed, proving the wait
+            # itself was never charged against that 0.05s render budget.
+            thread_b = threading.Thread(target=handler_b.do_POST)
+            thread_b.start()
+            time.sleep(0.3)
+            release_first.set()
+            thread_a.join(timeout=5)
+            thread_b.join(timeout=5)
+
+        handler_a.send_response.assert_called_with(200)
+        handler_b.send_response.assert_called_with(200)
+
+
+class BrowserCrashRecoveryTests(_ResetGlobalBrowserStateTestCase):
+    """
+    Regression tests for the other real risk multi-request load exposes: if
+    the single cached Chromium browser crashes or is OOM-killed mid-load,
+    every subsequent request must recover on its own, not keep trying to
+    use the same dead Browser object for the rest of this container
+    instance's lifetime.
+    """
+
+    def test_disconnected_browser_is_relaunched_on_next_request(self):
+        crashed_browser = MagicMock()
+        crashed_browser.is_connected = MagicMock(return_value=False)
+        canva_renderer._browser = crashed_browser
+        canva_renderer._playwright_ctx = MagicMock()
+        canva_renderer._playwright_ctx.stop = AsyncMock()
+
+        page = _make_async_page(screenshots=(b"\x89PNG recovered",))
+        context = _make_async_context(page)
+        fresh_browser = _make_async_browser(context)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=MagicMock(chromium=MagicMock(launch=AsyncMock(return_value=fresh_browser))))
+
+        with patch.object(canva_renderer, "async_playwright", MagicMock(return_value=starter)):
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG recovered"])
+        starter.start.assert_awaited_once()  # relaunched exactly once
+        self.assertIs(canva_renderer._browser, fresh_browser)  # cache updated, never left pointing at the dead one
+
+    def test_a_healthy_connected_browser_is_never_relaunched(self):
+        page = _make_async_page(screenshots=(b"\x89PNG healthy",))
+        context = _make_async_context(page)
+        healthy_browser = _make_async_browser(context)
+        healthy_browser.is_connected = MagicMock(return_value=True)
+        canva_renderer._browser = healthy_browser
+        canva_renderer._playwright_ctx = MagicMock()
+
+        with patch.object(canva_renderer, "async_playwright") as mock_playwright:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG healthy"])
+        mock_playwright.assert_not_called()  # never even touched async_playwright() - no relaunch needed
 
 
 if __name__ == "__main__":
