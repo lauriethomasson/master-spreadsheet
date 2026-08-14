@@ -100,6 +100,7 @@ results come in - never something the base extraction's own success depends
 on.
 """
 
+import base64
 import concurrent.futures
 import ctypes
 import functools
@@ -1003,11 +1004,23 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
     return response.content
 
 
-# Generous over the separate renderer's OWN internal navigation timeout
-# (see canva_renderer/app.py's NAV_TIMEOUT_MS) - this is the ceiling for
-# the WHOLE round trip (network + browser launch/render), so it must stay
-# comfortably above that service's own budget rather than racing it.
-_CANVA_RENDERER_TIMEOUT = 30
+# Generous over the separate renderer's OWN internal RENDER_TIMEOUT_SECONDS
+# backstop (see canva_renderer/app.py - it scales with MAX_CANVA_PAGES,
+# since capturing every page of a real multi-page brochure takes longer
+# than the old single-page-only budget this constant used to just barely
+# cover) - this is the ceiling for the WHOLE round trip (network + browser
+# launch/render of every page), so it must stay comfortably above that
+# service's own worst-case budget rather than racing it.
+_CANVA_RENDERER_TIMEOUT = 150
+
+# Defense-in-depth cap on how many pages this app will ever accept from ONE
+# Canva-renderer response, independent of that service's OWN MAX_CANVA_
+# PAGES cap - the renderer is a separately deployed, separately versioned
+# service (see canva_renderer/README.md), so this app never assumes its
+# own cap is being enforced correctly on the other side; a response
+# claiming more pages than this is simply truncated (with a loud log line),
+# never trusted at face value.
+_CANVA_MAX_PAGES_ACCEPTED = 20
 
 
 def _canva_renderer_auth_headers(renderer_url: str) -> dict:
@@ -1059,8 +1072,8 @@ def _canva_renderer_auth_headers(renderer_url: str) -> dict:
 
 def _fetch_canva_rendered_page(url: str):
     """
-    PNG bytes for the single page `url` (a public Canva "view" link)
-    renders to, obtained from the separate Canva-rendering service (see
+    PNG bytes for every page `url` (a public Canva "view" link) renders to,
+    in page order, obtained from the separate Canva-rendering service (see
     canva_renderer/README.md) - never attempted at all unless
     CANVA_RENDERER_URL is configured (see _canva_renderer_configured's own
     docstring); classify_link_eligibility/_is_eligible_brochure_url/_is_
@@ -1081,15 +1094,19 @@ def _fetch_canva_rendered_page(url: str):
       renderer's own short, non-sensitive reason string (never a raw
       exception, stack trace, or URL with a query string).
 
-    Only ever returns a SINGLE page's bytes - a genuinely multi-page Canva
-    brochure's other pages are not currently reachable (see canva_
-    renderer.app.render_canva_page's own "KNOWN LIMITATION" docstring) -
-    the returned PNG feeds into extract.render_pages/render_and_extract
-    exactly like any other document's bytes (see _fetch_pdf_bytes' own
-    Canva branch below and _looks_like_fetchable_document's own docstring
-    on PyMuPDF already opening genuine PNG bytes correctly regardless of
-    its own advisory filetype="pdf" hint) - no separate Canva extraction
-    system, no change to matching/enrichment rules.
+    Otherwise returns a non-empty list[bytes], ALWAYS at least one page (the
+    renderer itself never returns an empty "pages" list on a 200 - see its
+    own app.py) - a genuinely multi-page Canva brochure's OTHER pages are
+    now included too (see canva_renderer/README.md's "Multi-page capture"),
+    up to whatever that service's own MAX_CANVA_PAGES allowed, further
+    capped here at _CANVA_MAX_PAGES_ACCEPTED as defense-in-depth against a
+    misbehaving/compromised renderer response (that service is a separately
+    deployed, separately versioned service - this app never assumes its own
+    cap is what actually ran on the other side). This list feeds into
+    extract.images_from_png_pages/render_and_extract exactly like a multi-
+    page PDF's own per-page images already do (see _fetch_pdf_bytes' own
+    Canva branch below) - no separate Canva extraction system, no change to
+    matching/enrichment rules.
     """
     renderer_url = os.environ.get(CANVA_RENDERER_URL_ENV_VAR, "").rstrip("/")
     try:
@@ -1121,7 +1138,7 @@ def _fetch_canva_rendered_page(url: str):
         _record_status(STATUS_FETCH_FAILED, "Canva renderer authentication failed")
         return None
 
-    if response.status_code != 200 or "image/" not in response.headers.get("content-type", ""):
+    if response.status_code != 200 or "application/json" not in response.headers.get("content-type", ""):
         try:
             reason = response.json().get("reason", f"HTTP {response.status_code}")
         except Exception:
@@ -1130,21 +1147,46 @@ def _fetch_canva_rendered_page(url: str):
         _record_status(STATUS_RENDER_FAILED, f"Canva render failed: {reason}")
         return None
 
+    try:
+        payload = response.json()
+        raw_pages = payload["pages"]
+        pages = [base64.b64decode(p) for p in raw_pages]
+        if not pages:
+            raise ValueError("empty pages list")
+    except Exception as e:
+        print(
+            f"[brochure_enrichment] Canva renderer returned a malformed response for {url!r} ({e!r}) — "
+            "skipping enrichment.",
+            file=sys.stderr,
+        )
+        _record_status(STATUS_RENDER_FAILED, f"malformed renderer response ({e!r})")
+        return None
+
+    detected_total = payload.get("page_count_detected")
+    if len(pages) > _CANVA_MAX_PAGES_ACCEPTED:
+        print(
+            f"[brochure_enrichment] Canva renderer returned {len(pages)} pages for {url!r}, "
+            f"truncating to this app's own cap of {_CANVA_MAX_PAGES_ACCEPTED}.",
+            file=sys.stderr,
+        )
+        pages = pages[:_CANVA_MAX_PAGES_ACCEPTED]
+
     # The ONE clear, positive confirmation the whole authenticated round
     # trip actually worked - main app -> ID token -> Cloud Run IAM ->
-    # renderer -> Chromium -> PNG back. Every failure mode above already
+    # renderer -> Chromium -> pages back. Every failure mode above already
     # prints its own distinct message; this is deliberately the only
     # SUCCESS line for Canva specifically, so grepping Cloud Run logs for
     # "Canva render succeeded" is a single, unambiguous way to confirm
     # rendering itself worked for a given URL, separate from whether the
     # subsequent Gemini extraction (see _extract_brochure_units) then
     # found anything useful in it.
+    detected_str = f"{detected_total} detected" if detected_total else "total unknown"
     print(
-        f"[brochure_enrichment] Canva render succeeded for {url!r} ({len(response.content)} bytes) — "
-        "handing off to the existing extraction pipeline.",
+        f"[brochure_enrichment] Canva render succeeded for {url!r}: {len(pages)} page(s) captured "
+        f"({detected_str}) — handing off to the existing extraction pipeline.",
         file=sys.stderr,
     )
-    return response.content
+    return pages
 
 
 def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_image_formats: bool = False):
@@ -1196,6 +1238,13 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     than attempting a renderer call this deployment was never told about,
     keeps this function's own behavior correct independent of whether a
     caller already checked eligibility.
+
+    The Canva branch is the ONE case this function returns list[bytes]
+    (one PNG per page, see _fetch_canva_rendered_page) rather than a single
+    bytes object - every other branch/URL shape is unaffected. Both callers
+    (_extract_brochure_units/_extract_floorplan_units) branch on this via
+    _images_from_fetched_document, so neither needs its own isinstance
+    check duplicated.
     """
     if _box_share_token(url):
         return _fetch_box_shared_pdf(
@@ -1265,6 +1314,32 @@ class _BrochureUnits(list):
     building_features = None
 
 
+def _images_from_fetched_document(data):
+    """
+    list[types.Part] for `data` (whatever _fetch_pdf_bytes returned for a
+    given URL) - shared by _extract_brochure_units/_extract_floorplan_units
+    so neither duplicates this branch. `data` is either:
+    - bytes (a real PDF, or a single-page image) - rendered via extract.
+      render_pages, serialized behind extract._RENDER_LOCK (PyMuPDF/MuPDF's
+      own process-wide state isn't thread-safe - see render_pages' own
+      comment on fitz.TOOLS.store_shrink) - never written to a temp file at
+      all (see render_pages' own docstring on why: a tmpfs-backed container
+      /tmp, e.g. Cloud Run's default, would count that file's bytes against
+      the SAME memory budget as `data` itself, a real doubling of a payload
+      that can be up to ~32MB);
+    - list[bytes] (the ONE case: a Canva "view" link - see _fetch_canva_
+      rendered_page) - already-rendered PNG pages from a real browser
+      screenshot, wrapped directly via extract.images_from_png_pages, never
+      re-rasterized through render_pages/fitz (there is no vector PDF here
+      to rasterize - re-opening one PNG at a time as a fake one-page "PDF"
+      would just be a slower, no-op round trip for identical output).
+    """
+    if isinstance(data, list):
+        return extract.images_from_png_pages(data)
+    with extract._RENDER_LOCK:
+        return extract.render_pages(data)
+
+
 @functools.lru_cache(maxsize=64)
 def _extract_brochure_units(url: str):
     """
@@ -1308,13 +1383,7 @@ def _extract_brochure_units(url: str):
         return None
 
     try:
-        # Rendered directly from the in-memory bytes - never written to a
-        # temp file at all (see render_pages' own docstring on why: a
-        # tmpfs-backed container /tmp, e.g. Cloud Run's default, would
-        # count that file's bytes against the SAME memory budget as `data`
-        # itself, a real doubling of a payload that can be up to ~32MB).
-        with extract._RENDER_LOCK:
-            images = extract.render_pages(data)
+        images = _images_from_fetched_document(data)
     except Exception as e:
         print(
             f"[brochure_enrichment] Could not render {url!r} as a document ({e!r}) — skipping enrichment.",
@@ -1848,8 +1917,7 @@ def _extract_floorplan_units(url: str):
         return None
 
     try:
-        with extract._RENDER_LOCK:
-            images = extract.render_pages(data)
+        images = _images_from_fetched_document(data)
     except Exception as e:
         print(
             f"[brochure_enrichment] Could not render {url!r} as a floor plan ({e!r}) — skipping enrichment.",

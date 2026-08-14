@@ -13,6 +13,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_canva_renderer -v
 """
 
+import base64
 import concurrent.futures
 import importlib.util
 import json
@@ -94,23 +95,93 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_async_page(final_url="https://www.canva.com/design/x/y/view", goto_side_effect=None, screenshot=b"\x89PNG fake"):
-    """A MagicMock shaped like an async Playwright Page - every method
+def _make_async_page(
+    final_url="https://www.canva.com/design/x/y/view",
+    goto_side_effect=None,
+    screenshots=(b"\x89PNG fake",),
+    next_disabled_sequence=("true",),
+    next_button_raises=False,
+    go_to_page_text="1 / 1",
+    go_to_page_raises=True,
+):
+    """
+    A MagicMock shaped like an async Playwright Page - every method
     Playwright's own async API defines as a coroutine is an AsyncMock;
     the two plain (non-async) setters stay ordinary MagicMock attributes,
     matching the real API exactly (see canva_renderer.app's own comment on
-    this - confirmed directly against the installed playwright package)."""
+    this - confirmed directly against the installed playwright package).
+
+    `screenshots` is consumed in order, one per page.screenshot() call - the
+    FIRST is always the cover-page screenshot; each further one corresponds
+    to one successful Next-page loop iteration (see `next_disabled_sequence`
+    below), so callers must supply exactly as many as the sequence implies.
+
+    `next_disabled_sequence` mocks the "Next page" button's own aria-
+    disabled attribute across successive render_canva_page_async loop
+    iterations - "true" stops the loop (single-page default: stops after
+    just the cover page, matching every existing pre-multi-page test's own
+    expectations unchanged); None/"false" lets it click through to another
+    page. Exhausting the sequence keeps returning "true" (a safety net, not
+    something any real test here should actually rely on hitting).
+    `next_button_raises` simulates the button not existing at all (a Canva
+    frontend change, or a genuinely single-page design with no pagination
+    UI) - the loop stops on the very first attempt either way.
+
+    `go_to_page_text`/`go_to_page_raises` mock the accessible "Go to page"
+    total-page-count indicator used only for diagnostics (_detect_page_
+    count) - raising by default so most tests don't need to care about it.
+    """
     page = MagicMock()
     page.url = final_url
     page.set_default_navigation_timeout = MagicMock()
     page.set_default_timeout = MagicMock()
     page.route = AsyncMock()
     page.goto = AsyncMock(side_effect=goto_side_effect) if goto_side_effect else AsyncMock()
-    locator = MagicMock()
-    locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
-    page.get_by_text = MagicMock(return_value=locator)
+    cookie_locator = MagicMock()
+    cookie_locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
+    page.get_by_text = MagicMock(return_value=cookie_locator)
     page.wait_for_timeout = AsyncMock()
-    page.screenshot = AsyncMock(return_value=screenshot)
+
+    # itertools.cycle, not a one-shot iter - several tests below (sequential/
+    # concurrent renders) deliberately reuse the SAME mocked page across
+    # multiple independent render_canva_page calls (mirroring context.
+    # new_page() returning the same page every time in these tests), so
+    # screenshot()/get_attribute() must keep serving values indefinitely
+    # rather than raising StopIteration on a second, unrelated render.
+    import itertools
+    screenshot_iter = itertools.cycle(screenshots)
+
+    async def _screenshot(*args, **kwargs):
+        return next(screenshot_iter)
+
+    page.screenshot = AsyncMock(side_effect=_screenshot)
+
+    next_button = MagicMock()
+    if next_button_raises:
+        next_button.get_attribute = AsyncMock(side_effect=Exception("Next page button not found"))
+    else:
+        disabled_iter = itertools.cycle(next_disabled_sequence)
+
+        async def _get_attribute(_name):
+            return next(disabled_iter)
+
+        next_button.get_attribute = AsyncMock(side_effect=_get_attribute)
+    next_button.click = AsyncMock()
+
+    go_to_page_button = MagicMock()
+    if go_to_page_raises:
+        go_to_page_button.inner_text = AsyncMock(side_effect=Exception("Go to page button not found"))
+    else:
+        go_to_page_button.inner_text = AsyncMock(return_value=go_to_page_text)
+
+    def _get_by_role(role, name=None, **kwargs):
+        if name == "Next page":
+            return next_button
+        if name == "Go to page":
+            return go_to_page_button
+        return MagicMock()
+
+    page.get_by_role = MagicMock(side_effect=_get_by_role)
     return page
 
 
@@ -165,13 +236,83 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         mock_get_browser.assert_not_called()
 
     def test_successful_render_returns_png_bytes(self):
-        page = _make_async_page(screenshot=b"\x89PNG real bytes")
+        page = _make_async_page(screenshots=(b"\x89PNG real bytes",))
         patcher, context = self._patch_browser(page)
         with patcher:
-            result = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
-        self.assertEqual(result, b"\x89PNG real bytes")
+        self.assertEqual(pages, [b"\x89PNG real bytes"])
+        self.assertIsNone(detected_total)
         context.close.assert_awaited_once()  # resources cleaned up after the request
+
+    def test_single_page_design_with_no_pagination_ui_returns_one_page(self):
+        # No "Next page" control at all - a genuinely single-page design,
+        # or a future Canva frontend change; either way this must degrade
+        # to exactly the one-page behavior this service always had before
+        # multi-page capture existed, never a hard failure.
+        page = _make_async_page(screenshots=(b"\x89PNG only page",), next_button_raises=True)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG only page"])
+        context.close.assert_awaited_once()
+
+    def test_multi_page_design_captures_every_page_in_order(self):
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"),
+            next_disabled_sequence=(None, None, "true"),
+            go_to_page_text="1 / 3",
+            go_to_page_raises=False,
+        )
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])
+        self.assertEqual(detected_total, 3)
+        context.close.assert_awaited_once()
+
+    def test_page_limit_is_enforced_even_if_next_button_never_reports_disabled(self):
+        # A malformed/huge design whose Next-page button never reports
+        # aria-disabled="true" must still stop at MAX_CANVA_PAGES, never
+        # loop unboundedly.
+        screenshots = tuple(f"\x89PNG p{i}".encode() for i in range(1, 25))
+        page = _make_async_page(
+            screenshots=screenshots,
+            next_disabled_sequence=[None] * 30,  # "never disabled"
+        )
+        patcher, context = self._patch_browser(page)
+        with patch.object(canva_renderer, "MAX_CANVA_PAGES", 5), patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(len(pages), 5)
+        context.close.assert_awaited_once()
+
+    def test_a_later_page_failure_still_returns_the_pages_already_captured(self):
+        # Page 3's own click/screenshot fails partway through a multi-page
+        # capture - this must never lose pages 1-2 already safely captured,
+        # and must never escalate into a RenderError for the whole request.
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, None, "true"),
+        )
+        call_count = {"n": 0}
+        real_click = page.get_by_role("button", name="Next page").click
+
+        async def _flaky_click(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise Exception("page 3 click timed out")
+            return await real_click(*args, **kwargs)
+
+        page.get_by_role("button", name="Next page").click = AsyncMock(side_effect=_flaky_click)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
+        context.close.assert_awaited_once()
 
     def test_navigation_timeout_raises_render_error_and_still_cleans_up(self):
         page = _make_async_page(goto_side_effect=Exception("Timeout 15000ms exceeded"))
@@ -239,18 +380,18 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
         return patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser))
 
     def test_single_render_succeeds_through_the_real_thread_bridge(self):
-        page = _make_async_page(screenshot=b"\x89PNG single")
+        page = _make_async_page(screenshots=(b"\x89PNG single",))
         with self._patch_browser(page):
-            result = canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
-        self.assertEqual(result, b"\x89PNG single")
+            pages, _ = canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
+        self.assertEqual(pages, [b"\x89PNG single"])
 
     def test_sequential_renders_all_succeed(self):
-        page = _make_async_page(screenshot=b"\x89PNG seq")
+        page = _make_async_page(screenshots=(b"\x89PNG seq",))
         with self._patch_browser(page):
             results = [
                 canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view") for _ in range(5)
             ]
-        self.assertEqual(results, [b"\x89PNG seq"] * 5)
+        self.assertEqual([pages for pages, _ in results], [[b"\x89PNG seq"]] * 5)
 
     def test_concurrent_renders_from_multiple_threads_never_hit_a_cross_thread_playwright_error(self):
         # The exact real production shape: several /render requests
@@ -264,7 +405,7 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
         # must succeed regardless of which OS thread called render_canva_
         # page - genuinely exercising cross-thread calls via a real
         # ThreadPoolExecutor, not just sequential calls from one thread.
-        page = _make_async_page(screenshot=b"\x89PNG concurrent")
+        page = _make_async_page(screenshots=(b"\x89PNG concurrent",))
         with self._patch_browser(page):
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 futures = [
@@ -273,7 +414,7 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
                 ]
                 results = [f.result(timeout=10) for f in futures]
 
-        self.assertEqual(results, [b"\x89PNG concurrent"] * 8)
+        self.assertEqual([pages for pages, _ in results], [[b"\x89PNG concurrent"]] * 8)
 
     def test_context_is_cleaned_up_even_under_concurrent_load(self):
         page = _make_async_page()
@@ -319,12 +460,23 @@ class RenderHandlerTests(unittest.TestCase):
         handler.end_headers = MagicMock()
         return handler
 
-    def test_valid_request_returns_png(self):
+    def test_valid_request_returns_bounded_json_page_list(self):
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "render_canva_page", return_value=b"\x89PNG bytes"):
+        with patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], 1)):
             handler.do_POST()
         handler.send_response.assert_called_with(200)
-        self.assertEqual(handler.wfile.getvalue(), b"\x89PNG bytes")
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(payload["pages"], [base64.b64encode(b"\x89PNG bytes").decode("ascii")])
+        self.assertEqual(payload["page_count_detected"], 1)
+
+    def test_valid_request_with_multiple_pages_preserves_order(self):
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        pages = [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"]
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 3)):
+            handler.do_POST()
+        handler.send_response.assert_called_with(200)
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(payload["pages"], [base64.b64encode(p).decode("ascii") for p in pages])
 
     def test_render_error_returns_422_with_reason(self):
         handler = self._make_handler(json.dumps({"url": "https://example.com/x"}).encode())
@@ -350,7 +502,7 @@ class RenderHandlerTests(unittest.TestCase):
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
         handler.headers["Authorization"] = "Bearer topsecret"
         with patch.object(canva_renderer, "SHARED_SECRET", "topsecret"), \
-                patch.object(canva_renderer, "render_canva_page", return_value=b"\x89PNG bytes"):
+                patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], 1)):
             handler.do_POST()
         handler.send_response.assert_called_with(200)
 

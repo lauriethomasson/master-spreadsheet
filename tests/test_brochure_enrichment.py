@@ -9,6 +9,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_brochure_enrichment -v
 """
 
+import base64
 import os
 import sys
 import threading
@@ -635,18 +636,70 @@ class CanvaRendererConfiguredEligibilityTests(EnrichmentTestCase):
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url(_CANVA_URL))
 
 
+def _canva_pages_response(pages, page_count_detected=None, status_code=200):
+    """A MagicMock httpx.Response shaped like the renderer's own new JSON
+    multi-page format (see canva_renderer/app.py's Handler.do_POST) -
+    {"pages": [base64 PNG, ...], "page_count_detected": N|None}."""
+    payload = {
+        "pages": [base64.b64encode(p).decode("ascii") for p in pages],
+        "page_count_detected": page_count_detected,
+    }
+    return MagicMock(
+        status_code=status_code, headers={"content-type": "application/json"}, json=MagicMock(return_value=payload),
+    )
+
+
 class FetchCanvaRenderedPageTests(EnrichmentTestCase):
     def test_successful_render_returns_png_bytes(self):
-        response = MagicMock(status_code=200, content=b"\x89PNG real bytes", headers={"content-type": "image/png"})
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
                 patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
             result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
 
-        self.assertEqual(result, b"\x89PNG real bytes")
+        self.assertEqual(result, [b"\x89PNG real bytes"])
         mock_post.assert_called_once()
         self.assertEqual(mock_post.call_args.args[0], "https://canva-renderer.example.run.app/render")
         self.assertEqual(mock_post.call_args.kwargs["json"], {"url": _CANVA_URL})
+
+    def test_successful_render_with_multiple_pages_preserves_order(self):
+        pages = [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"]
+        response = _canva_pages_response(pages, page_count_detected=3)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertEqual(result, pages)
+
+    def test_response_with_more_pages_than_the_main_apps_own_cap_is_truncated(self):
+        # Defense-in-depth: this app never trusts the (separately deployed,
+        # separately versioned) renderer's own MAX_CANVA_PAGES cap at face
+        # value - a response claiming more is simply truncated here too.
+        pages = [f"\x89PNG p{i}".encode() for i in range(1, 30)]
+        response = _canva_pages_response(pages, page_count_detected=29)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch.object(brochure_enrichment, "_CANVA_MAX_PAGES_ACCEPTED", 5):
+            result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result, pages[:5])
+
+    def test_malformed_pages_payload_returns_none_and_records_render_failed(self):
+        response = MagicMock(
+            status_code=200, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"not_pages": []}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
 
     def test_successful_render_logs_a_single_unambiguous_success_line(self):
         # The ONE clear, greppable Cloud Run log line confirming the whole
@@ -654,7 +707,7 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         # message (renderer unreachable/auth failed/render failed), so an
         # operator can tell "rendering itself worked" apart from "Gemini
         # then found nothing useful" without ambiguity.
-        response = MagicMock(status_code=200, content=b"\x89PNG real bytes", headers={"content-type": "image/png"})
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch("brochure_enrichment.httpx.post", return_value=response), \
                 patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
@@ -724,7 +777,7 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         self.assertIn("Could not mint an ID token", logged)
 
     def test_auth_headers_included_in_request(self):
-        response = MagicMock(status_code=200, content=b"\x89PNG", headers={"content-type": "image/png"})
+        response = _canva_pages_response([b"\x89PNG"])
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
                 patch("brochure_enrichment._canva_renderer_auth_headers", return_value={"Authorization": "Bearer tok"}):
@@ -743,10 +796,10 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
 class FetchPdfBytesCanvaRoutingTests(EnrichmentTestCase):
     def test_fetch_pdf_bytes_routes_canva_urls_through_the_renderer(self):
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG bytes") as mock_render:
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG bytes"]) as mock_render:
             result = brochure_enrichment._fetch_pdf_bytes(_CANVA_URL)
 
-        self.assertEqual(result, b"\x89PNG bytes")
+        self.assertEqual(result, [b"\x89PNG bytes"])
         mock_render.assert_called_once_with(_CANVA_URL)
 
     def test_non_canva_url_never_calls_the_canva_renderer(self):
@@ -770,8 +823,10 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
     def test_successful_canva_render_feeds_the_existing_extraction_pipeline(self):
         rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None)]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
-                patch("brochure_enrichment.extract.render_pages", return_value=["img"]) as mock_render_pages, \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch(
+                    "brochure_enrichment.extract.images_from_png_pages", return_value=["img"],
+                ) as mock_images_from_pages, \
                 patch(
                     "brochure_enrichment.extract.render_and_extract",
                     return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Roof terrace"}]},
@@ -779,9 +834,60 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
             enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
 
         self.assertEqual(enriched[0].special_features, "Roof terrace")
-        mock_render_pages.assert_called_once_with(b"\x89PNG fake render")
+        mock_images_from_pages.assert_called_once_with([b"\x89PNG fake render"])
         mock_extract.assert_called_once()
         self.assertEqual(stats["document_issues"], [])
+
+    def test_multiple_canva_pages_all_reach_gemini_in_order(self):
+        # The whole point of multi-page capture: every page returned by the
+        # renderer must reach the SAME Gemini call, in the same order the
+        # renderer captured them - never dropped, never reordered.
+        pages = [b"\x89PNG cover", b"\x89PNG features", b"\x89PNG units", b"\x89PNG contacts"]
+        rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=pages), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Roof terrace"}]},
+                ) as mock_extract:
+            brochure_enrichment.enrich_rows_grouped(rows)
+
+        # extract.images_from_png_pages is NOT mocked here - the real
+        # function runs, so the images actually passed to render_and_extract
+        # are real types.Part objects built from these exact page bytes, in
+        # this exact order (see extract.images_from_png_pages' own docstring).
+        images_passed = mock_extract.call_args.args[0]
+        self.assertEqual(len(images_passed), len(pages))
+        for part, original_bytes in zip(images_passed, pages):
+            self.assertEqual(part.inline_data.data, original_bytes)
+
+    def test_field_from_a_later_page_fills_a_blank_property_field(self):
+        # Proves the actual bug this feature fixes: a field that's blank on
+        # the original row (special_features) gets filled from content that
+        # - in a real brochure - only exists on a LATER page (e.g. page 3's
+        # "Key Features"), not the cover page. The renderer/page-count is
+        # irrelevant to this unit-level test (extract.render_and_extract is
+        # mocked) - what matters is that whatever Gemini returns from
+        # however many pages it saw reaches _apply_units_to_row and fills
+        # the blank field, exactly as it would for a multi-page PDF.
+        rows = [ListingRow(building="Metropolitan Wharf", brochure_link=_CANVA_URL, special_features=None, contacts=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment._fetch_canva_rendered_page",
+                    return_value=[b"\x89PNG cover", b"\x89PNG features page", b"\x89PNG contacts page"],
+                ), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img1", "img2", "img3"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={
+                        "units": [{"building": "Metropolitan Wharf", "special_features": "24/7 access, roof terrace"}],
+                        "contacts": "Harry James - hj@theworkplacecompany.co.uk",
+                    },
+                ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].special_features, "24/7 access, roof terrace")
+        self.assertEqual(enriched[0].contacts, "Harry James - hj@theworkplacecompany.co.uk")
 
     def test_successful_canva_enrichment_logs_exactly_which_fields_were_added(self):
         # The "brochure enrichment succeeded and which fields were added"
@@ -790,8 +896,8 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
         # alone that it actually changed a real row).
         rows = [ListingRow(building="Metropolitan Wharf", floor_unit="3rd", brochure_link=_CANVA_URL, special_features=None)]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
-                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
                 patch(
                     "brochure_enrichment.extract.render_and_extract",
                     return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Roof terrace"}]},
@@ -840,9 +946,9 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
         ]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch(
-                    "brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake",
+                    "brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake"],
                 ) as mock_render, \
-                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
                 patch(
                     "brochure_enrichment.extract.render_and_extract",
                     return_value={"units": [{"building": "Metropolitan Wharf", "special_features": "Nice"}]},
@@ -864,8 +970,8 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
             size_sqft=2762, rent_psf=33, rent_pcm=None,
         )]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
-                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
                 patch(
                     "brochure_enrichment.extract.render_and_extract",
                     return_value={"units": [{
@@ -885,8 +991,8 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
             size_sqft=2762, rent_psf=33, rent_pcm=None,
         )]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
-                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
                 patch(
                     "brochure_enrichment.extract.render_and_extract",
                     return_value={"units": [{
@@ -908,8 +1014,8 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
             size_sqft=None, rent_psf=None, rent_pcm=None,
         )]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
-                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=[b"\x89PNG fake render"]), \
+                patch("brochure_enrichment.extract.images_from_png_pages", return_value=["img"]), \
                 patch(
                     "brochure_enrichment.extract.render_and_extract",
                     return_value={"units": [{

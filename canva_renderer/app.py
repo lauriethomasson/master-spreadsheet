@@ -27,9 +27,10 @@ isn't canva.com/canva.link in the first place - those all fail the same
 one allow-list check, by construction, with no separate denylist logic to
 keep in sync.
 
-Only ever captures the FIRST page a URL lands on - see render_canva_page's
-own "KNOWN LIMITATION" docstring for why a genuinely multi-page brochure's
-other pages are not currently reachable.
+Captures EVERY page of a multi-page brochure, up to MAX_CANVA_PAGES - see
+render_canva_page_async's own docstring for how (Canva's own accessible
+"Next page" button/aria-disabled state, confirmed directly against a real
+multi-page brochure - never a CSS-class-dependent scrape).
 
 --- Playwright thread-affinity (real production incident) -----------------
 
@@ -65,10 +66,12 @@ main app's own container) and required environment variables.
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import json
 import os
 import re
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -98,13 +101,43 @@ SETTLE_MS = 3_000
 COOKIE_DISMISS_TIMEOUT_MS = 2_000
 VIEWPORT = {"width": 1200, "height": 1600}
 MAX_CONCURRENT_RENDERS = int(os.environ.get("MAX_CONCURRENT_RENDERS", "2"))
+
+# Hard cap on how many pages of ONE Canva design this service will ever
+# capture, regardless of how many the design actually has - a malformed or
+# deliberately huge public design must never be able to make one /render
+# call consume unbounded time/memory. 20 is comfortably above every real
+# brochure seen so far (confirmed directly: a real multi-building brochure
+# runs to single-digit pages) while still a firm ceiling.
+MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "20"))
+# Settle time after each Next-page click, before that page's own
+# screenshot - shorter than the initial-load SETTLE_MS above since the
+# Canva app/design is already warm; still enough for that page's own
+# images to paint (confirmed directly against a real 7-page brochure).
+PAGE_NAV_SETTLE_MS = 1_200
+# Per-page-transition timeout budget used only to size RENDER_TIMEOUT_
+# SECONDS below - the click itself still uses page.set_default_timeout
+# (NAV_TIMEOUT_MS); this is a generous per-page allowance (click + settle +
+# screenshot + margin for a slow retry) for sizing the OUTER backstop only.
+_PER_PAGE_TIMEOUT_BUDGET_S = 5
 # Overall budget for one render's whole async round trip (navigation +
-# settle + cookie-dismiss + screenshot), enforced from the OUTSIDE via
-# concurrent.futures' own timeout - comfortably above NAV_TIMEOUT_MS+
-# SETTLE_MS so a render that's genuinely progressing is never cut off
-# before its own internal timeouts would have ended it anyway; this is
-# the backstop for a hang neither of those internal timeouts catches.
-RENDER_TIMEOUT_SECONDS = (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10
+# settle + cookie-dismiss + screenshot + up to MAX_CANVA_PAGES-1 further
+# page transitions), enforced from the OUTSIDE via concurrent.futures' own
+# timeout - comfortably above every internal timeout combined so a render
+# that's genuinely progressing is never cut off before its own internal
+# timeouts would have ended it anyway; this is the backstop for a hang none
+# of those internal timeouts catches.
+RENDER_TIMEOUT_SECONDS = (
+    (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10 + (MAX_CANVA_PAGES - 1) * _PER_PAGE_TIMEOUT_BUDGET_S
+)
+
+# Best-effort parse of Canva's own "current / total" page-count text (e.g.
+# "1 / 7") from the accessible "Go to page" button's own inner text -
+# purely a diagnostic ("Canva design detected: N pages" logging), never the
+# mechanism this service relies on to know when to stop (that's the Next-
+# page button's own aria-disabled state - see render_canva_page_async).
+# Collapses internal whitespace/newlines first since Canva renders this as
+# several separate text nodes ("1", "/", "7"), not one plain string.
+_PAGE_COUNT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 # Optional defense-in-depth on top of Cloud Run's own IAM-based invoker
 # check (see README.md) - never the primary access control, since a
 # static secret has to be stored/rotated somewhere, but cheap insurance
@@ -198,29 +231,55 @@ class RenderError(Exception):
         self.reason = reason
 
 
-async def render_canva_page_async(url: str) -> bytes:
+async def _detect_page_count(page) -> int:
+    """
+    Best-effort "current / total" page count from Canva's own accessible
+    "Go to page" button (e.g. "1 / 7") - purely for the caller's own
+    logging (see Handler.do_POST's "Canva design detected: N pages" line),
+    never used to decide when to stop capturing pages (see
+    render_canva_page_async's own docstring on why the Next-page button's
+    aria-disabled state is the real stopping mechanism). Returns None on
+    any failure - a design with no such indicator at all (or one Canva has
+    changed the shape of) simply logs without a detected total, never a
+    render failure.
+    """
+    try:
+        text = await page.get_by_role("button", name="Go to page").inner_text(timeout=2_000)
+    except Exception:
+        return None
+    match = _PAGE_COUNT_RE.search(re.sub(r"\s+", " ", text))
+    return int(match.group(2)) if match else None
+
+
+async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
     """
     The real render logic - see render_canva_page (this module's own sync-
     facing entry point HTTP requests actually call) for how this gets
     scheduled onto the single dedicated Playwright loop thread from an
     arbitrary request thread.
 
-    Returns PNG bytes for the first page `url` lands on, or raises
-    RenderError(reason) on any safe-failure condition - a caller only
-    ever needs to catch this one exception type.
+    Returns (pages, detected_total): `pages` is a list of PNG bytes, one
+    per page actually captured, in page order, ALWAYS at least length 1 (the
+    first/cover page `url` lands on) - or raises RenderError(reason) on any
+    safe-failure condition preventing even that first page, a caller only
+    ever needs to catch this one exception type. `detected_total` is Canva's
+    own reported page count if it could be read (see _detect_page_count),
+    else None - purely informational, never a promise that many pages were
+    actually captured (MAX_CANVA_PAGES may cap `pages` shorter).
 
-    KNOWN LIMITATION: only ever captures ONE page. A real public Canva
-    "view" link renders as a single-page-at-a-time viewer (confirmed
-    directly against a real example - the loaded page's own
-    document.body.scrollHeight equals the viewport height, not a tall,
-    continuously-scrollable list of every page stacked vertically), so a
-    genuinely multi-page brochure's remaining pages are not reachable
-    without interacting with Canva's own pagination controls - private,
-    unversioned frontend implementation detail with no stable, documented
-    contract to hook into (no public API, no stable "page N of M" URL
-    scheme). Deliberately not attempted here rather than building brittle
-    DOM-selector-dependent page-clicking logic that could silently break
-    on any future Canva frontend change.
+    Captures every further page via Canva's own accessible "Next page"
+    button (confirmed directly against a real multi-page public brochure:
+    a stable aria-label, unaffected by Canva's own CSS class names, which
+    are regenerated per build) - clicking it advances the SAME already-
+    loaded design in place (confirmed: the page's own URL fragment updates,
+    e.g. "...view#2", with no new navigation/network round trip), and its
+    own aria-disabled="true" state on the last page (confirmed directly) is
+    what stops the loop - never a fixed page count assumed up front, and
+    never CSS-class-dependent selector logic. Stops early, keeping every
+    page already captured, the instant this stable mechanism isn't found or
+    doesn't behave as expected (a future Canva frontend change) - the same
+    "start conservative" precedent as this service's other safe-failure
+    paths - rather than guessing at a replacement selector.
     """
     if not _is_recognized_canva_url(url):
         raise RenderError("not a recognized public Canva URL")
@@ -269,14 +328,42 @@ async def render_canva_page_async(url: str) -> bytes:
             except Exception:
                 continue
 
-        return await page.screenshot(type="png")
+        pages = [await page.screenshot(type="png")]
+        detected_total = await _detect_page_count(page)
+
+        # Every further page - see this function's own docstring above for
+        # why the Next-page button's aria-disabled state (not a fixed
+        # count) is what stops this loop. Any exception here (button not
+        # found at all, a click that times out, a page that fails to
+        # settle) simply stops the loop and keeps whatever was already
+        # captured - a genuinely multi-page brochure whose page 4 hiccups
+        # still yields pages 1-3 rather than losing all of them, and a
+        # single-page design (no Next-page button at all) yields exactly
+        # the one page it always did before this feature existed.
+        while len(pages) < MAX_CANVA_PAGES:
+            try:
+                next_button = page.get_by_role("button", name="Next page")
+                if await next_button.get_attribute("aria-disabled") == "true":
+                    break
+                await next_button.click(timeout=NAV_TIMEOUT_MS)
+                await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+                pages.append(await page.screenshot(type="png"))
+            except Exception as e:
+                print(
+                    f"[canva_renderer] Stopped after {len(pages)} page(s) for {url!r} ({e!r}) - "
+                    "keeping pages captured so far.",
+                    file=sys.stderr,
+                )
+                break
+
+        return pages, detected_total
     finally:
         # Always closed, success or failure - a leaked context/page would
         # otherwise accumulate memory across requests indefinitely.
         await context.close()
 
 
-def render_canva_page(url: str) -> bytes:
+def render_canva_page(url: str) -> tuple[list[bytes], int]:
     """
     Sync-facing entry point - what the HTTP handler actually calls, on
     whichever request thread is handling this call. Schedules render_
@@ -345,7 +432,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             try:
-                png_bytes = render_canva_page(url)
+                pages, detected_total = render_canva_page(url)
             except RenderError as e:
                 self._send_json(422, {"error": "render_failed", "reason": e.reason})
                 return
@@ -353,11 +440,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": "internal_error", "reason": repr(e)})
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(png_bytes)))
-            self.end_headers()
-            self.wfile.write(png_bytes)
+            # A single concise line whether this was one page or several -
+            # see this service's own module docstring on "Canva render
+            # succeeded" being the one unambiguous line to grep Cloud Run
+            # logs for to confirm rendering itself worked.
+            detected_str = f"{detected_total} detected" if detected_total else "total unknown"
+            print(
+                f"[canva_renderer] Canva render succeeded for {url!r}: "
+                f"{len(pages)} page(s) captured ({detected_str}).",
+                file=sys.stderr,
+            )
+            # A bounded JSON array of base64 PNGs, never a single giant
+            # concatenated image - each page stays a separate, independently
+            # sized image the main app can feed straight into its existing
+            # multi-image Gemini extraction (see extract.render_and_extract),
+            # exactly like a multi-page PDF's own per-page images already are.
+            self._send_json(200, {
+                "pages": [base64.b64encode(p).decode("ascii") for p in pages],
+                "page_count_detected": detected_total,
+            })
         finally:
             _render_semaphore.release()
 

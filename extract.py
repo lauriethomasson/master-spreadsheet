@@ -504,6 +504,26 @@ def render_pages(pdf_source) -> list[types.Part]:
         fitz.TOOLS.store_shrink(100)
 
 
+def images_from_png_pages(png_pages: list) -> list[types.Part]:
+    """
+    `png_pages` (a list of already-rendered PNG bytes, one per page - see
+    canva_renderer/app.py's multi-page capture) wrapped as types.Part
+    objects, in the same order and via the exact same construction render_
+    pages already uses per page (types.Part.from_bytes(..., mime_type=
+    "image/png")) - never a second, differently-built image representation.
+
+    Deliberately NOT routed through render_pages/fitz.open at all: these
+    bytes are already rendered raster pages (a real browser's own
+    screenshot), not a vector PDF that needs rasterizing - re-opening one
+    PNG at a time as a fake one-page "PDF" would just be a slower, no-op
+    round trip through PyMuPDF for identical output. The caller (see
+    brochure_enrichment._extract_brochure_units) still passes the result
+    straight into render_and_extract, exactly like render_pages' own
+    output - there is no separate extraction path for this source.
+    """
+    return [types.Part.from_bytes(data=png, mime_type="image/png") for png in png_pages]
+
+
 def render_and_extract(images: list, client=None, prompt: str = None) -> dict:
     """
     The second half of extract_raw_units, split out on its own so a caller

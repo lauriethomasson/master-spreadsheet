@@ -1,8 +1,8 @@
 # canva_renderer
 
 A small, isolated service whose only job is: given a public Canva "view"
-URL, render it in a real headless Chromium and return a single PNG
-screenshot of whatever page that URL lands on.
+URL, render it in a real headless Chromium and return a PNG screenshot of
+every page of that design, up to `MAX_CANVA_PAGES`.
 
 ## Why this is a separate service
 
@@ -17,18 +17,25 @@ This service isolates that entire risk in its own container with its own
 memory/CPU allocation: if Chromium OOMs or a page hangs here, the main
 app is completely unaffected.
 
-## Known limitation: single page only
+## Multi-page capture
 
-A real public Canva "view" link renders as a single-page-at-a-time
-viewer, not a continuously-scrollable list of every page (confirmed
-directly). Capturing every page of a multi-page brochure would require
-interacting with Canva's own pagination controls - private, unversioned
-frontend implementation detail with no stable, documented contract (no
-public API, no "page N of M" URL scheme). This service deliberately does
-NOT attempt that, to avoid brittle DOM-selector-dependent scraping that
-could silently break on any future Canva frontend change. It captures
-whichever page the supplied URL lands on (typically the cover/first page)
-and nothing more.
+A real public Canva "view" link renders as a single-page-at-a-time viewer,
+not a continuously-scrollable list of every page (confirmed directly). This
+service captures every page by driving Canva's own **accessible** page
+controls - the "Next page" button's stable `aria-label` and its
+`aria-disabled="true"` state on the last page (confirmed directly against a
+real multi-page brochure) - never a CSS-class-dependent scrape, and never
+one HTTP request per page (one browser context loads the design once, then
+navigates and screenshots in place). A design's own reported "N / M" page
+count (read from the accessible "Go to page" control) is used only for
+logging, never to decide when to stop.
+
+Capped at `MAX_CANVA_PAGES` (default 20, see below) regardless of how many
+pages a design actually has, so a malformed/huge public design can't make
+one `/render` call consume unbounded time or memory. If Canva's own page
+controls aren't found at all (a single-page design, or a future Canva
+frontend change), this service simply returns the one page it always did
+before this feature existed - never a hard failure.
 
 ## Local development
 
@@ -38,8 +45,11 @@ playwright install chromium
 python app.py
 ```
 
-Then `POST http://localhost:8080/render` with `{"url": "https://www.canva.com/design/.../.../view"}`
-and a `200` response body is the PNG bytes directly (content-type `image/png`).
+Then `POST http://localhost:8080/render` with `{"url": "https://www.canva.com/design/.../.../view"}`.
+A `200` response body is JSON: `{"pages": ["<base64 PNG>", ...], "page_count_detected": 7}`
+(`pages` in page order, always at least one; `page_count_detected` is Canva's
+own best-effort reported total, or `null` if it couldn't be read - never a
+promise that many pages were actually captured, see `MAX_CANVA_PAGES`).
 A recognized failure returns `422` with `{"error": "render_failed", "reason": "..."}`.
 
 ## Deployment (Cloud Run)
@@ -53,10 +63,15 @@ gcloud run deploy canva-renderer \
   --region <same region as the main app> \
   --memory 1Gi \
   --cpu 1 \
-  --timeout 30 \
+  --timeout 180 \
   --concurrency 4 \
   --no-allow-unauthenticated
 ```
+
+`--timeout 180` is comfortably above this service's own internal
+`RENDER_TIMEOUT_SECONDS` backstop (scales with `MAX_CANVA_PAGES` - see
+`app.py`), which itself is the ceiling for one `/render` call capturing up
+to `MAX_CANVA_PAGES` pages of a single design.
 
 `--no-allow-unauthenticated` is the primary access control (see
 "Authentication" below) - do not deploy this publicly.
@@ -88,6 +103,7 @@ check on top of that, never a replacement for `--no-allow-unauthenticated`.
 |----------------------------|---------|------------------------------------------------------------|
 | `PORT`                     | `8080`  | Set automatically by Cloud Run.                            |
 | `MAX_CONCURRENT_RENDERS`   | `2`     | Hard cap on simultaneous browser renders.                  |
+| `MAX_CANVA_PAGES`          | `20`    | Hard cap on pages captured per design (see above).          |
 | `RENDERER_SHARED_SECRET`   | (unset) | Optional extra `Authorization: Bearer <secret>` check.     |
 
 ### Environment variable the MAIN APP needs
