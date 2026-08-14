@@ -2,22 +2,25 @@
 Regression tests for canva_renderer/app.py - the separate, isolated
 Playwright/Chromium service that renders a public Canva "view" link (see
 that module's own docstring for why this is a SEPARATE service, never run
-inside the main app's own container). Playwright's own browser is mocked
-throughout - these tests never launch a real browser, matching this
-repo's existing convention (test_brochure_enrichment.py never calls the
-real network/Gemini API either).
+inside the main app's own container, and for the real production
+"greenlet.error: cannot switch to a different thread" incident this
+module's async-API-plus-one-dedicated-event-loop-thread architecture
+fixes). Playwright's own browser is mocked throughout - these tests never
+launch a real browser, matching this repo's existing convention (test_
+brochure_enrichment.py never calls the real network/Gemini API either).
 
 Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_canva_renderer -v
 """
 
+import concurrent.futures
 import importlib.util
 import json
 import sys
 import unittest
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -29,8 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # FIRST in a given test process wins that cache slot, silently handing
 # every later "import app" the WRONG module. Loading by path sidesteps
 # that entirely - this always loads canva_renderer/app.py specifically,
-# regardless of what else has already been imported in this process (see
-# the full-suite discovery run that first caught this exact collision).
+# regardless of what else has already been imported in this process.
 _spec = importlib.util.spec_from_file_location(
     "canva_renderer_app", Path(__file__).resolve().parent.parent / "canva_renderer" / "app.py",
 )
@@ -87,79 +89,218 @@ class HostAllowedSsrfTests(unittest.TestCase):
         self.assertFalse(canva_renderer._host_allowed("https://example.com/"))
 
 
-def _mock_page(final_url="https://www.canva.com/design/x/y/view", goto_side_effect=None, screenshot=b"\x89PNG fake"):
+def _run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _make_async_page(final_url="https://www.canva.com/design/x/y/view", goto_side_effect=None, screenshot=b"\x89PNG fake"):
+    """A MagicMock shaped like an async Playwright Page - every method
+    Playwright's own async API defines as a coroutine is an AsyncMock;
+    the two plain (non-async) setters stay ordinary MagicMock attributes,
+    matching the real API exactly (see canva_renderer.app's own comment on
+    this - confirmed directly against the installed playwright package)."""
     page = MagicMock()
     page.url = final_url
-    if goto_side_effect:
-        page.goto.side_effect = goto_side_effect
-    page.get_by_text.return_value.click.side_effect = Exception("no cookie banner")
-    page.screenshot.return_value = screenshot
+    page.set_default_navigation_timeout = MagicMock()
+    page.set_default_timeout = MagicMock()
+    page.route = AsyncMock()
+    page.goto = AsyncMock(side_effect=goto_side_effect) if goto_side_effect else AsyncMock()
+    locator = MagicMock()
+    locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
+    page.get_by_text = MagicMock(return_value=locator)
+    page.wait_for_timeout = AsyncMock()
+    page.screenshot = AsyncMock(return_value=screenshot)
     return page
 
 
-class RenderCanvaPageTests(unittest.TestCase):
+def _make_async_context(page):
+    context = MagicMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.close = AsyncMock()
+    return context
+
+
+def _make_async_browser(context):
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    return browser
+
+
+class _ResetGlobalBrowserStateTestCase(unittest.TestCase):
+    """The lazily-initialized browser/playwright-context globals are
+    process-lifetime singletons by design (see _get_browser_async's own
+    docstring) - reset between tests so each one gets its own mocked
+    browser rather than silently reusing a previous test's. The dedicated
+    event-loop thread itself is NOT reset - exactly like production, it
+    starts once and is reused for the rest of the process."""
+
     def setUp(self):
         canva_renderer._browser = None
         canva_renderer._playwright_ctx = None
+        canva_renderer._browser_init_lock = None
 
     def tearDown(self):
         canva_renderer._browser = None
         canva_renderer._playwright_ctx = None
+        canva_renderer._browser_init_lock = None
 
-    def _patched_browser(self, page):
-        context = MagicMock()
-        context.new_page.return_value = page
-        browser = MagicMock()
-        browser.new_context.return_value = context
-        return browser, context
 
-    def test_non_canva_url_raises_before_launching_a_browser(self):
-        with patch.object(canva_renderer, "_get_browser") as mock_get_browser:
+class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
+    """Unit-level tests against render_canva_page_async directly (run via
+    asyncio.run in this test process' own thread) - the render LOGIC
+    itself, independent of the sync-to-async threading bridge (see
+    RenderCanvaPageThreadBridgeTests for that)."""
+
+    def _patch_browser(self, page):
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        return patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser)), context
+
+    def test_non_canva_url_raises_before_touching_the_browser(self):
+        mock_get_browser = AsyncMock()
+        with patch.object(canva_renderer, "_get_browser_async", mock_get_browser):
             with self.assertRaises(canva_renderer.RenderError):
-                canva_renderer.render_canva_page("https://example.com/x")
+                _run(canva_renderer.render_canva_page_async("https://example.com/x"))
         mock_get_browser.assert_not_called()
 
     def test_successful_render_returns_png_bytes(self):
-        page = _mock_page(screenshot=b"\x89PNG real bytes")
-        browser, context = self._patched_browser(page)
-        with patch.object(canva_renderer, "_get_browser", return_value=browser):
-            result = canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
+        page = _make_async_page(screenshot=b"\x89PNG real bytes")
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            result = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(result, b"\x89PNG real bytes")
-        context.close.assert_called_once()  # resources cleaned up after the request
+        context.close.assert_awaited_once()  # resources cleaned up after the request
 
-    def test_navigation_timeout_raises_render_error(self):
-        page = _mock_page(goto_side_effect=Exception("Timeout 15000ms exceeded"))
-        browser, context = self._patched_browser(page)
-        with patch.object(canva_renderer, "_get_browser", return_value=browser):
+    def test_navigation_timeout_raises_render_error_and_still_cleans_up(self):
+        page = _make_async_page(goto_side_effect=Exception("Timeout 15000ms exceeded"))
+        patcher, context = self._patch_browser(page)
+        with patcher:
             with self.assertRaises(canva_renderer.RenderError):
-                canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
-        context.close.assert_called_once()  # still cleaned up even on failure
+                _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+        context.close.assert_awaited_once()
 
     def test_redirect_off_canva_host_raises_render_error(self):
-        # Simulates a malicious/broken redirect landing somewhere off
-        # canva.com after navigation completes without raising on its own.
-        page = _mock_page(final_url="http://169.254.169.254/latest/meta-data/")
-        browser, context = self._patched_browser(page)
-        with patch.object(canva_renderer, "_get_browser", return_value=browser):
+        page = _make_async_page(final_url="http://169.254.169.254/latest/meta-data/")
+        patcher, context = self._patch_browser(page)
+        with patcher:
             with self.assertRaises(canva_renderer.RenderError):
-                canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
-        context.close.assert_called_once()
+                _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+        context.close.assert_awaited_once()
 
     def test_request_route_guard_aborts_non_canva_requests(self):
-        page = _mock_page()
-        browser, context = self._patched_browser(page)
-        with patch.object(canva_renderer, "_get_browser", return_value=browser):
-            canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
+        page = _make_async_page()
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         guard = page.route.call_args.args[1]
         allowed_route = MagicMock(request=MagicMock(url="https://www.canva.com/some-asset.js"))
+        allowed_route.continue_ = AsyncMock()
+        allowed_route.abort = AsyncMock()
         blocked_route = MagicMock(request=MagicMock(url="http://10.0.0.5/steal"))
-        guard(allowed_route)
-        guard(blocked_route)
-        allowed_route.continue_.assert_called_once()
-        blocked_route.abort.assert_called_once()
+        blocked_route.continue_ = AsyncMock()
+        blocked_route.abort = AsyncMock()
+        _run(guard(allowed_route))
+        _run(guard(blocked_route))
+        allowed_route.continue_.assert_awaited_once()
+        blocked_route.abort.assert_awaited_once()
         blocked_route.continue_.assert_not_called()
+
+    def test_browser_is_only_ever_launched_once_across_renders(self):
+        page = _make_async_page()
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=MagicMock(chromium=MagicMock(launch=AsyncMock(return_value=browser))))
+
+        with patch.object(canva_renderer, "async_playwright", MagicMock(return_value=starter)):
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        starter.start.assert_awaited_once()  # never launched a second browser
+
+
+class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
+    """
+    Exercises the REAL sync-to-async bridge (render_canva_page -> the
+    single dedicated Playwright event-loop thread, via asyncio.
+    run_coroutine_threadsafe) - the actual fix for the real production
+    "greenlet.error: cannot switch to a different thread" crash. Still
+    mocks the browser/page tree itself (no real Chromium needed), but the
+    THREADING/event-loop machinery here is 100% real, run from this test's
+    own thread exactly like a real HTTP request thread would.
+    """
+
+    def _patch_browser(self, page):
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        return patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser))
+
+    def test_single_render_succeeds_through_the_real_thread_bridge(self):
+        page = _make_async_page(screenshot=b"\x89PNG single")
+        with self._patch_browser(page):
+            result = canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
+        self.assertEqual(result, b"\x89PNG single")
+
+    def test_sequential_renders_all_succeed(self):
+        page = _make_async_page(screenshot=b"\x89PNG seq")
+        with self._patch_browser(page):
+            results = [
+                canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view") for _ in range(5)
+            ]
+        self.assertEqual(results, [b"\x89PNG seq"] * 5)
+
+    def test_concurrent_renders_from_multiple_threads_never_hit_a_cross_thread_playwright_error(self):
+        # The exact real production shape: several /render requests
+        # arriving on DIFFERENT OS threads (ThreadingHTTPServer hands each
+        # connection its own thread) at the same time. Before the fix,
+        # this - or even a single request on any thread OTHER than the one
+        # that happened to launch the browser - raised "greenlet.error:
+        # cannot switch to a different thread". Every Playwright object
+        # here is only ever touched from the one dedicated loop thread
+        # (see _ensure_loop/render_canva_page's own docstrings), so this
+        # must succeed regardless of which OS thread called render_canva_
+        # page - genuinely exercising cross-thread calls via a real
+        # ThreadPoolExecutor, not just sequential calls from one thread.
+        page = _make_async_page(screenshot=b"\x89PNG concurrent")
+        with self._patch_browser(page):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [
+                    pool.submit(canva_renderer.render_canva_page, "https://www.canva.com/design/x/y/view")
+                    for _ in range(8)
+                ]
+                results = [f.result(timeout=10) for f in futures]
+
+        self.assertEqual(results, [b"\x89PNG concurrent"] * 8)
+
+    def test_context_is_cleaned_up_even_under_concurrent_load(self):
+        page = _make_async_page()
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        with patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser)):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [
+                    pool.submit(canva_renderer.render_canva_page, "https://www.canva.com/design/x/y/view")
+                    for _ in range(4)
+                ]
+                [f.result(timeout=10) for f in futures]
+
+        self.assertEqual(context.close.await_count, 4)  # once per request, none leaked
+
+    def test_a_hanging_render_times_out_as_a_safe_render_error(self):
+        page = _make_async_page()
+
+        async def _hang(*a, **kw):
+            import asyncio as _asyncio
+            await _asyncio.sleep(3600)
+
+        page.goto = AsyncMock(side_effect=_hang)
+        with self._patch_browser(page), \
+                patch.object(canva_renderer, "RENDER_TIMEOUT_SECONDS", 0.2):
+            with self.assertRaises(canva_renderer.RenderError):
+                canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
 
 
 class RenderHandlerTests(unittest.TestCase):

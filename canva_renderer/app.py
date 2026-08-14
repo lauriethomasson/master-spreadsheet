@@ -31,6 +31,30 @@ Only ever captures the FIRST page a URL lands on - see render_canva_page's
 own "KNOWN LIMITATION" docstring for why a genuinely multi-page brochure's
 other pages are not currently reachable.
 
+--- Playwright thread-affinity (real production incident) -----------------
+
+This service used Playwright's SYNC API (playwright.sync_api) under
+ThreadingHTTPServer, which hands each incoming request to a NEW OS thread.
+Playwright's sync API is built on greenlet, and greenlet's own switching
+mechanism is tied to the specific OS thread that first created the
+Playwright/Browser/Page objects - calling browser.new_context()/page.
+goto() etc. from a DIFFERENT thread than the one that created them raises
+"greenlet.error: cannot switch to a different thread", confirmed directly
+in production (every /render request after the first, on a fresh request
+thread, crashed this way and returned 503).
+
+Fixed by switching to Playwright's ASYNC API (playwright.async_api) driven
+by ONE dedicated background thread running its own asyncio event loop for
+the lifetime of this process - every Playwright object (Browser, the lazy
+launch, every render's own context/page) is created AND used exclusively
+from coroutines scheduled onto that SAME loop, via asyncio.
+run_coroutine_threadsafe from whichever HTTP request thread is handling a
+given call. This preserves genuine concurrency (multiple renders really
+can be in flight at once, up to MAX_CONCURRENT_RENDERS, interleaved via
+asyncio's own cooperative scheduling) without ever touching a Playwright
+object from more than one OS thread - the actual root cause, not merely a
+symptom to catch/retry around.
+
 Run locally:
     pip install -r requirements.txt
     playwright install chromium
@@ -40,6 +64,8 @@ See README.md for deployment (a separate Cloud Run service, never the
 main app's own container) and required environment variables.
 """
 
+import asyncio
+import concurrent.futures
 import json
 import os
 import re
@@ -47,7 +73,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 # Mirrors brochure_link_resolver.is_canva_view_link's own narrow shape in
 # the main app (never a bare "canva.com" substring) - kept as an
@@ -72,6 +98,13 @@ SETTLE_MS = 3_000
 COOKIE_DISMISS_TIMEOUT_MS = 2_000
 VIEWPORT = {"width": 1200, "height": 1600}
 MAX_CONCURRENT_RENDERS = int(os.environ.get("MAX_CONCURRENT_RENDERS", "2"))
+# Overall budget for one render's whole async round trip (navigation +
+# settle + cookie-dismiss + screenshot), enforced from the OUTSIDE via
+# concurrent.futures' own timeout - comfortably above NAV_TIMEOUT_MS+
+# SETTLE_MS so a render that's genuinely progressing is never cut off
+# before its own internal timeouts would have ended it anyway; this is
+# the backstop for a hang neither of those internal timeouts catches.
+RENDER_TIMEOUT_SECONDS = (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10
 # Optional defense-in-depth on top of Cloud Run's own IAM-based invoker
 # check (see README.md) - never the primary access control, since a
 # static secret has to be stored/rotated somewhere, but cheap insurance
@@ -80,9 +113,19 @@ MAX_CONCURRENT_RENDERS = int(os.environ.get("MAX_CONCURRENT_RENDERS", "2"))
 SHARED_SECRET = os.environ.get("RENDERER_SHARED_SECRET")
 
 _render_semaphore = threading.Semaphore(MAX_CONCURRENT_RENDERS)
-_playwright_lock = threading.Lock()
-_playwright_ctx = None
-_browser = None
+
+# The single dedicated thread + event loop that owns EVERY Playwright
+# object for this process' whole lifetime - see the module's own "Playwright
+# thread-affinity" docstring above for why this exists at all. _loop_ready
+# gates _ensure_loop() so concurrent first-callers block until the loop
+# thread has genuinely started (never a race constructing it twice).
+_loop = None
+_loop_ready = threading.Event()
+_loop_start_lock = threading.Lock()
+
+_playwright_ctx = None  # set once, on the loop thread only
+_browser = None  # set once, on the loop thread only
+_browser_init_lock = None  # an asyncio.Lock, created lazily ON the loop thread
 
 
 def _host_allowed(url: str) -> bool:
@@ -95,19 +138,52 @@ def _is_recognized_canva_url(url: str) -> bool:
     return bool(_CANVA_VIEW_URL_RE.match(url)) or bool(_CANVA_SHORT_LINK_RE.match(url))
 
 
-def _get_browser():
+def _run_loop_forever():
+    global _loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _loop = loop
+    _loop_ready.set()
+    loop.run_forever()
+
+
+def _ensure_loop():
+    """
+    Starts the single dedicated Playwright event-loop thread on first use
+    (idempotent, thread-safe across however many HTTP request threads race
+    to call this first) and returns its loop. Every Playwright-touching
+    coroutine in this module is scheduled onto THIS loop via asyncio.
+    run_coroutine_threadsafe, never run directly on a request thread -
+    that's the actual fix (see this module's own top-level docstring).
+    """
+    if not _loop_ready.is_set():
+        with _loop_start_lock:
+            if not _loop_ready.is_set():
+                threading.Thread(target=_run_loop_forever, name="canva-playwright-loop", daemon=True).start()
+                _loop_ready.wait()
+    return _loop
+
+
+async def _get_browser_async():
     """
     One Chromium process, launched lazily on first use and reused for
     every subsequent request (each request gets its own fresh browser
-    CONTEXT + page - see render_canva_page - so requests never share
+    CONTEXT + page - see render_canva_page_async - so requests never share
     cookies/storage/state) - never a new browser process per request,
-    which would be far slower and heavier for no benefit.
+    which would be far slower and heavier for no benefit. Only ever
+    awaited from a coroutine already running on the single dedicated
+    Playwright loop (see _ensure_loop) - an asyncio.Lock (not a threading
+    one) guards the lazy-init check itself, since two render coroutines on
+    the SAME loop could otherwise both see _browser as None and each start
+    their own browser if either awaited between the check and the launch.
     """
-    global _playwright_ctx, _browser
-    with _playwright_lock:
+    global _playwright_ctx, _browser, _browser_init_lock
+    if _browser_init_lock is None:
+        _browser_init_lock = asyncio.Lock()
+    async with _browser_init_lock:
         if _browser is None:
-            _playwright_ctx = sync_playwright().start()
-            _browser = _playwright_ctx.chromium.launch(headless=True)
+            _playwright_ctx = await async_playwright().start()
+            _browser = await _playwright_ctx.chromium.launch(headless=True)
         return _browser
 
 
@@ -122,8 +198,13 @@ class RenderError(Exception):
         self.reason = reason
 
 
-def render_canva_page(url: str) -> bytes:
+async def render_canva_page_async(url: str) -> bytes:
     """
+    The real render logic - see render_canva_page (this module's own sync-
+    facing entry point HTTP requests actually call) for how this gets
+    scheduled onto the single dedicated Playwright loop thread from an
+    arbitrary request thread.
+
     Returns PNG bytes for the first page `url` lands on, or raises
     RenderError(reason) on any safe-failure condition - a caller only
     ever needs to catch this one exception type.
@@ -146,34 +227,35 @@ def render_canva_page(url: str) -> bytes:
     if not _host_allowed(url):
         raise RenderError("host not allowed")
 
-    browser = _get_browser()
-    context = browser.new_context(viewport=VIEWPORT)
+    browser = await _get_browser_async()
+    context = await browser.new_context(viewport=VIEWPORT)
     try:
-        page = context.new_page()
+        page = await context.new_page()
+        # Plain (non-async) setters even on the async API - never awaited.
         page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
         page.set_default_timeout(NAV_TIMEOUT_MS)
 
-        def _guard(route):
+        async def _guard(route):
             if _host_allowed(route.request.url):
-                route.continue_()
+                await route.continue_()
             else:
-                route.abort()
+                await route.abort()
 
         # Applies to EVERY request this page makes, not just the initial
         # navigation - a redirect or sub-resource load reaching a
         # non-Canva host is aborted at the network layer, regardless of
         # how the page got there (see the module's own SSRF docstring).
-        page.route("**/*", _guard)
+        await page.route("**/*", _guard)
 
         try:
-            page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+            await page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
         except Exception as e:
             raise RenderError(f"navigation failed or timed out ({e!r})")
 
         if not _host_allowed(page.url):
             raise RenderError("navigation left the allowed Canva host")
 
-        page.wait_for_timeout(SETTLE_MS)
+        await page.wait_for_timeout(SETTLE_MS)
 
         # Best-effort only - a cookie-consent banner is common but not
         # guaranteed present, and its own exact wording is Canva's choice,
@@ -181,17 +263,40 @@ def render_canva_page(url: str) -> bytes:
         # doesn't find anything within its own short, bounded timeout.
         for label in ("Reject all cookies", "Accept all cookies"):
             try:
-                page.get_by_text(label, exact=True).click(timeout=COOKIE_DISMISS_TIMEOUT_MS)
-                page.wait_for_timeout(500)
+                await page.get_by_text(label, exact=True).click(timeout=COOKIE_DISMISS_TIMEOUT_MS)
+                await page.wait_for_timeout(500)
                 break
             except Exception:
                 continue
 
-        return page.screenshot(type="png")
+        return await page.screenshot(type="png")
     finally:
         # Always closed, success or failure - a leaked context/page would
         # otherwise accumulate memory across requests indefinitely.
-        context.close()
+        await context.close()
+
+
+def render_canva_page(url: str) -> bytes:
+    """
+    Sync-facing entry point - what the HTTP handler actually calls, on
+    whichever request thread is handling this call. Schedules render_
+    canva_page_async(url) onto the single dedicated Playwright loop thread
+    (see _ensure_loop) via asyncio.run_coroutine_threadsafe, then blocks
+    THIS thread (not the loop thread) waiting for the result - the
+    standard, safe way to bridge a sync caller to work that must run on a
+    specific already-running event loop. A RenderError raised inside the
+    coroutine propagates through .result() unchanged; a render that never
+    finishes within RENDER_TIMEOUT_SECONDS is converted into one too,
+    rather than leaking a bare concurrent.futures.TimeoutError to the
+    HTTP handler's own RenderError-only except clause.
+    """
+    loop = _ensure_loop()
+    future = asyncio.run_coroutine_threadsafe(render_canva_page_async(url), loop)
+    try:
+        return future.result(timeout=RENDER_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise RenderError("render timed out")
 
 
 class Handler(BaseHTTPRequestHandler):
