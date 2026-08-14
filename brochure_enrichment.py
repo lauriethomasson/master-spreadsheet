@@ -439,6 +439,89 @@ UNIT_LEVEL_FIELDS = ("special_features", "state_of_space", "floor_unit", "size_s
 # never derived from its sibling field.
 HIGH_RISK_UNIT_LEVEL_FIELDS = ("rent_pcm", "rent_psf")
 
+# Generous relative tolerance for _rent_values_consistent below - wide enough
+# to absorb ordinary real-world rounding (an agent quoting "£33 psf" for a
+# figure that's really £32.80, or a size rounded to the nearest 10 sqft),
+# narrow enough that a genuine mislabeling (e.g. a per-square-foot figure
+# read into rent_pcm) is still caught: a real confirmed production case had
+# rent_pcm=33/size=2762 against an actual rent_psf=33 for the same unit,
+# implying annual figures of 396 vs 91,146 - a ~230x divergence, nowhere
+# close to this tolerance regardless of how generous it is.
+_RENT_CONSISTENCY_TOLERANCE_FRACTION = 0.15
+
+
+def _rent_values_consistent(size_sqft, rent_pcm, rent_psf) -> bool:
+    """
+    True whenever there isn't enough data to check at all (any of the three
+    is missing, or non-positive - not this check's job to judge a zero/
+    negative value), OR whenever what IS available is internally consistent
+    within _RENT_CONSISTENCY_TOLERANCE_FRACTION: the annual rent implied by
+    rent_pcm (×12) and the annual rent implied by rent_psf×size_sqft must be
+    close to each other. Purely a generic mathematical relationship - no
+    property-specific thresholds, no notion of what a "plausible" rent looks
+    like for any particular market - so a genuinely unusual but internally
+    consistent rent (very cheap or very expensive) is never rejected on that
+    basis; only a mismatch between how the SAME rent is being described two
+    different ways is treated as suspicious.
+    """
+    if size_sqft is None or rent_pcm is None or rent_psf is None:
+        return True
+    if size_sqft <= 0 or rent_pcm <= 0 or rent_psf <= 0:
+        return True
+    annual_from_pcm = rent_pcm * 12
+    annual_from_psf = rent_psf * size_sqft
+    lo, hi = sorted((annual_from_pcm, annual_from_psf))
+    if lo == 0:
+        return hi == 0
+    return (hi / lo) - 1 <= _RENT_CONSISTENCY_TOLERANCE_FRACTION
+
+
+def _rent_check_values(row: ListingRow, unit: dict):
+    """
+    (size_sqft, rent_pcm, rent_psf) to feed _rent_values_consistent when
+    deciding whether `unit`'s own rent figures are safe to apply to `row` -
+    each is the row's OWN existing value when it already has one (a trusted,
+    already-protected value from whatever source originally supplied it,
+    never touched regardless of this check's outcome - see the blank-only
+    guard in _apply_units_to_row's own loop), otherwise `unit`'s own
+    candidate value for that same field. This mixing is deliberate: the
+    real, confirmed production case this guards against is exactly a row
+    that already has a trustworthy rent_psf/size_sqft from its original
+    source, with only rent_pcm left blank for a brochure to fill - checking
+    the brochure's OWN candidate pair against each other alone would miss
+    it entirely whenever Gemini's own two numbers happen to already agree
+    with each other (both wrong, but mutually "consistent" - a residual risk
+    no purely internal check can rule out; the two candidate pairs are only
+    combined with the row's own existing values BECAUSE the row's own values
+    are independently anchored - see this module's own docstring on why
+    fields other than the one being checked are never invented here).
+    """
+    size = row.size_sqft if not _is_blank(row.size_sqft) else _coerced_unit_value("size_sqft", unit.get("size_sqft"))
+    pcm = row.rent_pcm if not _is_blank(row.rent_pcm) else _coerced_unit_value("rent_pcm", unit.get("rent_pcm"))
+    psf = row.rent_psf if not _is_blank(row.rent_psf) else _coerced_unit_value("rent_psf", unit.get("rent_psf"))
+    return size, pcm, psf
+
+
+def _row_had_rent_conflict(row: ListingRow, units) -> bool:
+    """
+    True when the SAME unit _match_unit would confidently match for `row`
+    stated a rent_pcm/rent_psf figure that failed _rent_values_consistent
+    once paired against whatever size_sqft/sibling rent value is already
+    trustworthy for this row (see _rent_check_values) - i.e. this row's rent
+    field(s) stayed blank because the brochure's own stated number didn't
+    add up, not because the document had nothing to offer. Purely a
+    diagnostic signal (see STATUS_EXTRACTED_BUT_AMBIGUOUS), mirroring _row_
+    had_ambiguous_match's own role alongside it in enrich_rows_grouped's
+    main loop - never changes what gets enriched, only what's reported.
+    """
+    if not units:
+        return False
+    unit = _match_unit(row, units)
+    if unit is None:
+        return False
+    size, pcm, psf = _rent_check_values(row, unit)
+    return not _rent_values_consistent(size, pcm, psf)
+
 # The full set of fields this module can ever fill, for the single top-
 # level "is there anything at all worth fetching a brochure for" gate (see
 # needs_enrichment) - dict.fromkeys dedupes special_features (present in
@@ -1615,8 +1698,21 @@ def _apply_units_to_row(row: ListingRow, units):
     if units:
         unit = _match_unit(row, units)
         if unit is not None:
+            # Checked ONCE per unit, before the per-field loop below - see
+            # _rent_check_values/_rent_values_consistent's own docstrings.
+            # rent_conflict being True means this unit's own rent_pcm/
+            # rent_psf don't add up against whatever size/sibling-rent value
+            # is already trustworthy for this row, so neither is safe to
+            # write - "incorrect enrichment is worse than a blank field",
+            # same philosophy as every other tier in this module. Never
+            # affects a field that's already non-blank on the row (the
+            # per-field blank-only guard below still applies first), and
+            # never affects UNIT_LEVEL_FIELDS other than the two rent ones.
+            rent_conflict = not _rent_values_consistent(*_rent_check_values(row, unit))
             for field in UNIT_LEVEL_FIELDS + HIGH_RISK_UNIT_LEVEL_FIELDS:
                 if not _is_blank(getattr(row, field)):
+                    continue
+                if field in HIGH_RISK_UNIT_LEVEL_FIELDS and rent_conflict:
                     continue
                 value = _coerced_unit_value(field, unit.get(field))
                 if value is not None:
@@ -2398,7 +2494,7 @@ def enrich_rows_grouped(
                     # this row at all, which is a completely normal, silent
                     # outcome, not an issue.
                     try:
-                        ambiguous = _row_had_ambiguous_match(rows[i], units)
+                        ambiguous = _row_had_ambiguous_match(rows[i], units) or _row_had_rent_conflict(rows[i], units)
                     except Exception:
                         ambiguous = False
                     if ambiguous:

@@ -368,10 +368,26 @@ Also extract for each unit:
 - desks_max: the maximum desk count as a plain integer. If given as a range ("24-58 desks"), use the
   higher number. If given as a composite like "10 + MR + PB" (meeting room, phone booth), extract just
   the numeric desk count (10) and note "+ meeting room + phone booth" in special_features.
-- rent_pcm: monthly rent as a plain number (no currency symbols/commas), ONLY if explicitly stated in
-  the document. Do not calculate this yourself — leave null if not directly given.
-- rent_psf: rent per square foot as a plain number, ONLY if explicitly stated in the document. Do not
-  calculate this yourself — leave null if not directly given.
+- rent_pcm: the rent expressed per calendar month (PCM), as a plain number (no currency symbols/commas/
+  "pcm" suffix), ONLY if the document itself labels or clearly states a figure as a MONTHLY rent (e.g.
+  "pcm", "per month", "/month"). Do not calculate this yourself from rent_psf, an annual figure, or size —
+  leave null if not directly given as a monthly figure.
+- rent_psf: the rent expressed per square foot (almost always per annum, e.g. "£33 psf" or "£33 per sq ft
+  pa"), as a plain number (no currency symbols/commas/"psf" suffix), ONLY if the document itself labels or
+  clearly states a figure as a PER-SQUARE-FOOT rent (e.g. "psf", "per sq ft", "per square foot"). Do not
+  calculate this yourself from rent_pcm, an annual figure, or size — leave null if not directly given as a
+  per-square-foot figure.
+  A document routinely states only ONE of rent_pcm/rent_psf, never both — that is normal and expected;
+  never derive the other one from it, and never copy the same number into both fields. Other monetary
+  figures that can appear near a rent — a total ANNUAL rent, a service charge, business rates, or a
+  deposit — are each a genuinely different figure, not a rent_pcm or rent_psf value; never let one of
+  those fill either rent field. Never infer which category a figure belongs to from its magnitude alone
+  (e.g. a small number is not automatically "per square foot" and a large one is not automatically
+  "monthly") — only from the document's own explicit label or unambiguous wording. If a figure's own basis
+  (monthly vs per-square-foot vs annual vs some other charge) is not clearly stated, or the document shows
+  multiple rent-like figures and you cannot confidently tell which belongs to THIS unit, leave BOTH
+  rent_pcm and rent_psf null for this unit rather than guessing — a missing rent is far less costly than a
+  wrongly-labeled one.
 - brochure_link: a URL for this specific unit/listing (e.g. a "view listing" or brochure/document link), if
   one is clearly given for it. A floor plan link is NOT a brochure_link — it's a genuinely different
   document (a drawing, not the brochure), even when it's the only per-row link given for a unit. If the only

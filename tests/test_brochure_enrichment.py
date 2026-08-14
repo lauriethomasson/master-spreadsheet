@@ -851,6 +851,79 @@ class CanvaEndToEndEnrichmentTests(EnrichmentTestCase):
 
         mock_render.assert_called_once()  # one unique URL shared by 2 rows -> rendered once, not twice
 
+    def test_metropolitan_wharf_inconsistent_canva_rent_is_not_applied(self):
+        # Regression test for the real confirmed production bug: a Canva
+        # render of Metropolitan Wharf's page returned rent_pcm=33/
+        # rent_psf=0.14 for a 2762 sqft unit whose real rent_psf (from the
+        # original spreadsheet source, already on the row and protected) is
+        # 33 - implying a genuine rent_pcm around 7595.5, not 33. The
+        # candidate rent_pcm must be rejected, not stored, and the row's own
+        # trusted rent_psf must stay untouched.
+        rows = [ListingRow(
+            building="Metropolitan Wharf", floor_unit="1st", brochure_link=_CANVA_URL,
+            size_sqft=2762, rent_psf=33, rent_pcm=None,
+        )]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{
+                        "building": "Metropolitan Wharf", "floor_unit": "1st", "size_sqft": 2762,
+                        "rent_pcm": 33, "rent_psf": 0.14,
+                    }]},
+                ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIsNone(enriched[0].rent_pcm)
+        self.assertNotEqual(enriched[0].rent_pcm, 33)
+        self.assertEqual(enriched[0].rent_psf, 33)  # the trusted source value, never overwritten
+
+    def test_canva_rent_conflict_is_recorded_as_a_document_issue(self):
+        rows = [ListingRow(
+            building="Metropolitan Wharf", floor_unit="1st", brochure_link=_CANVA_URL,
+            size_sqft=2762, rent_psf=33, rent_pcm=None,
+        )]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{
+                        "building": "Metropolitan Wharf", "floor_unit": "1st", "size_sqft": 2762, "rent_pcm": 33,
+                    }]},
+                ):
+            _, _, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(len(stats["document_issues"]), 1)
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_EXTRACTED_BUT_AMBIGUOUS)
+
+    def test_consistent_canva_rent_still_fills_when_genuinely_blank(self):
+        # The gate must not become so strict that a genuinely good Canva
+        # render can no longer fill a real gap - a fresh, fully consistent
+        # rent trio (nothing pre-existing to check against, but internally
+        # self-consistent) still applies.
+        rows = [ListingRow(
+            building="Metropolitan Wharf", floor_unit="1st", brochure_link=_CANVA_URL,
+            size_sqft=None, rent_psf=None, rent_pcm=None,
+        )]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_canva_rendered_page", return_value=b"\x89PNG fake render"), \
+                patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{
+                        "building": "Metropolitan Wharf", "floor_unit": "1st", "size_sqft": 2762,
+                        "rent_pcm": 7595.5, "rent_psf": 33,
+                    }]},
+                ):
+            enriched, _, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].size_sqft, 2762)
+        self.assertEqual(enriched[0].rent_pcm, 7595.5)
+        self.assertEqual(enriched[0].rent_psf, 33)
+        self.assertEqual(stats["document_issues"], [])
+
 
 class LooksLikeFetchableDocumentTests(unittest.TestCase):
     def test_pdf_content_type_always_accepted(self):
@@ -1906,6 +1979,169 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
         self.assertNotIn("internal_ref", fields)
 
 
+class RentValuesConsistentTests(unittest.TestCase):
+    """
+    Direct tests of _rent_values_consistent - the generic, property-agnostic
+    math check (annual rent implied by rent_pcm vs by rent_psf*size_sqft)
+    behind the guard against a real confirmed production bug: a Canva-
+    rendered Metropolitan Wharf page produced rent_pcm=33/rent_psf=0.14 for
+    a 2762 sqft unit whose real, spreadsheet-sourced rent_psf was 33
+    (implying rent_pcm=7595.5, not 33) - a ~230x divergence between the
+    brochure's own candidate rent_pcm and what the row's OWN trusted
+    rent_psf*size_sqft implied. This pure function only ever sees whatever
+    three values its caller passes it - see _rent_check_values/_row_had_
+    rent_conflict/RentConsistencyApplicationTests below for where the row's
+    own trusted values are actually mixed in with a brochure's candidate
+    ones, which is what makes the real bug catchable at all (see this
+    class's own test_wildly_inconsistent_trio_is_rejected for why the bug's
+    two candidate numbers alone do NOT fail this check).
+    """
+
+    def test_missing_size_is_not_enough_data_to_judge(self):
+        self.assertTrue(brochure_enrichment._rent_values_consistent(None, 33, 0.14))
+
+    def test_missing_pcm_is_not_enough_data_to_judge(self):
+        self.assertTrue(brochure_enrichment._rent_values_consistent(2762, None, 33))
+
+    def test_missing_psf_is_not_enough_data_to_judge(self):
+        self.assertTrue(brochure_enrichment._rent_values_consistent(2762, 7595.5, None))
+
+    def test_consistent_trio_is_accepted(self):
+        # 2762 sqft at £33 psf pa implies pcm = 2762*33/12 = 7595.5 exactly.
+        self.assertTrue(brochure_enrichment._rent_values_consistent(2762, 7595.5, 33))
+
+    def test_consistent_trio_within_rounding_tolerance_is_accepted(self):
+        # A real agent's own rounding of the same figures - a few percent
+        # off, never rejected for ordinary rounding.
+        self.assertTrue(brochure_enrichment._rent_values_consistent(2762, 7700, 33))
+
+    def test_wildly_inconsistent_trio_is_rejected(self):
+        # size=2762 with rent_psf=33 implies an annual rent around 91,146
+        # (2762*33) - a rent_pcm of 33 (implying just 396/year) is nowhere
+        # close, exactly the divergence the user's own worked example
+        # describes. NOTE: the real Metropolitan Wharf bug's own two numbers
+        # (rent_pcm=33, rent_psf=0.14) do NOT fail this pure check when
+        # tested against each other alone - 33*12=396 and 0.14*2762=386.68
+        # are mutually consistent, because that pair was produced by the
+        # same pcm<->psf arithmetic this check itself uses (see this
+        # module's own docstring on why _rent_check_values always mixes in
+        # the ROW's own already-trusted value rather than only ever
+        # comparing a brochure's two candidate numbers against each other -
+        # see test_candidate_pcm_inconsistent_with_existing_psf_and_size_is_
+        # rejected below for the check that actually catches the real bug).
+        self.assertFalse(brochure_enrichment._rent_values_consistent(2762, 33, 33))
+
+    def test_non_positive_values_are_not_this_checks_job(self):
+        self.assertTrue(brochure_enrichment._rent_values_consistent(2762, 0, 33))
+        self.assertTrue(brochure_enrichment._rent_values_consistent(2762, -100, 33))
+
+
+class RentConsistencyApplicationTests(unittest.TestCase):
+    """
+    _apply_units_to_row-level tests for the rent-consistency gate - see
+    RentValuesConsistentTests above for the underlying math check on its
+    own. Confirms the gate only ever blocks a NEWLY PROPOSED, inconsistent
+    rent value, never an already-populated (protected) one, and never a
+    genuinely consistent one.
+    """
+
+    def test_psf_only_figure_maps_to_rent_psf_never_rent_pcm(self):
+        # No code path in brochure_enrichment.py derives one rent field from
+        # the other (unlike gemini_client.compute_rent, used only by the
+        # direct-upload/spreadsheet/email extraction pipelines - see this
+        # module's own HIGH_RISK_UNIT_LEVEL_FIELDS docstring) - a unit that
+        # explicitly states only rent_psf must fill only rent_psf.
+        row = ListingRow(building="Metropolitan Wharf", floor_unit="1st", rent_pcm=None, rent_psf=None, size_sqft=2762)
+        units = _brochure_units([{"building": "Metropolitan Wharf", "floor_unit": "1st", "rent_psf": 33}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.rent_psf, 33)
+        self.assertIsNone(new_row.rent_pcm)
+        self.assertEqual(fields, ["rent_psf"])
+
+    def test_pcm_only_figure_maps_to_rent_pcm(self):
+        row = ListingRow(building="Metropolitan Wharf", floor_unit="1st", rent_pcm=None, rent_psf=None, size_sqft=2762)
+        units = _brochure_units([{"building": "Metropolitan Wharf", "floor_unit": "1st", "rent_pcm": 7595.5}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.rent_pcm, 7595.5)
+        self.assertIsNone(new_row.rent_psf)
+        self.assertEqual(fields, ["rent_pcm"])
+
+    def test_non_numeric_rent_value_is_ignored_not_guessed(self):
+        # A stray non-numeric value (e.g. Gemini returning a range string
+        # despite the prompt's own instructions) coerces to None - never
+        # guessed at, same "one bad value degrades to no match" philosophy
+        # as every other coercion in this module.
+        row = ListingRow(building="A", floor_unit="1st", rent_pcm=None)
+        units = _brochure_units([{"building": "A", "floor_unit": "1st", "rent_pcm": "ask agent"}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.rent_pcm)
+        self.assertEqual(fields, [])
+
+    def test_consistent_new_rent_pair_with_consistent_size_is_accepted(self):
+        row = ListingRow(building="A", floor_unit="1st", size_sqft=2762, rent_pcm=None, rent_psf=None)
+        units = _brochure_units([
+            {"building": "A", "floor_unit": "1st", "rent_pcm": 7595.5, "rent_psf": 33},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.rent_pcm, 7595.5)
+        self.assertEqual(new_row.rent_psf, 33)
+        self.assertIn("rent_pcm", fields)
+        self.assertIn("rent_psf", fields)
+
+    def test_candidate_pcm_inconsistent_with_existing_psf_and_size_is_rejected(self):
+        # The exact real-world shape: row already has a trustworthy
+        # rent_psf/size_sqft (e.g. from the original spreadsheet source),
+        # only rent_pcm is blank - a brochure candidate of 33 implies an
+        # annual rent of 396, wildly incompatible with the row's own
+        # 2762*33=91,146 - rejected rather than stored.
+        row = ListingRow(building="Metropolitan Wharf", floor_unit="1st", size_sqft=2762, rent_psf=33, rent_pcm=None)
+        units = _brochure_units([{"building": "Metropolitan Wharf", "floor_unit": "1st", "rent_pcm": 33}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.rent_pcm)
+        self.assertEqual(new_row.rent_psf, 33)  # untouched, still the trusted source value
+        self.assertEqual(fields, [])
+
+    def test_existing_rent_is_never_overwritten_regardless_of_brochure_consistency(self):
+        row = ListingRow(building="A", floor_unit="1st", size_sqft=2762, rent_pcm=7595.5, rent_psf=33)
+        units = _brochure_units([{"building": "A", "floor_unit": "1st", "rent_pcm": 33, "rent_psf": 0.14}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.rent_pcm, 7595.5)
+        self.assertEqual(new_row.rent_psf, 33)
+        self.assertEqual(fields, [])
+        self.assertIs(new_row, row)
+
+    def test_inconsistent_rent_does_not_block_other_unit_level_fields(self):
+        # The rent gate is scoped to HIGH_RISK_UNIT_LEVEL_FIELDS only - a
+        # genuinely blank, unrelated field (state_of_space) on the SAME
+        # matched unit must still fill normally.
+        row = ListingRow(
+            building="Metropolitan Wharf", floor_unit="1st", size_sqft=2762, rent_psf=33, rent_pcm=None,
+            state_of_space=None,
+        )
+        units = _brochure_units([{
+            "building": "Metropolitan Wharf", "floor_unit": "1st", "rent_pcm": 33, "state_of_space": "Cat A",
+        }])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.rent_pcm)
+        self.assertEqual(new_row.state_of_space, "Cat A")
+        self.assertIn("state_of_space", fields)
+        self.assertNotIn("rent_pcm", fields)
+
+
 class FloorplanOnlyNeverInventsWiderScopeFeaturesTests(unittest.TestCase):
     """A floorplan-only document (see FLOORPLAN_ENRICHABLE_FIELDS) must
     never be treated as a marketing brochure - even if its own raw units
@@ -2144,6 +2380,26 @@ class EnrichRowTests(EnrichmentTestCase):
 
         self.assertEqual(new_row.rent_psf, 175)
         self.assertEqual(fields, ["special_features"])
+
+    def test_normal_pdf_brochure_with_consistent_rent_still_fills(self):
+        # Confirms the new rent-consistency gate (see RentConsistencyApplic-
+        # ationTests/CanvaEndToEndEnrichmentTests) doesn't regress the
+        # ordinary, non-Canva PDF-brochure enrichment path this whole module
+        # exists for - a genuinely consistent, freshly-stated rent trio from
+        # a plain PDF brochure link still fills normally.
+        row = ListingRow(
+            building="A", floor_unit="1st", brochure_link="https://example.com/brochure.pdf",
+            size_sqft=2762, rent_pcm=None, rent_psf=None,
+        )
+        units = [{"building": "A", "floor_unit": "1st", "rent_pcm": 7595.5, "rent_psf": 33}]
+
+        with self._mock_units(units):
+            new_row, fields = brochure_enrichment.enrich_row(row)
+
+        self.assertEqual(new_row.rent_pcm, 7595.5)
+        self.assertEqual(new_row.rent_psf, 33)
+        self.assertIn("rent_pcm", fields)
+        self.assertIn("rent_psf", fields)
 
     def test_spreadsheet_size_never_overwritten_by_different_brochure_size(self):
         row = ListingRow(
@@ -3251,6 +3507,27 @@ class RowHadAmbiguousMatchTests(unittest.TestCase):
             {"building": "Nash House", "floor_unit": "2nd Floor"},
         ])
         self.assertFalse(brochure_enrichment._row_had_ambiguous_match(row, units))
+
+
+class RowHadRentConflictTests(unittest.TestCase):
+    def test_inconsistent_candidate_rent_is_a_conflict(self):
+        row = ListingRow(building="Metropolitan Wharf", floor_unit="1st", size_sqft=2762, rent_psf=33, rent_pcm=None)
+        units = _brochure_units([{"building": "Metropolitan Wharf", "floor_unit": "1st", "rent_pcm": 33}])
+        self.assertTrue(brochure_enrichment._row_had_rent_conflict(row, units))
+
+    def test_consistent_candidate_rent_is_not_a_conflict(self):
+        row = ListingRow(building="Metropolitan Wharf", floor_unit="1st", size_sqft=2762, rent_pcm=None, rent_psf=None)
+        units = _brochure_units([{"building": "Metropolitan Wharf", "floor_unit": "1st", "rent_pcm": 7595.5, "rent_psf": 33}])
+        self.assertFalse(brochure_enrichment._row_had_rent_conflict(row, units))
+
+    def test_no_matched_unit_is_never_a_conflict(self):
+        row = ListingRow(building="A Building Not In This Document", rent_pcm=None)
+        units = _brochure_units([{"building": "Nash House", "floor_unit": "2nd Floor", "rent_pcm": 33}])
+        self.assertFalse(brochure_enrichment._row_had_rent_conflict(row, units))
+
+    def test_no_units_at_all_is_never_a_conflict(self):
+        row = ListingRow(building="Nash House", rent_pcm=None)
+        self.assertFalse(brochure_enrichment._row_had_rent_conflict(row, None))
 
 
 class DocumentStatusIntegrationTests(EnrichmentTestCase):
