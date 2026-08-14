@@ -1022,6 +1022,30 @@ _CANVA_RENDERER_TIMEOUT = 150
 # never trusted at face value.
 _CANVA_MAX_PAGES_ACCEPTED = 20
 
+# Same idea as the renderer's own _MAX_REASON_LENGTH (canva_renderer/app.py)
+# applied here too - this app never assumes the renderer's own truncation
+# actually ran (again: a separately deployed, separately versioned service),
+# so a "reason" string pulled out of its response is independently bounded
+# before ever reaching a log line.
+_MAX_LOGGED_REASON_LENGTH = 200
+
+
+def _truncate_reason(text: str) -> str:
+    """
+    `text` (a "reason" string from the Canva renderer's own JSON response,
+    or a locally built "HTTP {status}" fallback) collapsed to one line and
+    capped to _MAX_LOGGED_REASON_LENGTH before it's ever printed to this
+    app's own logs - defense-in-depth against a renderer response (a
+    separately deployed, separately versioned service - see canva_renderer/
+    README.md) that doesn't actually enforce its own reason-safety
+    guarantees, whether from an outdated deploy or a future change on that
+    side this app was never updated in lockstep with.
+    """
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) > _MAX_LOGGED_REASON_LENGTH:
+        collapsed = collapsed[:_MAX_LOGGED_REASON_LENGTH].rstrip() + "…"
+    return collapsed
+
 
 def _canva_renderer_auth_headers(renderer_url: str) -> dict:
     """
@@ -1167,7 +1191,15 @@ def _fetch_canva_rendered_page(url: str):
             reason = response.json().get("reason", f"HTTP {response.status_code}")
         except Exception:
             reason = f"HTTP {response.status_code}"
-        print(f"[brochure_enrichment] Canva renderer could not render {url!r} ({reason}) — skipping enrichment.", file=sys.stderr)
+        reason = _truncate_reason(reason)
+        # The renderer's own 422/500/503 bodies all now carry a short,
+        # already-safe "reason" straight from the caught exception that
+        # actually failed (see canva_renderer/app.py's _safe_reason) -
+        # previously this app could only ever log the bare HTTP status
+        # (e.g. "HTTP 503"), which hid whatever the renderer itself saw
+        # (a browser launch failure, a navigation timeout, ...). This is
+        # deliberately the one log line to grep for that question.
+        print(f"[brochure_enrichment] Canva renderer failed for {url!r}: {reason}", file=sys.stderr)
         _record_status(STATUS_RENDER_FAILED, f"Canva render failed: {reason}")
         return None
 

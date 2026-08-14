@@ -515,10 +515,79 @@ class RenderHandlerTests(unittest.TestCase):
             mock_render.assert_not_called()
             handler.send_response.assert_called_with(503)
 
+    def test_busy_semaphore_503_body_includes_a_reason(self):
+        # The main app's own generic reason-extraction (response.json().
+        # get("reason", ...)) should never need a special case for this
+        # one status code - it carries a "reason" key exactly like 422/500.
+        import threading
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(0)):
+            handler.do_POST()
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertIn("reason", payload)
+        self.assertTrue(payload["reason"])
+
+    def test_internal_error_returns_500_with_a_safe_reason(self):
+        # Regression guard for the real production diagnostic gap this was
+        # added to close: an uncaught exception previously surfaced to the
+        # main app as a bare "HTTP 500" - now it carries the actual (safety-
+        # bounded) exception text, so the main app's own log line can show
+        # what really failed instead of just the status code.
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        with patch.object(
+            canva_renderer, "render_canva_page", side_effect=RuntimeError("browser launch failed"),
+        ):
+            handler.do_POST()
+        handler.send_response.assert_called_with(500)
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertIn("browser launch failed", payload["reason"])
+
     def test_health_endpoint(self):
         handler = self._make_handler(b"", path="/health")
         handler.do_GET()
         handler.send_response.assert_called_with(200)
+
+
+class SafeReasonTests(unittest.TestCase):
+    """
+    _safe_reason is the ONE choke point every RenderError's own reason (see
+    RenderError.__init__) and the bare-exception 500 path (see Handler.
+    do_POST) both flow through before ever reaching this service's JSON
+    response body - these tests exercise it directly rather than through
+    a real Playwright failure, matching this file's own existing convention
+    of never launching a real browser.
+    """
+
+    def test_collapses_multiline_playwright_style_call_log_to_one_line(self):
+        raw = (
+            "TimeoutError: Timeout 15000ms exceeded.\n"
+            "Call log:\n"
+            "  - navigating to \"https://www.canva.com/design/x/y/view\"\n"
+            "  - waiting until \"networkidle\"\n"
+        )
+        result = canva_renderer._safe_reason(raw)
+        self.assertNotIn("\n", result)
+
+    def test_truncates_long_text_to_the_max_reason_length(self):
+        raw = "x" * 5000
+        result = canva_renderer._safe_reason(raw)
+        self.assertLessEqual(len(result), canva_renderer._MAX_REASON_LENGTH + 1)  # +1 for the trailing ellipsis char
+        self.assertTrue(result.endswith("…"))
+
+    def test_short_reason_is_returned_unchanged(self):
+        self.assertEqual(canva_renderer._safe_reason("navigation timed out"), "navigation timed out")
+
+    def test_shared_secret_is_redacted_if_present_in_the_text(self):
+        with patch.object(canva_renderer, "SHARED_SECRET", "supersecretvalue123"):
+            result = canva_renderer._safe_reason("failed while calling with token supersecretvalue123 attached")
+        self.assertNotIn("supersecretvalue123", result)
+        self.assertIn("[redacted]", result)
+
+    def test_render_error_reason_is_sanitized_at_construction_time(self):
+        long_multiline = "line one\nline two\n" + ("z" * 500)
+        err = canva_renderer.RenderError(long_multiline)
+        self.assertNotIn("\n", err.reason)
+        self.assertLessEqual(len(err.reason), canva_renderer._MAX_REASON_LENGTH + 1)
 
 
 if __name__ == "__main__":

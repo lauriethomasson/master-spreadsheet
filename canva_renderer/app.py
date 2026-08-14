@@ -220,13 +220,58 @@ async def _get_browser_async():
         return _browser
 
 
+# Generous enough to keep a genuinely useful failure description (e.g.
+# "navigation failed or timed out (TimeoutError('Timeout 15000ms exceeded
+# ... Call log: ...'))") readable, short enough that this service's own
+# 422/500 JSON body can never balloon into something resembling a full
+# stack trace dump - see _safe_reason below, this service's own diagnostic-
+# propagation contract with the main app (never tokens/credentials/env
+# vars/stack traces/arbitrary HTML, always capped).
+_MAX_REASON_LENGTH = 200
+
+
+def _safe_reason(raw) -> str:
+    """
+    `raw` (a RenderError's own reason string, or repr(exc) for a bare
+    uncaught exception - see Handler.do_POST's 500 branch) collapsed to a
+    single line (Playwright's own TimeoutError repr routinely embeds a
+    multi-line "Call log:" dump - never returned to a caller as-is) and
+    capped to _MAX_REASON_LENGTH, so the main app's own diagnostic log line
+    (see brochure_enrichment._fetch_canva_rendered_page) always gets
+    something short and safe to print, never a raw stack trace or an
+    unbounded string. Also redacts this service's own SHARED_SECRET if it
+    were ever somehow present (defense-in-depth only - a genuine Playwright/
+    Chromium navigation or launch failure never actually references this
+    service's own env vars, but this costs nothing to guard against).
+
+    This is NOT a claim that the input was already safe - repr(exc) for an
+    arbitrary caught exception is NOT guaranteed to exclude request URLs or
+    other caller-supplied text embedded in the exception's own message by
+    whatever library raised it; this only bounds LENGTH and collapses
+    newlines, the two properties a caller (the main app's log line) can't
+    otherwise protect itself against. It does not attempt to redact
+    arbitrary secret-shaped substrings it has no way to recognize.
+    """
+    text = " ".join(str(raw).split())
+    if SHARED_SECRET and SHARED_SECRET in text:
+        text = text.replace(SHARED_SECRET, "[redacted]")
+    if len(text) > _MAX_REASON_LENGTH:
+        text = text[:_MAX_REASON_LENGTH].rstrip() + "…"
+    return text
+
+
 class RenderError(Exception):
     """A clean, expected failure - a malformed/disallowed URL, a
     navigation timeout, or a page that never rendered real content.
     Always carries a short, non-sensitive reason string, never a raw
-    Playwright exception or stack trace."""
+    Playwright exception or stack trace - reason is run through
+    _safe_reason at construction time (not left to each raise site to
+    remember), so EVERY RenderError anywhere in this module - including
+    ones built from a raw caught exception's own repr, e.g. render_canva_
+    page_async's own navigation-timeout branch - is safe by construction."""
 
     def __init__(self, reason: str):
+        reason = _safe_reason(reason)
         super().__init__(reason)
         self.reason = reason
 
@@ -427,17 +472,31 @@ class Handler(BaseHTTPRequestHandler):
             # page must never be able to pile up unbounded work here; the
             # caller (see brochure_enrichment._fetch_canva_rendered_page)
             # already treats any non-2xx response as a normal, safe
-            # per-document failure.
-            self._send_json(503, {"error": "renderer busy, try again"})
+            # per-document failure. "reason" alongside "error" here purely
+            # so the main app's own generic reason-extraction (same field,
+            # same shape as the 422/500 bodies below) never needs a special
+            # case for this one response - not a caught exception, so
+            # nothing to run through _safe_reason.
+            self._send_json(503, {"error": "renderer busy, try again", "reason": "renderer busy, try again"})
             return
         try:
             try:
                 pages, detected_total = render_canva_page(url)
             except RenderError as e:
+                # e.reason is already _safe_reason'd at RenderError's own
+                # construction time (see that class's own docstring) -
+                # never re-truncated/re-collapsed here, since doing so
+                # again would be a silent no-op at best.
                 self._send_json(422, {"error": "render_failed", "reason": e.reason})
                 return
             except Exception as e:
-                self._send_json(500, {"error": "internal_error", "reason": repr(e)})
+                # The ONE path that can carry an arbitrary, un-vetted
+                # exception (anything Playwright/Chromium/asyncio itself
+                # raised that this module didn't already wrap in a
+                # RenderError) - always routed through _safe_reason before
+                # it ever reaches a caller, exactly like every RenderError
+                # reason already is.
+                self._send_json(500, {"error": "internal_error", "reason": _safe_reason(repr(e))})
                 return
 
             # A single concise line whether this was one page or several -

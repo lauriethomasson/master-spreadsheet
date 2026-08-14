@@ -740,6 +740,62 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
         self.assertIn("private design", sink["detail"])
 
+    def test_renderer_failure_reason_is_logged_instead_of_bare_http_status(self):
+        # Regression guard for the real production diagnostic gap: this app
+        # previously only ever logged "HTTP 503"/"HTTP 422" for a renderer
+        # failure, hiding whatever the renderer itself actually saw (a
+        # browser launch failure, a navigation timeout, ...). The renderer
+        # now always includes a "reason" (see canva_renderer/app.py's
+        # _safe_reason), and this app must surface it, not just the code.
+        response = MagicMock(
+            status_code=503, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"error": "render_failed", "reason": "browser launch failed"}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertIsNone(result)
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Canva renderer failed for", logged)
+        self.assertIn("browser launch failed", logged)
+        self.assertNotIn("HTTP 503", logged)
+
+    def test_renderer_422_reason_is_also_logged_by_name(self):
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"error": "render_failed", "reason": "page navigation timed out"}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("page navigation timed out", logged)
+
+    def test_long_or_secret_bearing_reason_is_truncated_before_logging(self):
+        # Defense-in-depth on this app's OWN side - never assumes the
+        # renderer (a separately deployed, separately versioned service)
+        # actually enforced its own reason-safety guarantees.
+        huge_reason = "leaked-token-abc123 " + ("x" * 5000)
+        response = MagicMock(
+            status_code=500, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"error": "internal_error", "reason": huge_reason}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        # The exact secret-shaped substring may still appear (this app has
+        # no way to recognize an arbitrary token shape it wasn't told
+        # about) - what's actually guaranteed is boundedness: the log line
+        # is never allowed to balloon to the full 5000+ char raw reason.
+        self.assertLess(len(logged), 2000)
+
     def test_401_from_renderer_is_distinguished_as_an_auth_failure(self):
         # Real, confirmed diagnostic gap this closes: a 401/403 from the
         # renderer (Cloud Run's own IAM check rejecting the call BEFORE it
