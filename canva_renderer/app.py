@@ -162,6 +162,20 @@ MAX_NEXT_CLICK_ATTEMPTS = 3
 # comfortably enough time to read a real, already-rendered element when
 # present.
 _PAGE_ADVANCE_INDICATOR_TIMEOUT_MS = 500
+# Timeout for the OUTER "does a 'Next page' control exist at all" check at
+# the top of each pagination loop iteration (see render_canva_page_async's
+# own while loop) - deliberately explicit and short, NEVER left to
+# implicitly inherit page.set_default_timeout's own NAV_TIMEOUT_MS (30s).
+# Real production evidence this fixes: a genuinely single-page design (or
+# a dead/expired Canva link - see the navigation-status check above) has
+# no such control at all, so Playwright's own auto-wait polls for up to
+# whatever timeout is in effect hoping it appears - silently costing a
+# full 30 EXTRA wasted seconds, holding this request's own Chromium
+# context (and therefore memory) open the whole time, on every single-
+# page render before this constant existed. Short enough to stay cheap
+# on the (common) no-button case, still comfortably enough time to read a
+# real, already-rendered element when one genuinely exists.
+_NEXT_BUTTON_PRESENCE_TIMEOUT_MS = 3_000
 # Per-page-transition timeout budget used only to size RENDER_TIMEOUT_
 # SECONDS below - the click itself now uses its own explicit
 # NEXT_PAGE_CLICK_TIMEOUT_MS (see that constant's own docstring), not
@@ -554,9 +568,26 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
             # this change - "load" simply stops this from also waiting on
             # network traffic that has nothing to do with whether the
             # design has rendered.
-            await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+            response = await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
         except Exception as e:
             raise RenderError(f"navigation failed or timed out ({e!r})")
+
+        # Real production evidence this catches: a dead/expired/access-
+        # revoked Canva link (both canva.link short links and plain
+        # www.canva.com/design/.../view URLs) still stays ON canva.com and
+        # still loads successfully - just Canva's OWN "Looks like we hit a
+        # roadblock / that link doesn't work" 404 error page, confirmed
+        # directly against three real production URLs. That page has
+        # neither a "Next page" nor a "Go to page" control, so - before
+        # this check existed - it was silently captured as a normal 1-page
+        # "successful" render (an error-page screenshot handed to Gemini
+        # as if it were real brochure content) rather than the clean,
+        # honest render failure it actually is. `response` can legitimately
+        # be None for some navigations (e.g. a same-document navigation) -
+        # never treated as a failure on its own, only a genuine non-2xx
+        # status is.
+        if response is not None and not (200 <= response.status < 300):
+            raise RenderError(f"navigation returned HTTP {response.status} (design not found or inaccessible)")
 
         if not _host_allowed(page.url):
             raise RenderError("navigation left the allowed Canva host")
@@ -604,7 +635,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
             # attempted.
             try:
                 next_button = page.get_by_role("button", name="Next page")
-                if await next_button.get_attribute("aria-disabled") == "true":
+                if await next_button.get_attribute("aria-disabled", timeout=_NEXT_BUTTON_PRESENCE_TIMEOUT_MS) == "true":
                     break
             except Exception as e:
                 print(
@@ -679,6 +710,43 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
                     file=sys.stderr,
                 )
                 break
+        else:
+            # Reached ONLY when the loop's own condition (len(pages) <
+            # MAX_CANVA_PAGES) became false WITHOUT a break - every other
+            # exit above (button not found/not readable, gave up after
+            # retries, the button's own aria-disabled="true" clean stop)
+            # explicitly breaks, so landing here means this render hit its
+            # own page cap - NOT, on its own, proof there's more beyond it:
+            # a design with EXACTLY MAX_CANVA_PAGES pages hits this same
+            # condition on its own genuinely final page. Distinguished by
+            # one more cheap, bounded check of the "Next page" control's
+            # OWN current state - only a control that's still genuinely
+            # present and enabled means pages were actually left
+            # uncaptured. Silent before this existed - real production
+            # evidence: a genuine 29-page brochure silently truncated to
+            # MAX_CANVA_PAGES=20 with nothing anywhere (log or response)
+            # distinguishing that from this normal, complete, exact-fit
+            # case.
+            if len(pages) >= MAX_CANVA_PAGES:
+                next_page_still_available = False
+                try:
+                    next_button = page.get_by_role("button", name="Next page")
+                    if await next_button.count() > 0:
+                        disabled = await next_button.get_attribute(
+                            "aria-disabled", timeout=_NEXT_BUTTON_PRESENCE_TIMEOUT_MS,
+                        )
+                        next_page_still_available = disabled != "true"
+                except Exception:
+                    next_page_still_available = False
+
+                if next_page_still_available:
+                    print(
+                        f"[canva_renderer] Pagination capped for {url!r}: reached MAX_CANVA_PAGES="
+                        f"{MAX_CANVA_PAGES} with 'Next page' still available (detected total: "
+                        f"{detected_total!r}) - stopping here with {len(pages)} page(s) captured; "
+                        "this brochure may have more pages than were captured.",
+                        file=sys.stderr,
+                    )
 
         return pages, detected_total
     finally:
@@ -799,9 +867,10 @@ class Handler(BaseHTTPRequestHandler):
             # succeeded" being the one unambiguous line to grep Cloud Run
             # logs for to confirm rendering itself worked.
             detected_str = f"{detected_total} detected" if detected_total else "total unknown"
+            page_count = len(pages)
             print(
                 f"[canva_renderer] Canva render succeeded for {url!r}: "
-                f"{len(pages)} page(s) captured ({detected_str}).",
+                f"{page_count} page(s) captured ({detected_str}).",
                 file=sys.stderr,
             )
             # A bounded JSON array of base64 PNGs, never a single giant
@@ -809,8 +878,30 @@ class Handler(BaseHTTPRequestHandler):
             # sized image the main app can feed straight into its existing
             # multi-image Gemini extraction (see extract.render_and_extract),
             # exactly like a multi-page PDF's own per-page images already are.
+            #
+            # Encoded INCREMENTALLY - draining a SHALLOW COPY of `pages`
+            # (cheap: just duplicating up to MAX_CANVA_PAGES references,
+            # never the underlying PNG bytes themselves) one raw PNG at a
+            # time, freeing each one (`del png`) the instant its own
+            # base64 copy exists - rather than a single list
+            # comprehension, which would keep EVERY raw PNG alive for the
+            # ENTIRE comprehension while ALSO building the full base64
+            # list alongside it. Real production evidence this matters
+            # for: "Memory limit of 1024 MiB exceeded" while processing a
+            # large multi-page brochure (an 18-page deck was one of this
+            # service's own successful renders) - this halves the peak
+            # extra memory this specific response-construction step
+            # needs, on top of whatever Chromium itself already used to
+            # render it. A copy, not `pages` itself, so this never mutates
+            # a list some OTHER caller/reference might still expect intact.
+            remaining = list(pages)
+            encoded_pages = []
+            while remaining:
+                png = remaining.pop(0)
+                encoded_pages.append(base64.b64encode(png).decode("ascii"))
+                del png
             self._send_json(200, {
-                "pages": [base64.b64encode(p).decode("ascii") for p in pages],
+                "pages": encoded_pages,
                 "page_count_detected": detected_total,
             })
         finally:

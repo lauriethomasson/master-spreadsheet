@@ -17,6 +17,7 @@ import base64
 import concurrent.futures
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import sys
@@ -174,9 +175,11 @@ def _run(coro):
 def _make_async_page(
     final_url="https://www.canva.com/design/x/y/view",
     goto_side_effect=None,
+    goto_response_status=200,
     screenshots=(b"\x89PNG fake",),
     next_disabled_sequence=("true",),
     next_button_raises=False,
+    next_button_count=1,
     go_to_page_text="1 / 1",
     go_to_page_raises=True,
     click_advances_page=True,
@@ -226,13 +229,29 @@ def _make_async_page(
     "debounced no-op" symptom this verification exists to catch: a click
     that Playwright reports as completed, yet nothing about the visible
     page actually changed.
+
+    `next_button_count` mocks the "Next page" locator's own .count() -
+    used only by the post-cap "is there genuinely more beyond
+    MAX_CANVA_PAGES" check (0 simulates the button having been removed
+    from the DOM entirely, e.g. a design whose last page coincides with
+    the cap).
     """
     page = MagicMock()
     page.url = final_url
     page.set_default_navigation_timeout = MagicMock()
     page.set_default_timeout = MagicMock()
     page.route = AsyncMock()
-    page.goto = AsyncMock(side_effect=goto_side_effect) if goto_side_effect else AsyncMock()
+    # A real Playwright navigation Response, not a bare MagicMock() whose
+    # own .status would itself be an unrelated auto-generated mock -
+    # render_canva_page_async checks this status explicitly (see its own
+    # docstring on why: a dead/expired Canva link still loads successfully
+    # as Canva's own 404 error page). goto_response_status defaults to 200
+    # so every existing test's implicit "navigation succeeded" assumption
+    # keeps holding without needing to know about this at all.
+    page.goto = (
+        AsyncMock(side_effect=goto_side_effect) if goto_side_effect
+        else AsyncMock(return_value=MagicMock(status=goto_response_status))
+    )
     page.close = AsyncMock()
     cookie_locator = MagicMock()
     cookie_locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
@@ -267,12 +286,13 @@ def _make_async_page(
     page.evaluate = AsyncMock(side_effect=_evaluate)
 
     next_button = MagicMock()
+    next_button.count = AsyncMock(return_value=next_button_count)
     if next_button_raises:
         next_button.get_attribute = AsyncMock(side_effect=Exception("Next page button not found"))
     else:
         disabled_iter = itertools.cycle(next_disabled_sequence)
 
-        async def _get_attribute(_name):
+        async def _get_attribute(_name, timeout=None):
             return next(disabled_iter)
 
         next_button.get_attribute = AsyncMock(side_effect=_get_attribute)
@@ -442,6 +462,80 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         self.assertEqual(len(pages), 5)
         context.close.assert_awaited_once()
 
+    def test_hitting_the_page_cap_with_next_button_still_available_logs_a_capped_warning(self):
+        # Real production evidence: a genuine 29-page brochure silently
+        # truncated to MAX_CANVA_PAGES=20 with nothing anywhere (log or
+        # response) distinguishing it from a normal, complete render. If
+        # the "Next page" control is STILL present and enabled right when
+        # the cap is hit, there is genuinely more beyond it - this must be
+        # logged distinctly from every other (clean) pagination stop.
+        screenshots = tuple(f"\x89PNG p{i}".encode() for i in range(1, 4))
+        page = _make_async_page(
+            screenshots=screenshots,
+            next_disabled_sequence=("false",),  # never reports disabled
+            next_button_count=1,  # still present at the cap
+        )
+        buf = io.StringIO()
+        patcher, context = self._patch_browser(page)
+        with patch.object(canva_renderer, "MAX_CANVA_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(len(pages), 3)
+        stderr_output = buf.getvalue()
+        self.assertIn("Pagination capped", stderr_output)
+        self.assertIn("may have more pages than were captured", stderr_output)
+        context.close.assert_awaited_once()
+
+    def test_hitting_the_page_cap_on_the_designs_genuinely_last_page_logs_no_false_warning(self):
+        # The false-positive this guards against: a design whose page
+        # count exactly EQUALS MAX_CANVA_PAGES is NOT truncated at all -
+        # its "Next page" control has genuinely become disabled right as
+        # the cap is reached, so no "may have more pages" warning should
+        # ever be logged for it.
+        screenshots = tuple(f"\x89PNG p{i}".encode() for i in range(1, 4))
+        page = _make_async_page(
+            screenshots=screenshots,
+            # First two checks (before each successful click) report "not
+            # disabled" so pagination proceeds to fill the cap; the THIRD
+            # check - the post-cap "is there really more?" check - reports
+            # "true", i.e. this genuinely was the design's last page.
+            next_disabled_sequence=("false", "false", "true"),
+            next_button_count=1,
+        )
+        buf = io.StringIO()
+        patcher, context = self._patch_browser(page)
+        with patch.object(canva_renderer, "MAX_CANVA_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(len(pages), 3)
+        stderr_output = buf.getvalue()
+        self.assertNotIn("Pagination capped", stderr_output)
+        self.assertNotIn("may have more pages than were captured", stderr_output)
+        context.close.assert_awaited_once()
+
+    def test_hitting_the_page_cap_with_next_button_removed_logs_no_false_warning(self):
+        # A second way the false-positive could show up: the "Next page"
+        # control disappears from the DOM entirely (count() == 0) right as
+        # the cap is reached, rather than staying present with aria-
+        # disabled="true". Must be treated the same as a genuine last
+        # page - no warning.
+        screenshots = tuple(f"\x89PNG p{i}".encode() for i in range(1, 4))
+        page = _make_async_page(
+            screenshots=screenshots,
+            next_disabled_sequence=("false",),
+            next_button_count=0,  # gone by the time the cap is hit
+        )
+        buf = io.StringIO()
+        patcher, context = self._patch_browser(page)
+        with patch.object(canva_renderer, "MAX_CANVA_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(len(pages), 3)
+        stderr_output = buf.getvalue()
+        self.assertNotIn("Pagination capped", stderr_output)
+        self.assertNotIn("may have more pages than were captured", stderr_output)
+        context.close.assert_awaited_once()
+
     def test_a_later_page_failure_still_returns_the_pages_already_captured(self):
         # Page 3's own click/screenshot fails partway through a multi-page
         # capture - this must never lose pages 1-2 already safely captured,
@@ -605,6 +699,62 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
                 _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
         context.close.assert_awaited_once()
 
+    def test_a_404_navigation_response_raises_render_error_and_captures_no_pages(self):
+        # Real production evidence this fixes: a dead/expired/access-
+        # revoked Canva link still loads successfully AS FAR AS
+        # PLAYWRIGHT IS CONCERNED - it's Canva's own "Looks like we hit a
+        # roadblock" 404 error page, confirmed directly against three
+        # real production URLs (both canva.link short links and a plain
+        # www.canva.com/design/.../view URL) - so without this check, that
+        # error page's own screenshot was silently captured and reported
+        # as a normal "1 page(s) captured" success.
+        page = _make_async_page(goto_response_status=404)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError) as ctx:
+                _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertIn("404", ctx.exception.reason)
+        page.screenshot.assert_not_called()  # never even tried to capture the error page
+        context.close.assert_awaited_once()
+
+    def test_a_200_navigation_response_is_unaffected_regression_guard(self):
+        # Regression guard for the 404 check above - a genuinely
+        # successful navigation (the overwhelming common case) must be
+        # completely unaffected by it.
+        page = _make_async_page(
+            goto_response_status=200,
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, "true"),
+        )
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
+        context.close.assert_awaited_once()
+
+    def test_aria_disabled_presence_check_uses_its_own_bounded_timeout(self):
+        # Regression guard: the outer "does a Next-page control exist at
+        # all" check must use its OWN short, explicit timeout - never
+        # silently inherit page.set_default_timeout's own NAV_TIMEOUT_MS
+        # (30s). Real production evidence this fixes: a genuinely single-
+        # page design (or a dead link - see the 404 test above) has no
+        # such control at all, so Playwright's own auto-wait would
+        # otherwise poll for the full 30s, holding this request's own
+        # Chromium context open the whole time, before this constant
+        # existed.
+        self.assertLess(canva_renderer._NEXT_BUTTON_PRESENCE_TIMEOUT_MS, canva_renderer.NAV_TIMEOUT_MS)
+        page = _make_async_page(screenshots=(b"\x89PNG only page",))
+        next_button = page.get_by_role("button", name="Next page")
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        next_button.get_attribute.assert_awaited_once_with(
+            "aria-disabled", timeout=canva_renderer._NEXT_BUTTON_PRESENCE_TIMEOUT_MS,
+        )
+
     def test_redirect_off_canva_host_raises_render_error(self):
         page = _make_async_page(final_url="http://169.254.169.254/latest/meta-data/")
         patcher, context = self._patch_browser(page)
@@ -760,6 +910,34 @@ class RenderHandlerTests(unittest.TestCase):
         handler.send_response.assert_called_with(200)
         payload = json.loads(handler.wfile.getvalue())
         self.assertEqual(payload["pages"], [base64.b64encode(p).decode("ascii") for p in pages])
+
+    def test_response_encoding_does_not_mutate_the_source_pages_list(self):
+        # Real production evidence this fixes: "Memory limit of 1024 MiB
+        # exceeded" while processing a large multi-page brochure. The fix
+        # drains a COPY of `pages`, freeing each raw PNG as its own
+        # base64 copy is made, rather than holding one full list of raw
+        # PNGs AND one full list of base64 strings simultaneously - but it
+        # must do that WITHOUT mutating whatever list render_canva_page
+        # itself returned, since nothing about that return value's own
+        # lifetime is this handler's to assume.
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        pages = [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"]
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 3)):
+            handler.do_POST()
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])  # untouched
+
+    def test_response_encoding_is_incremental_not_a_single_comprehension(self):
+        # A structural guard, not a literal memory measurement (which
+        # isn't meaningfully observable through a mock) - confirms the
+        # actual technique is still "drain and free one at a time" and
+        # hasn't silently regressed back to building the full base64 list
+        # via one comprehension over the full raw-bytes list (which would
+        # reintroduce holding both fully in memory at once).
+        source = inspect.getsource(canva_renderer.Handler.do_POST)
+        self.assertNotIn("[base64.b64encode(p", source)
+        self.assertIn(".pop(0)", source)
+        self.assertIn("del png", source)
 
     def test_render_error_returns_422_with_reason(self):
         handler = self._make_handler(json.dumps({"url": "https://example.com/x"}).encode())
