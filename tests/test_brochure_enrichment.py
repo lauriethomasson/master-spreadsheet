@@ -4176,6 +4176,98 @@ class DocumentStatusIntegrationTests(EnrichmentTestCase):
         self.assertEqual(len(stats["document_issues"]), 1)
 
 
+class IsConfirmedDeadCanvaLinkTests(unittest.TestCase):
+    """_is_confirmed_dead_canva_link - the substring match on canva_
+    renderer's own navigation-status reason text."""
+
+    def test_a_confirmed_non_2xx_navigation_status_matches(self):
+        self.assertTrue(brochure_enrichment._is_confirmed_dead_canva_link(
+            "Canva render failed: navigation returned HTTP 404 (design not found or inaccessible)"
+        ))
+
+    def test_a_navigation_timeout_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_confirmed_dead_canva_link(
+            "Canva render failed: navigation failed or timed out (TimeoutError('Timeout 30000ms exceeded'))"
+        ))
+
+    def test_none_detail_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_confirmed_dead_canva_link(None))
+
+    def test_unrelated_detail_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_confirmed_dead_canva_link("Canva render failed: private design"))
+
+
+class BrochureLinkBrokenFlagTests(EnrichmentTestCase):
+    """
+    ListingRow.brochure_link_broken - set from enrich_rows_grouped's own
+    per-URL document_status, end-to-end through the real Canva HTTP call
+    (only httpx.post is mocked, never this app's own fetch/render
+    functions - same "exercise the real _record_status call sites"
+    principle as DocumentStatusIntegrationTests above).
+
+    Real requirement this covers: True only for a CONFIRMED dead link
+    (Canva's own navigation-status check returning a non-2xx - see
+    canva_renderer/app.py) - a bare navigation timeout/exception is much
+    weaker evidence (could easily be a one-off glitch on an otherwise-
+    working link) and must leave the flag at None (not yet confirmed),
+    never jump straight to True from that alone.
+    """
+
+    def test_a_confirmed_non_2xx_navigation_status_sets_the_flag_true(self):
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={
+                "error": "render_failed",
+                "reason": "navigation returned HTTP 404 (design not found or inaccessible)",
+            }),
+        )
+        rows = [ListingRow(building="Dead Design", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIs(enriched[0].brochure_link_broken, True)
+
+    def test_a_navigation_timeout_leaves_the_flag_unconfirmed(self):
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={
+                "error": "render_failed",
+                "reason": "navigation failed or timed out (TimeoutError('Timeout 30000ms exceeded'))",
+            }),
+        )
+        rows = [ListingRow(building="Flaky Design", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIsNone(enriched[0].brochure_link_broken)
+
+    def test_a_genuinely_successful_render_sets_the_flag_false(self):
+        # Confirms the flag also self-heals: a link that previously failed
+        # and is now read fine must clear back to False, not just stay
+        # unset - see master_merge.py's own silent-merge handling of this
+        # field for why False (a genuine confirmed value, never treated
+        # as blank) is what lets that self-healing actually reach master.
+        response = _canva_pages_response([b"\x89PNG p1"], page_count_detected=1)
+        rows = [ListingRow(building="Fixed Design", brochure_link=_CANVA_URL, special_features=None)]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch(
+                    "brochure_enrichment.extract.render_and_extract",
+                    return_value={"units": [{"building": "Fixed Design", "special_features": "Nice"}]},
+                ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["document_issues"], [])
+        self.assertIs(enriched[0].brochure_link_broken, False)
+
+
 REAL_CANVA_VIEW_URL = (
     "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
     "?utm_content=DAGzsWW-Yp8&utm_campaign=designshare&utm_medium=link&utm_source=publishsharelink#7"

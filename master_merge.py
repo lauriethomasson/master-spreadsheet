@@ -1720,6 +1720,23 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             diffs = diff_fields(old_rec, new_dict)
             silent = silent_field_updates(old_rec, new_dict)
 
+            # brochure_link_broken is diagnostic pipeline metadata, not a
+            # property fact a reviewer should ever be asked to approve -
+            # moved out of diffs (where it would otherwise show up as a
+            # normal, clickable "field changed" row) and into silent
+            # (auto-applied, never shown in any diff UI - see MatchedRow.
+            # silent_updates' own docstring), the SAME bucket _apply_silent
+            # already folds into every write regardless of whether this
+            # row has any OTHER change at all. diff_fields' own blank-new-
+            # value-skip rule already gives this exactly the right merge
+            # behavior before this move: a fresh row that never got its
+            # link re-checked this run (None) never overwrites master's
+            # existing True/False, while a genuinely fresh True/False
+            # (this run's own real render outcome) always does - nothing
+            # else needed for a fixed-and-reuploaded link to self-heal.
+            if "brochure_link_broken" in diffs:
+                silent["brochure_link_broken"] = diffs.pop("brochure_link_broken")[1]
+
             # Auto-merge a DETAIL_LOSS_MERGE_FIELDS update BEFORE risky_fields
             # is computed below, whenever it's safe to (see merge_compatible_
             # text's own docstring): is_detail_loss says old_val has a

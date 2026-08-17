@@ -26,6 +26,24 @@ HYPERLINK_FONT = Font(color="0563C1", underline="single")
 HYPERLINK_DISPLAY_TEXT = "Open brochure"  # kept for brochure_link/back-compat single-column callers
 LINK_DISPLAY_TEXT = {"brochure_link": "Open brochure", "floorplan_link": "Open floor plan"}
 
+# brochure_link specifically (never floorplan_link - ListingRow.brochure_
+# link_broken's own docstring scopes it to the brochure link only), for a
+# row whose last known render attempt CONFIRMED the link dead (see that
+# field's own docstring for exactly what qualifies). The cell keeps its
+# real hyperlink target underneath (Option A of the two considered: the
+# alternative - dropping the hyperlink entirely - would make read_xlsx_
+# with_hyperlinks below read this cell's own display text, "Broken link",
+# back as brochure_link's actual value on the next load, corrupting a
+# real data field with UI text) - only the DISPLAYED text/font changes,
+# so read_xlsx_with_hyperlinks needs no change at all: it already
+# recovers the real URL from cell.hyperlink.target regardless of what
+# the cell displays. The cell is technically still one click away from
+# the dead link (Excel has no way to attach a hyperlink yet disable
+# clicking it) - a deliberate, accepted tradeoff for never losing the
+# underlying URL.
+BROKEN_LINK_DISPLAY_TEXT = "Broken link"
+BROKEN_LINK_FONT = Font(color="808080", italic=True)  # grey, italic, no underline - reads as inert, not urgent
+
 # Columns that regularly hold long text (a multi-sentence description, several
 # contacts, or a long URL) - wrapped so the full value is visible on several
 # lines within the row instead of overflowing past the column's fixed width or
@@ -127,8 +145,12 @@ def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
                 if cell.value:
                     url = cell.value
                     cell.hyperlink = url
-                    cell.value = display_text
-                    cell.font = HYPERLINK_FONT
+                    if field == "brochure_link" and rows[row_idx - 2].brochure_link_broken:
+                        cell.value = BROKEN_LINK_DISPLAY_TEXT
+                        cell.font = BROKEN_LINK_FONT
+                    else:
+                        cell.value = display_text
+                        cell.font = HYPERLINK_FONT
 
     if isinstance(output, (str, Path)):
         Path(output).parent.mkdir(parents=True, exist_ok=True)

@@ -1535,6 +1535,54 @@ class SilentFieldUpdatesTests(unittest.TestCase):
         self.assertEqual(updates, {})
 
 
+class BuildMergePlanBrochureLinkBrokenTests(unittest.TestCase):
+    """
+    ListingRow.brochure_link_broken - diagnostic pipeline metadata, never
+    a reviewable field change (see build_merge_plan's own comment on why
+    it's moved into silent_updates), but still a genuine value that must
+    reach master on Approve without a human click, and must never be
+    disturbed by a fresh row that simply didn't recompute it this run.
+    """
+
+    def test_a_genuine_change_is_routed_to_silent_never_to_diffs(self):
+        master_df = _master_df([{"building": "Dead Design House", "brochure_link_broken": True}])
+        new_row = ListingRow(building="Dead Design House", brochure_link_broken=False)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("brochure_link_broken", matched.diffs)
+        self.assertEqual(matched.silent_updates.get("brochure_link_broken"), False)
+
+    def test_a_fresh_row_that_never_rechecked_the_link_never_disturbs_master(self):
+        # The real "fixed link fixes itself on the NEXT genuine re-check"
+        # guarantee, from the other side: a row that simply wasn't re-
+        # enriched this run (brochure_link_broken defaults to None) must
+        # never accidentally clear master's own already-confirmed True -
+        # diff_fields' own blank-new-value-skip rule is what gives this
+        # for free (None is blank, so this field never even enters diffs
+        # or silent at all here).
+        master_df = _master_df([{"building": "Dead Design House", "brochure_link_broken": True}])
+        new_row = ListingRow(building="Dead Design House")  # brochure_link_broken defaults to None
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("brochure_link_broken", matched.diffs)
+        self.assertNotIn("brochure_link_broken", matched.silent_updates)
+
+    def test_applying_the_silent_update_actually_reaches_the_merged_row(self):
+        # End-to-end through apply_merge itself (the same call pages/2_
+        # Review_and_Master.py makes with silent_by_index folded in) -
+        # confirms a fixed-and-reverified link genuinely un-stalls, not
+        # just that build_merge_plan computed the right dict.
+        master_records = [ListingRow(building="Dead Design House", brochure_link_broken=True).model_dump()]
+
+        merged = master_merge.apply_merge(master_records, {0: {"brochure_link_broken": False}}, [])
+
+        self.assertIs(merged[0].brochure_link_broken, False)
+
+
 class ItemsSimilarTests(unittest.TestCase):
     """_items_similar's exact-match short-circuit - a short, abbreviation/
     number-heavy item (every token <= 2 chars) must still be recognized as

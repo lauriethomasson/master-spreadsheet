@@ -168,6 +168,80 @@ class HyperlinkDisplayTextTests(unittest.TestCase):
         self.assertEqual(self._cell_values([row], "floorplan_link"), ["Open floor plan"])
 
 
+class BrokenBrochureLinkDisplayTests(unittest.TestCase):
+    """
+    A row whose brochure_link_broken is True must show a short, plain,
+    grey/italic "Broken link" label instead of the normal clickable
+    "Open brochure" - see BROKEN_LINK_DISPLAY_TEXT/BROKEN_LINK_FONT's own
+    comment for why the cell keeps its real hyperlink underneath anyway
+    (Option A of the two considered - the real URL must never be lost on
+    a later read-back, see RoundTripTests below for the actual proof).
+    """
+
+    def _cell(self, row):
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("brochure_link")) + 1
+        return ws.cell(row=2, column=col_idx)
+
+    def test_broken_link_shows_the_broken_label_not_open_brochure(self):
+        row = ListingRow(building="A", brochure_link="https://example.com/dead.pdf", brochure_link_broken=True)
+        cell = self._cell(row)
+        self.assertEqual(cell.value, "Broken link")
+
+    def test_broken_link_cell_still_carries_the_real_hyperlink_target(self):
+        row = ListingRow(building="A", brochure_link="https://example.com/dead.pdf", brochure_link_broken=True)
+        cell = self._cell(row)
+        self.assertEqual(cell.hyperlink.target, "https://example.com/dead.pdf")
+
+    def test_broken_link_uses_the_broken_font_not_the_normal_hyperlink_font(self):
+        row = ListingRow(building="A", brochure_link="https://example.com/dead.pdf", brochure_link_broken=True)
+        cell = self._cell(row)
+        self.assertEqual(cell.font.color.rgb, "00808080")
+        self.assertTrue(cell.font.italic)
+        self.assertFalse(cell.font.underline)
+
+    def test_a_working_link_is_completely_unaffected_false(self):
+        row = ListingRow(building="A", brochure_link="https://example.com/fine.pdf", brochure_link_broken=False)
+        cell = self._cell(row)
+        self.assertEqual(cell.value, "Open brochure")
+
+    def test_a_never_rechecked_link_is_completely_unaffected_none(self):
+        row = ListingRow(building="A", brochure_link="https://example.com/unknown.pdf", brochure_link_broken=None)
+        cell = self._cell(row)
+        self.assertEqual(cell.value, "Open brochure")
+
+    def test_floorplan_link_is_never_affected_by_brochure_link_broken(self):
+        # brochure_link_broken is scoped to brochure_link only - a row's
+        # floorplan_link cell must never show "Broken link" because of it.
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/dead.pdf", brochure_link_broken=True,
+            floorplan_link="https://example.com/plan.pdf",
+        )
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("floorplan_link")) + 1
+        self.assertEqual(ws.cell(row=2, column=col_idx).value, "Open floor plan")
+
+    def test_broken_link_url_still_round_trips_correctly(self):
+        # The actual point of keeping the hyperlink (Option A) - a later
+        # load of this same file (every merge run does this) must recover
+        # the real URL, never the literal "Broken link" display text.
+        row = ListingRow(building="A", brochure_link="https://example.com/dead.pdf", brochure_link_broken=True)
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        df = read_xlsx_with_hyperlinks(buffer.getvalue())
+        self.assertEqual(df.iloc[0]["brochure_link"], "https://example.com/dead.pdf")
+
+
 class LegacyColumnCompatibilityTests(unittest.TestCase):
     """Regression coverage for a real bug found while verifying this exact
     scenario against the real data/master.xlsx: that file predates the

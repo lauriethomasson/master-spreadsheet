@@ -42,6 +42,20 @@ class ListingRow(BaseModel):
     property_id: Optional[str] = None  # assigned once a row lands in the master as a distinct property (master_merge.py); never set by extraction
     lat: Optional[float] = None
     lng: Optional[float] = None
+    # Tri-state, never Gemini-set (like lat/lng above) - set by brochure_
+    # enrichment.py's own last render attempt for THIS row's brochure_link:
+    # True only for a CONFIRMED dead link (Canva itself answered the page
+    # load with a non-2xx status - see canva_renderer/app.py's own
+    # navigation-status check), False when that same attempt read fine,
+    # None whenever no attempt was made this run (already fully populated,
+    # ineligible link, or a weaker failure signal - a timeout/exception -
+    # not confirmed enough to call the link itself dead) OR for any link
+    # type/failure shape this doesn't yet cover. None is deliberately NOT
+    # the same as False - see master_merge.diff_fields's own blank-skip
+    # rule, which is exactly why a fresh row that never got re-checked
+    # this run can never accidentally clear a master row's own already-
+    # confirmed True.
+    brochure_link_broken: Optional[bool] = None
     submarket: Optional[str] = None
     building: str
     floor_unit: Optional[str] = None

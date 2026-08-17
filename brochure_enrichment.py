@@ -176,6 +176,26 @@ _ISSUE_LABELS = {
     STATUS_EXTRACTED_BUT_AMBIGUOUS: "The document was read, but couldn't be safely matched to this property",
 }
 
+# render_canva_page_async's own navigation-status check (canva_renderer/
+# app.py) raises with this exact substring when Canva itself answered the
+# initial page load with a non-2xx status - a genuinely CONFIRMED dead/
+# expired/access-revoked link, never a one-off navigation hiccup. That
+# reason string flows verbatim into this app's own _record_status(STATUS_
+# RENDER_FAILED, ...) detail at _fetch_canva_rendered_page's generic
+# failure branch (f"Canva render failed: {reason}") - matched here as
+# plain substring text, deliberately, since this app and canva_renderer
+# are two independently deployed services with no shared import; the
+# renderer's own reason string IS the contract between them. A bare
+# navigation timeout/exception (canva_renderer's own "navigation failed or
+# timed out (...)" message) never contains this substring - weak, one-off-
+# glitch-shaped evidence ListingRow.brochure_link_broken must never be set
+# from (see that field's own docstring).
+_CONFIRMED_DEAD_CANVA_LINK_MARKER = "navigation returned HTTP"
+
+
+def _is_confirmed_dead_canva_link(detail) -> bool:
+    return bool(detail) and _CONFIRMED_DEAD_CANVA_LINK_MARKER in detail
+
 
 def issue_label(status: str) -> str:
     """User-facing wording for `status` - see _ISSUE_LABELS. Falls back to
@@ -2738,6 +2758,23 @@ def enrich_rows_grouped(
                         "building": rows[i].building, "floor_unit": rows[i].floor_unit, "status": document_status,
                     })
 
+            # brochure_link_broken update for every row sharing this URL -
+            # see that field's own schema.py docstring for the full tri-
+            # state contract. Computed ONCE per URL (never per row - it's
+            # the same underlying document/render outcome for all of
+            # them), then applied uniformly below. None here means "leave
+            # whatever this row already had alone" (see master_merge.
+            # diff_fields' own blank-new-value-skip rule for why that's
+            # exactly what a None ends up doing on the next merge) - never
+            # forced to False/True when this call has no fresh, confident
+            # signal either way.
+            if document_status in (STATUS_EXTRACTED_SUCCESSFULLY, STATUS_EXTRACTED_NO_USEFUL_DATA):
+                link_broken_update = False
+            elif document_status == STATUS_RENDER_FAILED and _is_confirmed_dead_canva_link(sink.get("detail")):
+                link_broken_update = True
+            else:
+                link_broken_update = None
+
             for i in indices_by_url[url]:
                 # Confirmed real, reproducible bug this guards against: raw
                 # units come straight from Gemini's own JSON (see
@@ -2762,6 +2799,8 @@ def enrich_rows_grouped(
                         file=sys.stderr,
                     )
                     new_row, fields = rows[i], []
+                if link_broken_update is not None:
+                    new_row = new_row.model_copy(update={"brochure_link_broken": link_broken_update})
                 current[i] = new_row
                 if fields:
                     if is_canva_view_link(url):
