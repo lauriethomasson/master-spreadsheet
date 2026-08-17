@@ -15,7 +15,9 @@ Run with:
 
 import base64
 import concurrent.futures
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import threading
@@ -92,6 +94,78 @@ class HostAllowedSsrfTests(unittest.TestCase):
         self.assertFalse(canva_renderer._host_allowed("https://example.com/"))
 
 
+class PageAdvanceVerificationTests(unittest.TestCase):
+    """
+    Unit-level tests for _page_has_advanced/_page_advance_signature - the
+    pagination-verification logic itself (see render_canva_page_async's
+    own pagination docstring for the real production symptom this
+    closes: a "Next page" click that Playwright reports as completed can
+    still land on Canva's own debounced no-op). Exercised directly
+    against mocked Page objects, independent of the full render loop -
+    RenderCanvaPageAsyncTests below covers the integration.
+    """
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def _page(self, go_to_page_text=None, fingerprint="same"):
+        page = MagicMock()
+        if go_to_page_text is None:
+            button = MagicMock()
+            button.inner_text = AsyncMock(side_effect=Exception("no indicator"))
+        else:
+            button = MagicMock()
+            button.inner_text = AsyncMock(return_value=go_to_page_text)
+        page.get_by_role = MagicMock(return_value=button)
+        page.evaluate = AsyncMock(return_value=fingerprint)
+        return page
+
+    def test_prefers_the_numeric_indicator_when_both_sides_have_it(self):
+        page_before = self._page(go_to_page_text="2 / 7")
+        page_after = self._page(go_to_page_text="3 / 7")
+        before = self._run(canva_renderer._page_advance_signature(page_before))
+        after = self._run(canva_renderer._page_advance_signature(page_after))
+        self.assertTrue(canva_renderer._page_has_advanced(before, after))
+
+    def test_numeric_indicator_unchanged_is_not_advanced_even_if_fingerprint_differs(self):
+        # The numeric indicator, when both sides have it, is authoritative
+        # over the fingerprint fallback - a real "current/total" match
+        # takes precedence, never overridden by an unrelated text change
+        # elsewhere on the page (e.g. an animation, a loading spinner).
+        page_before = self._page(go_to_page_text="2 / 7", fingerprint="fingerprint-a")
+        page_after = self._page(go_to_page_text="2 / 7", fingerprint="fingerprint-b")
+        before = self._run(canva_renderer._page_advance_signature(page_before))
+        after = self._run(canva_renderer._page_advance_signature(page_after))
+        self.assertFalse(canva_renderer._page_has_advanced(before, after))
+
+    def test_falls_back_to_content_fingerprint_when_no_numeric_indicator(self):
+        page_before = self._page(go_to_page_text=None, fingerprint="fingerprint-a")
+        page_after = self._page(go_to_page_text=None, fingerprint="fingerprint-b")
+        before = self._run(canva_renderer._page_advance_signature(page_before))
+        after = self._run(canva_renderer._page_advance_signature(page_after))
+        self.assertTrue(canva_renderer._page_has_advanced(before, after))
+
+    def test_unchanged_fingerprint_is_not_advanced(self):
+        page_before = self._page(go_to_page_text=None, fingerprint="same-content")
+        page_after = self._page(go_to_page_text=None, fingerprint="same-content")
+        before = self._run(canva_renderer._page_advance_signature(page_before))
+        after = self._run(canva_renderer._page_advance_signature(page_after))
+        self.assertFalse(canva_renderer._page_has_advanced(before, after))
+
+    def test_two_empty_fingerprints_are_never_a_false_positive(self):
+        # Both signals unavailable (no indicator, evaluate itself fails)
+        # must never be treated as "confirmed changed" - only a genuine,
+        # non-empty difference counts.
+        page_before = self._page(go_to_page_text=None)
+        page_before.evaluate = AsyncMock(side_effect=Exception("evaluate failed"))
+        page_after = self._page(go_to_page_text=None)
+        page_after.evaluate = AsyncMock(side_effect=Exception("evaluate failed"))
+        before = self._run(canva_renderer._page_advance_signature(page_before))
+        after = self._run(canva_renderer._page_advance_signature(page_after))
+        self.assertFalse(canva_renderer._page_has_advanced(before, after))
+
+
 def _run(coro):
     import asyncio
     return asyncio.run(coro)
@@ -105,6 +179,7 @@ def _make_async_page(
     next_button_raises=False,
     go_to_page_text="1 / 1",
     go_to_page_raises=True,
+    click_advances_page=True,
 ):
     """
     A MagicMock shaped like an async Playwright Page - every method
@@ -131,7 +206,26 @@ def _make_async_page(
 
     `go_to_page_text`/`go_to_page_raises` mock the accessible "Go to page"
     total-page-count indicator used only for diagnostics (_detect_page_
-    count) - raising by default so most tests don't need to care about it.
+    count) AND, when NOT raising, as the PREFERRED page-advance-
+    verification signal (see canva_renderer.app._page_advance_signature) -
+    raising by default so most tests don't need to care about either.
+    `go_to_page_text` supplies the TOTAL half of "N / M"; the CURRENT half
+    is always read live from this page's own advance state below, so a
+    test exercising real pagination sees a genuinely changing indicator
+    (e.g. "1 / 3" -> "2 / 3"), never a value frozen at whatever string was
+    passed in.
+
+    `click_advances_page` (default True, matching every pre-existing
+    test's own implicit assumption that a click just works) controls
+    whether the DEFAULT "Next page" click - and any custom click side
+    effect that calls back into it via `real_click`, see existing tests'
+    own "_flaky_click" pattern - advances this page's own shared advance-
+    verification state (both the live "Go to page" current half above
+    AND the content-fingerprint fallback _page_content_fingerprint reads
+    via page.evaluate). Set False to simulate the real production
+    "debounced no-op" symptom this verification exists to catch: a click
+    that Playwright reports as completed, yet nothing about the visible
+    page actually changed.
     """
     page = MagicMock()
     page.url = final_url
@@ -159,6 +253,19 @@ def _make_async_page(
 
     page.screenshot = AsyncMock(side_effect=_screenshot)
 
+    # Shared "current page" advance state - a pure counter, read (never
+    # mutated) by page.evaluate/the "Go to page" indicator below, and
+    # advanced ONLY by a successful default click (see next_button.click
+    # below) when click_advances_page is True. Reading it any number of
+    # times without an intervening successful click correctly reports
+    # "unchanged", exactly like a real Canva viewer's own DOM would.
+    advance_state = {"page": 1}
+
+    async def _evaluate(script):
+        return f"content-page-{advance_state['page']}"
+
+    page.evaluate = AsyncMock(side_effect=_evaluate)
+
     next_button = MagicMock()
     if next_button_raises:
         next_button.get_attribute = AsyncMock(side_effect=Exception("Next page button not found"))
@@ -169,13 +276,24 @@ def _make_async_page(
             return next(disabled_iter)
 
         next_button.get_attribute = AsyncMock(side_effect=_get_attribute)
-    next_button.click = AsyncMock()
+
+    async def _default_click(*args, **kwargs):
+        if click_advances_page:
+            advance_state["page"] += 1
+
+    next_button.click = AsyncMock(side_effect=_default_click)
 
     go_to_page_button = MagicMock()
     if go_to_page_raises:
         go_to_page_button.inner_text = AsyncMock(side_effect=Exception("Go to page button not found"))
     else:
-        go_to_page_button.inner_text = AsyncMock(return_value=go_to_page_text)
+        _match = canva_renderer._PAGE_COUNT_RE.search(go_to_page_text)
+        _total_text = _match.group(2) if _match else go_to_page_text
+
+        async def _inner_text(timeout=None):
+            return f"{advance_state['page']} / {_total_text}"
+
+        go_to_page_button.inner_text = AsyncMock(side_effect=_inner_text)
 
     def _get_by_role(role, name=None, **kwargs):
         if name == "Next page":
@@ -394,6 +512,77 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
 
         self.assertEqual(pages, [b"\x89PNG p1"])
         self.assertEqual(next_button.click.await_count, canva_renderer.MAX_NEXT_CLICK_ATTEMPTS)
+        context.close.assert_awaited_once()
+
+    def test_pagination_retries_when_a_click_succeeds_but_the_page_does_not_advance(self):
+        # The real production symptom Task 3 closes: a "Next page" click
+        # that Playwright reports as completed (never raises) yet the
+        # visible page never actually changed - a debounced no-op. Must
+        # be retried via the SAME bounded mechanism as a raising click,
+        # and recovers once a later attempt genuinely advances.
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, "true"),
+        )
+        call_count = {"n": 0}
+        real_click = page.get_by_role("button", name="Next page").click
+
+        async def _debounced_then_real_click(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return None  # "succeeds" per Playwright, but nothing changes
+            return await real_click(*args, **kwargs)
+
+        page.get_by_role("button", name="Next page").click = AsyncMock(side_effect=_debounced_then_real_click)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
+        self.assertEqual(call_count["n"], 2)  # one no-op "success" + one real advance
+        context.close.assert_awaited_once()
+
+    def test_pagination_gives_up_when_the_click_never_actually_advances_the_page(self):
+        # Every attempt "succeeds" (never raises) but the page never
+        # changes - must still give up after the bounded retry, exactly
+        # like a raising click would, never an infinite loop, and never
+        # counted as a captured page.
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1",),
+            next_disabled_sequence=(None,),
+            click_advances_page=False,
+        )
+        next_button = page.get_by_role("button", name="Next page")
+        buf = io.StringIO()
+        patcher, context = self._patch_browser(page)
+        with patcher, contextlib.redirect_stderr(buf):
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1"])  # never advanced past the cover
+        self.assertEqual(next_button.click.await_count, canva_renderer.MAX_NEXT_CLICK_ATTEMPTS)
+        context.close.assert_awaited_once()
+        logged = buf.getvalue()
+        self.assertIn("did not advance", logged)
+        self.assertIn("attempt", logged)
+        self.assertIn("gave up after 3 attempts", logged)
+
+    def test_page_advance_verification_uses_the_go_to_page_indicator_when_available(self):
+        # Integration-level confirmation that a design WITH a readable
+        # "Go to page" indicator drives verification off it correctly
+        # end to end, not just in the PageAdvanceVerificationTests unit
+        # tests above.
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, "true"),
+            go_to_page_text="1 / 2",
+            go_to_page_raises=False,
+        )
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
+        self.assertEqual(detected_total, 2)
         context.close.assert_awaited_once()
 
     def test_page_is_closed_before_the_context_on_a_successful_multi_page_render(self):

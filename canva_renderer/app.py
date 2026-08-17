@@ -150,6 +150,18 @@ NEXT_PAGE_CLICK_TIMEOUT_MS = 15_000
 # broken "Next page" control gives up exactly like before this constant
 # existed, never an infinite retry loop.
 MAX_NEXT_CLICK_ATTEMPTS = 3
+# Timeout for the "Go to page" indicator read used to VERIFY a click
+# actually advanced the page (see _page_advance_signature) - deliberately
+# much shorter than _detect_page_count's own one-time-per-render 2000ms
+# budget for the SAME read, since this one runs up to twice per attempt,
+# up to MAX_NEXT_CLICK_ATTEMPTS times per page transition: a design with
+# no such indicator at all would otherwise pay the full timeout on every
+# single check, silently slowing down the common (indicator-less) case
+# rather than just the one genuinely-optional diagnostic read this was
+# originally sized for. Short enough to stay cheap when absent, still
+# comfortably enough time to read a real, already-rendered element when
+# present.
+_PAGE_ADVANCE_INDICATOR_TIMEOUT_MS = 500
 # Per-page-transition timeout budget used only to size RENDER_TIMEOUT_
 # SECONDS below - the click itself now uses its own explicit
 # NEXT_PAGE_CLICK_TIMEOUT_MS (see that constant's own docstring), not
@@ -359,24 +371,116 @@ class RenderError(Exception):
         self.reason = reason
 
 
-async def _detect_page_count(page) -> int:
+async def _read_current_and_total_pages(page, timeout_ms: int = 2_000) -> tuple:
     """
-    Best-effort "current / total" page count from Canva's own accessible
-    "Go to page" button (e.g. "1 / 7") - purely for the caller's own
-    logging (see Handler.do_POST's "Canva design detected: N pages" line),
-    never used to decide when to stop capturing pages (see
-    render_canva_page_async's own docstring on why the Next-page button's
-    aria-disabled state is the real stopping mechanism). Returns None on
-    any failure - a design with no such indicator at all (or one Canva has
-    changed the shape of) simply logs without a detected total, never a
-    render failure.
+    Best-effort "current / total" page indicator from Canva's own
+    accessible "Go to page" button (e.g. "1 / 7") - the SAME read
+    _detect_page_count has always used for its own diagnostic-only total,
+    generalized here to also expose the CURRENT page number, which
+    render_canva_page_async's own pagination loop uses (when available)
+    to verify a "Next page" click actually advanced anything, rather than
+    inventing a second, differently-shaped selector just for that check.
+
+    `timeout_ms` defaults to _detect_page_count's own original one-time-
+    per-render budget, but _page_advance_signature (called up to twice
+    PER PAGINATION ATTEMPT, unlike the one-time initial detection) passes
+    a much smaller value - a design with no such indicator at all would
+    otherwise pay this full timeout, twice, on every single attempt,
+    which would silently slow down the common case rather than only the
+    one-time initial check this constant was originally sized for.
+
+    Returns (None, None) - never raises - whenever this indicator isn't
+    present/readable at all, a normal outcome for many real designs (see
+    _detect_page_count's own docstring); a caller checking `current is
+    not None` before trusting it is what makes this safe to treat as
+    optional everywhere it's used.
     """
     try:
-        text = await page.get_by_role("button", name="Go to page").inner_text(timeout=2_000)
+        text = await page.get_by_role("button", name="Go to page").inner_text(timeout=timeout_ms)
     except Exception:
-        return None
+        return None, None
     match = _PAGE_COUNT_RE.search(re.sub(r"\s+", " ", text))
-    return int(match.group(2)) if match else None
+    if not match:
+        return None, None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _detect_page_count(page) -> int:
+    """
+    Best-effort TOTAL page count only - see _read_current_and_total_pages
+    for the shared read this wraps. Purely for the caller's own logging
+    (see Handler.do_POST's "Canva design detected: N pages" line), never
+    used to decide when to stop capturing pages (see render_canva_page_
+    async's own docstring on why the Next-page button's aria-disabled
+    state is the real stopping mechanism). Returns None on any failure -
+    a design with no such indicator at all (or one Canva has changed the
+    shape of) simply logs without a detected total, never a render
+    failure.
+    """
+    _current, total = await _read_current_and_total_pages(page)
+    return total
+
+
+async def _page_content_fingerprint(page) -> str:
+    """
+    Fallback page-advance signal for when the "Go to page" indicator
+    isn't present/readable at all (see _read_current_and_total_pages) -
+    a cheap snapshot of the page's own visible text, which differs
+    between any two genuinely different Canva slides in a real brochure
+    (address, unit numbers, floor plan labels, ...). Deliberately NOT a
+    Canva-specific CSS selector or DOM structure guess - just the same
+    kind of accessible-text read this module already relies on elsewhere
+    (see _read_current_and_total_pages), applied to the whole page
+    rather than one specific button, so it degrades the same safe way:
+    returns "" (never raises) on any failure, and callers treat two ""
+    results as "still don't know", never as a false confirmation of
+    change.
+    """
+    try:
+        return await page.evaluate("() => document.body.innerText.slice(0, 500)")
+    except Exception:
+        return ""
+
+
+async def _page_advance_signature(page) -> tuple:
+    """
+    Everything render_canva_page_async's pagination loop needs to later
+    decide "did the page actually change" (see _page_has_advanced) -
+    captured the SAME way both before and after a click so the two sides
+    of that comparison are never taken via different mechanisms. Always
+    reads BOTH signals (never either/or) - the numeric "current/total"
+    indicator when available (see _read_current_and_total_pages) AND the
+    content fingerprint fallback (see _page_content_fingerprint) - so a
+    comparison is never left stuck with a "before" value from one
+    mechanism and an "after" value from the other, e.g. if the indicator
+    happens to be readable at one moment but not the other.
+    """
+    page_number, _total = await _read_current_and_total_pages(page, timeout_ms=_PAGE_ADVANCE_INDICATOR_TIMEOUT_MS)
+    fingerprint = await _page_content_fingerprint(page)
+    return page_number, fingerprint
+
+
+def _page_has_advanced(before: tuple, after: tuple) -> bool:
+    """
+    Confirms a "Next page" click actually changed the visible page,
+    rather than trusting a click that merely didn't raise (see
+    render_canva_page_async's own pagination docstring for the real
+    production symptom this closes: a click that Playwright reports as
+    completed can still land on Canva's own debounced no-op).
+
+    `before`/`after` are both _page_advance_signature(page) results.
+    Prefers the numeric "current/total" indicator when BOTH sides have
+    it - an exact, unambiguous comparison; falls back to the content-
+    fingerprint comparison otherwise (see _page_content_fingerprint's
+    own "least brittle alternative" reasoning) - e.g. a design with no
+    such indicator at all, or one that was briefly unreadable on just
+    one side of this specific comparison.
+    """
+    page_before, fingerprint_before = before
+    page_after, fingerprint_after = after
+    if page_before is not None and page_after is not None:
+        return page_after != page_before
+    return bool(fingerprint_after) and fingerprint_after != fingerprint_before
 
 
 async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
@@ -493,31 +597,69 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
             # another one", which are different questions. A failure here
             # (button gone, attribute read itself fails) is the same
             # "stop conservatively, keep what's captured" precedent as
-            # every other pagination failure in this loop.
+            # every other pagination failure in this loop - logged
+            # distinctly from a CLICK failure below (see Task 4's own
+            # "button not found" vs "click timed out" distinction), since
+            # this is a different failure shape: no click was ever even
+            # attempted.
             try:
                 next_button = page.get_by_role("button", name="Next page")
                 if await next_button.get_attribute("aria-disabled") == "true":
                     break
-            except Exception:
+            except Exception as e:
+                print(
+                    f"[canva_renderer] Pagination ended for {url!r}: 'Next page' button not found or not "
+                    f"readable ({e!r}) - {len(pages)} page(s) captured, keeping them.",
+                    file=sys.stderr,
+                )
                 break
 
             advanced = False
             last_error = None
+            signature_after = (None, "")
             for attempt in range(1, MAX_NEXT_CLICK_ATTEMPTS + 1):
+                signature_before = await _page_advance_signature(page)
                 try:
                     # Re-acquired fresh on EVERY attempt - never the same
                     # handle reused across a retry (see MAX_NEXT_CLICK_
                     # ATTEMPTS's own docstring on why).
                     next_button = page.get_by_role("button", name="Next page")
                     await next_button.click(timeout=NEXT_PAGE_CLICK_TIMEOUT_MS)
-                    await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+                except Exception as e:
+                    last_error = e
+                    print(
+                        f"[canva_renderer] Pagination click failed for {url!r} on attempt "
+                        f"{attempt}/{MAX_NEXT_CLICK_ATTEMPTS} (page before: {signature_before[0]!r}) - "
+                        f"{e!r}.",
+                        file=sys.stderr,
+                    )
+                    if attempt < MAX_NEXT_CLICK_ATTEMPTS:
+                        await page.wait_for_timeout(400 * attempt)  # brief backoff, then re-acquire
+                    continue
+
+                await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+
+                # The click itself didn't raise, but that alone is NOT
+                # trusted as proof the page advanced (see _page_has_
+                # advanced's own docstring for the real production
+                # symptom this closes) - only counted as a successful
+                # page once the page's own state is confirmed different.
+                signature_after = await _page_advance_signature(page)
+                if _page_has_advanced(signature_before, signature_after):
                     pages.append(await page.screenshot(type="png"))
                     advanced = True
                     break
-                except Exception as e:
-                    last_error = e
-                    if attempt < MAX_NEXT_CLICK_ATTEMPTS:
-                        await page.wait_for_timeout(400 * attempt)  # brief backoff, then re-acquire
+
+                last_error = "click completed but the page did not advance"
+                print(
+                    f"[canva_renderer] Pagination click for {url!r} on attempt "
+                    f"{attempt}/{MAX_NEXT_CLICK_ATTEMPTS} completed but the page did not advance "
+                    f"(page before: {signature_before[0]!r}, after: {signature_after[0]!r}).",
+                    file=sys.stderr,
+                )
+                if attempt < MAX_NEXT_CLICK_ATTEMPTS:
+                    await page.wait_for_timeout(400 * attempt)  # brief backoff, then re-acquire
+
             if advanced and attempt > 1:
                 # Distinct from the plain "captured a page" case below -
                 # confirms a retry actually recovered a page that would
@@ -526,14 +668,14 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
                 # named URL, attempt number, page count so far).
                 print(
                     f"[canva_renderer] Pagination click recovered on attempt {attempt}/{MAX_NEXT_CLICK_ATTEMPTS} "
-                    f"for {url!r} - {len(pages)} page(s) captured so far.",
+                    f"for {url!r} (page now: {signature_after[0]!r}) - {len(pages)} page(s) captured so far.",
                     file=sys.stderr,
                 )
             if not advanced:
                 print(
                     f"[canva_renderer] Pagination failure for {url!r}: gave up after "
-                    f"{MAX_NEXT_CLICK_ATTEMPTS} attempts ({last_error!r}) - stopped at "
-                    f"{len(pages)} page(s) captured, keeping them.",
+                    f"{MAX_NEXT_CLICK_ATTEMPTS} attempts (last: {last_error!r}) - stopped at "
+                    f"{len(pages)} page(s) captured (detected total: {detected_total!r}), keeping them.",
                     file=sys.stderr,
                 )
                 break

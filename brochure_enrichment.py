@@ -1023,20 +1023,42 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
 # a real renderer failure from here.
 _CANVA_RENDERER_TIMEOUT = 300
 
-# A 502/503/504 from the renderer is Cloud Run's OWN infrastructure
-# giving up on the request (a cold start, a transient network blip, the
-# renderer briefly unreachable during a container swap) - never the
-# renderer's own code actually running and reporting a real render
-# failure (that's always a 422 with its own "reason", handled separately
-# below). Confirmed real production shape this covers: two otherwise-
-# healthy Canva URLs both failing with a bare "HTTP 504" and nothing
-# else. Retried a SMALL, bounded number of times with a short, fixed
-# backoff - never indefinitely, and never on a raw connection-level
-# exception (a DNS failure/genuine unreachability already burned a full
-# _CANVA_RENDERER_TIMEOUT once; retrying that blindly would only double a
-# large spreadsheet upload's worst-case wait for a URL that's very
-# unlikely to succeed on retry anyway - see _fetch_canva_rendered_page).
-_CANVA_RENDERER_TRANSIENT_STATUS_CODES = (502, 503, 504)
+# A 502/503 from the renderer is Cloud Run's OWN infrastructure or the
+# renderer's own busy-semaphore giving up on the request BEFORE any real
+# Playwright work started for this attempt (a cold start, a transient
+# network blip, the renderer briefly unreachable during a container
+# swap, or its own "renderer busy, try again" 503 - see canva_renderer/
+# app.py's SEMAPHORE_WAIT_TIMEOUT_SECONDS) - never the renderer's own
+# code actually running and reporting a real render failure (that's
+# always a 422 with its own "reason", handled separately below). Retried
+# a SMALL, bounded number of times with a short, fixed backoff - never
+# indefinitely, and never on a raw connection-level exception (a DNS
+# failure/genuine unreachability already burned a full _CANVA_RENDERER_
+# TIMEOUT once; retrying that blindly would only double a large
+# spreadsheet upload's worst-case wait for a URL that's very unlikely to
+# succeed on retry anyway - see _fetch_canva_rendered_page).
+#
+# 504 is deliberately EXCLUDED here, unlike 502/503 - confirmed real
+# production shape: two otherwise-healthy Canva URLs both surfaced a bare
+# "HTTP 504" to this app, while canva_renderer's OWN logs (Cloud Run logs,
+# not visible to this app) showed the SAME render continuing to run in
+# the background and later succeeding (partially or fully) - because a
+# 504 is Cloud Run's OWN proxy giving up waiting on the response, a layer
+# ENTIRELY OUTSIDE the renderer's Python process (confirmed: canva_
+# renderer/app.py's Handler.do_POST never sends a 504 itself - only
+# 200/400/401/404/422/500/503). The renderer's own Playwright work runs
+# on its dedicated background event-loop thread, decoupled from the HTTP
+# request thread/client socket, so it keeps running to completion
+# regardless of whether the proxy already gave up - a 504 is NOT proof
+# the renderer failed or that no work is in flight. Retrying it by firing
+# a SECOND, fully independent render (a new browser context/page, no
+# relation to the first) duplicates expensive Chromium work for a render
+# that may already be finishing successfully, and produces exactly the
+# confusing double "Pagination failure"/"Canva render succeeded" log
+# pairs seen in production for a single logical brochure fetch. A 504
+# simply surfaces as a normal STATUS_FETCH_FAILED below, same as any
+# other non-2xx response this app can't recover from on ITS OWN side.
+_CANVA_RENDERER_TRANSIENT_STATUS_CODES = (502, 503)
 _CANVA_RENDERER_MAX_ATTEMPTS = 2
 _CANVA_RENDERER_RETRY_BACKOFF_SECONDS = 2
 
@@ -1135,21 +1157,31 @@ def _fetch_canva_rendered_page(url: str):
     exists (a stuck/misbehaving Canva page or a Chromium OOM must never be
     able to affect this app's own memory budget or uptime).
 
-    A transient HTTP 502/503/504 from the renderer (Cloud Run's own
-    infrastructure giving up on the request, not the renderer's own code
-    reporting a real failure - see _CANVA_RENDERER_TRANSIENT_STATUS_CODES'
-    own docstring) is retried a small, bounded number of times
-    (_CANVA_RENDERER_MAX_ATTEMPTS) with a short fixed backoff before
-    falling through to the same failure handling as any other bad
+    A transient HTTP 502/503 from the renderer (Cloud Run's own
+    infrastructure or its own busy-semaphore giving up on the request
+    BEFORE any real work started for this attempt, not the renderer's
+    own code reporting a real failure - see _CANVA_RENDERER_TRANSIENT_
+    STATUS_CODES' own docstring) is retried a small, bounded number of
+    times (_CANVA_RENDERER_MAX_ATTEMPTS) with a short fixed backoff
+    before falling through to the same failure handling as any other bad
     response - never retried indefinitely, and never on a raw connection-
-    level exception (see that constant's own docstring on why).
+    level exception (see that constant's own docstring on why). A 504 is
+    deliberately NEVER retried this way (see that constant's own
+    docstring) - it means Cloud Run's proxy gave up waiting on the
+    response, not that the renderer's own work stopped or failed, and
+    firing a second independent render would duplicate expensive
+    Chromium work for a render that may already be succeeding.
 
     Returns None (never raises) whenever:
-    - the renderer service is unreachable, times out, or returns a non-
-      2xx/malformed response (including a transient 502/503/504 that
-      didn't recover within the retry budget above) - recorded as
+    - the renderer service is unreachable or times out (a raw connection-
+      level exception, no HTTP response received at all) - recorded as
       STATUS_FETCH_FAILED, the same status a real network failure gets
       for any other document host;
+    - the renderer returns a non-2xx/malformed response - including a
+      transient 502/503 that didn't recover within the retry budget
+      above, or a 504 (never retried at all - see above) - recorded as
+      STATUS_RENDER_FAILED with the HTTP status/reason (same generic
+      fallback path as any other bad response, see below);
     - the renderer itself reports a clean, safe failure - a malformed
       Canva URL, a private/login-required design, a page that never
       finished loading - recorded as STATUS_RENDER_FAILED with the

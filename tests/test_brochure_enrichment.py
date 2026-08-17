@@ -726,7 +726,7 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         self.assertIsNone(result)
         self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
         # A raw connection-level exception is NEVER retried (unlike an
-        # actual transient 502/503/504 HTTP response - see
+        # actual transient 502/503 HTTP response - see
         # TransientRendererRetryTests) - it already burned a full
         # _CANVA_RENDERER_TIMEOUT once, so retrying it blindly would only
         # add latency for a URL very unlikely to succeed on retry anyway.
@@ -887,52 +887,53 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
 class TransientRendererRetryTests(EnrichmentTestCase):
     """
     Real production evidence this covers: two otherwise-healthy Canva
-    URLs both failing with a bare HTTP 504 - Cloud Run's own
-    infrastructure giving up on the request, never the renderer's own
-    code actually running (that's always a clean RenderError/422,
-    exercised elsewhere in FetchCanvaRenderedPageTests). A small, bounded
-    retry (_CANVA_RENDERER_MAX_ATTEMPTS) with a short fixed backoff rides
-    through a transient 502/503/504 without retrying indefinitely.
+    URLs both failing with a bare HTTP 504, while canva_renderer's OWN
+    logs showed the SAME render continuing to run in the background and
+    later succeeding (partially or fully) - see canva_renderer/app.py's
+    Handler.do_POST, which never sends a 504 itself (only 200/400/401/
+    404/422/500/503), proving a 504 is Cloud Run's OWN proxy giving up on
+    the request, never the renderer's own code failing or stopping. A
+    502/503 IS retried (Cloud Run's own infrastructure or the renderer's
+    busy-semaphore giving up BEFORE any work started for that attempt -
+    see _CANVA_RENDERER_TRANSIENT_STATUS_CODES' own docstring), a SMALL,
+    bounded number of times with a short fixed backoff. 504 is NEVER
+    retried this way - see TransientRendererRetryTests' own 504-specific
+    tests below for why firing a second, fully independent render would
+    duplicate expensive Chromium work for a render that may already be
+    succeeding.
     """
 
-    def test_a_single_transient_504_recovers_on_retry(self):
-        response_504 = MagicMock(status_code=504, headers={"content-type": "text/html"})
-        response_ok = _canva_pages_response([b"\x89PNG recovered"], page_count_detected=1)
-        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
-                patch("brochure_enrichment.httpx.post", side_effect=[response_504, response_ok]) as mock_post, \
-                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
-                patch("brochure_enrichment.time.sleep") as mock_sleep, \
-                patch("brochure_enrichment.sys.stderr") as mock_stderr:
-            result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
-
-        self.assertEqual(result, [b"\x89PNG recovered"])
-        self.assertEqual(mock_post.call_count, 2)
-        # Auth headers are mocked above (never itself calls time.sleep),
-        # so the ONLY sleep call possible here is this module's own retry
-        # backoff - a real fixed value, never library jitter.
-        mock_sleep.assert_called_once_with(brochure_enrichment._CANVA_RENDERER_RETRY_BACKOFF_SECONDS)
-        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
-        self.assertIn("transient HTTP 504", logged)
-        self.assertIn("attempt 1/2", logged)
-        self.assertIn("Canva render succeeded", logged)
-
-    def test_a_persistent_504_gives_up_after_the_bounded_retry(self):
+    def test_a_single_504_does_not_trigger_a_second_render(self):
+        # The core fix: a 504 must never cause this app to fire a second,
+        # independent Canva render (a new browser context/page, no
+        # relation to the first) - see this class' own docstring for why
+        # that duplicates expensive work for a render that may already be
+        # succeeding server-side.
         response_504 = MagicMock(status_code=504, headers={"content-type": "text/html"}, json=MagicMock(side_effect=ValueError))
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch("brochure_enrichment.httpx.post", return_value=response_504) as mock_post, \
                 patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
-                patch("brochure_enrichment.time.sleep"), \
+                patch("brochure_enrichment.time.sleep") as mock_sleep, \
                 patch("brochure_enrichment.sys.stderr") as mock_stderr:
             with brochure_enrichment._StatusCapture({}) as sink:
                 result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
 
         self.assertIsNone(result)
-        # Bounded - exactly _CANVA_RENDERER_MAX_ATTEMPTS, never more, never
-        # indefinite.
-        self.assertEqual(mock_post.call_count, brochure_enrichment._CANVA_RENDERER_MAX_ATTEMPTS)
+        mock_post.assert_called_once()  # exactly ONE request - never a duplicate render
+        mock_sleep.assert_not_called()  # never backs off/retries a 504 at all
         self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
         logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
         self.assertIn("HTTP 504", logged)
+        self.assertNotIn("retrying", logged)  # never claims a retry that didn't happen
+
+    def test_504_is_not_in_the_transient_retry_set(self):
+        # Direct regression guard on the actual constant, not just the
+        # end-to-end behavior above - a future edit that accidentally
+        # re-adds 504 here would silently reintroduce the duplicate-
+        # render bug this fix closes.
+        self.assertNotIn(504, brochure_enrichment._CANVA_RENDERER_TRANSIENT_STATUS_CODES)
+        self.assertIn(502, brochure_enrichment._CANVA_RENDERER_TRANSIENT_STATUS_CODES)
+        self.assertIn(503, brochure_enrichment._CANVA_RENDERER_TRANSIENT_STATUS_CODES)
 
     def test_a_502_and_a_503_are_both_treated_as_transient(self):
         for status in (502, 503):
@@ -959,7 +960,9 @@ class TransientRendererRetryTests(EnrichmentTestCase):
         # A 422 is the renderer's OWN code reporting a clean, deliberate
         # failure (see canva_renderer/app.py's RenderError) - retrying
         # that immediately would almost certainly hit the exact same
-        # wall again; only an infrastructure-level 502/503/504 is retried.
+        # wall again; only an infrastructure-level 502/503 is retried (see
+        # TransientRendererRetryTests' own docstring on why 504 - despite
+        # ALSO being infrastructure-level - is deliberately excluded).
         response_422 = MagicMock(
             status_code=422, headers={"content-type": "application/json"},
             json=MagicMock(return_value={"error": "render_failed", "reason": "not a recognized public Canva URL"}),
