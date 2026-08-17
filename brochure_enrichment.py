@@ -623,12 +623,57 @@ def _strip_building_address_suffix(building):
     return head
 
 
+# Generic UK street-type words that can legitimately appear as the LAST
+# word of a building/address string - both full forms and common
+# abbreviations. Deliberately a small, explicit list (same "conservative,
+# a human catches a case this misses" philosophy as normalize_key itself
+# and master_merge._STREET_SUFFIX_EXPANSIONS), not a general gazetteer.
+_TRAILING_STREET_SUFFIX_WORDS = frozenset({
+    "road", "rd", "street", "st", "avenue", "ave", "av", "lane", "ln",
+    "place", "pl", "court", "ct", "crescent", "cres", "gardens", "gdns",
+    "terrace", "ter", "square", "sq", "drive", "dr", "way", "close",
+    "walk", "row", "grove", "hill", "rise", "mews", "boulevard", "blvd",
+    "parade",
+})
+
+
+def _strip_trailing_street_suffix_word(key: str) -> str:
+    """
+    `key` (an ALREADY normalize_key'd string) with its own trailing
+    generic street-type word dropped, when the last word is one - e.g.
+    "35a westminster bridge road" -> "35a westminster bridge". Confirmed
+    real gap this closes: a spreadsheet row's own building text ("35a
+    Westminster Bridge") against the SAME building's fuller name as a
+    brochure itself states it ("35A Westminster Bridge Road") - genuinely
+    the same building, but sharing no normalize_key() overlap at all
+    since one side simply never carries the trailing street-type word the
+    other does.
+
+    Deliberately a DROP, not master_merge._STREET_SUFFIX_EXPANSIONS' own
+    abbreviation-to-full-form EXPANSION (that module's own docstring scopes
+    _STREET_SUFFIX_EXPANSIONS to intra-batch duplicate grouping only, and
+    expanding "Rd" to "Road" would never make "bridge" equal "bridge
+    road" anyway - only dropping the extra word closes THIS gap, one side
+    having the word at all, not the two sides merely abbreviating it
+    differently).
+
+    Never strips when there's only one word (e.g. a building genuinely
+    just named "Court" or "Row") or the last word isn't a recognized
+    street-type word - a building's own genuine one-word name is left
+    alone rather than guessed at.
+    """
+    words = key.split()
+    if len(words) > 1 and words[-1] in _TRAILING_STREET_SUFFIX_WORDS:
+        return " ".join(words[:-1])
+    return key
+
+
 def _building_identity_matches(row_building, candidate_buildings: list) -> list:
     """
     Indices into `candidate_buildings` (a list of raw building-name strings,
     e.g. one per brochure unit/building_features entry) that confidently
     identify the SAME building as `row_building` - never a fuzzy/similarity
-    match, only exact-string comparisons at two tiers:
+    match, only exact-string comparisons at three tiers:
 
     1. EXACT (both sides' own normalize_key, no suffix stripped) - always
        sufficient identity evidence by itself. Every exact match is
@@ -650,6 +695,20 @@ def _building_identity_matches(row_building, candidate_buildings: list) -> list:
        as every other tier in this module. This is what makes the stripped
        tier only ever a WEAK, corroborated signal - unique-within-this-
        comparison is the corroboration, never the bare shortened name alone.
+    3. TRAILING-STREET-SUFFIX-STRIPPED (see _strip_trailing_street_suffix_
+       word) - e.g. "35a Westminster Bridge" (a row) vs "35A Westminster
+       Bridge Road" (a brochure's own fuller name) - confirmed against a
+       real production case. Same weak-signal treatment as tier 2 and for
+       the identical reason: dropping a generic trailing word can coincide
+       two genuinely different streets that merely share everything before
+       their own street-type word (e.g. "Kings Road" and "Kings Street" in
+       the same portfolio brochure both drop to "kings") - only ever
+       accepted when it is the SOLE candidate sharing that key. Tried
+       independently of tier 2, on the ORIGINAL (non-address-suffix-
+       stripped) keys - the two gaps are unrelated (one is a spreadsheet
+       baking a full address onto a building name, the other is one side
+       simply omitting a trailing street-type word) and neither building's
+       real text needs both stripped at once for any case seen so far.
 
     Returns [] when row_building has no genuine key at all (blank/
     whitespace-only).
@@ -663,13 +722,20 @@ def _building_identity_matches(row_building, candidate_buildings: list) -> list:
         return exact
 
     row_stripped_key = normalize_key(_strip_building_address_suffix(row_building))
-    if not row_stripped_key:
-        return []
-    stripped = [
+    if row_stripped_key:
+        stripped = [
+            i for i, c in enumerate(candidate_buildings)
+            if normalize_key(_strip_building_address_suffix(c)) == row_stripped_key
+        ]
+        if len(stripped) == 1:
+            return stripped
+
+    row_street_key = _strip_trailing_street_suffix_word(row_key)
+    street_suffix = [
         i for i, c in enumerate(candidate_buildings)
-        if normalize_key(_strip_building_address_suffix(c)) == row_stripped_key
+        if _strip_trailing_street_suffix_word(normalize_key(c)) == row_street_key
     ]
-    return stripped if len(stripped) == 1 else []
+    return street_suffix if len(street_suffix) == 1 else []
 
 
 def needs_enrichment(row: ListingRow) -> bool:

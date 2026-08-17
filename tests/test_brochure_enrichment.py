@@ -1530,8 +1530,9 @@ class BuildingAddressSuffixTests(unittest.TestCase):
 
 
 class BuildingIdentityMatchesTests(unittest.TestCase):
-    """_building_identity_matches - see its own docstring for the two-tier
-    exact/stripped-and-corroborated-by-uniqueness rule."""
+    """_building_identity_matches - see its own docstring for the three-tier
+    exact/address-suffix-stripped/street-suffix-stripped, all corroborated-
+    by-uniqueness-past-tier-1, rule."""
 
     def test_exact_match_returns_every_exact_index(self):
         indices = brochure_enrichment._building_identity_matches(
@@ -1556,6 +1557,51 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
 
     def test_no_candidates_returns_empty(self):
         self.assertEqual(brochure_enrichment._building_identity_matches("28 Lime Street", []), [])
+
+    def test_unique_street_suffix_stripped_match_is_accepted(self):
+        # Real production case: a row's own building text lacks the
+        # trailing street-type word a brochure's fuller name states -
+        # "35a Westminister Bridge" (sic - the row's own real typo,
+        # unrelated to this fix) vs Gemini's own extracted "35A
+        # Westminster Bridge Road". This test uses the correctly-spelled
+        # row text - the typo itself is a source-data problem, fixed in
+        # the spreadsheet, not something this matcher is meant to paper
+        # over (see BUILDING_FUZZY_MATCH_THRESHOLD's own module elsewhere
+        # for why a similarity-score fuzzy match is deliberately NOT used
+        # here).
+        indices = brochure_enrichment._building_identity_matches(
+            "35a Westminster Bridge", ["35A Westminster Bridge Road"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_street_suffix_stripped_match_works_in_either_direction(self):
+        # The row side carrying the extra street-type word instead of the
+        # brochure side - the strip must be symmetric, not a one-way rule.
+        indices = brochure_enrichment._building_identity_matches(
+            "35 Example Road", ["35 Example"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_ambiguous_street_suffix_stripped_match_is_rejected(self):
+        # Two genuinely different streets that merely share everything
+        # before their own street-type word - incorrect enrichment is
+        # worse than a blank field, same philosophy as the address-suffix
+        # tier's own ambiguous case.
+        indices = brochure_enrichment._building_identity_matches(
+            "Kings", ["Kings Road", "Kings Street"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_two_different_one_word_street_type_building_names_never_collide(self):
+        # The real risk _strip_trailing_street_suffix_word's own
+        # len(words) > 1 guard closes: a building's own genuine one-word
+        # name that happens to BE a street-type word (e.g. "Court",
+        # "Road") must never strip down to an empty, universally-matching
+        # key - without that guard, "Court" and "Road" (two genuinely
+        # different, unrelated buildings) would both reduce to "" and
+        # incorrectly match each other.
+        indices = brochure_enrichment._building_identity_matches("Court", ["Road"])
+        self.assertEqual(indices, [])
 
 
 class MatchBuildingFeatureTests(unittest.TestCase):
