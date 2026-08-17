@@ -33,7 +33,11 @@ read from a document here; this module has no second geocoding path.
 
 Brochure information is applied at the WIDEST level the brochure itself
 clearly supports, never wider - three scopes, each narrower than the last
-(see _apply_units_to_row's own docstring for the exact precedence):
+(see _apply_units_to_row's own docstring for the exact precedence).
+special_features is the one exception: rather than the narrowest present
+scope winning outright and the wider ones being discarded, every scope
+that's genuinely present is combined into one value (see that same
+docstring for why).
 1. Property/document-wide (PROPERTY_LEVEL_FIELDS: property_features,
    contacts - see _extract_brochure_units) - genuinely true of every row
    sharing this brochure_link, applied regardless of whether a specific
@@ -1948,9 +1952,20 @@ def _apply_units_to_row(row: ListingRow, units):
     widest to narrowest - see the module docstring for the full "widest
     safe level" rationale and PROPERTY_LEVEL_FIELDS/BUILDING_LEVEL_FIELDS/
     UNIT_LEVEL_FIELDS/HIGH_RISK_UNIT_LEVEL_FIELDS for exactly which fields
-    each scope covers. Each later, narrower source OVERWRITES the same key
-    in `updates` set by an earlier, wider one when both apply, since a more
-    specific value is always preferred over a less specific one:
+    each scope covers. For every field EXCEPT special_features, each later,
+    narrower source OVERWRITES the same key in `updates` set by an earlier,
+    wider one when both apply, since a more specific value is always
+    preferred over a less specific one. special_features is the one
+    exception: whichever of the three tiers below are genuinely present
+    are instead COMBINED into one value, specific-to-general (unit, then
+    building, then property), "; "-joined - a unit's own stated features
+    are never allowed to silently discard a real building- or property-
+    wide amenity just because a narrower tier also happened to say
+    something. No deduplication between tiers (a unit's own text may
+    legitimately restate a building-wide detail Gemini already saw) -
+    deliberately not attempted here; a bad dedup rule risks stripping
+    something real, a worse failure mode than an occasional repeated
+    phrase.
 
     1. DOCUMENT-level (PROPERTY_LEVEL_FIELDS - contacts, special_features's
        property_features fallback - see units.property_features/units.
@@ -1996,19 +2011,36 @@ def _apply_units_to_row(row: ListingRow, units):
     or the run.
     """
     updates = {}
+    unit = _match_unit(row, units) if units else None
 
     if units is not None:
         contacts = getattr(units, "contacts", None)
         if _is_blank(row.contacts) and isinstance(contacts, str) and not _is_blank(contacts):
             updates["contacts"] = contacts
 
-        property_features = getattr(units, "property_features", None)
-        if _is_blank(row.special_features) and isinstance(property_features, str) and not _is_blank(property_features):
-            updates["special_features"] = property_features
+        if _is_blank(row.special_features):
+            # Combines every tier actually present, specific-to-general
+            # (unit, then building, then property) - deliberately NOT the
+            # old "narrowest present tier wins outright, the wider ones are
+            # simply dropped" behavior (still true for every OTHER field's
+            # own property/building/unit fallback - this is a special_
+            # features-only change). No deduplication against overlapping
+            # phrasing between tiers (e.g. a unit's own text already
+            # echoing a building-wide amenity) - deliberately out of scope,
+            # see this change's own commit message for why a dedup rule
+            # is its own, separate risk (wrongly stripping something real)
+            # not worth taking on here.
+            unit_features = _coerced_unit_value("special_features", unit.get("special_features")) if unit else None
+            building_features = _match_building_feature(row, units)
+            if not (isinstance(building_features, str) and not _is_blank(building_features)):
+                building_features = None
+            property_features = getattr(units, "property_features", None)
+            if not (isinstance(property_features, str) and not _is_blank(property_features)):
+                property_features = None
 
-        building_features = _match_building_feature(row, units)
-        if _is_blank(row.special_features) and isinstance(building_features, str) and not _is_blank(building_features):
-            updates["special_features"] = building_features  # more specific than property_features above
+            combined = "; ".join(seg for seg in (unit_features, building_features, property_features) if seg)
+            if combined:
+                updates["special_features"] = combined
 
         for field in BUILDING_LEVEL_FIELDS:
             if not _is_blank(getattr(row, field)):
@@ -2017,28 +2049,28 @@ def _apply_units_to_row(row: ListingRow, units):
             if value is not None:
                 updates[field] = value
 
-    if units:
-        unit = _match_unit(row, units)
-        if unit is not None:
-            # Checked ONCE per unit, before the per-field loop below - see
-            # _rent_check_values/_rent_values_consistent's own docstrings.
-            # rent_conflict being True means this unit's own rent_pcm/
-            # rent_psf don't add up against whatever size/sibling-rent value
-            # is already trustworthy for this row, so neither is safe to
-            # write - "incorrect enrichment is worse than a blank field",
-            # same philosophy as every other tier in this module. Never
-            # affects a field that's already non-blank on the row (the
-            # per-field blank-only guard below still applies first), and
-            # never affects UNIT_LEVEL_FIELDS other than the two rent ones.
-            rent_conflict = not _rent_values_consistent(*_rent_check_values(row, unit))
-            for field in UNIT_LEVEL_FIELDS + HIGH_RISK_UNIT_LEVEL_FIELDS:
-                if not _is_blank(getattr(row, field)):
-                    continue
-                if field in HIGH_RISK_UNIT_LEVEL_FIELDS and rent_conflict:
-                    continue
-                value = _coerced_unit_value(field, unit.get(field))
-                if value is not None:
-                    updates[field] = value  # a genuine unit match beats both fallbacks above
+    if units and unit is not None:
+        # Checked ONCE per unit, before the per-field loop below - see
+        # _rent_check_values/_rent_values_consistent's own docstrings.
+        # rent_conflict being True means this unit's own rent_pcm/
+        # rent_psf don't add up against whatever size/sibling-rent value
+        # is already trustworthy for this row, so neither is safe to
+        # write - "incorrect enrichment is worse than a blank field",
+        # same philosophy as every other tier in this module. Never
+        # affects a field that's already non-blank on the row (the
+        # per-field blank-only guard below still applies first), and
+        # never affects UNIT_LEVEL_FIELDS other than the two rent ones.
+        rent_conflict = not _rent_values_consistent(*_rent_check_values(row, unit))
+        for field in UNIT_LEVEL_FIELDS + HIGH_RISK_UNIT_LEVEL_FIELDS:
+            if field == "special_features":
+                continue  # handled above (combined across all three tiers), never the single-value overwrite below
+            if not _is_blank(getattr(row, field)):
+                continue
+            if field in HIGH_RISK_UNIT_LEVEL_FIELDS and rent_conflict:
+                continue
+            value = _coerced_unit_value(field, unit.get(field))
+            if value is not None:
+                updates[field] = value  # a genuine unit match beats both fallbacks above
 
     if not updates:
         return row, []

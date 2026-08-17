@@ -1942,7 +1942,11 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertEqual(new_row.special_features, "Exposed beams; canalside frontage")
         self.assertEqual(fields, ["special_features"])
 
-    def test_matched_unit_specific_text_beats_both_wider_fallbacks(self):
+    def test_all_three_levels_present_are_combined_specific_to_general(self):
+        # Real gap this closes: the three tiers used to overwrite each
+        # other (narrowest present wins outright, the wider ones simply
+        # discarded) - now every genuinely present tier is combined into
+        # one value, unit first, then building, then property.
         row = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)
         units = _brochure_units(
             [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"}],
@@ -1952,7 +1956,49 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
 
         new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
 
+        self.assertEqual(new_row.special_features, "Includes mezzanine; Exposed beams; WiredScore Platinum")
+        self.assertEqual(fields, ["special_features"])
+
+    def test_unit_only_special_features_is_unchanged(self):
+        # No wider tier present at all - a single segment, byte-identical
+        # to the pre-combining behavior.
+        row = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
         self.assertEqual(new_row.special_features, "Includes mezzanine")
+
+    def test_unit_and_building_features_are_combined(self):
+        # Real gap this closes, specifically: previously the building-wide
+        # text would have OVERWRITTEN the unit's own text (a narrower
+        # source always won outright) - now both are kept, unit first.
+        row = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": "Includes mezzanine"}],
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "Includes mezzanine; Exposed beams")
+
+    def test_blank_unit_text_still_falls_back_to_the_building_level_alone(self):
+        # No unit-specific text to combine with (the unit itself IS
+        # matched, but its own special_features is blank) - the existing
+        # single-tier building-level fallback must still work exactly as
+        # before this change.
+        row = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor", "special_features": None}],
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "Exposed beams")
 
     def test_existing_special_features_never_overwritten_by_any_level(self):
         row = ListingRow(
@@ -2057,12 +2103,27 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
             ListingRow(building="The Packing House", floor_unit="Ground Floor", special_features=None), units,
         )
 
-        # Floor-specific text wins where it exists.
-        self.assertEqual(thorley.special_features, "1,851 sq ft outdoor space")
-        self.assertEqual(canal_5th.special_features, "Includes mezzanine")
-        # No floor-specific text -> building-level fallback, never blank.
-        self.assertEqual(canal_4th.special_features, "Exposed beams; canalside frontage")
-        self.assertEqual(packing_ground.special_features, "Stunning rooftop terrace")
+        # Every genuinely present tier combines, specific-to-general -
+        # property_features is document-wide, so it reaches every row here
+        # regardless of which narrower tiers also applied.
+        self.assertEqual(
+            thorley.special_features,
+            "1,851 sq ft outdoor space; WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers",
+        )
+        self.assertEqual(
+            canal_5th.special_features,
+            "Includes mezzanine; Exposed beams; canalside frontage; "
+            "WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers",
+        )
+        # No floor-specific text -> building-level + property-level combine, never blank.
+        self.assertEqual(
+            canal_4th.special_features,
+            "Exposed beams; canalside frontage; WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers",
+        )
+        self.assertEqual(
+            packing_ground.special_features,
+            "Stunning rooftop terrace; WiredScore Platinum; BREEAM Excellent; 16 showers & 108 lockers",
+        )
 
     def test_a_brochures_own_floorplan_pages_contribute_floor_specific_content(self):
         # A brochure PDF that also contains floorplan pages is still ONE
@@ -2092,9 +2153,14 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
             ListingRow(building="40 New Bond Street", floor_unit="9th Floor", special_features=None), units,
         )
 
-        # The floorplan-page-derived, floor-specific text wins for the row
-        # it was actually stated for.
-        self.assertEqual(floor_matched.special_features, "72 desks; 10-person boardroom; phone booths; kitchen/breakout")
+        # The floorplan-page-derived, floor-specific text combines with the
+        # SAME document's own property-wide blurb - both usable, unit text
+        # first (most specific).
+        self.assertEqual(
+            floor_matched.special_features,
+            "72 desks; 10-person boardroom; phone booths; kitchen/breakout; "
+            "WiredScore Platinum; BREEAM Excellent; manned reception",
+        )
         # A DIFFERENT floor in the same document, with no floor-specific
         # match, still safely falls back to the property-wide fact - never
         # blank just because this document also happens to contain floor
@@ -2938,8 +3004,8 @@ class EnrichRowsBatchTests(EnrichmentTestCase):
              patch("brochure_enrichment.extract.render_and_extract", return_value=raw):
             enriched, log = brochure_enrichment.enrich_rows(rows)
 
-        self.assertEqual(enriched[0].special_features, "Exposed beams; canalside frontage")
-        self.assertEqual(enriched[1].special_features, "Stunning rooftop terrace")
+        self.assertEqual(enriched[0].special_features, "Exposed beams; canalside frontage; WiredScore Platinum; BREEAM Excellent")
+        self.assertEqual(enriched[1].special_features, "Stunning rooftop terrace; WiredScore Platinum; BREEAM Excellent")
         self.assertEqual(enriched[0].contacts, "Jane Smith, jane@agent.com, 020 7946 0000")
         self.assertEqual(enriched[1].contacts, "Jane Smith, jane@agent.com, 020 7946 0000")
 
