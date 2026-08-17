@@ -99,7 +99,15 @@ _CANVA_SHORT_LINK_RE = re.compile(r"^https?://canva\.link/[^/\s?#]+(?:[/?#].*)?$
 # ".canva.com".
 _ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link")
 
-NAV_TIMEOUT_MS = 15_000
+# Real production evidence this covers: `Page.goto: Timeout 15000ms
+# exceeded` on a genuine public Canva "view" link that DOES eventually
+# render - 15s was too tight for Canva's own initial bundle/design load
+# on a cold request, not a sign the page was actually broken. Applies
+# ONLY to the initial navigation (see page.goto below) - kept
+# deliberately separate from NEXT_PAGE_CLICK_TIMEOUT_MS, since a page
+# transition on an already-loaded, warm design has no reason to need
+# anywhere near this long (see that constant's own docstring).
+NAV_TIMEOUT_MS = 30_000
 SETTLE_MS = 3_000
 COOKIE_DISMISS_TIMEOUT_MS = 2_000
 VIEWPORT = {"width": 1200, "height": 1600}
@@ -117,6 +125,19 @@ MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "20"))
 # Canva app/design is already warm; still enough for that page's own
 # images to paint (confirmed directly against a real 7-page brochure).
 PAGE_NAV_SETTLE_MS = 1_200
+# Deliberately SEPARATE from NAV_TIMEOUT_MS (see that constant's own
+# docstring on why it was raised to 30s) - a "Next page" click advances
+# an ALREADY-loaded, warm design in place (confirmed: no new navigation/
+# network round trip, just a DOM/canvas transition - see render_canva_
+# page_async's own docstring), so it has no reason to need anywhere near
+# as long as the initial cold navigation does. Kept at the ORIGINAL
+# NAV_TIMEOUT_MS value (15s) on purpose: raising this too would make
+# every one of the bounded MAX_NEXT_CLICK_ATTEMPTS retries take
+# proportionally longer, working against the whole point of a FAST,
+# bounded retry - real production evidence this covers: `Locator.click:
+# Timeout 15000ms exceeded` on the "Next page" button after already
+# capturing several pages successfully.
+NEXT_PAGE_CLICK_TIMEOUT_MS = 15_000
 # One real click failure can be transient (an in-flight CSS transition, a
 # frame Canva's own JS hadn't finished attaching a handler to yet) -
 # confirmed production symptom this guards against: a "Next page" click
@@ -130,8 +151,9 @@ PAGE_NAV_SETTLE_MS = 1_200
 # existed, never an infinite retry loop.
 MAX_NEXT_CLICK_ATTEMPTS = 3
 # Per-page-transition timeout budget used only to size RENDER_TIMEOUT_
-# SECONDS below - the click itself still uses page.set_default_timeout
-# (NAV_TIMEOUT_MS); this is a generous per-page allowance (click + settle
+# SECONDS below - the click itself now uses its own explicit
+# NEXT_PAGE_CLICK_TIMEOUT_MS (see that constant's own docstring), not
+# NAV_TIMEOUT_MS; this is a generous per-page allowance (click + settle
 # + screenshot + margin for an occasional retry - see MAX_NEXT_CLICK_
 # ATTEMPTS) for sizing the OUTER backstop only. Deliberately NOT sized to
 # every page hitting its own worst-case retry simultaneously (that would
@@ -414,7 +436,21 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
         await page.route("**/*", _guard)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+            # "load" (the browser's own load event - initial HTML/JS/CSS/
+            # image resources fetched), NOT "networkidle" - Canva is a
+            # heavy SPA that keeps background network activity going
+            # indefinitely (websockets, polling, analytics beacons), so
+            # "networkidle" can wait out the ENTIRE timeout even after the
+            # design has already visually finished rendering, confirmed as
+            # a real contributor to production navigation timeouts. This
+            # does NOT risk screenshotting a blank/half-drawn design: "load"
+            # only gets the page's own resources in; SETTLE_MS below (kept
+            # unchanged) is what actually waits for Canva's OWN JS to paint
+            # the design after that, exactly like it already did before
+            # this change - "load" simply stops this from also waiting on
+            # network traffic that has nothing to do with whether the
+            # design has rendered.
+            await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
         except Exception as e:
             raise RenderError(f"navigation failed or timed out ({e!r})")
 
@@ -473,7 +509,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
                     # handle reused across a retry (see MAX_NEXT_CLICK_
                     # ATTEMPTS's own docstring on why).
                     next_button = page.get_by_role("button", name="Next page")
-                    await next_button.click(timeout=NAV_TIMEOUT_MS)
+                    await next_button.click(timeout=NEXT_PAGE_CLICK_TIMEOUT_MS)
                     await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
                     pages.append(await page.screenshot(type="png"))
                     advanced = True
@@ -482,10 +518,22 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
                     last_error = e
                     if attempt < MAX_NEXT_CLICK_ATTEMPTS:
                         await page.wait_for_timeout(400 * attempt)  # brief backoff, then re-acquire
+            if advanced and attempt > 1:
+                # Distinct from the plain "captured a page" case below -
+                # confirms a retry actually recovered a page that would
+                # otherwise have been lost, useful to see in Cloud Run
+                # logs alongside the give-up line below (same shape:
+                # named URL, attempt number, page count so far).
+                print(
+                    f"[canva_renderer] Pagination click recovered on attempt {attempt}/{MAX_NEXT_CLICK_ATTEMPTS} "
+                    f"for {url!r} - {len(pages)} page(s) captured so far.",
+                    file=sys.stderr,
+                )
             if not advanced:
                 print(
-                    f"[canva_renderer] Stopped after {len(pages)} page(s) for {url!r} ({last_error!r}) - "
-                    f"keeping pages captured so far (gave up after {MAX_NEXT_CLICK_ATTEMPTS} attempts).",
+                    f"[canva_renderer] Pagination failure for {url!r}: gave up after "
+                    f"{MAX_NEXT_CLICK_ATTEMPTS} attempts ({last_error!r}) - stopped at "
+                    f"{len(pages)} page(s) captured, keeping them.",
                     file=sys.stderr,
                 )
                 break

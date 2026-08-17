@@ -109,6 +109,7 @@ import platform
 import re
 import sys
 import threading
+import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
@@ -1005,18 +1006,39 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
 
 
 # Generous over the separate renderer's OWN internal worst-case budget -
-# RENDER_TIMEOUT_SECONDS (scales with MAX_CANVA_PAGES, since capturing
-# every page of a real multi-page brochure takes longer than a single-
-# page-only budget would) PLUS SEMAPHORE_WAIT_TIMEOUT_SECONDS (a request
-# arriving while MAX_CONCURRENT_RENDERS are already in flight now queues
-# for a free slot rather than being rejected instantly - see that
-# constant's own docstring in canva_renderer/app.py for the real bulk-
-# upload production bug this fixes) - both summed (see that module's own
-# worst-case: 123 + 90 = 213s at current defaults). This is the ceiling
-# for the WHOLE round trip (network + queueing + browser launch/render of
-# every page), so it must stay comfortably above that service's own
-# worst-case combined budget rather than racing it.
-_CANVA_RENDERER_TIMEOUT = 240
+# RENDER_TIMEOUT_SECONDS (scales with MAX_CANVA_PAGES AND NAV_TIMEOUT_MS,
+# since capturing every page of a real multi-page brochure takes longer
+# than a single-page-only budget would) PLUS SEMAPHORE_WAIT_TIMEOUT_
+# SECONDS (a request arriving while MAX_CONCURRENT_RENDERS are already in
+# flight now queues for a free slot rather than being rejected instantly -
+# see that constant's own docstring in canva_renderer/app.py for the real
+# bulk-upload production bug this fixes) - both summed (see that module's
+# own worst-case: 195 + 90 = 285s at current defaults - raised from 213s
+# when NAV_TIMEOUT_MS there went from 15s to 30s, see that constant's own
+# docstring). This is the ceiling for the WHOLE round trip (network +
+# queueing + browser launch/render of every page), so it must stay
+# comfortably above that service's own worst-case combined budget rather
+# than racing it - a value below that budget would make THIS app give up
+# on a renderer that's still genuinely working, which looks identical to
+# a real renderer failure from here.
+_CANVA_RENDERER_TIMEOUT = 300
+
+# A 502/503/504 from the renderer is Cloud Run's OWN infrastructure
+# giving up on the request (a cold start, a transient network blip, the
+# renderer briefly unreachable during a container swap) - never the
+# renderer's own code actually running and reporting a real render
+# failure (that's always a 422 with its own "reason", handled separately
+# below). Confirmed real production shape this covers: two otherwise-
+# healthy Canva URLs both failing with a bare "HTTP 504" and nothing
+# else. Retried a SMALL, bounded number of times with a short, fixed
+# backoff - never indefinitely, and never on a raw connection-level
+# exception (a DNS failure/genuine unreachability already burned a full
+# _CANVA_RENDERER_TIMEOUT once; retrying that blindly would only double a
+# large spreadsheet upload's worst-case wait for a URL that's very
+# unlikely to succeed on retry anyway - see _fetch_canva_rendered_page).
+_CANVA_RENDERER_TRANSIENT_STATUS_CODES = (502, 503, 504)
+_CANVA_RENDERER_MAX_ATTEMPTS = 2
+_CANVA_RENDERER_RETRY_BACKOFF_SECONDS = 2
 
 # Defense-in-depth cap on how many pages this app will ever accept from ONE
 # Canva-renderer response, independent of that service's OWN MAX_CANVA_
@@ -1113,10 +1135,21 @@ def _fetch_canva_rendered_page(url: str):
     exists (a stuck/misbehaving Canva page or a Chromium OOM must never be
     able to affect this app's own memory budget or uptime).
 
+    A transient HTTP 502/503/504 from the renderer (Cloud Run's own
+    infrastructure giving up on the request, not the renderer's own code
+    reporting a real failure - see _CANVA_RENDERER_TRANSIENT_STATUS_CODES'
+    own docstring) is retried a small, bounded number of times
+    (_CANVA_RENDERER_MAX_ATTEMPTS) with a short fixed backoff before
+    falling through to the same failure handling as any other bad
+    response - never retried indefinitely, and never on a raw connection-
+    level exception (see that constant's own docstring on why).
+
     Returns None (never raises) whenever:
     - the renderer service is unreachable, times out, or returns a non-
-      2xx/malformed response - recorded as STATUS_FETCH_FAILED, the same
-      status a real network failure gets for any other document host;
+      2xx/malformed response (including a transient 502/503/504 that
+      didn't recover within the retry budget above) - recorded as
+      STATUS_FETCH_FAILED, the same status a real network failure gets
+      for any other document host;
     - the renderer itself reports a clean, safe failure - a malformed
       Canva URL, a private/login-required design, a page that never
       finished loading - recorded as STATUS_RENDER_FAILED with the
@@ -1138,14 +1171,39 @@ def _fetch_canva_rendered_page(url: str):
     matching/enrichment rules.
     """
     renderer_url = os.environ.get(CANVA_RENDERER_URL_ENV_VAR, "").rstrip("/")
-    try:
-        response = httpx.post(
-            f"{renderer_url}/render", json={"url": url},
-            headers=_canva_renderer_auth_headers(renderer_url), timeout=_CANVA_RENDERER_TIMEOUT,
+    connect_exception = None
+    response = None
+    for attempt in range(1, _CANVA_RENDERER_MAX_ATTEMPTS + 1):
+        try:
+            response = httpx.post(
+                f"{renderer_url}/render", json={"url": url},
+                headers=_canva_renderer_auth_headers(renderer_url), timeout=_CANVA_RENDERER_TIMEOUT,
+            )
+        except Exception as e:
+            # A raw connection-level failure (DNS, refused, read timeout)
+            # already burned a full _CANVA_RENDERER_TIMEOUT once - never
+            # retried (see _CANVA_RENDERER_MAX_ATTEMPTS's own docstring on
+            # why), so this always ends the loop, retry or not.
+            connect_exception = e
+            break
+        if response.status_code not in _CANVA_RENDERER_TRANSIENT_STATUS_CODES:
+            break  # a real answer - success or a non-transient failure - stop retrying
+        if attempt < _CANVA_RENDERER_MAX_ATTEMPTS:
+            print(
+                f"[brochure_enrichment] Canva renderer returned a transient HTTP {response.status_code} for "
+                f"{url!r} on attempt {attempt}/{_CANVA_RENDERER_MAX_ATTEMPTS} - retrying "
+                f"after {_CANVA_RENDERER_RETRY_BACKOFF_SECONDS}s.",
+                file=sys.stderr,
+            )
+            time.sleep(_CANVA_RENDERER_RETRY_BACKOFF_SECONDS)
+
+    if response is None:
+        print(
+            f"[brochure_enrichment] Canva renderer unreachable for {url!r} ({connect_exception!r}) — "
+            "skipping enrichment.",
+            file=sys.stderr,
         )
-    except Exception as e:
-        print(f"[brochure_enrichment] Canva renderer unreachable for {url!r} ({e!r}) — skipping enrichment.", file=sys.stderr)
-        _record_status(STATUS_FETCH_FAILED, f"Canva renderer unreachable ({e!r})")
+        _record_status(STATUS_FETCH_FAILED, f"Canva renderer unreachable ({connect_exception!r})")
         return None
 
     if response.status_code in (401, 403):

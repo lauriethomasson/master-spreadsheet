@@ -248,6 +248,38 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         self.assertIsNone(detected_total)
         context.close.assert_awaited_once()  # resources cleaned up after the request
 
+    def test_initial_navigation_waits_for_load_not_networkidle(self):
+        # Canva is a heavy SPA with persistent background network activity
+        # (websockets, polling, analytics beacons) - "networkidle" can wait
+        # out the ENTIRE navigation timeout even after the design has
+        # already rendered, a real confirmed contributor to production
+        # navigation timeouts. "load" fires once the page's own resources
+        # are in, without waiting on unrelated ongoing network traffic.
+        page = _make_async_page(screenshots=(b"\x89PNG real bytes",))
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(page.goto.call_args.kwargs["wait_until"], "load")
+        self.assertEqual(page.goto.call_args.kwargs["timeout"], canva_renderer.NAV_TIMEOUT_MS)
+
+    def test_next_page_click_uses_its_own_dedicated_timeout_not_nav_timeout(self):
+        # Regression guard: a "Next page" click on an already-loaded, warm
+        # design has no reason to need the same generous budget the COLD
+        # initial navigation does - see NEXT_PAGE_CLICK_TIMEOUT_MS's own
+        # docstring for why these two are deliberately decoupled.
+        self.assertNotEqual(canva_renderer.NAV_TIMEOUT_MS, canva_renderer.NEXT_PAGE_CLICK_TIMEOUT_MS)
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, "true"),
+        )
+        next_button = page.get_by_role("button", name="Next page")
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        next_button.click.assert_awaited_once_with(timeout=canva_renderer.NEXT_PAGE_CLICK_TIMEOUT_MS)
+
     def test_single_page_design_with_no_pagination_ui_returns_one_page(self):
         # No "Next page" control at all - a genuinely single-page design,
         # or a future Canva frontend change; either way this must degrade

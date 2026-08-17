@@ -85,7 +85,7 @@ gcloud run deploy canva-renderer \
   --region <same region as the main app> \
   --memory 2Gi \
   --cpu 1 \
-  --timeout 300 \
+  --timeout 330 \
   --concurrency 4 \
   --no-allow-unauthenticated
 ```
@@ -101,15 +101,18 @@ meaningfully more memory than a single-page one did. `MAX_CANVA_PAGES`
 already bounds that per-request cost; `2Gi` gives headroom on top of
 that bound. CPU stays at `1` - nothing about this fix is CPU-bound.
 
-`--timeout 300` is comfortably above this service's own internal worst
-case: `RENDER_TIMEOUT_SECONDS` (scales with `MAX_CANVA_PAGES` - see
-`app.py`) PLUS `SEMAPHORE_WAIT_TIMEOUT_SECONDS` (a request arriving while
-`MAX_CONCURRENT_RENDERS` are already in flight now queues for a free slot
-rather than being rejected instantly - see that constant's own docstring
-for the real bulk-upload production bug this fixes), summed - 270s at
-current defaults. `--concurrency 4` lets Cloud Run itself route a genuine
-overflow (more requests than even the queue can absorb) to a fresh
-instance rather than piling everything onto one.
+`--timeout 330` is comfortably above this service's own internal worst
+case: `RENDER_TIMEOUT_SECONDS` (scales with `MAX_CANVA_PAGES` AND
+`NAV_TIMEOUT_MS` - see `app.py`) PLUS `SEMAPHORE_WAIT_TIMEOUT_SECONDS` (a
+request arriving while `MAX_CONCURRENT_RENDERS` are already in flight now
+queues for a free slot rather than being rejected instantly - see that
+constant's own docstring for the real bulk-upload production bug this
+fixes), summed - 285s at current defaults (raised from 270s when
+`NAV_TIMEOUT_MS` went from 15s to 30s - see that constant's own docstring
+for the real production navigation timeouts this fixes). `--concurrency 4`
+lets Cloud Run itself route a genuine overflow (more requests than even
+the queue can absorb) to a fresh instance rather than piling everything
+onto one.
 
 `--no-allow-unauthenticated` is the primary access control (see
 "Authentication" below) - do not deploy this publicly.
