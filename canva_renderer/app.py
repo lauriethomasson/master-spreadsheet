@@ -30,7 +30,10 @@ keep in sync.
 Captures EVERY page of a multi-page brochure, up to MAX_CANVA_PAGES - see
 render_canva_page_async's own docstring for how (Canva's own accessible
 "Next page" button/aria-disabled state, confirmed directly against a real
-multi-page brochure - never a CSS-class-dependent scrape).
+multi-page brochure - never a CSS-class-dependent scrape), with a bounded
+retry against a freshly re-acquired button locator on a transient click
+failure (see MAX_NEXT_CLICK_ATTEMPTS) before giving up on pagination and
+keeping whatever was already captured.
 
 --- Playwright thread-affinity (real production incident) -----------------
 
@@ -114,11 +117,28 @@ MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "20"))
 # Canva app/design is already warm; still enough for that page's own
 # images to paint (confirmed directly against a real 7-page brochure).
 PAGE_NAV_SETTLE_MS = 1_200
+# One real click failure can be transient (an in-flight CSS transition, a
+# frame Canva's own JS hadn't finished attaching a handler to yet) -
+# confirmed production symptom this guards against: a "Next page" click
+# whose OWN actionability checks reported the element visible, enabled,
+# and stable, yet the click itself still timed out. A bounded retry, each
+# with a FRESHLY re-acquired button locator (never the same handle reused
+# across attempts - Canva's own SPA can re-render, and therefore detach,
+# this exact button between attempts), rides through that without
+# turning a single hiccup into a lost page; still bounded, so a genuinely
+# broken "Next page" control gives up exactly like before this constant
+# existed, never an infinite retry loop.
+MAX_NEXT_CLICK_ATTEMPTS = 3
 # Per-page-transition timeout budget used only to size RENDER_TIMEOUT_
 # SECONDS below - the click itself still uses page.set_default_timeout
-# (NAV_TIMEOUT_MS); this is a generous per-page allowance (click + settle +
-# screenshot + margin for a slow retry) for sizing the OUTER backstop only.
-_PER_PAGE_TIMEOUT_BUDGET_S = 5
+# (NAV_TIMEOUT_MS); this is a generous per-page allowance (click + settle
+# + screenshot + margin for an occasional retry - see MAX_NEXT_CLICK_
+# ATTEMPTS) for sizing the OUTER backstop only. Deliberately NOT sized to
+# every page hitting its own worst-case retry simultaneously (that would
+# make this backstop enormous, the exact "just increase the timeout to
+# something huge" anti-pattern this fix avoids) - a retry is the
+# exception, not the per-page norm.
+_PER_PAGE_TIMEOUT_BUDGET_S = 8
 # Overall budget for one render's whole async round trip (navigation +
 # settle + cookie-dismiss + screenshot + up to MAX_CANVA_PAGES-1 further
 # page transitions), enforced from the OUTSIDE via concurrent.futures' own
@@ -374,6 +394,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
 
     browser = await _get_browser_async()
     context = await browser.new_context(viewport=VIEWPORT)
+    page = None
     try:
         page = await context.new_page()
         # Plain (non-async) setters even on the async API - never awaited.
@@ -419,33 +440,69 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], int]:
 
         # Every further page - see this function's own docstring above for
         # why the Next-page button's aria-disabled state (not a fixed
-        # count) is what stops this loop. Any exception here (button not
-        # found at all, a click that times out, a page that fails to
-        # settle) simply stops the loop and keeps whatever was already
-        # captured - a genuinely multi-page brochure whose page 4 hiccups
-        # still yields pages 1-3 rather than losing all of them, and a
-        # single-page design (no Next-page button at all) yields exactly
-        # the one page it always did before this feature existed.
+        # count) is what stops this loop. A transient click failure gets
+        # a bounded retry with a freshly re-acquired locator (see
+        # MAX_NEXT_CLICK_ATTEMPTS's own docstring); once those attempts
+        # are exhausted, this simply stops the loop and keeps whatever
+        # was already captured - a genuinely multi-page brochure whose
+        # page 4 hiccups still yields pages 1-3 rather than losing all of
+        # them, and a single-page design (no Next-page button at all)
+        # yields exactly the one page it always did before this feature
+        # existed.
         while len(pages) < MAX_CANVA_PAGES:
+            # Checked ONCE per transition, never inside the retry loop
+            # below - this reflects live DOM state at the START of this
+            # transition; re-querying it again mid-retry would conflate
+            # "did this transition finish" with "should we even attempt
+            # another one", which are different questions. A failure here
+            # (button gone, attribute read itself fails) is the same
+            # "stop conservatively, keep what's captured" precedent as
+            # every other pagination failure in this loop.
             try:
                 next_button = page.get_by_role("button", name="Next page")
                 if await next_button.get_attribute("aria-disabled") == "true":
                     break
-                await next_button.click(timeout=NAV_TIMEOUT_MS)
-                await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
-                pages.append(await page.screenshot(type="png"))
-            except Exception as e:
+            except Exception:
+                break
+
+            advanced = False
+            last_error = None
+            for attempt in range(1, MAX_NEXT_CLICK_ATTEMPTS + 1):
+                try:
+                    # Re-acquired fresh on EVERY attempt - never the same
+                    # handle reused across a retry (see MAX_NEXT_CLICK_
+                    # ATTEMPTS's own docstring on why).
+                    next_button = page.get_by_role("button", name="Next page")
+                    await next_button.click(timeout=NAV_TIMEOUT_MS)
+                    await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+                    pages.append(await page.screenshot(type="png"))
+                    advanced = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < MAX_NEXT_CLICK_ATTEMPTS:
+                        await page.wait_for_timeout(400 * attempt)  # brief backoff, then re-acquire
+            if not advanced:
                 print(
-                    f"[canva_renderer] Stopped after {len(pages)} page(s) for {url!r} ({e!r}) - "
-                    "keeping pages captured so far.",
+                    f"[canva_renderer] Stopped after {len(pages)} page(s) for {url!r} ({last_error!r}) - "
+                    f"keeping pages captured so far (gave up after {MAX_NEXT_CLICK_ATTEMPTS} attempts).",
                     file=sys.stderr,
                 )
                 break
 
         return pages, detected_total
     finally:
-        # Always closed, success or failure - a leaked context/page would
-        # otherwise accumulate memory across requests indefinitely.
+        # Page closed BEFORE its context - releases this request's own
+        # renderer-process resources (every slide's DOM/canvas state
+        # visited during pagination) as early as possible, rather than
+        # waiting on context.close()'s own cascade. Always closed, success
+        # or failure - a leaked context/page would otherwise accumulate
+        # memory across requests indefinitely.
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
         await context.close()
 
 

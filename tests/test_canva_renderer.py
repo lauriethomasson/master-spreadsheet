@@ -139,6 +139,7 @@ def _make_async_page(
     page.set_default_timeout = MagicMock()
     page.route = AsyncMock()
     page.goto = AsyncMock(side_effect=goto_side_effect) if goto_side_effect else AsyncMock()
+    page.close = AsyncMock()
     cookie_locator = MagicMock()
     cookie_locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
     page.get_by_text = MagicMock(return_value=cookie_locator)
@@ -314,6 +315,65 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
             pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
+        context.close.assert_awaited_once()
+
+    def test_transient_click_failure_recovers_via_retry_with_a_fresh_locator(self):
+        # The real production symptom this fixes: a "Next page" click
+        # whose own actionability checks reported the element visible,
+        # enabled, and stable, yet the click itself still timed out once -
+        # a bounded retry with a freshly re-acquired locator must ride
+        # through a single transient failure like this, never losing the
+        # page it was trying to reach.
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"),
+            next_disabled_sequence=(None, None, "true"),
+        )
+        call_count = {"n": 0}
+        real_click = page.get_by_role("button", name="Next page").click
+
+        async def _flaky_click(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:  # only the FIRST attempt at the 2nd transition fails
+                raise Exception("Timeout 15000ms exceeded")
+            return await real_click(*args, **kwargs)
+
+        page.get_by_role("button", name="Next page").click = AsyncMock(side_effect=_flaky_click)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])
+        self.assertEqual(call_count["n"], 3)  # one failed attempt + one successful retry
+        context.close.assert_awaited_once()
+
+    def test_repeated_click_failure_gives_up_after_the_bounded_retry_and_keeps_partial_pages(self):
+        # Every attempt at the 2nd transition fails (not just one) - must
+        # give up after MAX_NEXT_CLICK_ATTEMPTS, never retry forever, while
+        # still returning the pages already captured before that point.
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, None, "true"),
+        )
+        next_button = page.get_by_role("button", name="Next page")
+        next_button.click = AsyncMock(side_effect=Exception("Timeout 15000ms exceeded"))
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        self.assertEqual(pages, [b"\x89PNG p1"])
+        self.assertEqual(next_button.click.await_count, canva_renderer.MAX_NEXT_CLICK_ATTEMPTS)
+        context.close.assert_awaited_once()
+
+    def test_page_is_closed_before_the_context_on_a_successful_multi_page_render(self):
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2"),
+            next_disabled_sequence=(None, "true"),
+        )
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+
+        page.close.assert_awaited_once()
         context.close.assert_awaited_once()
 
     def test_navigation_timeout_raises_render_error_and_still_cleans_up(self):

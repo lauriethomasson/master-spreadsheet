@@ -83,19 +83,30 @@ this container/its dependencies to the main app's own `Dockerfile`.
 gcloud run deploy canva-renderer \
   --source canva_renderer \
   --region <same region as the main app> \
-  --memory 1Gi \
+  --memory 2Gi \
   --cpu 1 \
   --timeout 300 \
   --concurrency 4 \
   --no-allow-unauthenticated
 ```
 
+`--memory 2Gi` (raised from an earlier `1Gi`) - a real production render
+hit `Memory limit of 1024 MiB exceeded with 1027 MiB used` while
+capturing a multi-page brochure: every page visited during pagination
+keeps its own DOM/canvas rendering state alive in the SAME browser
+context for the whole request (Canva's own pagination advances the
+already-loaded design in place, it's not a real page navigation - see
+`app.py`'s own pagination docstring), so a many-page render costs
+meaningfully more memory than a single-page one did. `MAX_CANVA_PAGES`
+already bounds that per-request cost; `2Gi` gives headroom on top of
+that bound. CPU stays at `1` - nothing about this fix is CPU-bound.
+
 `--timeout 300` is comfortably above this service's own internal worst
 case: `RENDER_TIMEOUT_SECONDS` (scales with `MAX_CANVA_PAGES` - see
 `app.py`) PLUS `SEMAPHORE_WAIT_TIMEOUT_SECONDS` (a request arriving while
 `MAX_CONCURRENT_RENDERS` are already in flight now queues for a free slot
 rather than being rejected instantly - see that constant's own docstring
-for the real bulk-upload production bug this fixes), summed - 213s at
+for the real bulk-upload production bug this fixes), summed - 270s at
 current defaults. `--concurrency 4` lets Cloud Run itself route a genuine
 overflow (more requests than even the queue can absorb) to a fresh
 instance rather than piling everything onto one.
