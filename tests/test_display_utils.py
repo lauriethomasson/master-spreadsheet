@@ -131,5 +131,107 @@ class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
         self.assertIn("building", display_utils.visible_columns(df))
 
 
+class WithBrochureLinkStatusTests(unittest.TestCase):
+    """
+    with_brochure_link_status - the on-screen-grid equivalent of staging_
+    writer.write_rows_to_xlsx's own "Broken link" label swap, needed
+    because st.column_config.LinkColumn can't vary display_text per row
+    (confirmed against the installed Streamlit's own docs, not assumed -
+    see that function's own docstring). brochure_link itself must never be
+    touched by this - only the new synthetic column carries the signal.
+    """
+
+    def test_confirmed_broken_row_gets_the_label(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/dead.pdf", "brochure_link_broken": True}])
+        result = display_utils.with_brochure_link_status(df)
+        self.assertEqual(result[display_utils.BROCHURE_LINK_STATUS_COLUMN].iloc[0], "⚠️ Broken link")
+
+    def test_working_link_gets_a_blank_status(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/fine.pdf", "brochure_link_broken": False}])
+        result = display_utils.with_brochure_link_status(df)
+        self.assertEqual(result[display_utils.BROCHURE_LINK_STATUS_COLUMN].iloc[0], "")
+
+    def test_never_rechecked_link_gets_a_blank_status(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/unknown.pdf", "brochure_link_broken": None}])
+        result = display_utils.with_brochure_link_status(df)
+        self.assertEqual(result[display_utils.BROCHURE_LINK_STATUS_COLUMN].iloc[0], "")
+
+    def test_label_matches_the_exported_xlsx_wording_exactly(self):
+        # The whole point: the on-screen grid and the downloaded file must
+        # never describe the same brochure_link_broken fact two different
+        # ways - see BROCHURE_LINK_BROKEN_LABEL's own comment.
+        from staging_writer import BROKEN_LINK_DISPLAY_TEXT
+        self.assertIn(BROKEN_LINK_DISPLAY_TEXT, display_utils.BROCHURE_LINK_BROKEN_LABEL)
+
+    def test_new_column_is_inserted_immediately_after_brochure_link(self):
+        df = pd.DataFrame([{"building": "A", "brochure_link": "u", "floorplan_link": "f"}])
+        df["brochure_link_broken"] = True
+        result = display_utils.with_brochure_link_status(df)
+        columns = list(result.columns)
+        self.assertEqual(
+            columns.index(display_utils.BROCHURE_LINK_STATUS_COLUMN), columns.index("brochure_link") + 1,
+        )
+
+    def test_absent_brochure_link_broken_is_a_complete_no_op(self):
+        df = pd.DataFrame([{"building": "A", "brochure_link": "u"}])
+        result = display_utils.with_brochure_link_status(df)
+        self.assertIs(result, df)
+        self.assertNotIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, result.columns)
+
+    def test_survives_visible_columns_narrowing(self):
+        # Callers must run this BEFORE visible_columns (see this function's
+        # own docstring) - confirms the synthetic column is never itself
+        # treated as an ALWAYS_HIDDEN_COLUMNS entry.
+        df = pd.DataFrame([{"building": "A", "brochure_link": "u", "brochure_link_broken": True}])
+        result = display_utils.with_brochure_link_status(df)
+        self.assertIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, display_utils.visible_columns(result))
+
+    def test_original_dataframe_is_never_mutated(self):
+        df = pd.DataFrame([{"brochure_link": "u", "brochure_link_broken": True}])
+        display_utils.with_brochure_link_status(df)
+        self.assertNotIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, df.columns)
+
+
+class LinkStatusColumnConfigTests(unittest.TestCase):
+    def test_config_present_when_column_present(self):
+        df = pd.DataFrame([{display_utils.BROCHURE_LINK_STATUS_COLUMN: "⚠️ Broken link"}])
+        config = display_utils.link_status_column_config(df)
+        self.assertIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, config)
+        self.assertTrue(config[display_utils.BROCHURE_LINK_STATUS_COLUMN]["disabled"])
+
+    def test_no_op_when_column_absent(self):
+        df = pd.DataFrame([{"building": "A"}])
+        self.assertEqual(display_utils.link_status_column_config(df), {})
+
+
+class RestoreHiddenColumnsDropsSyntheticStatusColumnTests(unittest.TestCase):
+    """
+    The Export page relies on restore_hidden_columns to drop with_brochure_
+    link_status's synthetic column automatically (it reindexes to original_
+    df's own columns - see that function's own docstring) rather than
+    needing its own explicit strip step before dataframe_to_listing_rows.
+    """
+
+    def test_synthetic_status_column_never_survives_restore(self):
+        # Mirrors the REAL pages/3_Export.py pipeline exactly: with_brochure_
+        # link_status runs first, then visible_columns narrows the frame
+        # actually handed to st.data_editor (excluding brochure_link_broken,
+        # per ALWAYS_HIDDEN_COLUMNS, but keeping the new synthetic column) -
+        # restore_hidden_columns only reindexes to original_df's own columns
+        # when something was ACTUALLY missing from edited_df to restore;
+        # skipping the visible_columns narrowing step (as an earlier,
+        # incorrect version of this test did) leaves brochure_link_broken
+        # still present in "edited_df", which short-circuits that reindex
+        # entirely and would wrongly report this as passing either way.
+        original_df = pd.DataFrame([{"brochure_link": "u", "brochure_link_broken": True}])
+        with_status = display_utils.with_brochure_link_status(original_df)
+        edited_df = with_status[display_utils.visible_columns(with_status)]
+
+        restored = display_utils.restore_hidden_columns(edited_df, original_df)
+
+        self.assertNotIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, restored.columns)
+        self.assertEqual(list(restored.columns), list(original_df.columns))
+
+
 if __name__ == "__main__":
     unittest.main()

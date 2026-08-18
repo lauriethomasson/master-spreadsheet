@@ -492,8 +492,9 @@ def _render_master_table(df: pd.DataFrame, key: str) -> None:
     """
     st.subheader("Master spreadsheet")
 
-    visible = display_utils.visible_columns(df)
-    display_df = df[visible].copy()
+    with_status = display_utils.with_brochure_link_status(df)
+    visible = display_utils.visible_columns(with_status)
+    display_df = with_status[visible].copy()
 
     query = st.text_input("Search master spreadsheet", key=f"{key}_filter")
     filtered_df = display_df
@@ -624,6 +625,7 @@ def _render_row_selector(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
         column_config={
             **display_utils.label_column_config(selector_df),
             **display_utils.link_column_config(selector_df),
+            **display_utils.link_status_column_config(selector_df),
             **display_utils.wide_text_column_config(selector_df),
             **display_utils.numeric_column_config(selector_df),
         },
@@ -1175,6 +1177,7 @@ def _render_master_lookup(master_df: pd.DataFrame) -> None:
                 mask = mask | df[c].fillna("").astype(str).str.contains(query.strip(), case=False)
             df = df[mask]
 
+        df = display_utils.with_brochure_link_status(df)
         visible = display_utils.visible_columns(df)
         display_df = df[visible]
         st.dataframe(
@@ -1183,6 +1186,7 @@ def _render_master_lookup(master_df: pd.DataFrame) -> None:
             column_config={
                 **display_utils.label_column_config(display_df),
                 **display_utils.link_column_config(display_df),
+                **display_utils.link_status_column_config(display_df),
                 **display_utils.wide_text_column_config(display_df),
                 **display_utils.numeric_column_config(display_df),
             },

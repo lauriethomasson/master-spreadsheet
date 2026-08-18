@@ -13,7 +13,7 @@ import streamlit as st
 
 from master_merge import field_kind, row_label  # noqa: F401 - row_label re-exported for display_utils.row_label(...) call sites
 from schema import ListingRow
-from staging_writer import LINK_DISPLAY_TEXT, title_case_label
+from staging_writer import BROKEN_LINK_DISPLAY_TEXT, LINK_DISPLAY_TEXT, title_case_label
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
@@ -241,6 +241,82 @@ def link_column_config(df: pd.DataFrame) -> dict:
         )
         for col in LINK_COLUMNS
         if col in df.columns
+    }
+
+
+# Synthetic column name for with_brochure_link_status/link_status_column_
+# config below - never a real ListingRow field, so it can never collide with
+# one, and restore_hidden_columns (see pages/3_Export.py) already drops any
+# column not present in its own original_df, which this deliberately never
+# is - no explicit strip-before-dataframe_to_listing_rows step needed there.
+BROCHURE_LINK_STATUS_COLUMN = "brochure_link_status"
+
+# Identical wording to the exported .xlsx (staging_writer.BROKEN_LINK_
+# DISPLAY_TEXT, imported above, never a separate literal) - the on-screen
+# grid and the downloaded file must always describe a confirmed-dead
+# brochure_link the same way, never two independently-drifting terms for
+# the same underlying brochure_link_broken fact. The "⚠️" prefix is purely
+# this page's OWN display convention (every other "needs attention" signal
+# already on this page uses it - see e.g. the document-issues caption), so
+# it's added here only, never folded into the shared .xlsx-facing constant,
+# which has no use for an emoji glyph.
+BROCHURE_LINK_BROKEN_LABEL = f"⚠️ {BROKEN_LINK_DISPLAY_TEXT}"
+
+
+def with_brochure_link_status(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a COPY of df with one extra, synthetic, display-only column -
+    BROCHURE_LINK_STATUS_COLUMN - inserted immediately after brochure_link
+    (or appended at the end if brochure_link isn't present in df for some
+    reason), showing BROCHURE_LINK_BROKEN_LABEL for a row whose brochure_
+    link_broken is confirmed True, blank for False/None/anything else.
+
+    Exists because st.column_config.LinkColumn cannot vary its own
+    display_text per row - confirmed directly against the installed
+    Streamlit's own LinkColumn docs: display_text is fixed once for the
+    whole column, or a regex capture group extracted from the URL itself,
+    never independent literal text keyed off a DIFFERENT column's value.
+    brochure_link itself is therefore left completely untouched by this -
+    always "Open brochure", always clickable, for every row, identical to
+    today - this new column is what actually carries the distinction,
+    mirroring staging_writer.write_rows_to_xlsx's own "Option A" choice
+    (see BROKEN_LINK_DISPLAY_TEXT's own comment there) of never touching
+    the real link, only ever changing what communicates its state.
+
+    A no-op (returns df completely UNCHANGED, not even a copy) when
+    brochure_link_broken isn't a column in df at all - same guard style as
+    link_column_config/wide_text_column_config's own "if col in df.columns"
+    checks, e.g. a caller that already narrowed to visible_columns(df)
+    before this runs (ALWAYS_HIDDEN_COLUMNS already strips brochure_link_
+    broken - see that list's own comment), so callers must run this BEFORE
+    visible_columns, not after (visible_columns itself never strips this
+    new synthetic column - it isn't in ALWAYS_HIDDEN_COLUMNS - so it
+    survives that narrowing intact once added).
+    """
+    if "brochure_link_broken" not in df.columns:
+        return df
+    df = df.copy()
+    status = df["brochure_link_broken"].apply(lambda broken: BROCHURE_LINK_BROKEN_LABEL if broken is True else "")
+    if "brochure_link" in df.columns:
+        df.insert(df.columns.get_loc("brochure_link") + 1, BROCHURE_LINK_STATUS_COLUMN, status)
+    else:
+        df[BROCHURE_LINK_STATUS_COLUMN] = status
+    return df
+
+
+def link_status_column_config(df: pd.DataFrame) -> dict:
+    """column_config for the synthetic BROCHURE_LINK_STATUS_COLUMN added by
+    with_brochure_link_status - disabled=True (read-only) even inside an
+    editable st.data_editor grid (see pages/3_Export.py), since this column
+    is always a computed display artifact, never real row data a reviewer
+    edits. A no-op dict (same "if col in df.columns" guard as link_column_
+    config) when that column was never added to this particular df."""
+    if BROCHURE_LINK_STATUS_COLUMN not in df.columns:
+        return {}
+    return {
+        BROCHURE_LINK_STATUS_COLUMN: st.column_config.TextColumn(
+            label="Brochure Link Status", disabled=True, width="small",
+        ),
     }
 
 
