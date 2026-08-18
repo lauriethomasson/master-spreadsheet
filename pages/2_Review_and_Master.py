@@ -934,9 +934,14 @@ def _render_edit_property_form(df: pd.DataFrame, property_id: str, key: str) -> 
                 new_values[field] = edited if edited != "" else None
                 original_for_compare[field] = current
 
-        save_col, cancel_col = st.columns(2)
-        save_clicked = save_col.button("Save", key=f"{key}_edit_save_{property_id}", type="primary")
-        cancel_clicked = cancel_col.button("Cancel", key=f"{key}_edit_cancel_{property_id}")
+        # horizontal=True sizes each button to its own content instead of
+        # stretching across equal-width st.columns - the same fix as "Undo
+        # this update" above (see that container's own comment) applied
+        # here, so "Cancel" sits right beside "Save" instead of stranded
+        # at the 50% mark of the form's own full width.
+        with st.container(horizontal=True):
+            save_clicked = st.button("Save", key=f"{key}_edit_save_{property_id}", type="primary")
+            cancel_clicked = st.button("Cancel", key=f"{key}_edit_cancel_{property_id}")
 
         if cancel_clicked:
             st.session_state[editing_key] = None
@@ -1125,13 +1130,20 @@ def _render_discard_pending(pending: list, new_rows: list):
             "master, and this cannot be undone (nothing was ever written to master.xlsx, so there's no "
             "version to restore)."
         )
-        confirm_cols = st.columns(2)
-        if confirm_cols[0].button("Confirm discard", key="discard_pending_confirm_btn", type="primary"):
+        # horizontal=True sizes each button to its own content instead of
+        # stretching across equal-width st.columns - the same fix as "Undo
+        # this update" above (see that container's own comment) applied
+        # here, so "Cancel" sits right beside "Confirm discard" instead of
+        # stranded at the 50% mark of the card's own full width.
+        with st.container(horizontal=True):
+            confirm_clicked = st.button("Confirm discard", key="discard_pending_confirm_btn", type="primary")
+            cancel_clicked = st.button("Cancel", key="discard_pending_cancel")
+        if confirm_clicked:
             discard_pending_staging_files(pending)
             st.session_state.pop("discard_pending_confirm", None)
             st.session_state["just_discarded"] = n
             st.rerun()
-        if confirm_cols[1].button("Cancel", key="discard_pending_cancel"):
+        if cancel_clicked:
             st.session_state.pop("discard_pending_confirm", None)
             st.rerun()
     st.divider()
@@ -1233,14 +1245,21 @@ def _render_single_file_discard(path: str, label: str = "Discard this upload") -
             "applied to master, and this cannot be undone (nothing was ever written to master.xlsx, so "
             "there's no version to restore)."
         )
-        confirm_cols = st.columns(2)
-        if confirm_cols[0].button("Confirm discard", key=f"discard_single_confirm_btn_{path}", type="primary"):
+        # horizontal=True sizes each button to its own content instead of
+        # stretching across equal-width st.columns - the same fix as "Undo
+        # this update" above (see that container's own comment) applied
+        # here, so "Cancel" sits right beside "Confirm discard" instead of
+        # stranded at the 50% mark of the card's own full width.
+        with st.container(horizontal=True):
+            confirm_clicked = st.button("Confirm discard", key=f"discard_single_confirm_btn_{path}", type="primary")
+            cancel_clicked = st.button("Cancel", key=f"discard_single_cancel_{path}")
+        if confirm_clicked:
             n = get_staging_row_count(path)
             discard_pending_staging_files([path])
             st.session_state.pop(confirm_key, None)
             st.session_state["just_discarded"] = n
             st.rerun()
-        if confirm_cols[1].button("Cancel", key=f"discard_single_cancel_{path}"):
+        if cancel_clicked:
             st.session_state.pop(confirm_key, None)
             st.rerun()
 
@@ -1853,14 +1872,23 @@ with page_setup.setup_page("review"):
                         f"{display_utils.to_london_display(v['timestamp'])}. This itself creates a "
                         f"new version, so it can be undone."
                     )
-                    confirm_cols = st.columns(2)
-                    if confirm_cols[0].button("Confirm restore", key=f"{restore_key}_confirm", type="primary"):
+                    # horizontal=True sizes each button to its own content
+                    # instead of stretching across equal-width st.columns -
+                    # the same fix as "Undo this update" elsewhere on this
+                    # page (see that container's own comment) applied here,
+                    # so "Cancel" sits right beside "Confirm restore"
+                    # instead of stranded at the 50% mark of the row's own
+                    # full width.
+                    with st.container(horizontal=True):
+                        confirm_clicked = st.button("Confirm restore", key=f"{restore_key}_confirm", type="primary")
+                        cancel_clicked = st.button("Cancel", key=f"{restore_key}_cancel")
+                    if confirm_clicked:
                         with st.spinner("Restoring..."):
                             master_writer.restore_version(v["path"])
                         st.session_state[pending_key] = False
                         st.session_state["just_restored"] = v["path"]
                         st.rerun()
-                    if confirm_cols[1].button("Cancel", key=f"{restore_key}_cancel"):
+                    if cancel_clicked:
                         st.session_state[pending_key] = False
                         st.rerun()
 
