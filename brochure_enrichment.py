@@ -2952,10 +2952,10 @@ def run_brochure_enrichment(
     rather than two independently-maintained copies of it.
 
     Renders its own progress bar (caller prints any introductory caption
-    first, e.g. "N row(s) have missing information..." vs. "Resuming...",
-    since that wording legitimately differs per caller) and a final
-    "Brochure enrichment complete: ..." caption once every remaining
-    brochure AND floorplan has been processed. Returns the enriched rows so
+    first, e.g. "Now checking N brochures..." vs. "Resuming...", since
+    that wording legitimately differs per caller) and a final "Done: ..."
+    caption once every remaining brochure AND floorplan has been
+    processed. Returns the enriched rows so
     the caller can reassign its own `rows` variable to the final state.
 
     Persists incrementally exactly like the automatic run always has:
@@ -3065,19 +3065,22 @@ def run_brochure_enrichment(
     )
 
     counts = _derive_cumulative_counts(cumulative_processed_urls)
+    total_brochures = len(unique_urls)
+    rows_enriched = stats["rows_enriched"]
     summary = (
-        f"{len(unique_urls)} unique brochure(s) considered, "
-        f"{counts['ok']} read successfully, {stats['rows_enriched']} row(s) enriched this run."
+        f"{counts['ok']} of {total_brochures} brochure{'s' if total_brochures != 1 else ''} read successfully, "
+        f"adding details to {rows_enriched} row{'s' if rows_enriched != 1 else ''}."
     )
     if counts["unavailable"]:
-        summary += f" {counts['unavailable']} brochure(s) could not be processed."
+        summary += f" {counts['unavailable']} couldn't be read."
     if stats["unique_floorplans_considered"]:
         floorplan_counts = _derive_cumulative_counts(cumulative_floorplan_processed_urls)
+        total_floorplans = stats["unique_floorplans_considered"]
         summary += (
-            f" {stats['unique_floorplans_considered']} unique floor plan(s) also considered, "
-            f"{floorplan_counts['ok']} read successfully."
+            f" {floorplan_counts['ok']} of {total_floorplans} "
+            f"floor plan{'s' if total_floorplans != 1 else ''} also read."
         )
-    st.caption(f"Brochure enrichment complete: {summary}")
+    st.caption(f"Done: {summary}")
 
     return enriched_rows
 

@@ -257,9 +257,8 @@ def _run_automatic_brochure_enrichment(
         return rows
 
     st.caption(
-        f"{len(eligible)} row(s) have missing descriptive information — "
-        f"checking {len(unique_urls)} unique brochure(s) for it. "
-        "Your extracted spreadsheet data has already been saved — this step only adds extra detail."
+        f"Now checking {len(unique_urls)} brochure{'s' if len(unique_urls) != 1 else ''} to fill in missing "
+        "details — your data's already saved either way."
     )
     return brochure_enrichment.run_brochure_enrichment(
         rows, staging_path, already_processed=already_processed or {},
@@ -923,7 +922,8 @@ with page_setup.setup_page("upload"):
                     # that the row count above is already real and saved,
                     # before any further (potentially slow) step runs.
                     if is_spreadsheet_source and not reused:
-                        st.caption(f"Spreadsheet extracted — {len(rows)} row(s) saved.")
+                        row_count = len(rows)
+                        st.caption(f"Spreadsheet extracted — {row_count} row{'s' if row_count != 1 else ''} saved.")
 
                     # Automatic - for a fresh spreadsheet extraction always,
                     # and ALSO for a reused (byte-identical previous

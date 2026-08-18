@@ -129,7 +129,15 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         self.assertEqual(df.iloc[0]["size_sqft"], 1200)  # primary source untouched
 
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("Brochure enrichment complete", caption_text)
+        self.assertIn("Spreadsheet extracted — 1 row saved.", caption_text)
+        self.assertIn(
+            "Now checking 1 brochure to fill in missing details — your data's already saved either way.",
+            caption_text,
+        )
+        # Fully singular case (1 row, 1 brochure, 1 read, 1 enriched, 0
+        # failed) - the exact wording, not just a substring, so a
+        # hardcoded "s" would fail this immediately.
+        self.assertIn("Done: 1 of 1 brochure read successfully, adding details to 1 row.", caption_text)
         # The "keep this page open" caption shares run_brochure_enrichment's
         # own progress_slot placeholder with the progress bar (see that
         # function's own docstring) - both must disappear together once
@@ -203,6 +211,62 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         self.assertEqual(len(df), 10)
         self.assertTrue(all(df["special_features"].notna()))
 
+        # Mixed singular/plural in the SAME message: exactly 1 unique
+        # brochure (shared by every row) but 10 rows enriched from it -
+        # "brochure" and "row" must pluralize independently based on
+        # their OWN count, never coupled to each other.
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("Done: 1 of 1 brochure read successfully, adding details to 10 rows.", caption_text)
+
+    def test_two_rows_with_two_distinct_brochures_pluralizes_the_brochure_count_too(self):
+        # test_ten_rows_sharing_one_brochure above proves "row" pluralizes
+        # independently of "brochure" - this proves the reverse: "brochure"
+        # itself must ALSO pluralize correctly when there are genuinely
+        # several distinct ones, not just when there are several rows.
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Availability"
+        ws.append(["Building", "Floor/Unit", "Size (sq ft)", "Monthly Rate", "Brochure"])
+        ws.append(["Building 0", "0th Floor", 1200, 15000, "https://example.com/brochure-0.pdf"])
+        ws.append(["Building 1", "1st Floor", 1300, 16000, "https://example.com/brochure-1.pdf"])
+        buffer = BytesIO()
+        wb.save(buffer)
+
+        # Both mocked brochure fetches return the SAME response, containing
+        # units for BOTH buildings - deliberately redundant so the result
+        # is correct regardless of which of the two brochures enrich_rows_
+        # grouped's own thread pool happens to fetch first (never assume a
+        # specific ordering between two independently-dispatched URLs).
+        raw_units_both = {"units": [
+            {"building": "Building 0", "floor_unit": "0th Floor", "special_features": "Feature 0"},
+            {"building": "Building 1", "floor_unit": "1st Floor", "special_features": "Feature 1"},
+        ]}
+        with patch("brochure_enrichment.httpx.get", return_value=_pdf_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=raw_units_both):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Two.xlsx", buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        pending = list_pending_staging_files()
+        df = load_staging_as_dataframe(pending[0])
+        self.assertEqual(len(df), 2)
+        self.assertTrue(all(df["special_features"].notna()))
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn(
+            "Now checking 2 brochures to fill in missing details — your data's already saved either way.",
+            caption_text,
+        )
+        self.assertIn("Done: 2 of 2 brochures read successfully, adding details to 2 rows.", caption_text)
+
     def test_a_run_that_completes_normally_is_tagged_complete_not_left_in_progress(self):
         # _run_automatic_brochure_enrichment writes an interim
         # "in_progress" marker before enrich_rows_grouped even starts (see
@@ -258,6 +322,13 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         df = load_staging_as_dataframe(pending[0])
         self.assertEqual(df.iloc[0]["building"], "Building 0")
+
+        # 0 read, 0 enriched, 1 failed - the "couldn't be read" clause
+        # carries no noun of its own to pluralize (see brochure_
+        # enrichment.py's own comment), so this is the same wording
+        # whether the count is 1 or many.
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("Done: 0 of 1 brochure read successfully, adding details to 0 rows. 1 couldn't be read.", caption_text)
 
     def test_base_extraction_survives_even_a_catastrophic_enrichment_crash(self):
         # Belt-and-braces on top of enrich_rows_grouped's own per-brochure
