@@ -69,8 +69,13 @@ DATA_ROW_HEIGHT = 60
 # listing ever needs tracing back to its source upload. property_id is
 # master_merge.py's internal identity for a property across uploads - never
 # meaningful to a person, but needed in the file so re-loading the master
-# preserves it.
-HIDDEN_COLUMNS = ["source_file", "property_id"]
+# preserves it. brochure_link_broken is pipeline diagnostics (see that
+# field's own schema.py docstring and build_merge_plan's own routing of it
+# into silent_updates, never the reviewable diff) - a raw True/False/blank
+# column would otherwise expose that internal bookkeeping directly next to
+# brochure_link, which is exactly what BROKEN_LINK_DISPLAY_TEXT's own label
+# swap is meant to communicate instead.
+HIDDEN_COLUMNS = ["source_file", "property_id", "brochure_link_broken"]
 
 
 def title_case_label(field_name: str) -> str:

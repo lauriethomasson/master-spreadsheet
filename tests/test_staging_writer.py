@@ -241,6 +241,24 @@ class BrokenBrochureLinkDisplayTests(unittest.TestCase):
         df = read_xlsx_with_hyperlinks(buffer.getvalue())
         self.assertEqual(df.iloc[0]["brochure_link"], "https://example.com/dead.pdf")
 
+    def test_brochure_link_broken_column_is_hidden_not_shown_as_a_raw_flag(self):
+        # brochure_link_broken is pipeline diagnostics, never something a
+        # reviewer should see as a raw True/False/blank column next to
+        # brochure_link - see HIDDEN_COLUMNS' own comment on why it's
+        # hidden rather than dropped (same treatment as source_file/
+        # property_id), still there to unhide/read directly if ever
+        # needed, but not surfaced by default.
+        row = ListingRow(building="A", brochure_link="https://example.com/dead.pdf", brochure_link_broken=True)
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("brochure_link_broken")) + 1
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        self.assertTrue(ws.column_dimensions[column_letter].hidden)
+
 
 class LegacyColumnCompatibilityTests(unittest.TestCase):
     """Regression coverage for a real bug found while verifying this exact

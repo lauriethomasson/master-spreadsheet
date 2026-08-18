@@ -13,6 +13,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import display_utils
@@ -101,6 +103,32 @@ class CoercedNewValueTests(unittest.TestCase):
         # number_input's own default=0.0 fallback there.
         self.assertEqual(display_utils.coerced_new_value(None, "int"), 0)
         self.assertEqual(display_utils.coerced_new_value(None, "float"), 0.0)
+
+
+class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
+    """
+    visible_columns' own ALWAYS_HIDDEN_COLUMNS filter - internal/
+    traceability-only columns that never belong in front of Mark/Laurie on
+    the review grid, regardless of value (see that list's own comment).
+    brochure_link_broken is pipeline diagnostics (same reasoning as
+    staging_writer.HIDDEN_COLUMNS, which hides it from the exported .xlsx
+    for the identical reason) - this is the separate list governing the
+    on-screen grid instead.
+    """
+
+    def test_brochure_link_broken_is_never_shown_on_the_review_grid(self):
+        df = pd.DataFrame([{"building": "A", "brochure_link_broken": True}])
+        self.assertNotIn("brochure_link_broken", display_utils.visible_columns(df))
+
+    def test_source_file_and_property_id_are_never_shown_either(self):
+        df = pd.DataFrame([{"building": "A", "source_file": "x.pdf", "property_id": "p1"}])
+        visible = display_utils.visible_columns(df)
+        self.assertNotIn("source_file", visible)
+        self.assertNotIn("property_id", visible)
+
+    def test_an_ordinary_column_is_unaffected(self):
+        df = pd.DataFrame([{"building": "A", "brochure_link_broken": True}])
+        self.assertIn("building", display_utils.visible_columns(df))
 
 
 if __name__ == "__main__":

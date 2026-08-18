@@ -192,10 +192,15 @@ RANGE_COLUMNS = [
 # Unlike RANGE_COLUMNS (hidden only when every row is empty), these are
 # internal/traceability-only columns that never belong in front of Mark/Laurie
 # regardless of whether they have a value - still written to the underlying
-# .xlsx (see write_rows_to_xlsx), just never rendered here.
+# .xlsx (see write_rows_to_xlsx), just never rendered here. brochure_link_broken
+# is pipeline diagnostics (see ListingRow.brochure_link_broken's own schema.py
+# docstring) - same reasoning as staging_writer.HIDDEN_COLUMNS, which hides it
+# from the exported file for the identical reason; kept as its own separate
+# list here since this one governs the on-screen review grid, not the .xlsx.
 ALWAYS_HIDDEN_COLUMNS = [
     "source_file",
     "property_id",
+    "brochure_link_broken",
 ]
 
 
