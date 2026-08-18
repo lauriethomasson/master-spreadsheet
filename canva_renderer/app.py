@@ -71,6 +71,7 @@ main app's own container) and required environment variables.
 import asyncio
 import base64
 import concurrent.futures
+import io
 import json
 import os
 import re
@@ -80,6 +81,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
+from PIL import Image
 
 # Mirrors brochure_link_resolver.is_canva_view_link's own narrow shape in
 # the main app (never a bare "canva.com" substring) - kept as an
@@ -201,6 +203,41 @@ _PER_PAGE_TIMEOUT_BUDGET_S = 8
 RENDER_TIMEOUT_SECONDS = (
     (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10 + (MAX_CANVA_PAGES - 1) * _PER_PAGE_TIMEOUT_BUDGET_S
 )
+
+# Cloud Run's own hard ceiling on a single HTTP response body - confirmed
+# directly via real production evidence: Cloud Run's own platform-level
+# "Response size was too large. Please consider reducing response size."
+# WARNING (never this app's own logging), immediately followed by an HTTP
+# 500 the main app received - the FIRST time a 29-page capture (Risborough,
+# right after MAX_CANVA_PAGES was raised from 20 to 30) ever actually
+# produced a response this large. Not a Cloud Run *setting* - --memory/
+# --timeout/--concurrency have no effect on this at all; the only lever on
+# this side of the boundary is the response's own byte size. See do_POST's
+# own adaptive JPEG re-encoding below, which exists specifically to stay
+# under this.
+CLOUD_RUN_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# Re-encode every page as JPEG (see JPEG_QUALITY) instead of sending the
+# lossless PNG Chromium actually produced, but ONLY when the estimated
+# base64+JSON payload would come within this margin of CLOUD_RUN_MAX_
+# RESPONSE_BYTES - most renders (the large majority: small/medium decks)
+# never get anywhere near this and keep full lossless PNG quality
+# completely unchanged; only a genuinely large and/or photo-dense capture
+# pays JPEG's lossy-compression cost, and only when actually needed to
+# avoid a hard platform failure. Deliberately NOT set right up against
+# CLOUD_RUN_MAX_RESPONSE_BYTES itself - the estimate below (raw-bytes-
+# times-4/3) approximates base64's own exact blow-up but ignores the
+# JSON envelope's own small fixed overhead, so this margin covers that
+# approximation being imprecise, not just the platform limit itself.
+RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES = 24 * 1024 * 1024
+# Confirmed directly against a real production capture (Risborough, 29
+# pages): 25.68MB raw PNG total -> 5.25MB JPEG total at this exact
+# quality - a ~4.9x reduction with no visible quality loss for a real
+# photo-heavy brochure page, since PNG (lossless) is a poor fit for
+# photographic content in the first place. Not tuned further than this
+# one confirmed data point - revisit with real evidence if a future
+# capture's own text/floor-plan legibility is ever actually reported as
+# degraded, never preemptively.
+JPEG_QUALITY = 85
 
 # How long ONE request will wait for a free render slot (MAX_CONCURRENT_
 # RENDERS already in flight) before giving up - confirmed real production
@@ -791,6 +828,27 @@ def render_canva_page(url: str) -> tuple[list[bytes], int]:
         raise RenderError("render timed out")
 
 
+def _reencode_as_jpeg(page_bytes: bytes) -> bytes:
+    """
+    Re-encodes one already-captured screenshot (PNG, from page.screenshot)
+    as a JPEG at JPEG_QUALITY - only ever called from Handler.do_POST when
+    the estimated response payload would otherwise risk Cloud Run's own
+    hard CLOUD_RUN_MAX_RESPONSE_BYTES ceiling (see RESPONSE_SIZE_SAFETY_
+    THRESHOLD_BYTES). PNG's lossless compression is a poor fit for a real
+    screenshot of a photo-heavy brochure page in the first place - JPEG's
+    lossy compression shrinks this kind of content roughly 5x with no
+    visible quality loss, confirmed directly (see JPEG_QUALITY's own
+    comment). convert("RGB") first: page.screenshot's own PNG output has
+    no alpha channel to lose (the page background is always opaque), but
+    Pillow's JPEG encoder rejects saving an RGBA image outright without
+    this - never a lossy step of its own on an already-opaque image.
+    """
+    image = Image.open(io.BytesIO(page_bytes)).convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+    return buffer.getvalue()
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -877,36 +935,69 @@ class Handler(BaseHTTPRequestHandler):
                 f"{page_count} page(s) captured ({detected_str}).",
                 file=sys.stderr,
             )
-            # A bounded JSON array of base64 PNGs, never a single giant
-            # concatenated image - each page stays a separate, independently
-            # sized image the main app can feed straight into its existing
-            # multi-image Gemini extraction (see extract.render_and_extract),
-            # exactly like a multi-page PDF's own per-page images already are.
+            # Estimated from the RAW page bytes still in hand, before any
+            # encoding - base64 blows up its input by exactly 4/3, so this
+            # is a close, cheap upper-bound estimate of the eventual JSON
+            # payload size (the JSON envelope's own small fixed overhead
+            # on top of that is exactly why RESPONSE_SIZE_SAFETY_THRESHOLD_
+            # BYTES leaves real margin below CLOUD_RUN_MAX_RESPONSE_BYTES,
+            # rather than comparing against it directly).
+            total_raw_bytes = sum(len(p) for p in pages)
+            estimated_payload_bytes = total_raw_bytes * 4 // 3
+            if estimated_payload_bytes > RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES:
+                print(
+                    f"[canva_renderer] {url!r}: estimated payload "
+                    f"~{estimated_payload_bytes / (1024 * 1024):.1f}MB would risk Cloud Run's own "
+                    f"{CLOUD_RUN_MAX_RESPONSE_BYTES // (1024 * 1024)}MB response-size limit - re-encoding "
+                    f"{page_count} page(s) as JPEG (quality={JPEG_QUALITY}) instead of PNG.",
+                    file=sys.stderr,
+                )
+                image_format = "jpeg"
+                source_pages = [_reencode_as_jpeg(p) for p in pages]
+            else:
+                image_format = "png"
+                source_pages = pages
+
+            # A bounded JSON array of base64-encoded pages, never a single
+            # giant concatenated image - each page stays a separate,
+            # independently sized image the main app can feed straight
+            # into its existing multi-image Gemini extraction (see
+            # extract.render_and_extract), exactly like a multi-page PDF's
+            # own per-page images already are. image_format is purely
+            # informational here (see this response's own docstring in
+            # extract.images_from_png_pages - the main app sniffs the
+            # actual bytes' own magic number instead of trusting this
+            # field, so the two services need no wire-contract
+            # coordination for this at all) - included only so Cloud Run
+            # logs/a manual response inspection can see which format was
+            # actually used without decoding page bytes by hand.
             #
-            # Encoded INCREMENTALLY - draining a SHALLOW COPY of `pages`
-            # (cheap: just duplicating up to MAX_CANVA_PAGES references,
-            # never the underlying PNG bytes themselves) one raw PNG at a
-            # time, freeing each one (`del png`) the instant its own
-            # base64 copy exists - rather than a single list
-            # comprehension, which would keep EVERY raw PNG alive for the
-            # ENTIRE comprehension while ALSO building the full base64
-            # list alongside it. Real production evidence this matters
-            # for: "Memory limit of 1024 MiB exceeded" while processing a
-            # large multi-page brochure (an 18-page deck was one of this
-            # service's own successful renders) - this halves the peak
-            # extra memory this specific response-construction step
-            # needs, on top of whatever Chromium itself already used to
-            # render it. A copy, not `pages` itself, so this never mutates
-            # a list some OTHER caller/reference might still expect intact.
-            remaining = list(pages)
+            # Encoded INCREMENTALLY - draining a SHALLOW COPY of source_
+            # pages (cheap: just duplicating up to MAX_CANVA_PAGES
+            # references, never the underlying image bytes themselves) one
+            # page at a time, freeing each one (`del page_bytes`) the
+            # instant its own base64 copy exists - rather than a single
+            # list comprehension, which would keep EVERY raw page alive
+            # for the ENTIRE comprehension while ALSO building the full
+            # base64 list alongside it. Real production evidence this
+            # matters for: "Memory limit of 1024 MiB exceeded" while
+            # processing a large multi-page brochure (an 18-page deck was
+            # one of this service's own successful renders) - this halves
+            # the peak extra memory this specific response-construction
+            # step needs, on top of whatever Chromium itself already used
+            # to render it. A copy, not `pages`/source_pages itself, so
+            # this never mutates a list some OTHER caller/reference might
+            # still expect intact.
+            remaining = list(source_pages)
             encoded_pages = []
             while remaining:
-                png = remaining.pop(0)
-                encoded_pages.append(base64.b64encode(png).decode("ascii"))
-                del png
+                page_bytes = remaining.pop(0)
+                encoded_pages.append(base64.b64encode(page_bytes).decode("ascii"))
+                del page_bytes
             self._send_json(200, {
                 "pages": encoded_pages,
                 "page_count_detected": detected_total,
+                "image_format": image_format,
             })
         finally:
             _render_semaphore.release()

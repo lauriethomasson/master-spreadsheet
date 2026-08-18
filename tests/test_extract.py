@@ -547,5 +547,43 @@ class RealCityTowerBrochureGroundingTests(unittest.TestCase):
             doc.close()
 
 
+class ImagesFromPngPagesMimeTypeSniffingTests(unittest.TestCase):
+    """
+    images_from_png_pages' own mime-type sniffing (see that function's own
+    docstring) - canva_renderer/app.py adaptively re-encodes a large/photo-
+    dense capture as JPEG instead of PNG to stay under Cloud Run's own
+    32MB response-size limit, with no new field in the renderer's JSON
+    response this app has to know about - the actual mime_type Gemini
+    receives is read from the real bytes' own magic number instead.
+    """
+
+    _PNG_BYTES = b"\x89PNG\r\n\x1a\n rest of a real PNG"
+    _JPEG_BYTES = b"\xff\xd8\xff\xe0 rest of a real JPEG"
+
+    def test_png_bytes_get_the_png_mime_type(self):
+        parts = extract.images_from_png_pages([self._PNG_BYTES])
+        self.assertEqual(parts[0].inline_data.mime_type, "image/png")
+
+    def test_jpeg_bytes_get_the_jpeg_mime_type(self):
+        parts = extract.images_from_png_pages([self._JPEG_BYTES])
+        self.assertEqual(parts[0].inline_data.mime_type, "image/jpeg")
+
+    def test_format_is_sniffed_once_from_the_first_page_and_applied_to_every_page(self):
+        # A whole render's pages are always all the same format (the
+        # renderer picks one format for the entire response, never mixed
+        # per page) - confirming every page gets the SAME mime_type from
+        # just the first page's own bytes, never a per-page re-sniff.
+        parts = extract.images_from_png_pages([self._JPEG_BYTES, self._JPEG_BYTES, self._JPEG_BYTES])
+        self.assertTrue(all(p.inline_data.mime_type == "image/jpeg" for p in parts))
+
+    def test_empty_list_never_raises(self):
+        self.assertEqual(extract.images_from_png_pages([]), [])
+
+    def test_page_data_and_order_are_unaffected_by_the_format_sniff(self):
+        parts = extract.images_from_png_pages([self._JPEG_BYTES, self._PNG_BYTES])
+        self.assertEqual(parts[0].inline_data.data, self._JPEG_BYTES)
+        self.assertEqual(parts[1].inline_data.data, self._PNG_BYTES)
+
+
 if __name__ == "__main__":
     unittest.main()

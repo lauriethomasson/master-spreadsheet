@@ -504,24 +504,47 @@ def render_pages(pdf_source) -> list[types.Part]:
         fitz.TOOLS.store_shrink(100)
 
 
+_JPEG_MAGIC = b"\xff\xd8\xff"
+
+
 def images_from_png_pages(png_pages: list) -> list[types.Part]:
     """
-    `png_pages` (a list of already-rendered PNG bytes, one per page - see
-    canva_renderer/app.py's multi-page capture) wrapped as types.Part
-    objects, in the same order and via the exact same construction render_
-    pages already uses per page (types.Part.from_bytes(..., mime_type=
-    "image/png")) - never a second, differently-built image representation.
+    `png_pages` (a list of already-rendered page image bytes, one per page
+    - see canva_renderer/app.py's multi-page capture) wrapped as types.Part
+    objects, in the same order, via the exact same construction render_
+    pages already uses per page (types.Part.from_bytes(..., mime_type=...))
+    - never a second, differently-built image representation.
+
+    Despite this function's own name (kept for backward compatibility with
+    every existing call site - see brochure_enrichment._extract_brochure_
+    units, the only caller), the bytes aren't always actually PNG: canva_
+    renderer/app.py adaptively re-encodes a large/photo-dense capture as
+    JPEG instead, to stay under Cloud Run's own hard 32MB response-size
+    ceiling (confirmed directly - a real 29-page brochure's PNG+base64
+    payload measured at 34.24MB, over that limit; JPEG at quality=85
+    measured at 7.00MB for the identical real capture). The mime_type used
+    for EVERY page here is sniffed once from the FIRST page's own magic
+    bytes (JPEG's fixed \\xff\\xd8\\xff header vs. anything else treated as
+    PNG) - a whole render's pages are always ALL the same format (the
+    renderer picks one format for the entire response, never mixed per
+    page), so checking just the first is sufficient and avoids a per-page
+    branch. Deliberately NOT a new field in the renderer's own JSON
+    response that this app would have to know about - sniffing the actual
+    bytes works correctly regardless of which of the two services gets
+    deployed first, with zero cross-service wire-contract coordination
+    required either way.
 
     Deliberately NOT routed through render_pages/fitz.open at all: these
     bytes are already rendered raster pages (a real browser's own
     screenshot), not a vector PDF that needs rasterizing - re-opening one
-    PNG at a time as a fake one-page "PDF" would just be a slower, no-op
-    round trip through PyMuPDF for identical output. The caller (see
-    brochure_enrichment._extract_brochure_units) still passes the result
-    straight into render_and_extract, exactly like render_pages' own
-    output - there is no separate extraction path for this source.
+    at a time as a fake one-page "PDF" would just be a slower, no-op round
+    trip through PyMuPDF for identical output. The caller (see brochure_
+    enrichment._extract_brochure_units) still passes the result straight
+    into render_and_extract, exactly like render_pages' own output - there
+    is no separate extraction path for this source.
     """
-    return [types.Part.from_bytes(data=png, mime_type="image/png") for png in png_pages]
+    mime_type = "image/jpeg" if png_pages and png_pages[0][:3] == _JPEG_MAGIC else "image/png"
+    return [types.Part.from_bytes(data=page, mime_type=mime_type) for page in png_pages]
 
 
 def render_and_extract(images: list, client=None, prompt: str = None) -> dict:

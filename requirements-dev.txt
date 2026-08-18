@@ -2,3 +2,4 @@
 psutil
 playwright
 # after installing, also run: playwright install chromium
+Pillow  # canva_renderer/app.py's own dependency (tests/test_canva_renderer.py loads that module directly)

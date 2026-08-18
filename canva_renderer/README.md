@@ -59,6 +59,40 @@ the very next request detects this (`Browser.is_connected()`) and
 relaunches it automatically - a single crash no longer poisons every
 subsequent render for the rest of this container instance's lifetime.
 
+## Response size: adaptive JPEG re-encoding
+
+Cloud Run enforces a hard **32MB limit on a single HTTP response body**
+(`CLOUD_RUN_MAX_RESPONSE_BYTES` in `app.py`) - not a configurable setting;
+`--memory`/`--timeout`/`--concurrency` have no effect on it at all. Real
+production evidence: a genuine 29-page brochure (Risborough, the first
+capture to actually reach that size after `MAX_CANVA_PAGES` was raised
+from 20 to 30) measured at **34.24MB** as PNG+base64+JSON - over the
+limit, surfacing as Cloud Run's own platform WARNING ("Response size was
+too large...") immediately followed by a 500, even though the render
+itself succeeded and canva_renderer's own logs said so.
+
+`do_POST` estimates the payload size from the raw captured bytes
+(`RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES`, a safety margin below the 32MB
+ceiling) and, only when that estimate is large enough to risk the limit,
+re-encodes every page as JPEG (`JPEG_QUALITY = 85`) instead of sending the
+lossless PNG Chromium produced - confirmed against that same real 29-page
+capture: 25.68MB raw PNG -> 5.25MB JPEG, comfortably under the limit with
+real margin, and matching the intuition that PNG (lossless) is a poor
+format for a real screenshot of a photo-heavy brochure page in the first
+place. The large majority of renders (small/medium decks) never approach
+the threshold and keep full lossless PNG quality completely unchanged -
+this only ever costs anything on the rare large/photo-dense capture, and
+only pays for exactly as much compression as needed to avoid a hard
+platform failure.
+
+The response's own `"image_format"` field is purely informational (for
+Cloud Run logs/manual inspection) - the main app never trusts it. It
+instead sniffs the actual bytes' own magic number (see `extract.
+images_from_png_pages`) to decide the correct mime_type to hand Gemini,
+so this adaptive behavior needs **no wire-contract coordination** between
+the two independently-deployed services at all - it works correctly
+regardless of which one gets redeployed first.
+
 ## Local development
 
 ```bash

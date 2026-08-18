@@ -20,6 +20,7 @@ import importlib.util
 import inspect
 import io
 import json
+import random
 import sys
 import threading
 import time
@@ -27,6 +28,8 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -879,6 +882,59 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
                 canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
 
 
+class ReencodeAsJpegTests(unittest.TestCase):
+    """
+    _reencode_as_jpeg - a real Pillow round-trip (no mocking), confirming
+    it actually produces valid, smaller JPEG bytes from a real PNG, not
+    just that it returns SOMETHING. Only ever called from do_POST when a
+    render's estimated payload risks Cloud Run's own 32MB response limit
+    (see RenderHandlerTests' own adaptive-re-encoding tests).
+    """
+
+    @staticmethod
+    def _make_real_png(size=(200, 200), color=(255, 0, 0)) -> bytes:
+        buffer = BytesIO()
+        Image.new("RGB", size, color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_produces_real_decodable_jpeg_bytes(self):
+        png_bytes = self._make_real_png()
+        jpeg_bytes = canva_renderer._reencode_as_jpeg(png_bytes)
+        self.assertTrue(jpeg_bytes.startswith(b"\xff\xd8\xff"))
+        decoded = Image.open(BytesIO(jpeg_bytes))
+        self.assertEqual(decoded.format, "JPEG")
+        self.assertEqual(decoded.size, (200, 200))
+
+    def test_a_real_photo_like_image_shrinks_meaningfully(self):
+        # A flat single-color PNG (the case above) is already tiny under
+        # PNG's own lossless compression - not representative of a real,
+        # noisy/photo-heavy brochure page, where PNG is a poor fit. Random
+        # per-pixel noise is the cheap, offline stand-in that's genuinely
+        # hard for PNG to compress, the same way a real photo is.
+        random.seed(0)
+        width, height = 200, 200
+        pixels = bytes(random.randrange(256) for _ in range(width * height * 3))
+        image = Image.frombytes("RGB", (width, height), pixels)
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        png_bytes = buffer.getvalue()
+
+        jpeg_bytes = canva_renderer._reencode_as_jpeg(png_bytes)
+
+        self.assertLess(len(jpeg_bytes), len(png_bytes))
+
+    def test_quality_uses_the_module_constant(self):
+        png_bytes = self._make_real_png()
+        fake_image = MagicMock()
+        fake_image.convert.return_value = fake_image
+        with patch.object(canva_renderer, "JPEG_QUALITY", 42), \
+                patch.object(canva_renderer.Image, "open", return_value=fake_image):
+            canva_renderer._reencode_as_jpeg(png_bytes)
+        save_kwargs = fake_image.save.call_args.kwargs
+        self.assertEqual(save_kwargs["quality"], 42)
+        self.assertEqual(save_kwargs["format"], "JPEG")
+
+
 class RenderHandlerTests(unittest.TestCase):
     """HTTP-layer behavior - auth, malformed input, busy/backpressure -
     exercised directly against the handler methods rather than a real
@@ -939,7 +995,53 @@ class RenderHandlerTests(unittest.TestCase):
         source = inspect.getsource(canva_renderer.Handler.do_POST)
         self.assertNotIn("[base64.b64encode(p", source)
         self.assertIn(".pop(0)", source)
-        self.assertIn("del png", source)
+        self.assertIn("del page_bytes", source)
+
+    def test_small_render_stays_png_and_never_re_encodes(self):
+        # The common case (small/medium decks): well under RESPONSE_SIZE_
+        # SAFETY_THRESHOLD_BYTES at its real default, so image_format
+        # stays "png" and _reencode_as_jpeg is never even called - full
+        # lossless quality, completely unchanged from before this feature.
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        with patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], 1)), \
+                patch.object(canva_renderer, "_reencode_as_jpeg") as mock_reencode:
+            handler.do_POST()
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(payload["image_format"], "png")
+        self.assertEqual(payload["pages"], [base64.b64encode(b"\x89PNG bytes").decode("ascii")])
+        mock_reencode.assert_not_called()
+
+    def test_large_estimated_payload_re_encodes_every_page_as_jpeg(self):
+        # RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES patched down so even tiny
+        # fixture pages cross it, without needing genuinely huge test
+        # data here - the real default (24MB) and JPEG_QUALITY (85) were
+        # sized against a real, live 29-page Risborough capture (25.68MB
+        # raw PNG -> 5.25MB JPEG; the unmodified PNG+base64+JSON payload
+        # measured at 34.24MB, over Cloud Run's real 32MB limit) rather
+        # than a guess - see canva_renderer/README.md's own "Response
+        # size" section and CLOUD_RUN_MAX_RESPONSE_BYTES's own comment.
+        pages = [b"\x89PNG p1", b"\x89PNG p2"]
+        jpeg_bytes = [b"\xff\xd8\xff jpeg1", b"\xff\xd8\xff jpeg2"]
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 2)), \
+                patch.object(canva_renderer, "RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES", 1), \
+                patch.object(canva_renderer, "_reencode_as_jpeg", side_effect=jpeg_bytes) as mock_reencode:
+            handler.do_POST()
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(payload["image_format"], "jpeg")
+        self.assertEqual(payload["pages"], [base64.b64encode(p).decode("ascii") for p in jpeg_bytes])
+        # Every original PNG page was actually handed to the re-encoder,
+        # in order - never skipped, never reordered.
+        self.assertEqual([c.args[0] for c in mock_reencode.call_args_list], pages)
+
+    def test_re_encoding_never_mutates_the_original_pages_list(self):
+        pages = [b"\x89PNG p1", b"\x89PNG p2"]
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 2)), \
+                patch.object(canva_renderer, "RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES", 1), \
+                patch.object(canva_renderer, "_reencode_as_jpeg", side_effect=lambda p: b"jpeg-" + p):
+            handler.do_POST()
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])  # untouched
 
     def test_render_error_returns_422_with_reason(self):
         handler = self._make_handler(json.dumps({"url": "https://example.com/x"}).encode())
