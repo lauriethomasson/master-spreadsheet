@@ -196,6 +196,22 @@ class WithBrochureLinkDisplayLabelsTests(unittest.TestCase):
         result = display_utils.with_brochure_link_display_labels(df)
         self.assertIsNone(result["brochure_link"].iloc[0])
 
+    def test_nan_brochure_link_in_a_multi_row_dataframe_is_left_blank(self):
+        # The real-world shape that actually triggers the bug: a genuinely
+        # blank cell in a mixed column comes back from pandas as
+        # float('nan'), not None - `not url` alone doesn't catch that
+        # (`not float('nan')` is False), so this row must be handled
+        # explicitly rather than relying on a single-row DataFrame's own
+        # None inference (see test_blank_brochure_link_is_left_blank above,
+        # which doesn't actually exercise this).
+        df = pd.DataFrame([
+            {"brochure_link": "https://example.com/fine.pdf", "brochure_link_broken": False},
+            {"brochure_link": None, "brochure_link_broken": True},
+        ])
+        self.assertTrue(pd.isna(df["brochure_link"].iloc[1]))
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertTrue(pd.isna(result["brochure_link"].iloc[1]))
+
     def test_absent_brochure_link_column_is_a_complete_no_op(self):
         df = pd.DataFrame([{"building": "A"}])
         result = display_utils.with_brochure_link_display_labels(df)
@@ -242,6 +258,15 @@ class StripDisplayLabelTests(unittest.TestCase):
     def test_blank_passes_through_unchanged(self):
         self.assertIsNone(display_utils.strip_display_label(None))
         self.assertEqual(display_utils.strip_display_label(""), "")
+
+    def test_nan_passes_through_unchanged(self):
+        # Same latent trap as with_brochure_link_display_labels's own
+        # blank check (`not url` alone doesn't catch float('nan')) - this
+        # hadn't crashed yet only because it hadn't happened to receive a
+        # NaN, not because it was actually safe.
+        nan = float("nan")
+        result = display_utils.strip_display_label(nan)
+        self.assertTrue(pd.isna(result))
 
     def test_a_genuine_edit_to_a_different_part_of_the_url_is_preserved(self):
         # Only OUR OWN marker is ever removed - a reviewer's real edit to

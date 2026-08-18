@@ -324,7 +324,7 @@ def with_brochure_link_display_labels(df: pd.DataFrame) -> pd.DataFrame:
     broken = df["brochure_link_broken"] if "brochure_link_broken" in df.columns else pd.Series(False, index=df.index)
 
     def _label_for(url, is_broken):
-        if not url:
+        if not url or (isinstance(url, float) and pd.isna(url)):
             return url
         return _with_display_label(url, BROCHURE_LINK_BROKEN_LABEL if is_broken is True else BROCHURE_LINK_WORKING_LABEL)
 
@@ -340,7 +340,7 @@ def strip_display_label(url):
     or on a genuinely reviewer-edited value (only ever strips OUR OWN
     marker, never touches a real edit to any other part of the URL).
     Blank/None passes through unchanged."""
-    if not url:
+    if not url or (isinstance(url, float) and pd.isna(url)):
         return url
     return _DISPLAY_LABEL_STRIP_RE.sub("", url, count=1)
 
