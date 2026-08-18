@@ -1785,6 +1785,84 @@ def backfill_postcode_submarkets(master_records: list) -> tuple:
     return updated_records, changes
 
 
+def build_submarket_casing_lookup(master_records: list) -> dict:
+    """
+    Maps normalize_key(submarket) -> the one, already-confirmed properly-
+    cased submarket value for it - self-learning from master's own
+    existing data, the same philosophy as build_postcode_submarket_
+    lookup, deliberately never a maintained list (unlike canonicalize_
+    provider_name's own KNOWN_PROVIDERS). Fixes e.g. a Workplace Plus
+    upload's own "MAYFAIR"/"OLD STREET"/"KING'S CROSS" (a source
+    spreadsheet's column-wide ALL-CAPS convention, copied verbatim by
+    this pipeline with zero normalization) back to whatever properly-
+    cased form ("Mayfair"/"Old Street"/"King's Cross") is already
+    confirmed elsewhere in master for that same real place.
+
+    normalize_key (lowercases, strips punctuation, collapses whitespace)
+    is reused as-is, not reimplemented - confirmed directly against this
+    exact real data that it does the right thing on every case that
+    matters here: "KING'S CROSS" and "King's Cross" both normalize to
+    "kings cross" (apostrophe simply stripped from both sides, never
+    reconstructed via a naive .title()-style transform that would mangle
+    it into "King'S Cross" - this function never algorithmically re-cases
+    anything at all; it only ever substitutes an already-existing,
+    humanly-authored verbatim string, exactly like build_postcode_
+    submarket_lookup already does). "BANK", "MONUMENT", and "CANNON
+    STREET/MONUMENT" normalize to three genuinely distinct keys ("bank",
+    "monument", "cannon streetmonument") - the "/" is deleted as
+    punctuation, never replaced with a space, so it can never accidentally
+    fuse into a key some OTHER real area also happens to produce.
+
+    A candidate value counts as "properly cased" only when it is NEITHER
+    fully upper-case NOR fully lower-case (str.isupper()/.islower()) - an
+    ALL-CAPS or all-lowercase value is exactly the symptom this fixes (a
+    source spreadsheet's own column-wide casing convention), never
+    trusted as the canonical form itself even though it still counts as
+    real evidence that the underlying key exists.
+
+    When several DIFFERENT properly-cased spellings already exist in
+    master for the same key (a real, if rare, possibility - inconsistent
+    history), the MOST FREQUENT one wins, ties broken alphabetically for
+    a fully deterministic result - deliberately NOT build_postcode_
+    submarket_lookup's own "disagreement resolves to nothing" rule: that
+    rule protects against picking the wrong REAL FACT among several
+    substantively different, all-equally-plausible answers (which actual
+    submarket a postcode district is in - a genuine factual risk). Every
+    candidate for one key here already names the IDENTICAL real place;
+    the only question is which already-attested spelling/casing variant
+    is most representative, a purely cosmetic choice with none of the
+    "confidently wrong fact" risk a postcode guess carries, so a majority
+    vote is a reasonable, low-risk tie-break rather than refusing to
+    correct at all.
+
+    A key with NO properly-cased candidate at all (every existing
+    occurrence is itself all-caps/all-lowercase, never yet fixed) is
+    simply absent from the returned dict - nothing confirmed-good exists
+    yet to borrow, so nothing is corrected: the same "not yet known is
+    not a wrong answer" principle as the postcode lookup, e.g. a
+    genuinely new area (this same file's own Manchester rows) that has
+    never appeared in any casing before is left completely untouched.
+    """
+    candidates_by_key = {}
+    for rec in master_records:
+        submarket = rec.get("submarket")
+        if not submarket or not isinstance(submarket, str):
+            continue
+        if submarket.isupper() or submarket.islower():
+            continue
+        key = normalize_key(submarket)
+        if not key:
+            continue
+        candidates_by_key.setdefault(key, Counter())[submarket] += 1
+
+    lookup = {}
+    for key, counts in candidates_by_key.items():
+        max_count = max(counts.values())
+        best = sorted(value for value, count in counts.items() if count == max_count)[0]
+        lookup[key] = best
+    return lookup
+
+
 def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
     master_records = [
         {key: clean_value(value) for key, value in rec.items()}
@@ -1805,6 +1883,7 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
         fuzzy_anchor_index.setdefault(_fuzzy_anchor_key(rec), []).append(i)
 
     postcode_submarket_lookup = build_postcode_submarket_lookup(master_records)
+    submarket_casing_lookup = build_submarket_casing_lookup(master_records)
 
     matched_changed, matched_unchanged, unmatched = [], [], []
 
@@ -1825,6 +1904,27 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             confirmed_submarket = postcode_submarket_lookup.get(submarket.strip().upper())
             if confirmed_submarket:
                 new_row = new_row.model_copy(update={"submarket": confirmed_submarket})
+
+        # Casing correction runs AFTER the postcode fix above (on whatever
+        # submarket value is current at this point) and deliberately needs
+        # NO explicit diffs/silent routing of its own, unlike brochure_link_
+        # broken's - _values_equal/silent_field_updates (both already
+        # case/whitespace-insensitive - see their own docstrings) already
+        # do the right thing automatically once the value itself is fixed
+        # here, BEFORE new_dict/diffs/silent are computed below: an old_rec
+        # that already has the good casing makes this byte-identical (no
+        # diff, no silent update, fully invisible - correct, nothing
+        # changed); an old_rec that's ALSO still badly cased makes this
+        # tolerant-equal-but-not-identical, which silent_field_updates
+        # already auto-applies as a silent update with no new code needed
+        # here at all; see build_submarket_casing_lookup's own docstring
+        # for why this is a silent update rather than a reviewable diff
+        # (formatting of an already-known fact, never a new one).
+        submarket = new_row.submarket
+        if submarket:
+            confirmed_casing = submarket_casing_lookup.get(normalize_key(submarket))
+            if confirmed_casing and confirmed_casing != submarket:
+                new_row = new_row.model_copy(update={"submarket": confirmed_casing})
 
         new_dict = new_row.model_dump()
         master_idx, tier = None, None

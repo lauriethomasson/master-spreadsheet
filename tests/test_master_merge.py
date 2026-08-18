@@ -1832,6 +1832,189 @@ class BuildMergePlanPostcodeSubmarketTests(unittest.TestCase):
         self.assertEqual(matched.diffs.get("submarket"), ("Bankside", "Shoreditch"))
 
 
+class BuildSubmarketCasingLookupTests(unittest.TestCase):
+    """
+    build_submarket_casing_lookup - self-learning submarket casing
+    correction, using today's real Workplace Plus data as the test
+    fixtures (see that function's own docstring for the full contract).
+    """
+
+    def test_confirmed_mixed_case_wins_over_all_caps(self):
+        records = [
+            {"building": "A", "submarket": "MAYFAIR"},
+            {"building": "B", "submarket": "Mayfair"},
+        ]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup.get("mayfair"), "Mayfair")
+
+    def test_apostrophe_is_preserved_never_mangled_like_a_naive_title_case(self):
+        # normalize_key strips the apostrophe from BOTH sides to match them
+        # - the corrected VALUE itself is always copied verbatim from an
+        # already-existing master row, never reconstructed via .title()
+        # (which would turn "king's cross" into the wrong "King'S Cross").
+        records = [
+            {"building": "A", "submarket": "KING'S CROSS"},
+            {"building": "B", "submarket": "King's Cross"},
+        ]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup.get("kings cross"), "King's Cross")
+        self.assertNotIn("King'S Cross", lookup.values())
+
+    def test_old_street_all_caps_resolves_to_the_confirmed_spelling(self):
+        records = [
+            {"building": "A", "submarket": "OLD STREET"},
+            {"building": "B", "submarket": "Old Street"},
+        ]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup.get("old street"), "Old Street")
+
+    def test_bank_monument_and_cannon_street_monument_never_collide(self):
+        # Three genuinely different real areas, all from today's actual
+        # data - must resolve to three distinct keys, never merged.
+        records = [
+            {"building": "A", "submarket": "BANK"},
+            {"building": "B", "submarket": "Bank"},
+            {"building": "C", "submarket": "MONUMENT"},
+            {"building": "D", "submarket": "Monument"},
+            {"building": "E", "submarket": "CANNON STREET/MONUMENT"},
+            {"building": "F", "submarket": "Cannon Street/Monument"},
+        ]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup.get("bank"), "Bank")
+        self.assertEqual(lookup.get("monument"), "Monument")
+        self.assertEqual(lookup.get("cannon streetmonument"), "Cannon Street/Monument")
+        # Confirms these are genuinely three separate dict entries, not
+        # one collapsed key silently overwriting another.
+        self.assertEqual(len({lookup["bank"], lookup["monument"], lookup["cannon streetmonument"]}), 3)
+
+    def test_a_genuinely_new_area_with_only_all_caps_history_is_not_in_the_lookup(self):
+        # This same real upload's own Manchester rows - a genuinely new
+        # area never yet seen in any casing - must be absent entirely,
+        # never guessed at via .title() or any other derivation.
+        records = [{"building": "A", "submarket": "MANCHESTER CITY CENTRE"}]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertNotIn("manchester city centre", lookup)
+
+    def test_all_lowercase_is_also_never_trusted_as_the_canonical_form(self):
+        records = [{"building": "A", "submarket": "mayfair"}]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertNotIn("mayfair", lookup)
+
+    def test_majority_vote_breaks_a_genuine_disagreement_between_two_good_castings(self):
+        records = [
+            {"building": "A", "submarket": "Kings Cross"},
+            {"building": "B", "submarket": "Kings Cross"},
+            {"building": "C", "submarket": "King's Cross"},
+        ]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup.get("kings cross"), "Kings Cross")
+
+    def test_a_true_tie_breaks_alphabetically_for_a_deterministic_result(self):
+        records = [
+            {"building": "A", "submarket": "Kings Cross"},
+            {"building": "B", "submarket": "King's Cross"},
+        ]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup.get("kings cross"), "King's Cross")  # "K" < "K" but "'" < "s" alphabetically
+
+    def test_blank_submarket_never_contributes(self):
+        records = [{"building": "A", "submarket": None}, {"building": "B", "submarket": ""}]
+        lookup = master_merge.build_submarket_casing_lookup(records)
+        self.assertEqual(lookup, {})
+
+
+class BuildMergePlanSubmarketCasingTests(unittest.TestCase):
+    """
+    A fresh row's badly-cased submarket ("MAYFAIR") is corrected to
+    whatever properly-cased spelling ("Mayfair") is already confirmed
+    elsewhere in master - see build_submarket_casing_lookup's own
+    docstring for the full contract, including why this is a SILENT
+    update (formatting of an already-known fact) rather than a
+    reviewable diff, unlike the postcode-driven submarket correction.
+    """
+
+    def test_matched_row_already_well_cased_in_master_is_fully_invisible(self):
+        # old_rec already has the good casing - after correction the
+        # fresh value is byte-identical to it, so there's no diff AND no
+        # silent update at all; nothing to see, nothing changed.
+        master_df = _master_df([{"building": "Existing Building", "submarket": "Mayfair"}])
+        new_row = ListingRow(building="Existing Building", submarket="MAYFAIR")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("submarket", matched.diffs)
+        self.assertNotIn("submarket", matched.silent_updates)
+
+    def test_matched_row_still_badly_cased_in_master_gets_a_silent_update(self):
+        # old_rec is ALSO still "MAYFAIR" (never yet fixed) - a DIFFERENT
+        # master row confirms "Mayfair" - the correction must land in
+        # silent_updates, never as a reviewable diff a human has to
+        # approve, since this is only formatting of an already-known fact.
+        master_df = _master_df([
+            {"building": "Confirmed Elsewhere", "submarket": "Mayfair"},
+            {"building": "Existing Building", "submarket": "MAYFAIR"},
+        ])
+        new_row = ListingRow(building="Existing Building", submarket="MAYFAIR")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = next(m for m in (plan.matched_changed + plan.matched_unchanged) if m.new_row.building == "Existing Building")
+        self.assertNotIn("submarket", matched.diffs)
+        self.assertEqual(matched.silent_updates.get("submarket"), "Mayfair")
+
+    def test_unmatched_brand_new_property_also_gets_corrected(self):
+        master_df = _master_df([{"building": "Unrelated Building", "submarket": "Old Street"}])
+        new_row = ListingRow(building="Brand New Building", submarket="OLD STREET")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(plan.unmatched[0].new_row.submarket, "Old Street")
+
+    def test_a_genuinely_new_area_stays_untouched_no_crash(self):
+        # Today's real Manchester rows from the same Workplace Plus file -
+        # never before seen in any casing - must pass through unchanged,
+        # not raise, not get guessed at.
+        master_df = _master_df([{"building": "Unrelated Building", "submarket": "Mayfair"}])
+        new_row = ListingRow(building="Brand New Manchester Building", submarket="MANCHESTER CITY CENTRE")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(plan.unmatched[0].new_row.submarket, "MANCHESTER CITY CENTRE")
+
+    def test_cannon_street_monument_is_never_confused_with_monument_alone(self):
+        # Real distinctness check through the FULL pipeline, not just the
+        # lookup in isolation - a fresh "CANNON STREET/MONUMENT" upload
+        # must never be corrected using "Monument"'s own confirmed casing.
+        master_df = _master_df([
+            {"building": "A", "submarket": "Monument"},
+            {"building": "B", "submarket": "Cannon Street/Monument"},
+            {"building": "Existing Building", "submarket": "CANNON STREET/MONUMENT"},
+        ])
+        new_row = ListingRow(building="Existing Building", submarket="CANNON STREET/MONUMENT")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = next(m for m in (plan.matched_changed + plan.matched_unchanged) if m.new_row.building == "Existing Building")
+        self.assertEqual(matched.new_row.submarket, "Cannon Street/Monument")
+
+    def test_a_genuine_new_submarket_fact_from_the_source_is_still_a_normal_diff(self):
+        # A real, substantive change the source itself states (not a
+        # casing artifact) must still surface as an ordinary reviewable
+        # diff - casing correction must never swallow a genuine change.
+        master_df = _master_df([
+            {"building": "Existing Building", "submarket": "Mayfair"},
+        ])
+        new_row = ListingRow(building="Existing Building", submarket="Soho")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.diffs.get("submarket"), ("Mayfair", "Soho"))
+
+
 class ItemsSimilarTests(unittest.TestCase):
     """_items_similar's exact-match short-circuit - a short, abbreviation/
     number-heavy item (every token <= 2 chars) must still be recognized as
