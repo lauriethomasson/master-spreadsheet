@@ -30,7 +30,7 @@ navigates and screenshots in place). A design's own reported "N / M" page
 count (read from the accessible "Go to page" control) is used only for
 logging, never to decide when to stop.
 
-Capped at `MAX_CANVA_PAGES` (default 20, see below) regardless of how many
+Capped at `MAX_CANVA_PAGES` (default 30, see below) regardless of how many
 pages a design actually has, so a malformed/huge public design can't make
 one `/render` call consume unbounded time or memory. If Canva's own page
 controls aren't found at all (a single-page design, or a future Canva
@@ -83,36 +83,42 @@ this container/its dependencies to the main app's own `Dockerfile`.
 gcloud run deploy canva-renderer \
   --source canva_renderer \
   --region <same region as the main app> \
-  --memory 2Gi \
+  --memory 4Gi \
   --cpu 1 \
-  --timeout 330 \
+  --timeout 420 \
   --concurrency 4 \
   --no-allow-unauthenticated
 ```
 
-`--memory 2Gi` (raised from an earlier `1Gi`) - a real production render
-hit `Memory limit of 1024 MiB exceeded with 1027 MiB used` while
-capturing a multi-page brochure: every page visited during pagination
-keeps its own DOM/canvas rendering state alive in the SAME browser
-context for the whole request (Canva's own pagination advances the
-already-loaded design in place, it's not a real page navigation - see
-`app.py`'s own pagination docstring), so a many-page render costs
-meaningfully more memory than a single-page one did. `MAX_CANVA_PAGES`
-already bounds that per-request cost; `2Gi` gives headroom on top of
-that bound. CPU stays at `1` - nothing about this fix is CPU-bound.
+`--memory 4Gi` (raised from `2Gi`, itself raised from an earlier `1Gi`) -
+a real production render hit `Memory limit of 1024 MiB exceeded with 1027
+MiB used` while capturing a multi-page brochure: every page visited
+during pagination keeps its own DOM/canvas rendering state alive in the
+SAME browser context for the whole request (Canva's own pagination
+advances the already-loaded design in place, it's not a real page
+navigation - see `app.py`'s own pagination docstring), so a many-page
+render costs meaningfully more memory than a single-page one did.
+`MAX_CANVA_PAGES` already bounds that per-request cost, but raising it
+from 20 to 30 (see that constant's own docstring - a real brochure had
+its contact info lost on page 29 of 29) raises the per-render ceiling
+too; two concurrent cap=30 renders (`MAX_CONCURRENT_RENDERS=2`) can
+approach ~2.5GB, close enough to `2Gi` to have no real headroom left -
+`4Gi` keeps comfortable headroom above that without having to reduce
+`MAX_CONCURRENT_RENDERS` (which would slow down bulk uploads dispatching
+several brochures at once). CPU stays at `1` - nothing about this fix is
+CPU-bound, and `1 vCPU` still supports up to `4Gi` on Cloud Run.
 
-`--timeout 330` is comfortably above this service's own internal worst
+`--timeout 420` is comfortably above this service's own internal worst
 case: `RENDER_TIMEOUT_SECONDS` (scales with `MAX_CANVA_PAGES` AND
 `NAV_TIMEOUT_MS` - see `app.py`) PLUS `SEMAPHORE_WAIT_TIMEOUT_SECONDS` (a
 request arriving while `MAX_CONCURRENT_RENDERS` are already in flight now
 queues for a free slot rather than being rejected instantly - see that
 constant's own docstring for the real bulk-upload production bug this
-fixes), summed - 285s at current defaults (raised from 270s when
-`NAV_TIMEOUT_MS` went from 15s to 30s - see that constant's own docstring
-for the real production navigation timeouts this fixes). `--concurrency 4`
-lets Cloud Run itself route a genuine overflow (more requests than even
-the queue can absorb) to a fresh instance rather than piling everything
-onto one.
+fixes), summed - 365s at current defaults (raised from 285s when
+`MAX_CANVA_PAGES` went from 20 to 30 - see that constant's own docstring).
+`--concurrency 4` lets Cloud Run itself route a genuine overflow (more
+requests than even the queue can absorb) to a fresh instance rather than
+piling everything onto one.
 
 `--no-allow-unauthenticated` is the primary access control (see
 "Authentication" below) - do not deploy this publicly.
@@ -145,7 +151,7 @@ check on top of that, never a replacement for `--no-allow-unauthenticated`.
 | `PORT`                          | `8080`  | Set automatically by Cloud Run.                            |
 | `MAX_CONCURRENT_RENDERS`        | `2`     | Hard cap on simultaneous browser renders.                  |
 | `SEMAPHORE_WAIT_TIMEOUT_SECONDS`| `90`    | How long a request queues for a free render slot before failing (see `app.py`) - never instant-reject. |
-| `MAX_CANVA_PAGES`               | `20`    | Hard cap on pages captured per design (see above).          |
+| `MAX_CANVA_PAGES`               | `30`    | Hard cap on pages captured per design (see above).          |
 | `RENDERER_SHARED_SECRET`        | (unset) | Optional extra `Authorization: Bearer <secret>` check.     |
 
 ### Environment variable the MAIN APP needs

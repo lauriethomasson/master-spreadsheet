@@ -1103,15 +1103,15 @@ def _fetch_box_shared_pdf(share_url: str, reject_floorplan_filename: bool = True
 # flight now queues for a free slot rather than being rejected instantly -
 # see that constant's own docstring in canva_renderer/app.py for the real
 # bulk-upload production bug this fixes) - both summed (see that module's
-# own worst-case: 195 + 90 = 285s at current defaults - raised from 213s
-# when NAV_TIMEOUT_MS there went from 15s to 30s, see that constant's own
+# own worst-case: 275 + 90 = 365s at current defaults - raised from 285s
+# when MAX_CANVA_PAGES there went from 20 to 30, see that constant's own
 # docstring). This is the ceiling for the WHOLE round trip (network +
 # queueing + browser launch/render of every page), so it must stay
 # comfortably above that service's own worst-case combined budget rather
 # than racing it - a value below that budget would make THIS app give up
 # on a renderer that's still genuinely working, which looks identical to
 # a real renderer failure from here.
-_CANVA_RENDERER_TIMEOUT = 300
+_CANVA_RENDERER_TIMEOUT = 400
 
 # A 502/503 from the renderer is Cloud Run's OWN infrastructure or the
 # renderer's own busy-semaphore giving up on the request BEFORE any real
@@ -1158,8 +1158,12 @@ _CANVA_RENDERER_RETRY_BACKOFF_SECONDS = 2
 # service (see canva_renderer/README.md), so this app never assumes its
 # own cap is being enforced correctly on the other side; a response
 # claiming more pages than this is simply truncated (with a loud log line),
-# never trusted at face value.
-_CANVA_MAX_PAGES_ACCEPTED = 20
+# never trusted at face value. Raised from 20 to 30 in lockstep with the
+# renderer's own MAX_CANVA_PAGES (canva_renderer/app.py) - a real
+# production brochure (Risborough) had its contact info on page 29 of 29;
+# leaving this constant at 20 would keep truncating it right back down
+# even after the renderer itself was raised to capture it.
+_CANVA_MAX_PAGES_ACCEPTED = 30
 
 # Same idea as the renderer's own _MAX_REASON_LENGTH (canva_renderer/app.py)
 # applied here too - this app never assumes the renderer's own truncation

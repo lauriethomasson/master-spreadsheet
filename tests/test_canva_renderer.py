@@ -30,6 +30,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import brochure_enrichment
+
 # Loaded via an explicit file path under a unique module name, never a
 # bare "import app" - the main repo's OWN top-level app.py (the Streamlit
 # entrypoint, imported as a bare "app" module by several other test files,
@@ -1250,6 +1252,32 @@ class BrowserCrashRecoveryTests(_ResetGlobalBrowserStateTestCase):
 
         self.assertEqual(pages, [b"\x89PNG healthy"])
         mock_playwright.assert_not_called()  # never even touched async_playwright() - no relaunch needed
+
+
+class MaxPagesCapsStayInSyncTests(unittest.TestCase):
+    """
+    This service's own MAX_CANVA_PAGES and the main app's independent,
+    separately-maintained brochure_enrichment._CANVA_MAX_PAGES_ACCEPTED
+    (defense-in-depth against a misbehaving/compromised renderer response
+    - see that constant's own docstring) MUST be raised together. Real
+    incident this guards against: a genuine 29-page brochure (Risborough)
+    had its contact info on page 29, lost by the old MAX_CANVA_PAGES=20
+    cap - raising ONLY the renderer's own cap while leaving the main
+    app's _CANVA_MAX_PAGES_ACCEPTED at its old value would silently
+    truncate the very same page right back out on the OTHER side of the
+    two services' own boundary, undoing the fix without either service's
+    own test suite ever catching it (each only ever asserts its own
+    constant in isolation).
+    """
+
+    def test_renderer_and_main_app_page_caps_are_equal(self):
+        self.assertEqual(
+            canva_renderer.MAX_CANVA_PAGES,
+            brochure_enrichment._CANVA_MAX_PAGES_ACCEPTED,
+            "canva_renderer.MAX_CANVA_PAGES and brochure_enrichment._CANVA_MAX_PAGES_ACCEPTED "
+            "must be raised together - a mismatch means the main app silently truncates pages "
+            "the renderer was just raised to capture.",
+        )
 
 
 if __name__ == "__main__":

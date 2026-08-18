@@ -116,10 +116,14 @@ MAX_CONCURRENT_RENDERS = int(os.environ.get("MAX_CONCURRENT_RENDERS", "2"))
 # Hard cap on how many pages of ONE Canva design this service will ever
 # capture, regardless of how many the design actually has - a malformed or
 # deliberately huge public design must never be able to make one /render
-# call consume unbounded time/memory. 20 is comfortably above every real
-# brochure seen so far (confirmed directly: a real multi-building brochure
-# runs to single-digit pages) while still a firm ceiling.
-MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "20"))
+# call consume unbounded time/memory. Raised from 20 to 30: a real
+# production brochure (Risborough) had its contact info on page 29 of 29,
+# lost outright by the old cap - confirmed as a real truncation, not an
+# extraction failure. Must be kept in lockstep with the main app's own
+# independent _CANVA_MAX_PAGES_ACCEPTED (brochure_enrichment.py) - that
+# defense-in-depth cap truncates whatever this service returns, so raising
+# this one alone would silently keep losing page 29.
+MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "30"))
 # Settle time after each Next-page click, before that page's own
 # screenshot - shorter than the initial-load SETTLE_MS above since the
 # Canva app/design is already warm; still enough for that page's own
