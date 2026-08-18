@@ -5,7 +5,9 @@ Display-only helpers for the Review/Master pages. These never affect what
 gets written to the staging/master .xlsx files — only what's rendered.
 """
 
+import re
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -232,92 +234,110 @@ def label_column_config(df: pd.DataFrame) -> dict:
 def link_column_config(df: pd.DataFrame) -> dict:
     """column_config for st.dataframe/st.data_editor: renders every column in
     LINK_COLUMNS that's actually present in df as a clickable link showing a
-    short fixed label rather than the raw URL. Editing still works exactly as
+    short label rather than the raw URL. Editing still works exactly as
     before (LinkColumn behaves like a text input when edited) - this only
-    changes how a cell is displayed, not what's stored."""
-    return {
-        col: st.column_config.LinkColumn(
-            label=title_case_label(col), display_text=LINK_DISPLAY_TEXT.get(col, "Open link"),
-        )
-        for col in LINK_COLUMNS
-        if col in df.columns
-    }
+    changes how a cell is displayed, not what's stored.
+
+    brochure_link is the one exception: its own display_text is a regex
+    (see _DISPLAY_LABEL_CAPTURE_RE), not a fixed string, so it varies per
+    row - see with_brochure_link_display_labels's own docstring for why
+    and how. Every other LINK_COLUMNS entry (floorplan_link) keeps a
+    single fixed label for the whole column, unchanged."""
+    config = {}
+    for col in LINK_COLUMNS:
+        if col not in df.columns:
+            continue
+        display_text = _DISPLAY_LABEL_CAPTURE_RE if col == "brochure_link" else LINK_DISPLAY_TEXT.get(col, "Open link")
+        config[col] = st.column_config.LinkColumn(label=title_case_label(col), display_text=display_text)
+    return config
 
 
-# Synthetic column name for with_brochure_link_status/link_status_column_
-# config below - never a real ListingRow field, so it can never collide with
-# one, and restore_hidden_columns (see pages/3_Export.py) already drops any
-# column not present in its own original_df, which this deliberately never
-# is - no explicit strip-before-dataframe_to_listing_rows step needed there.
-BROCHURE_LINK_STATUS_COLUMN = "brochure_link_status"
+# brochure_link's own per-row display label, encoded as an extra query
+# parameter on the URL itself (see with_brochure_link_display_labels) -
+# never a separate column. st.column_config.LinkColumn's display_text
+# cannot vary per row from a fixed string or a value in a DIFFERENT
+# column, but it CAN be a regex capturing a piece of the URL's OWN text
+# (confirmed directly against the installed Streamlit 1.60.0, via a real
+# headless-browser render - not assumed: a genuine "?display_label=Open+
+# brochure"/"&display_label=Broken+link" query value renders as real text
+# with a real space, "+" and "%20" both correctly decoded by the
+# frontend). This regex is deliberately anchored to "display_label="
+# specifically (never a bare generic pattern) so it can never accidentally
+# capture text from utm_content/utlId or any other real query parameter
+# Canva's own share links already carry.
+_DISPLAY_LABEL_PARAM = "display_label"
+_DISPLAY_LABEL_CAPTURE_RE = r"[?&]display_label=([^&]+)"
+_DISPLAY_LABEL_STRIP_RE = re.compile(r"[?&]display_label=[^&]*")
 
 # Identical wording to the exported .xlsx (staging_writer.BROKEN_LINK_
 # DISPLAY_TEXT, imported above, never a separate literal) - the on-screen
 # grid and the downloaded file must always describe a confirmed-dead
 # brochure_link the same way, never two independently-drifting terms for
-# the same underlying brochure_link_broken fact. The "⚠️" prefix is purely
-# this page's OWN display convention (every other "needs attention" signal
-# already on this page uses it - see e.g. the document-issues caption), so
-# it's added here only, never folded into the shared .xlsx-facing constant,
-# which has no use for an emoji glyph.
-BROCHURE_LINK_BROKEN_LABEL = f"⚠️ {BROKEN_LINK_DISPLAY_TEXT}"
+# the same underlying brochure_link_broken fact.
+BROCHURE_LINK_WORKING_LABEL = LINK_DISPLAY_TEXT.get("brochure_link", "Open brochure")
+BROCHURE_LINK_BROKEN_LABEL = BROKEN_LINK_DISPLAY_TEXT
 
 
-def with_brochure_link_status(df: pd.DataFrame) -> pd.DataFrame:
+def _with_display_label(url, label: str) -> str:
+    """Appends `&display_label=<label>` (or `?display_label=<label>` if
+    `url` has no query string at all yet) - urllib.parse.quote_plus so a
+    space survives as the SAME "+" encoding confirmed to render correctly
+    (see _DISPLAY_LABEL_CAPTURE_RE's own comment), not raw/unescaped."""
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{_DISPLAY_LABEL_PARAM}={quote_plus(label)}"
+
+
+def with_brochure_link_display_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns a COPY of df with one extra, synthetic, display-only column -
-    BROCHURE_LINK_STATUS_COLUMN - inserted immediately after brochure_link
-    (or appended at the end if brochure_link isn't present in df for some
-    reason), showing BROCHURE_LINK_BROKEN_LABEL for a row whose brochure_
-    link_broken is confirmed True, blank for False/None/anything else.
-
-    Exists because st.column_config.LinkColumn cannot vary its own
-    display_text per row - confirmed directly against the installed
-    Streamlit's own LinkColumn docs: display_text is fixed once for the
-    whole column, or a regex capture group extracted from the URL itself,
-    never independent literal text keyed off a DIFFERENT column's value.
-    brochure_link itself is therefore left completely untouched by this -
-    always "Open brochure", always clickable, for every row, identical to
-    today - this new column is what actually carries the distinction,
-    mirroring staging_writer.write_rows_to_xlsx's own "Option A" choice
-    (see BROKEN_LINK_DISPLAY_TEXT's own comment there) of never touching
-    the real link, only ever changing what communicates its state.
+    Returns a COPY of df where every non-blank brochure_link value has a
+    display_label query parameter appended - BROCHURE_LINK_BROKEN_LABEL
+    for a row whose brochure_link_broken is confirmed True, BROCHURE_
+    LINK_WORKING_LABEL (today's existing default) for every other row,
+    UNCONDITIONALLY - never left blank/absent, even when brochure_link_
+    broken isn't a column in df at all. That unconditional part matters:
+    confirmed directly (real headless-browser render) that a URL with NO
+    display_label param at all falls back to showing the RAW URL, not a
+    blank cell or an error - a real regression from today's clean "Open
+    brochure" label if any row were ever left untransformed.
 
     A no-op (returns df completely UNCHANGED, not even a copy) when
-    brochure_link_broken isn't a column in df at all - same guard style as
-    link_column_config/wide_text_column_config's own "if col in df.columns"
-    checks, e.g. a caller that already narrowed to visible_columns(df)
-    before this runs (ALWAYS_HIDDEN_COLUMNS already strips brochure_link_
-    broken - see that list's own comment), so callers must run this BEFORE
-    visible_columns, not after (visible_columns itself never strips this
-    new synthetic column - it isn't in ALWAYS_HIDDEN_COLUMNS - so it
-    survives that narrowing intact once added).
+    brochure_link isn't a column in df at all - nothing to transform.
+
+    Never touches the real, persisted brochure_link value - this is a
+    display-only transformation of a COPY, exactly like the with_
+    brochure_link_status helper this replaces. The one caller that also
+    WRITES its own edited grid back out (pages/3_Export.py, via st.
+    data_editor) must call strip_display_label on brochure_link before
+    ever reaching dataframe_to_listing_rows - unlike the old synthetic-
+    column approach, this transformation now lives INSIDE the real
+    brochure_link column's own value, so it does not get dropped
+    automatically the way a synthetic extra column did.
     """
-    if "brochure_link_broken" not in df.columns:
+    if "brochure_link" not in df.columns:
         return df
     df = df.copy()
-    status = df["brochure_link_broken"].apply(lambda broken: BROCHURE_LINK_BROKEN_LABEL if broken is True else "")
-    if "brochure_link" in df.columns:
-        df.insert(df.columns.get_loc("brochure_link") + 1, BROCHURE_LINK_STATUS_COLUMN, status)
-    else:
-        df[BROCHURE_LINK_STATUS_COLUMN] = status
+    broken = df["brochure_link_broken"] if "brochure_link_broken" in df.columns else pd.Series(False, index=df.index)
+
+    def _label_for(url, is_broken):
+        if not url:
+            return url
+        return _with_display_label(url, BROCHURE_LINK_BROKEN_LABEL if is_broken is True else BROCHURE_LINK_WORKING_LABEL)
+
+    df["brochure_link"] = [_label_for(url, is_broken) for url, is_broken in zip(df["brochure_link"], broken)]
     return df
 
 
-def link_status_column_config(df: pd.DataFrame) -> dict:
-    """column_config for the synthetic BROCHURE_LINK_STATUS_COLUMN added by
-    with_brochure_link_status - disabled=True (read-only) even inside an
-    editable st.data_editor grid (see pages/3_Export.py), since this column
-    is always a computed display artifact, never real row data a reviewer
-    edits. A no-op dict (same "if col in df.columns" guard as link_column_
-    config) when that column was never added to this particular df."""
-    if BROCHURE_LINK_STATUS_COLUMN not in df.columns:
-        return {}
-    return {
-        BROCHURE_LINK_STATUS_COLUMN: st.column_config.TextColumn(
-            label="Brochure Link Status", disabled=True, width="small",
-        ),
-    }
+def strip_display_label(url):
+    """Reverses _with_display_label - removes exactly the display_label
+    query parameter with_brochure_link_display_labels added (wherever it
+    sits, "?"- or "&"-prefixed), leaving everything else about `url`
+    untouched. Safe to call on a value that never had one at all (a no-op)
+    or on a genuinely reviewer-edited value (only ever strips OUR OWN
+    marker, never touches a real edit to any other part of the URL).
+    Blank/None passes through unchanged."""
+    if not url:
+        return url
+    return _DISPLAY_LABEL_STRIP_RE.sub("", url, count=1)
 
 
 def wide_text_column_config(df: pd.DataFrame) -> dict:

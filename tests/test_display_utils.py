@@ -9,6 +9,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_display_utils -v
 """
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -131,106 +132,132 @@ class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
         self.assertIn("building", display_utils.visible_columns(df))
 
 
-class WithBrochureLinkStatusTests(unittest.TestCase):
+class WithBrochureLinkDisplayLabelsTests(unittest.TestCase):
     """
-    with_brochure_link_status - the on-screen-grid equivalent of staging_
-    writer.write_rows_to_xlsx's own "Broken link" label swap, needed
-    because st.column_config.LinkColumn can't vary display_text per row
-    (confirmed against the installed Streamlit's own docs, not assumed -
-    see that function's own docstring). brochure_link itself must never be
-    touched by this - only the new synthetic column carries the signal.
+    with_brochure_link_display_labels - encodes brochure_link's own
+    per-row display label AS the URL's own display_label query parameter,
+    since st.column_config.LinkColumn can't vary display_text per row
+    from a fixed string or a different column's value, but CAN from a
+    regex capturing a piece of the URL's own text (confirmed directly
+    against the installed Streamlit 1.60.0 via a real headless-browser
+    render - not assumed; see link_column_config's own comment).
     """
 
-    def test_confirmed_broken_row_gets_the_label(self):
+    def test_confirmed_broken_row_gets_the_broken_label(self):
         df = pd.DataFrame([{"brochure_link": "https://example.com/dead.pdf", "brochure_link_broken": True}])
-        result = display_utils.with_brochure_link_status(df)
-        self.assertEqual(result[display_utils.BROCHURE_LINK_STATUS_COLUMN].iloc[0], "⚠️ Broken link")
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Broken+link", result["brochure_link"].iloc[0])
 
-    def test_working_link_gets_a_blank_status(self):
+    def test_working_link_gets_the_default_open_label(self):
         df = pd.DataFrame([{"brochure_link": "https://example.com/fine.pdf", "brochure_link_broken": False}])
-        result = display_utils.with_brochure_link_status(df)
-        self.assertEqual(result[display_utils.BROCHURE_LINK_STATUS_COLUMN].iloc[0], "")
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Open+brochure", result["brochure_link"].iloc[0])
 
-    def test_never_rechecked_link_gets_a_blank_status(self):
+    def test_never_rechecked_link_gets_the_default_open_label(self):
         df = pd.DataFrame([{"brochure_link": "https://example.com/unknown.pdf", "brochure_link_broken": None}])
-        result = display_utils.with_brochure_link_status(df)
-        self.assertEqual(result[display_utils.BROCHURE_LINK_STATUS_COLUMN].iloc[0], "")
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Open+brochure", result["brochure_link"].iloc[0])
+
+    def test_absent_brochure_link_broken_column_still_gets_the_default_label(self):
+        # Confirmed directly (real headless-browser render): a URL with NO
+        # display_label param at all falls back to showing the raw URL,
+        # not a blank cell - a real regression from today's clean label if
+        # any row were ever left untransformed. Every non-blank brochure_
+        # link must ALWAYS get a label, even when brochure_link_broken
+        # isn't a column in df at all.
+        df = pd.DataFrame([{"building": "A", "brochure_link": "https://example.com/fine.pdf"}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Open+brochure", result["brochure_link"].iloc[0])
 
     def test_label_matches_the_exported_xlsx_wording_exactly(self):
-        # The whole point: the on-screen grid and the downloaded file must
-        # never describe the same brochure_link_broken fact two different
-        # ways - see BROCHURE_LINK_BROKEN_LABEL's own comment.
+        # The on-screen grid and the downloaded file must never describe
+        # the same brochure_link_broken fact two different ways.
         from staging_writer import BROKEN_LINK_DISPLAY_TEXT
-        self.assertIn(BROKEN_LINK_DISPLAY_TEXT, display_utils.BROCHURE_LINK_BROKEN_LABEL)
+        self.assertEqual(display_utils.BROCHURE_LINK_BROKEN_LABEL, BROKEN_LINK_DISPLAY_TEXT)
 
-    def test_new_column_is_inserted_immediately_after_brochure_link(self):
-        df = pd.DataFrame([{"building": "A", "brochure_link": "u", "floorplan_link": "f"}])
-        df["brochure_link_broken"] = True
-        result = display_utils.with_brochure_link_status(df)
-        columns = list(result.columns)
-        self.assertEqual(
-            columns.index(display_utils.BROCHURE_LINK_STATUS_COLUMN), columns.index("brochure_link") + 1,
-        )
+    def test_a_url_with_no_existing_query_string_uses_a_question_mark(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/design/x/view", "brochure_link_broken": None}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertTrue(result["brochure_link"].iloc[0].endswith("?display_label=Open+brochure"))
 
-    def test_absent_brochure_link_broken_is_a_complete_no_op(self):
-        df = pd.DataFrame([{"building": "A", "brochure_link": "u"}])
-        result = display_utils.with_brochure_link_status(df)
+    def test_a_url_with_an_existing_query_string_appends_with_ampersand(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/view?utm_content=x", "brochure_link_broken": None}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertTrue(result["brochure_link"].iloc[0].endswith("&display_label=Open+brochure"))
+
+    def test_blank_brochure_link_is_left_blank(self):
+        df = pd.DataFrame([{"brochure_link": None, "brochure_link_broken": True}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIsNone(result["brochure_link"].iloc[0])
+
+    def test_absent_brochure_link_column_is_a_complete_no_op(self):
+        df = pd.DataFrame([{"building": "A"}])
+        result = display_utils.with_brochure_link_display_labels(df)
         self.assertIs(result, df)
-        self.assertNotIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, result.columns)
-
-    def test_survives_visible_columns_narrowing(self):
-        # Callers must run this BEFORE visible_columns (see this function's
-        # own docstring) - confirms the synthetic column is never itself
-        # treated as an ALWAYS_HIDDEN_COLUMNS entry.
-        df = pd.DataFrame([{"building": "A", "brochure_link": "u", "brochure_link_broken": True}])
-        result = display_utils.with_brochure_link_status(df)
-        self.assertIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, display_utils.visible_columns(result))
 
     def test_original_dataframe_is_never_mutated(self):
-        df = pd.DataFrame([{"brochure_link": "u", "brochure_link_broken": True}])
-        display_utils.with_brochure_link_status(df)
-        self.assertNotIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, df.columns)
+        df = pd.DataFrame([{"brochure_link": "https://example.com/fine.pdf", "brochure_link_broken": False}])
+        display_utils.with_brochure_link_display_labels(df)
+        self.assertEqual(df["brochure_link"].iloc[0], "https://example.com/fine.pdf")
+
+    def test_regex_used_by_link_column_config_actually_captures_the_label(self):
+        # Proves the encode side and the LinkColumn regex side genuinely
+        # agree with each other, independent of the real browser check.
+        df = pd.DataFrame([{"brochure_link": "https://example.com/dead.pdf", "brochure_link_broken": True}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        match = re.search(display_utils._DISPLAY_LABEL_CAPTURE_RE, result["brochure_link"].iloc[0])
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "Broken+link")
 
 
-class LinkStatusColumnConfigTests(unittest.TestCase):
-    def test_config_present_when_column_present(self):
-        df = pd.DataFrame([{display_utils.BROCHURE_LINK_STATUS_COLUMN: "⚠️ Broken link"}])
-        config = display_utils.link_status_column_config(df)
-        self.assertIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, config)
-        self.assertTrue(config[display_utils.BROCHURE_LINK_STATUS_COLUMN]["disabled"])
+class StripDisplayLabelTests(unittest.TestCase):
+    """strip_display_label - reverses with_brochure_link_display_labels,
+    the step pages/3_Export.py must run before dataframe_to_listing_rows
+    (see that page's own comment) since this transformation now lives
+    inside the real brochure_link value, not a synthetic extra column."""
 
-    def test_no_op_when_column_absent(self):
-        df = pd.DataFrame([{"building": "A"}])
-        self.assertEqual(display_utils.link_status_column_config(df), {})
+    def test_strips_a_label_appended_with_ampersand(self):
+        url = "https://example.com/view?utm_content=x&display_label=Open+brochure"
+        self.assertEqual(display_utils.strip_display_label(url), "https://example.com/view?utm_content=x")
+
+    def test_strips_a_label_appended_with_question_mark(self):
+        url = "https://example.com/view?display_label=Open+brochure"
+        self.assertEqual(display_utils.strip_display_label(url), "https://example.com/view")
+
+    def test_round_trips_back_to_the_exact_original_url(self):
+        original = "https://www.canva.com/design/x/y/view?utm_content=x&utm_campaign=designshare"
+        labeled = display_utils._with_display_label(original, "Open brochure")
+        self.assertEqual(display_utils.strip_display_label(labeled), original)
+
+    def test_a_url_with_no_display_label_is_a_no_op(self):
+        url = "https://example.com/view?utm_content=x"
+        self.assertEqual(display_utils.strip_display_label(url), url)
+
+    def test_blank_passes_through_unchanged(self):
+        self.assertIsNone(display_utils.strip_display_label(None))
+        self.assertEqual(display_utils.strip_display_label(""), "")
+
+    def test_a_genuine_edit_to_a_different_part_of_the_url_is_preserved(self):
+        # Only OUR OWN marker is ever removed - a reviewer's real edit to
+        # anything else about the URL must survive untouched.
+        url = "https://example.com/view?utm_content=EDITED&display_label=Open+brochure"
+        self.assertEqual(display_utils.strip_display_label(url), "https://example.com/view?utm_content=EDITED")
 
 
-class RestoreHiddenColumnsDropsSyntheticStatusColumnTests(unittest.TestCase):
-    """
-    The Export page relies on restore_hidden_columns to drop with_brochure_
-    link_status's synthetic column automatically (it reindexes to original_
-    df's own columns - see that function's own docstring) rather than
-    needing its own explicit strip step before dataframe_to_listing_rows.
-    """
+class LinkColumnConfigBrochureLinkRegexTests(unittest.TestCase):
+    """link_column_config's own brochure_link special-case - a regex
+    display_text, never the old fixed string - while floorplan_link keeps
+    its existing fixed label completely unchanged."""
 
-    def test_synthetic_status_column_never_survives_restore(self):
-        # Mirrors the REAL pages/3_Export.py pipeline exactly: with_brochure_
-        # link_status runs first, then visible_columns narrows the frame
-        # actually handed to st.data_editor (excluding brochure_link_broken,
-        # per ALWAYS_HIDDEN_COLUMNS, but keeping the new synthetic column) -
-        # restore_hidden_columns only reindexes to original_df's own columns
-        # when something was ACTUALLY missing from edited_df to restore;
-        # skipping the visible_columns narrowing step (as an earlier,
-        # incorrect version of this test did) leaves brochure_link_broken
-        # still present in "edited_df", which short-circuits that reindex
-        # entirely and would wrongly report this as passing either way.
-        original_df = pd.DataFrame([{"brochure_link": "u", "brochure_link_broken": True}])
-        with_status = display_utils.with_brochure_link_status(original_df)
-        edited_df = with_status[display_utils.visible_columns(with_status)]
+    def test_brochure_link_gets_the_regex_not_a_fixed_string(self):
+        df = pd.DataFrame([{"brochure_link": "u"}])
+        config = display_utils.link_column_config(df)
+        self.assertEqual(config["brochure_link"]["type_config"]["display_text"], display_utils._DISPLAY_LABEL_CAPTURE_RE)
 
-        restored = display_utils.restore_hidden_columns(edited_df, original_df)
-
-        self.assertNotIn(display_utils.BROCHURE_LINK_STATUS_COLUMN, restored.columns)
-        self.assertEqual(list(restored.columns), list(original_df.columns))
+    def test_floorplan_link_keeps_its_existing_fixed_label(self):
+        df = pd.DataFrame([{"floorplan_link": "u"}])
+        config = display_utils.link_column_config(df)
+        self.assertEqual(config["floorplan_link"]["type_config"]["display_text"], "Open floor plan")
 
 
 if __name__ == "__main__":
