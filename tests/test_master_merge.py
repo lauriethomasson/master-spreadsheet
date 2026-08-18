@@ -1583,6 +1583,255 @@ class BuildMergePlanBrochureLinkBrokenTests(unittest.TestCase):
         self.assertIs(merged[0].brochure_link_broken, False)
 
 
+class IsBarePostcodeDistrictTests(unittest.TestCase):
+    def test_bare_district_is_recognized(self):
+        self.assertTrue(master_merge._is_bare_postcode_district("SE1"))
+        self.assertTrue(master_merge._is_bare_postcode_district("ec1v"))  # case-insensitive
+
+    def test_a_real_place_name_is_not_a_bare_district(self):
+        self.assertFalse(master_merge._is_bare_postcode_district("Borough"))
+        self.assertFalse(master_merge._is_bare_postcode_district("London Bridge"))
+
+    def test_a_full_postcode_is_not_bare(self):
+        self.assertFalse(master_merge._is_bare_postcode_district("SE1 8QH"))
+
+    def test_blank_is_not_bare(self):
+        self.assertFalse(master_merge._is_bare_postcode_district(None))
+        self.assertFalse(master_merge._is_bare_postcode_district(""))
+
+
+class OutwardCodeFromPostcodeTests(unittest.TestCase):
+    def test_full_postcode_extracts_the_outward_code(self):
+        self.assertEqual(master_merge._outward_code_from_postcode("SE1 8QH"), "SE1")
+
+    def test_bare_postcode_returns_itself_normalized(self):
+        self.assertEqual(master_merge._outward_code_from_postcode("se1"), "SE1")
+
+    def test_subdivision_letter_is_preserved_not_collapsed(self):
+        # Deliberately different from geocode.py's own _district_parts,
+        # which WOULD collapse "EC1V" to ("EC", "1") - see this function's
+        # own docstring for why that's wrong for naming specifically.
+        self.assertEqual(master_merge._outward_code_from_postcode("EC1V 9RT"), "EC1V")
+
+    def test_non_postcode_text_returns_none(self):
+        self.assertIsNone(master_merge._outward_code_from_postcode("Borough"))
+        self.assertIsNone(master_merge._outward_code_from_postcode(None))
+
+
+class BuildPostcodeSubmarketLookupTests(unittest.TestCase):
+    """
+    Takes build_merge_plan's own already-clean_value'd master_records
+    (plain dicts with real None, never a raw DataFrame) - see that
+    function's own docstring for why a raw master_df.to_dict() (float(
+    'nan') for a missing value, truthy in Python) would silently corrupt
+    this. test_a_raw_dataframe_nan_is_never_mistaken_for_a_confirmed_value
+    below exercises that exact real bug directly, not just via a plain
+    dict input.
+    """
+
+    def test_a_single_confirmed_row_populates_the_lookup(self):
+        lookup = master_merge.build_postcode_submarket_lookup(
+            [{"postcode": "SE1 9RT", "submarket": "Bankside"}],
+        )
+        self.assertEqual(lookup.get("SE1"), "Bankside")
+
+    def test_unanimous_agreement_across_several_rows_still_resolves(self):
+        lookup = master_merge.build_postcode_submarket_lookup([
+            {"postcode": "SE1 9RT", "submarket": "Bankside"},
+            {"postcode": "SE1 0AA", "submarket": "Bankside"},
+        ])
+        self.assertEqual(lookup.get("SE1"), "Bankside")
+
+    def test_genuine_disagreement_resolves_to_nothing_never_a_guess(self):
+        # The real SE1 case: South Bank, Borough, Bankside, and Waterloo
+        # are all genuinely correct for different SE1 buildings - picking
+        # any ONE of several already-observed real answers is still a
+        # guess, so this must stay unresolved, not pick a majority/latest.
+        lookup = master_merge.build_postcode_submarket_lookup([
+            {"postcode": "SE1 9RT", "submarket": "Bankside"},
+            {"postcode": "SE1 0AA", "submarket": "Borough"},
+        ])
+        self.assertNotIn("SE1", lookup)
+
+    def test_a_bare_postcode_submarket_is_never_itself_treated_as_confirmed(self):
+        lookup = master_merge.build_postcode_submarket_lookup(
+            [{"postcode": "SE1 9RT", "submarket": "SE1"}],
+        )
+        self.assertNotIn("SE1", lookup)
+
+    def test_a_row_with_no_postcode_never_contributes(self):
+        lookup = master_merge.build_postcode_submarket_lookup([{"submarket": "Bankside"}])
+        self.assertEqual(lookup, {})
+
+    def test_different_districts_never_interfere_with_each_other(self):
+        lookup = master_merge.build_postcode_submarket_lookup([
+            {"postcode": "SE1 9RT", "submarket": "Bankside"},
+            {"postcode": "EC1V 4PW", "submarket": "Clerkenwell"},
+        ])
+        self.assertEqual(lookup.get("SE1"), "Bankside")
+        self.assertEqual(lookup.get("EC1V"), "Clerkenwell")
+
+    def test_a_row_with_no_submarket_at_all_never_contributes(self):
+        # A real regression this guards against: a raw master_df.to_dict()
+        # record's missing submarket comes back as float('nan') - truthy
+        # in Python, so a naive `not submarket` check alone doesn't catch
+        # it, which would otherwise look like a SECOND, conflicting
+        # confirmed value for the same district and wrongly blank out a
+        # real one (see this function's own docstring). None (what a
+        # properly clean_value'd record actually holds) must be excluded
+        # just as cleanly as an empty string.
+        lookup = master_merge.build_postcode_submarket_lookup([
+            {"postcode": "SE1 9RT", "submarket": "Bankside"},
+            {"postcode": "SE1 0AA", "submarket": None},
+        ])
+        self.assertEqual(lookup.get("SE1"), "Bankside")
+
+
+class BackfillPostcodeSubmarketsTests(unittest.TestCase):
+    """
+    backfill_postcode_submarkets - the SEPARATE, explicit retroactive
+    action (see its own docstring for why this is never bundled into
+    every ordinary approve the way the forward-only fresh-row correction
+    in build_merge_plan is).
+    """
+
+    def test_a_bare_row_is_corrected_when_a_confirmed_name_exists_elsewhere(self):
+        records = [
+            {"building": "A", "postcode": "SE1 0AA", "submarket": "Bankside"},
+            {"building": "B", "postcode": "SE1 9RT", "submarket": "SE1"},
+        ]
+        updated, changes = master_merge.backfill_postcode_submarkets(records)
+        self.assertEqual(updated[1]["submarket"], "Bankside")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["old_submarket"], "SE1")
+        self.assertEqual(changes[0]["new_submarket"], "Bankside")
+        self.assertEqual(changes[0]["building"], "B")
+
+    def test_original_records_list_is_never_mutated(self):
+        records = [
+            {"building": "A", "postcode": "SE1 0AA", "submarket": "Bankside"},
+            {"building": "B", "postcode": "SE1 9RT", "submarket": "SE1"},
+        ]
+        master_merge.backfill_postcode_submarkets(records)
+        self.assertEqual(records[1]["submarket"], "SE1")  # untouched
+
+    def test_no_confirmed_name_leaves_the_row_completely_unchanged(self):
+        records = [{"building": "B", "postcode": "SE1 9RT", "submarket": "SE1"}]
+        updated, changes = master_merge.backfill_postcode_submarkets(records)
+        self.assertEqual(updated, records)
+        self.assertEqual(changes, [])
+
+    def test_a_genuine_place_name_is_never_touched_or_reported_as_a_change(self):
+        records = [
+            {"building": "A", "postcode": "SE1 0AA", "submarket": "Bankside"},
+            {"building": "B", "postcode": "SE1 9RT", "submarket": "Borough"},
+        ]
+        updated, changes = master_merge.backfill_postcode_submarkets(records)
+        self.assertEqual(updated, records)
+        self.assertEqual(changes, [])
+
+    def test_disagreement_across_master_leaves_every_bare_row_unchanged(self):
+        records = [
+            {"building": "A", "postcode": "SE1 0AA", "submarket": "Bankside"},
+            {"building": "B", "postcode": "SE1 1AA", "submarket": "Borough"},
+            {"building": "C", "postcode": "SE1 9RT", "submarket": "SE1"},
+        ]
+        updated, changes = master_merge.backfill_postcode_submarkets(records)
+        self.assertEqual(updated[2]["submarket"], "SE1")
+        self.assertEqual(changes, [])
+
+
+class BuildMergePlanPostcodeSubmarketTests(unittest.TestCase):
+    """
+    A fresh row's bare-postcode submarket ("SE1") is replaced with the one
+    real name already confirmed elsewhere in master for that exact
+    district - see build_postcode_submarket_lookup's own docstring for the
+    full "never a guess" contract. Applied to new_row itself (not just a
+    local dict) specifically so it reaches an UNMATCHED/brand-new-property
+    row too, not only a matched row's diff.
+    """
+
+    def test_matched_row_gets_a_normal_reviewable_diff_not_a_silent_update(self):
+        # old_rec's own submarket is blank (never yet resolved) while a
+        # DIFFERENT confirmed row supplies the real name - the correction
+        # must show up as a normal, reviewable "submarket changed" diff,
+        # never routed into silent_updates the way brochure_link_broken
+        # (pure diagnostics) is.
+        master_df = _master_df([
+            {"building": "Confirmed Elsewhere", "postcode": "SE1 0AA", "submarket": "Bankside"},
+            {"building": "Existing Building", "postcode": "SE1 9RT", "submarket": None},
+        ])
+        new_row = ListingRow(building="Existing Building", postcode="SE1 9RT", submarket="SE1")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = next(m for m in (plan.matched_changed + plan.matched_unchanged) if m.new_row.building == "Existing Building")
+        self.assertEqual(matched.diffs.get("submarket"), (None, "Bankside"))
+        self.assertNotIn("submarket", matched.silent_updates)
+
+    def test_correction_is_sourced_from_a_different_row_than_the_one_it_matches(self):
+        # The confirmed name doesn't have to come from the SAME building
+        # this row matches - any confirmed row sharing the same postcode
+        # district counts, per the lookup's own docstring.
+        master_df = _master_df([
+            {"building": "Confirmed Elsewhere", "postcode": "SE1 0AA", "submarket": "Borough"},
+            {"building": "Existing Building", "postcode": "SE1 9RT", "submarket": None},
+        ])
+        new_row = ListingRow(building="Existing Building", postcode="SE1 9RT", submarket="SE1")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.diffs.get("submarket"), (None, "Borough"))
+
+    def test_unmatched_brand_new_property_also_gets_corrected(self):
+        # The real bug this guards against: correcting only a local dict
+        # used for diffing would leave an UNMATCHED row's own new_row
+        # object (what actually becomes the new master entry) untouched.
+        master_df = _master_df([
+            {"building": "Unrelated Building", "postcode": "SE1 9RT", "submarket": "Bankside"},
+        ])
+        new_row = ListingRow(building="Brand New Building", postcode="SE1 0AA", submarket="SE1")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(plan.unmatched[0].new_row.submarket, "Bankside")
+
+    def test_disagreement_leaves_the_bare_postcode_completely_unchanged(self):
+        master_df = _master_df([
+            {"building": "A", "postcode": "SE1 9RT", "submarket": "Bankside"},
+            {"building": "B", "postcode": "SE1 0AA", "submarket": "Borough"},
+            {"building": "Existing Building", "postcode": "SE1 1AA", "submarket": "SE1"},
+        ])
+        new_row = ListingRow(building="Existing Building", postcode="SE1 1AA", submarket="SE1")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("submarket", matched.diffs)  # unchanged: still "SE1" on both sides
+
+    def test_no_confirmed_mapping_at_all_leaves_the_bare_postcode_unchanged(self):
+        master_df = _master_df([{"building": "Existing Building", "postcode": "SE1 9RT", "submarket": "SE1"}])
+        new_row = ListingRow(building="Existing Building", postcode="SE1 9RT", submarket="SE1")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("submarket", matched.diffs)
+
+    def test_a_genuine_place_name_submarket_is_never_touched(self):
+        master_df = _master_df([
+            {"building": "Existing Building", "postcode": "SE1 9RT", "submarket": "Bankside"},
+        ])
+        new_row = ListingRow(building="Existing Building", postcode="SE1 9RT", submarket="Shoreditch")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.diffs.get("submarket"), ("Bankside", "Shoreditch"))
+
+
 class ItemsSimilarTests(unittest.TestCase):
     """_items_similar's exact-match short-circuit - a short, abbreviation/
     number-heavy item (every token <= 2 chars) must still be recognized as

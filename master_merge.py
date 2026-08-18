@@ -1647,6 +1647,144 @@ def consolidate_unmatched_duplicates(plan: MergePlan) -> MergePlan:
     )
 
 
+# A bare UK postcode outward code and nothing else - area letters, district
+# digits, an optional finer-subdivision letter (e.g. "SE1", "EC2", "W1S") -
+# used both to recognize a submarket value that's really just a postcode
+# district (never a genuine place name, which never matches this short
+# letter+digit[+letter] shape) and to pull the identical exact code out of a
+# row's own postcode field. Deliberately self-contained here rather than
+# imported from geocode.py's own _is_bare_postcode_district/_district_parts
+# (which answer a related but different question, see _outward_code_from_
+# postcode's own docstring for why) - geocode.py already imports normalize_
+# key FROM this module, so importing the other way would create a circular
+# import between the two.
+_OUTWARD_CODE_RE = re.compile(r"^([A-Za-z]{1,2}\d{1,2}[A-Za-z]?)$")
+
+
+def _is_bare_postcode_district(value) -> bool:
+    """True only when `value`, once trimmed, IS a bare UK postcode outward
+    code (e.g. "SE1", "EC1V") and nothing else - false for a genuine place
+    name ("Borough", "Shoreditch"), which never matches this shape, and
+    false for a full postcode ("SE1 8QH", with its own inward code)."""
+    if not value or not isinstance(value, str):
+        return False
+    return bool(_OUTWARD_CODE_RE.match(value.strip().upper()))
+
+
+def _outward_code_from_postcode(postcode):
+    """
+    The exact, letter-preserving UK postcode outward code from a full or
+    bare postcode string ("SE1 8QH" or "SE1" -> "SE1"; "EC1V 9RT" or
+    "EC1V" -> "EC1V") - or None when `postcode` doesn't structurally look
+    like a UK postcode at all.
+
+    Deliberately NEVER collapses the optional subdivision letter the way
+    geocode.py's own _district_parts does ("EC1A"/"EC1V"/"EC1" all treated
+    as the same district there) - that collapsing is correct for THAT
+    function's own purpose (rejecting a geocoding candidate in an
+    obviously wrong area, where over-matching is the only real risk), but
+    wrong for naming a submarket: a subdivision letter can mark a
+    genuinely different named area, and collapsing it away here would risk
+    exactly the kind of cross-area conflation this feature exists to
+    avoid (see build_postcode_submarket_lookup's own docstring - SE1
+    itself, which has no subdivision letter at all, is the sharpest real
+    example of this exact ambiguity already existing at the finest grain
+    UK postcodes offer).
+    """
+    if not postcode or not isinstance(postcode, str):
+        return None
+    match = re.match(r"^([A-Za-z]{1,2}\d{1,2}[A-Za-z]?)(?:\s*\d[A-Za-z]{2})?$", postcode.strip().upper())
+    return match.group(1) if match else None
+
+
+def build_postcode_submarket_lookup(master_records: list) -> dict:
+    """
+    Maps a bare UK postcode outward code (e.g. "SE1", "EC1V") to the one
+    real, named submarket value already confirmed for it elsewhere in
+    master - built ENTIRELY from existing master rows that already have
+    both a real postcode and a genuinely useful (non-blank, non-bare-
+    postcode-itself) submarket. Never a guess: an outward code with two or
+    more confirmed rows that disagree on the name (a real, expected case -
+    SE1 alone genuinely covers South Bank, Borough, Bankside, and
+    Waterloo) maps to nothing here rather than picking one - "no confident
+    answer yet" is never treated as license to guess among several
+    already-observed real answers, the same zero-fabrication standard
+    applied to why this doesn't ask Gemini to guess either. An outward
+    code no confirmed row has ever stated at all is simply absent from the
+    returned dict - a "not yet known" gap that resolves itself the next
+    time any brochure in that district states its real name, never
+    something this function tries to fill in.
+
+    Takes build_merge_plan's own ALREADY-clean_value'd master_records
+    (never a raw master_df.to_dict()) - deliberately, not just for reuse:
+    a missing submarket/postcode on a raw DataFrame record comes back as
+    float('nan'), which is truthy in Python and NOT caught by a plain
+    `not submarket` check, so an unrelated row with no submarket at all
+    would otherwise silently count as a second, conflicting "confirmed"
+    value for its own postcode district - a real bug caught directly by
+    this function's own test suite, not a hypothetical. clean_value
+    already normalizes NaN to real None for exactly this reason.
+
+    Sourced from each record's own `postcode` field only (never address_1/
+    building free-text parsing, unlike geocode.py's own broader location-
+    hint fallbacks) - keeps this feature's own definition of "confirmed"
+    narrow and simple: a row's OWN stated postcode, nothing inferred.
+    """
+    confirmed_names_by_code = {}
+    for rec in master_records:
+        submarket = rec.get("submarket")
+        if not submarket or _is_bare_postcode_district(submarket):
+            continue
+        outward_code = _outward_code_from_postcode(rec.get("postcode"))
+        if not outward_code:
+            continue
+        confirmed_names_by_code.setdefault(outward_code, set()).add(submarket)
+    return {code: next(iter(names)) for code, names in confirmed_names_by_code.items() if len(names) == 1}
+
+
+def backfill_postcode_submarkets(master_records: list) -> tuple:
+    """
+    A SEPARATE, EXPLICIT action - deliberately never run automatically as
+    part of build_merge_plan/every approve, unlike the fresh-row
+    correction there. Re-scans EVERY existing row in `master_records`
+    whose own submarket is still a bare postcode district and fills it in
+    wherever build_postcode_submarket_lookup (built from this SAME
+    snapshot) already has a confirmed name for that exact district - the
+    same "never a guess, disagreement resolves to nothing" contract as
+    the fresh-row path, applied retroactively instead of only going
+    forward.
+
+    Deliberately not automatic: silently rewriting existing master rows
+    on every ordinary approve - unrelated to whatever that approve was
+    actually about - is a much bigger, less reviewable blast radius than
+    fixing only the rows a human just chose to re-check. A caller (e.g. a
+    "Fix known bare postcodes" button on the Review & Master page, or a
+    one-off script) is expected to show `changes` to a reviewer before
+    actually writing `updated_records` to master, the same way every
+    other write to master in this app is reviewable rather than silent.
+
+    Returns (updated_records, changes) - a NEW list (master_records
+    itself is never mutated) plus [{"property_id", "building", "postcode",
+    "old_submarket", "new_submarket"}, ...] for every row actually
+    corrected, in master_records' own order.
+    """
+    lookup = build_postcode_submarket_lookup(master_records)
+    updated_records = []
+    changes = []
+    for rec in master_records:
+        submarket = rec.get("submarket")
+        confirmed = lookup.get(submarket.strip().upper()) if submarket and _is_bare_postcode_district(submarket) else None
+        if confirmed:
+            updated_records.append({**rec, "submarket": confirmed})
+            changes.append({
+                "property_id": rec.get("property_id"), "building": rec.get("building"),
+                "postcode": rec.get("postcode"), "old_submarket": submarket, "new_submarket": confirmed,
+            })
+        else:
+            updated_records.append(rec)
+    return updated_records, changes
+
+
 def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
     master_records = [
         {key: clean_value(value) for key, value in rec.items()}
@@ -1666,9 +1804,28 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
         fallback_index.setdefault(_fallback_key(rec), []).append(i)
         fuzzy_anchor_index.setdefault(_fuzzy_anchor_key(rec), []).append(i)
 
+    postcode_submarket_lookup = build_postcode_submarket_lookup(master_records)
+
     matched_changed, matched_unchanged, unmatched = [], [], []
 
     for new_row in new_rows:
+        # Deterministic postcode-district -> submarket correction, BEFORE
+        # matching/diffing - see build_postcode_submarket_lookup's own
+        # docstring for the full "never a guess" contract. Applied to
+        # new_row itself (a fresh model_copy, never mutated in place -
+        # ListingRow is frozen-by-convention elsewhere in this codebase),
+        # not just a local dict, so this reaches BOTH downstream paths
+        # equally: a MATCHED row's diff (built from new_dict below) and an
+        # UNMATCHED row's own eventual master entry (built directly from
+        # new_row.model_dump() elsewhere - see UnmatchedRow's own call
+        # sites) - a fix that only touched a local dict here would silently
+        # never reach the unmatched/brand-new-property path at all.
+        submarket = new_row.submarket
+        if submarket and _is_bare_postcode_district(submarket):
+            confirmed_submarket = postcode_submarket_lookup.get(submarket.strip().upper())
+            if confirmed_submarket:
+                new_row = new_row.model_copy(update={"submarket": confirmed_submarket})
+
         new_dict = new_row.model_dump()
         master_idx, tier = None, None
 
