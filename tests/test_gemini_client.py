@@ -150,5 +150,77 @@ class CallGeminiTests(unittest.TestCase):
             gemini_client.call_gemini(self.client, "prompt", [])
 
 
+class TransientServerErrorRetryTests(unittest.TestCase):
+    """
+    _generate_content_with_retry - confirmed real production evidence,
+    three separate times, of a transient Gemini 503 ("Deadline expired
+    before operation could complete.") on an otherwise perfectly healthy
+    call (see that function's own docstring, and _GEMINI_TRANSIENT_
+    STATUS_CODES' for the specific incident this traces to: design
+    DAHENodGhUU, "The Timber Yard" Unit 13, whose Canva render succeeded
+    fully but whose very next Gemini extraction call failed this way one
+    second later, leaving the row silently unenriched).
+    """
+
+    def setUp(self):
+        self.client = MagicMock()
+        self.sleep_patcher = patch("gemini_client.time.sleep")
+        self.mock_sleep = self.sleep_patcher.start()
+        self.addCleanup(self.sleep_patcher.stop)
+
+    def test_a_single_503_is_retried_once_and_then_succeeds(self):
+        error = genai_errors.ServerError(503, {"error": {"message": "Deadline expired"}})
+        self.client.models.generate_content.side_effect = [error, _response('{"a": 1}')]
+
+        result = gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertEqual(result, {"a": 1})
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+        self.mock_sleep.assert_called_once_with(gemini_client._GEMINI_RETRY_BACKOFF_SECONDS)
+
+    def test_persistent_503s_exhaust_the_retry_and_raise(self):
+        error = genai_errors.ServerError(503, {"error": {"message": "Deadline expired"}})
+        self.client.models.generate_content.side_effect = [error, error]
+
+        with self.assertRaises(genai_errors.ServerError):
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertEqual(self.client.models.generate_content.call_count, gemini_client._GEMINI_TRANSIENT_MAX_ATTEMPTS)
+
+    def test_a_non_503_server_error_is_never_retried(self):
+        # A genuine bad-request/parsing-shaped failure must still fail
+        # immediately, exactly as before this retry existed - only the
+        # specific, confirmed transient-outage signature (503) is retried.
+        error = genai_errors.ServerError(500, {"error": {"message": "internal error"}})
+        self.client.models.generate_content.side_effect = error
+
+        with self.assertRaises(genai_errors.ServerError):
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.client.models.generate_content.assert_called_once()
+        self.mock_sleep.assert_not_called()
+
+    def test_a_healthy_first_call_never_sleeps_or_retries(self):
+        self.client.models.generate_content.return_value = _response('{"a": 1}')
+
+        result = gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertEqual(result, {"a": 1})
+        self.client.models.generate_content.assert_called_once()
+        self.mock_sleep.assert_not_called()
+
+    def test_quota_exceeded_429_still_works_through_the_retry_wrapper(self):
+        # ClientError (4xx) must pass through this wrapper completely
+        # untouched - call_gemini's own existing except clause is what
+        # turns a 429 into QuotaExceededError, unaffected by this retry.
+        error = genai_errors.ClientError(429, {"error": {"message": "quota"}})
+        self.client.models.generate_content.side_effect = error
+
+        with self.assertRaises(gemini_client.QuotaExceededError):
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.mock_sleep.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

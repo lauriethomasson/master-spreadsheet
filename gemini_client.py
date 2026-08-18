@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -75,16 +76,73 @@ def _is_truncated(response) -> bool:
     return candidates[0].finish_reason == types.FinishReason.MAX_TOKENS
 
 
+# Confirmed real production evidence, three separate times: a genuine 503
+# ("Deadline expired before operation could complete.") from Gemini's own
+# backend, on an otherwise perfectly healthy call - a real Canva render
+# that had just succeeded (7/7 pages) had its very next step, the Gemini
+# extraction call, fail this way one second later, leaving that row with
+# no enrichment data and no error surfaced anywhere a reviewer would see
+# (design DAHENodGhUU, "The Timber Yard" Unit 13 - see brochure_
+# enrichment.py's own STATUS_EXTRACTION_FAILED handling for why a failure
+# here doesn't get flagged the same way a confirmed-dead link does). Two
+# earlier occurrences (Colonial Building, Uncommon Liverpool St) and a
+# fourth from an unrelated concurrency benchmark are the same signature -
+# never a sign the DOCUMENT/URL itself is bad, unlike a genuine bad-
+# request or parsing error, which must still fail immediately exactly as
+# before. Scoped to 503 specifically (not blanket 5xx) - the one status
+# actually confirmed, mirroring how brochure_enrichment.py's own
+# _CANVA_RENDERER_TRANSIENT_STATUS_CODES is scoped to the specific codes
+# actually observed rather than guessing at every plausible one.
+_GEMINI_TRANSIENT_STATUS_CODES = (503,)
+_GEMINI_TRANSIENT_MAX_ATTEMPTS = 2
+_GEMINI_RETRY_BACKOFF_SECONDS = 2
+
+
+def _generate_content_with_retry(client: genai.Client, contents: list, config):
+    """
+    client.models.generate_content, retried a small, bounded number of
+    times (_GEMINI_TRANSIENT_MAX_ATTEMPTS) with a short fixed backoff on a
+    transient Gemini-side 503 (see _GEMINI_TRANSIENT_STATUS_CODES' own
+    docstring for the real production evidence this covers) - mirrors
+    brochure_enrichment._fetch_canva_rendered_page's own transient-retry
+    loop for the Canva renderer's 502/503s, the same "small, bounded
+    retry with a short fixed backoff, logged so a future trace shows it
+    happening" shape.
+
+    A non-503 ServerError (or a 503 on the final attempt) is re-raised
+    unchanged - never swallowed, and never retried further. genai_errors.
+    ClientError (4xx, including the 429/quota case) is left completely
+    untouched by this function - it propagates straight through to call_
+    gemini's own existing except clause exactly as before this retry
+    existed, since a bad request/quota error is never transient and
+    retrying it would just waste time before the same, certain failure.
+
+    No trailing return/raise after this loop - every one of its
+    iterations either returns (a successful call) or raises (the final
+    attempt, or a non-transient status), by construction, so control can
+    never actually fall off the end.
+    """
+    for attempt in range(1, _GEMINI_TRANSIENT_MAX_ATTEMPTS + 1):
+        try:
+            return client.models.generate_content(model=MODEL_NAME, contents=contents, config=config)
+        except genai_errors.ServerError as e:
+            if e.code not in _GEMINI_TRANSIENT_STATUS_CODES or attempt == _GEMINI_TRANSIENT_MAX_ATTEMPTS:
+                raise
+            print(
+                f"[gemini_client] Gemini returned a transient HTTP {e.code} on attempt "
+                f"{attempt}/{_GEMINI_TRANSIENT_MAX_ATTEMPTS} - retrying after "
+                f"{_GEMINI_RETRY_BACKOFF_SECONDS}s.",
+                file=sys.stderr,
+            )
+            time.sleep(_GEMINI_RETRY_BACKOFF_SECONDS)
+
+
 def call_gemini(client: genai.Client, prompt: str, parts: list) -> dict:
     current_prompt = prompt
     config = types.GenerateContentConfig(response_mime_type="application/json")
     for attempt in range(2):
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[current_prompt, *parts],
-                config=config,
-            )
+            response = _generate_content_with_retry(client, [current_prompt, *parts], config)
         except genai_errors.ClientError as e:
             if e.code == 429:
                 raise QuotaExceededError(
