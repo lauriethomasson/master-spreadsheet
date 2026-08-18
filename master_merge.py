@@ -452,9 +452,38 @@ def canonicalize_providers(rows: list[ListingRow]) -> None:
     (Gemini or spreadsheet) has produced a provider value, before that row
     is ever used for matching or diffing. Suffix-stripping runs first since
     it can turn an otherwise-unrecognized "X Availability" into the bare "X"
-    that KNOWN_PROVIDERS might then separately recognize."""
+    that KNOWN_PROVIDERS might then separately recognize.
+
+    internal_ref is kept in sync with this SAME correction, but only for a
+    row whose internal_ref already case-insensitively matched provider's
+    own value BEFORE this correction ran. internal_ref is documented (see
+    schema.ExtractedFields' own "internal_ref ... mirrors provider"
+    comment) to mirror provider - confirmed real bug this fixes: a PDF
+    upload's own Gemini extraction (extract.py's "internal_ref": raw.get(
+    "provider"), a verbatim copy at extraction time) produced internal_ref
+    ="business cube" while provider, corrected here to "Business Cube" via
+    KNOWN_PROVIDERS, left internal_ref stranded at the old lowercase text -
+    the two fields drifted apart despite representing the identical real
+    fact, purely because only one of them ever got corrected.
+
+    Deliberately NOT unconditional: extract_spreadsheet.py's own column-
+    alias mapping can populate internal_ref from a genuinely different,
+    provider-specific "External Ref" spreadsheet column (a real per-
+    listing reference code, nothing to do with the provider's own name) -
+    a row like that never case-insensitively matched provider in the
+    first place, so this leaves it completely untouched rather than
+    guessing that two already-different values were somehow meant to
+    become the same one.
+    """
     for row in rows:
-        row.provider = canonicalize_provider_name(_strip_provider_purpose_suffix(row.provider))
+        old_provider = row.provider
+        new_provider = canonicalize_provider_name(_strip_provider_purpose_suffix(old_provider))
+        if (
+            not _is_blank(row.internal_ref) and not _is_blank(old_provider)
+            and str(row.internal_ref).strip().lower() == str(old_provider).strip().lower()
+        ):
+            row.internal_ref = new_provider
+        row.provider = new_provider
 
 
 # Providers whose spreadsheet upload always represents that provider's ENTIRE

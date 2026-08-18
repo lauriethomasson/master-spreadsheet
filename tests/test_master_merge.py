@@ -1237,6 +1237,95 @@ class CanonicalizeProvidersTests(unittest.TestCase):
         self.assertEqual([r.provider for r in rows], ["Workplace Plus", "Workplace Plus", "Newco Realty", None])
 
 
+class CanonicalizeProvidersInternalRefSyncTests(unittest.TestCase):
+    """
+    Real confirmed bug: internal_ref is documented (schema.ExtractedFields'
+    own "internal_ref ... mirrors provider" comment) to mirror provider,
+    but canonicalize_providers only ever corrected row.provider - a real
+    "Business Cube.pdf" upload's own Gemini extraction (extract.py's
+    "internal_ref": raw.get("provider"), a verbatim copy at extraction
+    time) produced internal_ref="business cube" while provider got
+    corrected to "Business Cube" via KNOWN_PROVIDERS, leaving internal_ref
+    stranded at the old lowercase text despite representing the identical
+    real fact. "Business Cube" is a real KNOWN_PROVIDERS entry, so this
+    exercises the actual correction, not a synthetic stand-in.
+    """
+
+    def test_business_cube_lowercase_internal_ref_is_corrected_alongside_provider(self):
+        row = ListingRow(building="A", provider="business cube", internal_ref="business cube")
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertEqual(row.provider, "Business Cube")
+        self.assertEqual(row.internal_ref, "Business Cube")
+
+    def test_internal_ref_already_correctly_cased_is_unaffected(self):
+        row = ListingRow(building="A", provider="business cube", internal_ref="Business Cube")
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertEqual(row.internal_ref, "Business Cube")
+
+    def test_a_genuinely_different_internal_ref_is_never_touched(self):
+        # extract_spreadsheet.py's own "External Ref" column mapping - a
+        # real, provider-specific reference code with nothing to do with
+        # the provider's own name. Never case-insensitively matched
+        # provider in the first place, so this must be left completely
+        # alone rather than guessing the two were meant to become equal.
+        row = ListingRow(building="A", provider="business cube", internal_ref="REF-12345")
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertEqual(row.provider, "Business Cube")
+        self.assertEqual(row.internal_ref, "REF-12345")
+
+    def test_blank_internal_ref_is_never_forced_to_match_provider(self):
+        # fill_missing_provider (app.py) already owns filling a genuinely
+        # blank internal_ref from provider - canonicalize_providers must
+        # never duplicate or race that by inventing a value here.
+        row = ListingRow(building="A", provider="business cube", internal_ref=None)
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertIsNone(row.internal_ref)
+
+    def test_blank_provider_never_crashes_or_touches_internal_ref(self):
+        row = ListingRow(building="A", provider=None, internal_ref="Some Ref")
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertIsNone(row.provider)
+        self.assertEqual(row.internal_ref, "Some Ref")
+
+    def test_both_blank_is_a_complete_no_op(self):
+        row = ListingRow(building="A", provider=None, internal_ref=None)
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertIsNone(row.provider)
+        self.assertIsNone(row.internal_ref)
+
+    def test_suffix_stripped_provider_still_syncs_a_matching_internal_ref(self):
+        # internal_ref was copied from the RAW pre-strip provider text
+        # (e.g. extract_email.py's own "internal_ref": raw.get("provider"))
+        # - the case-insensitive match must compare against that SAME raw
+        # value, before either stage of correction, not the already-
+        # stripped/canonicalized one.
+        row = ListingRow(building="A", provider="Copthall Estates Availability", internal_ref="copthall estates availability")
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertEqual(row.provider, "Copthall Estates")
+        self.assertEqual(row.internal_ref, "Copthall Estates")
+
+    def test_mismatched_case_and_whitespace_still_counts_as_a_match(self):
+        row = ListingRow(building="A", provider="  business cube  ", internal_ref="BUSINESS CUBE")
+
+        master_merge.canonicalize_providers([row])
+
+        self.assertEqual(row.internal_ref, "Business Cube")
+
+
 class ProviderPurposeSuffixTests(unittest.TestCase):
     """Real reported bug: a single uploaded Copthall Estates workbook's
     per-sheet provider extraction (see extract_spreadsheet_gemini.PROMPT -
