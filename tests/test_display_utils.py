@@ -127,6 +127,12 @@ class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
         self.assertNotIn("source_file", visible)
         self.assertNotIn("property_id", visible)
 
+    def test_floorplan_link_is_never_shown_either(self):
+        # Purely a visibility change - the field/data/enrichment logic are
+        # all untouched, it just no longer appears as its own column.
+        df = pd.DataFrame([{"building": "A", "floorplan_link": "https://example.com/plan.pdf"}])
+        self.assertNotIn("floorplan_link", display_utils.visible_columns(df))
+
     def test_an_ordinary_column_is_unaffected(self):
         df = pd.DataFrame([{"building": "A", "brochure_link_broken": True}])
         self.assertIn("building", display_utils.visible_columns(df))

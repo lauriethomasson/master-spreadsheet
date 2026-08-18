@@ -74,8 +74,13 @@ DATA_ROW_HEIGHT = 60
 # into silent_updates, never the reviewable diff) - a raw True/False/blank
 # column would otherwise expose that internal bookkeeping directly next to
 # brochure_link, which is exactly what BROKEN_LINK_DISPLAY_TEXT's own label
-# swap is meant to communicate instead.
-HIDDEN_COLUMNS = ["source_file", "property_id", "brochure_link_broken"]
+# swap is meant to communicate instead. floorplan_link is a pure visibility
+# change, not a data/logic one - the field, its data, and its own
+# enrichment (FLOORPLAN_PROMPT etc. in brochure_enrichment.py) are all
+# completely untouched, still written into this file exactly as before and
+# still hyperlinked (see HYPERLINK_COLUMNS/LINK_DISPLAY_TEXT below, both
+# unaffected by this) - it just no longer shows as its own visible column.
+HIDDEN_COLUMNS = ["source_file", "property_id", "brochure_link_broken", "floorplan_link"]
 
 
 def title_case_label(field_name: str) -> str:

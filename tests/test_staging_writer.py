@@ -259,6 +259,22 @@ class BrokenBrochureLinkDisplayTests(unittest.TestCase):
         column_letter = ws.cell(row=1, column=col_idx).column_letter
         self.assertTrue(ws.column_dimensions[column_letter].hidden)
 
+    def test_floorplan_link_column_is_hidden_but_still_present_with_its_real_data(self):
+        # Purely a visibility change (see HIDDEN_COLUMNS' own comment) -
+        # the column is hidden in Excel, never dropped: still there with
+        # its real hyperlink/data, unhide-able, just not shown by default.
+        row = ListingRow(building="A", floorplan_link="https://example.com/plan.pdf")
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("floorplan_link")) + 1
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        self.assertTrue(ws.column_dimensions[column_letter].hidden)
+        self.assertEqual(ws.cell(row=2, column=col_idx).hyperlink.target, "https://example.com/plan.pdf")
+
 
 class LegacyColumnCompatibilityTests(unittest.TestCase):
     """Regression coverage for a real bug found while verifying this exact

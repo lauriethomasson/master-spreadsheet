@@ -199,10 +199,15 @@ RANGE_COLUMNS = [
 # docstring) - same reasoning as staging_writer.HIDDEN_COLUMNS, which hides it
 # from the exported file for the identical reason; kept as its own separate
 # list here since this one governs the on-screen review grid, not the .xlsx.
+# floorplan_link is a pure visibility change, not a data/logic one - the
+# field, its data, and its own enrichment (FLOORPLAN_PROMPT etc. in
+# brochure_enrichment.py) are all completely untouched; it's just no
+# longer shown as its own column here.
 ALWAYS_HIDDEN_COLUMNS = [
     "source_file",
     "property_id",
     "brochure_link_broken",
+    "floorplan_link",
 ]
 
 
