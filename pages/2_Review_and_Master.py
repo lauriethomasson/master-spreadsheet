@@ -1241,9 +1241,8 @@ def _render_single_file_discard(path: str, label: str = "Discard this upload") -
 
     if st.session_state.get(confirm_key):
         st.warning(
-            "Are you sure? This permanently discards ONLY this one staging entry — no changes will be "
-            "applied to master, and this cannot be undone (nothing was ever written to master.xlsx, so "
-            "there's no version to restore)."
+            "Are you sure? This can't be undone — but master isn't affected either way, since nothing "
+            "here was ever written to it."
         )
         # horizontal=True sizes each button to its own content instead of
         # stretching across equal-width st.columns - the same fix as "Undo
