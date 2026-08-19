@@ -161,7 +161,7 @@ class HiddenPortfolioSheetSkippedTests(unittest.TestCase):
 
         info_text = "".join(i.value for i in at.info)
         self.assertIn("Portfolio", info_text)
-        self.assertIn("hidden", info_text.lower())
+        self.assertIn("summary tab", info_text.lower())
 
         pending = list_pending_staging_files()
         self.assertEqual(len(pending), 1)

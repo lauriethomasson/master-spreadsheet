@@ -129,9 +129,8 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
         self.assertEqual(df.iloc[0]["size_sqft"], 1200)  # primary source untouched
 
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("Spreadsheet extracted — 1 row saved.", caption_text)
         self.assertIn(
-            "Now checking 1 brochure to fill in missing details — your data's already saved either way.",
+            "1 row saved — now checking 1 brochure for extra details, your data's safe either way.",
             caption_text,
         )
         # Fully singular case (1 row, 1 brochure, 1 read, 1 enriched, 0
@@ -262,7 +261,7 @@ class AutomaticEnrichmentOnExtractTests(unittest.TestCase):
 
         caption_text = "".join(c.value for c in at.caption)
         self.assertIn(
-            "Now checking 2 brochures to fill in missing details — your data's already saved either way.",
+            "2 rows saved — now checking 2 brochures for extra details, your data's safe either way.",
             caption_text,
         )
         self.assertIn("Done: 2 of 2 brochures read successfully, adding details to 2 rows.", caption_text)

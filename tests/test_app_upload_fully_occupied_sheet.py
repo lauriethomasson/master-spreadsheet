@@ -78,8 +78,8 @@ class FullyOccupiedSheetMessageTests(unittest.TestCase):
             self.assertFalse(at.exception)
 
         info_text = "".join(i.value for i in at.info)
-        self.assertIn("recognized a building, but nothing currently available", info_text)
-        self.assertNotIn("no listing data recognized", info_text)
+        self.assertIn("nothing available in this building right now", info_text)
+        self.assertNotIn("no listings found on this sheet", info_text)
 
     def test_no_recognizable_data_sheet_shows_original_message(self):
         xlsx = _build_xlsx([
@@ -102,8 +102,8 @@ class FullyOccupiedSheetMessageTests(unittest.TestCase):
             self.assertFalse(at.exception)
 
         info_text = "".join(i.value for i in at.info)
-        self.assertIn("no listing data recognized on this sheet", info_text)
-        self.assertNotIn("recognized a building, but nothing currently available", info_text)
+        self.assertIn("no listings found on this sheet", info_text)
+        self.assertNotIn("nothing available in this building right now", info_text)
 
 
 if __name__ == "__main__":

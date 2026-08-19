@@ -203,7 +203,7 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
 
 def _run_automatic_brochure_enrichment(
     rows: list[ListingRow], staging_path: str, already_processed: dict = None,
-    floorplan_already_processed: dict = None,
+    floorplan_already_processed: dict = None, row_count: int = None,
 ) -> list[ListingRow]:
     """
     Runs immediately after a FRESH spreadsheet upload's base rows are
@@ -225,8 +225,17 @@ def _run_automatic_brochure_enrichment(
     to resume) for the ordinary fresh-upload case, identical to every prior
     behavior before either parameter existed.
 
-    A no-op, with no UI at all, only when NEITHER brochure NOR floorplan
-    enrichment has anything eligible to do (see brochure_enrichment.
+    row_count, when given (the caller's freshly-extracted row count - never
+    passed for the "reused but incomplete" resume case below, since that
+    path never announced a row count of its own before this parameter
+    existed either), is folded into the caption this shows so the caller no
+    longer needs its OWN separate "N row(s) saved" caption alongside this
+    one - see this function's own caption logic below for the combined
+    wording, including the case where there's nothing left to check.
+
+    Has no UI at all beyond that combined "row(s) saved" caption (none, if
+    row_count isn't given) when NEITHER brochure NOR floorplan enrichment
+    has anything eligible to do (see brochure_enrichment.
     eligible_rows_and_brochures/eligible_rows_and_floorplans) - the common
     case for a provider whose spreadsheet already states everything
     ENRICHABLE_FIELDS covers, and the ONLY case that should ever feel
@@ -254,12 +263,21 @@ def _run_automatic_brochure_enrichment(
     eligible, unique_urls = brochure_enrichment.eligible_rows_and_brochures(rows)
     eligible_floorplans, unique_floorplan_urls = brochure_enrichment.eligible_rows_and_floorplans(rows)
     if not unique_urls and not unique_floorplan_urls:
+        if row_count is not None:
+            st.caption(f"{row_count} row{'s' if row_count != 1 else ''} saved.")
         return rows
 
-    st.caption(
-        f"Now checking {len(unique_urls)} brochure{'s' if len(unique_urls) != 1 else ''} to fill in missing "
-        "details — your data's already saved either way."
-    )
+    brochure_count = f"{len(unique_urls)} brochure{'s' if len(unique_urls) != 1 else ''}"
+    if row_count is not None:
+        st.caption(
+            f"{row_count} row{'s' if row_count != 1 else ''} saved — now checking "
+            f"{brochure_count} for extra details, your data's safe either way."
+        )
+    else:
+        st.caption(
+            f"Now checking {brochure_count} to fill in missing "
+            "details — your data's already saved either way."
+        )
     return brochure_enrichment.run_brochure_enrichment(
         rows, staging_path, already_processed=already_processed or {},
         floorplan_already_processed=floorplan_already_processed or {},
@@ -781,7 +799,7 @@ with page_setup.setup_page("upload"):
                                 # its sibling sheets' own genuinely current data.
                                 if classification["outcome"] == "auto_skip":
                                     st.info(
-                                        f"{sheet_label}: hidden, non-authoritative rollup sheet — skipped."
+                                        f"{sheet_label}: a summary tab, not original data — skipped."
                                     )
                                     sheet_rows = []
                                 elif classification["outcome"] == "ambiguous" and decision == SHEET_DECISION_SKIP:
@@ -796,11 +814,10 @@ with page_setup.setup_page("upload"):
                                         text = plan["text"]
                                         if extract_spreadsheet_gemini.sheet_shows_fully_occupied_building(text):
                                             st.info(
-                                                f"{sheet_label}: recognized a building, but nothing currently "
-                                                "available — skipped."
+                                                f"{sheet_label}: nothing available in this building right now — skipped."
                                             )
                                         else:
-                                            st.info(f"{sheet_label}: no listing data recognized on this sheet — skipped.")
+                                            st.info(f"{sheet_label}: no listings found on this sheet — skipped.")
                                     else:
                                         _warn_if_extraction_looks_garbled(sheet_rows, sheet_label)
                                         _warn_if_units_look_undercounted(sheet_rows, ws, sheet_label)
@@ -920,14 +937,14 @@ with page_setup.setup_page("upload"):
                         source_identity_hash=source_identity_hash,
                     )
 
-                    # Shown for every spreadsheet upload, whether or not
-                    # anything below turns out to be eligible for
-                    # enrichment - the point is confirming, immediately,
-                    # that the row count above is already real and saved,
-                    # before any further (potentially slow) step runs.
-                    if is_spreadsheet_source and not reused:
-                        row_count = len(rows)
-                        st.caption(f"Spreadsheet extracted — {row_count} row{'s' if row_count != 1 else ''} saved.")
+                    # Computed here (never for a "reused but incomplete"
+                    # resume, which never announced a row count of its own
+                    # either) so _run_automatic_brochure_enrichment below
+                    # can fold it into ITS OWN caption - confirming,
+                    # immediately, that the row count is already real and
+                    # saved, before any further (potentially slow) step
+                    # runs, without a second, separate caption alongside it.
+                    row_count = len(rows) if is_spreadsheet_source and not reused else None
 
                     # Automatic - for a fresh spreadsheet extraction always,
                     # and ALSO for a reused (byte-identical previous
@@ -951,6 +968,7 @@ with page_setup.setup_page("upload"):
                             rows = _run_automatic_brochure_enrichment(
                                 rows, staging_path, already_processed=resume_already_processed,
                                 floorplan_already_processed=resume_floorplan_already_processed,
+                                row_count=row_count,
                             )
                         except Exception as e:
                             st.warning(
