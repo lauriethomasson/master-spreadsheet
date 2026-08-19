@@ -193,6 +193,182 @@ def render_sheet_as_text(ws) -> str:
     return "\n".join(lines)
 
 
+# Rough character budget for a single batch (see _split_text_into_batches) -
+# deliberately conservative relative to Gemini's own 65,536-output-token
+# ceiling (see gemini_client.RETRY_MAX_OUTPUT_TOKENS): the real, confirmed
+# case this exists for (Workplace Plus's LONDON sheet, ~231 units, ~48,900
+# chars of rendered text) sometimes truncated even on that retry ceiling, so
+# this aims for several batches per large sheet rather than cutting it as
+# close to the edge as possible.
+_MAX_BATCH_CHARS = 12000
+
+_LINE_ROW_NUMBER_RE = re.compile(r"^Row (\d+):")
+
+
+def _split_text_into_batches(text: str, max_batch_chars: int = _MAX_BATCH_CHARS) -> list:
+    """
+    Splits `text` (render_sheet_as_text's own output) into the batches
+    _call_gemini_in_batches sends as separate Gemini calls - splitting
+    ONLY at a row-number gap (see render_sheet_as_text/PROMPT's own note:
+    a gap means fully-blank rows were skipped, and "a large gap often
+    separates one section from the next"), NEVER in the middle of a
+    contiguous run of consecutive row numbers.
+
+    That guarantee is what makes batching safe at all: a repeating-block
+    sheet's own building block (heading line + that building's own mini-
+    table, see PROMPT shape (b)) is, by construction, always one such
+    contiguous run - never split by a blank row in the middle of a real
+    provider file confirmed against (Workplace Plus's own LONDON sheet
+    included). So a batch boundary can never land inside a single
+    building's own block, which keeps a "blank cell inherits the building
+    named on the row above it" case (see PROMPT's own building field
+    instructions) entirely within the ONE batch containing that whole
+    block - Gemini is never asked to resolve an inherited value using
+    text it wasn't actually given.
+
+    Batches greedily fill up to max_batch_chars, only ever starting a new
+    one BETWEEN two runs, never inside one - a single run that alone
+    already exceeds max_batch_chars still becomes its own, oversized
+    batch rather than being split further (preserving the guarantee above
+    matters more than staying under budget). The real, honest limitation
+    this leaves: a sheet with no row-number gaps at all anywhere (PROMPT
+    shape (a) - one consistent table straight through, with every row
+    genuinely contiguous) has nowhere safe to split at all, and comes
+    back as a single batch no matter how large - this only ever helps a
+    genuinely block-structured (shape (b)) sheet.
+
+    Returns [text] unchanged - a single batch - whenever the whole text
+    already fits under max_batch_chars, which is every sheet this module
+    has ever handled until now: an ordinary sheet keeps making exactly
+    the one Gemini call it always has, with no behavior change at all.
+    """
+    if len(text) <= max_batch_chars:
+        return [text]
+
+    lines = text.splitlines()
+    runs = []
+    prev_row_num = None
+    for line in lines:
+        match = _LINE_ROW_NUMBER_RE.match(line)
+        row_num = int(match.group(1)) if match else None
+        continues_prev_run = (
+            runs and prev_row_num is not None and row_num is not None and row_num == prev_row_num + 1
+        )
+        if continues_prev_run:
+            runs[-1].append(line)
+        else:
+            runs.append([line])
+        prev_row_num = row_num
+
+    batches = []
+    current = []
+    for run in runs:
+        run_text = "\n".join(run)
+        candidate = current + [run_text]
+        if current and len("\n".join(candidate)) > max_batch_chars:
+            batches.append("\n".join(current))
+            current = [run_text]
+        else:
+            current = candidate
+    if current:
+        batches.append("\n".join(current))
+    return batches
+
+
+def _merge_batch_results(results: list) -> dict:
+    """
+    Merges N independent per-batch Gemini responses (see _call_gemini_
+    in_batches) back into the same {"provider", "contacts", "fully_
+    occupied_buildings", "units"} shape a single whole-sheet call already
+    returns, so extract_sheet_with_metadata's own post-processing (last_
+    building inheritance, _verify_address_house_numbers, the deterministic
+    brochure/floorplan-link recovery) runs completely unchanged on the
+    result regardless of how many actual calls produced it - every one of
+    those already operates on the FULL merged unit list plus the FULL
+    original sheet text (never a per-batch slice), so this is the only
+    place that needs to know batching happened at all.
+
+    provider: the first non-null value across batches, in order - a
+    cover/title section naming the provider typically appears in only ONE
+    batch (often, but not necessarily, the first), never something every
+    batch's own text independently restates, so this carries it forward
+    rather than requiring every batch to agree or waiting for a specific
+    one to answer.
+
+    contacts: every batch's own value (already ";"-joined, per PROMPT's
+    own convention) is split back into individual entries, deduplicated
+    by exact text while preserving first-seen order across batches, then
+    rejoined the same way - a named contact stated in one batch's own
+    section (e.g. one submarket's own agent, sitting in a different part
+    of the sheet from another) is never lost just because a DIFFERENT
+    batch's own text didn't restate them.
+
+    fully_occupied_buildings/units: straight concatenation, in batch
+    order - each batch's own list already names only the buildings/units
+    ITS OWN text actually contains, and batches never share so much as one
+    row with each other (see _split_text_into_batches' own no-mid-block-
+    split guarantee), so there is nothing to deduplicate or reconcile
+    between them.
+    """
+    provider = next((r.get("provider") for r in results if r.get("provider")), None)
+
+    contacts_items = []
+    seen = set()
+    for r in results:
+        contacts = r.get("contacts")
+        if not contacts:
+            continue
+        for item in str(contacts).split(";"):
+            item = item.strip()
+            if item and item not in seen:
+                seen.add(item)
+                contacts_items.append(item)
+
+    return {
+        "provider": provider,
+        "contacts": "; ".join(contacts_items) if contacts_items else None,
+        "fully_occupied_buildings": [b for r in results for b in (r.get("fully_occupied_buildings") or [])],
+        "units": [u for r in results for u in (r.get("units") or [])],
+    }
+
+
+def _call_gemini_in_batches(client, text: str, sheet_label: str) -> dict:
+    """
+    Splits `text` into batches (see _split_text_into_batches) whenever
+    it's large enough to risk exhausting a single call's own output-token
+    ceiling - the real, confirmed cause of "This document has too much
+    content for Gemini to return in one response" on a sheet like
+    Workplace Plus's LONDON (~231 units, one call) - and merges every
+    batch's own independent response back into one (see _merge_batch_
+    results) before returning, so extract_sheet_with_metadata's own
+    return shape/behavior is completely unaffected by how many actual
+    Gemini calls happened underneath.
+
+    A sheet whose whole text already fits under one batch makes exactly
+    the SAME single call it always has, with the SAME unmodified PROMPT -
+    this only ever adds calls for a genuinely large sheet, never changes
+    anything about an ordinary one.
+
+    Passes _MAX_BATCH_CHARS through explicitly (rather than relying on
+    _split_text_into_batches' own same-valued default parameter) so a
+    test can patch the module-level constant and actually change this
+    call's behavior - a default parameter's value is bound once, at
+    function-definition time, so patching the module attribute alone
+    would silently have no effect on a call that relied on the default.
+    """
+    batches = _split_text_into_batches(text, max_batch_chars=_MAX_BATCH_CHARS)
+    if len(batches) == 1:
+        return call_gemini(client, PROMPT, [batches[0]])
+
+    print(
+        f"[extract_spreadsheet_gemini] {sheet_label}: {len(text)} chars of sheet text - "
+        f"splitting into {len(batches)} batches to stay clear of Gemini's own output-token ceiling.",
+        file=sys.stderr,
+    )
+    results = [call_gemini(client, PROMPT, [batch]) for batch in batches]
+    return _merge_batch_results(results)
+
+
 def _next_distinct_building(units: list[dict], i: int):
     """The building name of the next unit after index i whose building
     differs from unit i's own (units' own iteration order, after inheritance
@@ -523,12 +699,22 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
     multi-sheet upload's rows/warnings are traceable back to which sheet
     produced them, since a single .xlsx upload can now yield rows from
     several different sheets via several different Gemini calls.
+
+    A large sheet's own text may itself be split into several Gemini
+    calls (see _call_gemini_in_batches/_split_text_into_batches) rather
+    than one - transparent to everything below this point, which still
+    runs exactly once over the merged (raw), full-sheet result: the
+    last_building inheritance loop, _verify_address_house_numbers, and
+    the deterministic brochure/floorplan-link recovery all already
+    operate on the complete unit list plus the COMPLETE original `text`
+    (never a per-batch slice), whether that list/text came from one call
+    or several.
     """
     text = render_sheet_as_text(ws)
     if not text.strip():
         return [], []
     client = get_client()
-    raw = call_gemini(client, PROMPT, [text])
+    raw = _call_gemini_in_batches(client, text, sheet_label)
 
     brochure = {
         "internal_ref": raw.get("provider"),

@@ -1271,6 +1271,254 @@ class ExtractSheetWithMetadataTests(unittest.TestCase):
         self.assertEqual(rows[0].building, "28 Lime Street")
 
 
+class SplitTextIntoBatchesTests(unittest.TestCase):
+    """_split_text_into_batches - the row-number-gap-only splitting rule
+    batching depends on for safety (see its own docstring): a batch
+    boundary must never land inside a contiguous run of row numbers, since
+    that's exactly what keeps a building's own block (heading + that
+    building's own unit rows) from ever being split in half."""
+
+    def test_text_under_the_budget_is_a_single_unchanged_batch(self):
+        text = "Row 1: A\nRow 2: B"
+        self.assertEqual(extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=1000), [text])
+
+    def test_splits_only_between_runs_never_inside_one(self):
+        # Two contiguous runs (1-2, then 10-11) separated by a genuine
+        # row-number gap - forced to split by a tiny budget that neither
+        # run alone exceeds, but combining both would.
+        text = "Row 1: AAAA\nRow 2: BBBB\nRow 10: CCCC\nRow 11: DDDD"
+        batches = extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=25)
+        self.assertEqual(batches, ["Row 1: AAAA\nRow 2: BBBB", "Row 10: CCCC\nRow 11: DDDD"])
+
+    def test_a_single_oversized_run_with_no_gap_stays_one_batch(self):
+        # Shape (a) - one consistent table, genuinely no row-number gap
+        # anywhere - there is nowhere safe to split, so this must stay a
+        # single (oversized, relative to the budget) batch rather than
+        # risk cutting a run in half.
+        text = "Row 1: AAAA\nRow 2: BBBB\nRow 3: CCCC"
+        batches = extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=5)
+        self.assertEqual(batches, [text])
+
+    def test_three_runs_pack_greedily_up_to_the_budget(self):
+        text = "Row 1: AA\nRow 5: BB\nRow 9: CC"
+        batches = extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=19)
+        # "Row 1: AA" (9 chars) + "\n" + "Row 5: BB" (9 chars) = 19, fits;
+        # adding the third run would exceed it, so it starts a new batch.
+        self.assertEqual(batches, ["Row 1: AA\nRow 5: BB", "Row 9: CC"])
+
+
+class MergeBatchResultsTests(unittest.TestCase):
+    """_merge_batch_results - recombining N independent per-batch Gemini
+    responses back into the single {"provider", "contacts", "fully_
+    occupied_buildings", "units"} shape extract_sheet_with_metadata's own
+    post-processing already expects from a single call."""
+
+    def test_provider_is_the_first_non_null_value_across_batches(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([
+            {"provider": None, "units": []},
+            {"provider": "Acme Flex", "units": []},
+            {"provider": "A Different Name", "units": []},
+        ])
+        self.assertEqual(merged["provider"], "Acme Flex")
+
+    def test_provider_is_none_when_no_batch_ever_stated_one(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([{"units": []}, {"provider": None, "units": []}])
+        self.assertIsNone(merged["provider"])
+
+    def test_contacts_are_unioned_across_batches_deduplicated_in_order(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([
+            {"contacts": "Alice Smith, alice@acme.com", "units": []},
+            {"contacts": None, "units": []},
+            {"contacts": "Bob Jones, bob@acme.com; Alice Smith, alice@acme.com", "units": []},
+        ])
+        # Bob is new (kept); Alice is an exact repeat of batch 1's own
+        # entry (dropped, not duplicated) - order is first-seen.
+        self.assertEqual(merged["contacts"], "Alice Smith, alice@acme.com; Bob Jones, bob@acme.com")
+
+    def test_contacts_is_none_when_no_batch_stated_any(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([{"contacts": None, "units": []}, {"units": []}])
+        self.assertIsNone(merged["contacts"])
+
+    def test_fully_occupied_buildings_and_units_concatenate_in_batch_order(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([
+            {"fully_occupied_buildings": ["50 Wells Street"], "units": [{"building": "28 Lime Street"}]},
+            {"fully_occupied_buildings": ["12 Old Street"], "units": [{"building": "40 Fenchurch Street"}]},
+        ])
+        self.assertEqual(merged["fully_occupied_buildings"], ["50 Wells Street", "12 Old Street"])
+        self.assertEqual(merged["units"], [{"building": "28 Lime Street"}, {"building": "40 Fenchurch Street"}])
+
+    def test_missing_optional_fields_default_safely(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([{"units": [{"building": "X"}]}])
+        self.assertEqual(merged, {
+            "provider": None, "contacts": None, "fully_occupied_buildings": [], "units": [{"building": "X"}],
+        })
+
+
+class BatchedExtractionEndToEndTests(unittest.TestCase):
+    """
+    extract_sheet_with_metadata, forced into genuinely splitting a small
+    synthetic sheet into several batches (via a tiny patched _MAX_BATCH_
+    CHARS - the real 12,000-char default would never split a sheet this
+    small) with call_gemini mocked to return a DIFFERENT raw response per
+    batch (side_effect, not a single shared return_value) - proving the
+    three real complications the batching feature has to get right,
+    end-to-end through the real merge/post-processing pipeline, not just
+    the pure _merge_batch_results helper in isolation.
+    """
+
+    def _two_run_sheet(self):
+        # Two contiguous row-number runs (rows 1-2, then row 4) with a
+        # genuine gap at row 3 (never written to at all, so render_sheet_
+        # as_text's own "fully blank rows are skipped" behavior creates
+        # a real gap here) - exactly what _split_text_into_batches needs
+        # to safely split between them.
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=1, column=2, value="Block A heading")
+        ws.cell(row=2, column=2, value="Block A row 2")
+        ws.cell(row=4, column=2, value="Block B heading")
+        return ws
+
+    def test_provider_and_contacts_carry_forward_into_every_row(self):
+        # Only the FIRST batch's own text states provider/contacts (e.g. a
+        # cover section) - the second batch's own response correctly
+        # returns null for both, since its own text never restated them.
+        raw_batch_1 = {
+            "provider": "Acme Flex", "contacts": "Alice Smith, alice@acme.com",
+            "fully_occupied_buildings": [],
+            "units": [{"building": "28 Lime Street", "floor_unit": "3rd Floor", "size_sqft": 1200, "rent_pcm": 18000}],
+        }
+        raw_batch_2 = {
+            "provider": None, "contacts": None, "fully_occupied_buildings": [],
+            "units": [{"building": "40 Fenchurch Street", "floor_unit": "2nd Floor", "size_sqft": 2000, "rent_pcm": 22000}],
+        }
+        with patch("extract_spreadsheet_gemini._MAX_BATCH_CHARS", 5), \
+             patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", side_effect=[raw_batch_1, raw_batch_2]) as mock_call:
+            rows, _ = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._two_run_sheet(), "file.xlsx — Sheet1", "file.xlsx",
+            )
+
+        self.assertEqual(mock_call.call_count, 2)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row.provider, "Acme Flex")
+            self.assertEqual(row.contacts, "Alice Smith, alice@acme.com")
+
+    def test_last_building_inheritance_carries_across_a_batch_boundary(self):
+        # The second batch's own FIRST unit states no building at all -
+        # by construction (splitting only ever happens between complete
+        # blocks) a real Gemini response should always restate the
+        # building for a batch's own first unit, but this proves the
+        # existing inheritance loop (unchanged - it already runs once over
+        # the merged, full-sheet unit list) still correctly falls back to
+        # whatever building the PREVIOUS batch's own last unit had, rather
+        # than resetting to blank/skipping the unit at a batch seam.
+        raw_batch_1 = {
+            "provider": "Acme Flex", "contacts": None, "fully_occupied_buildings": [],
+            "units": [{"building": "28 Lime Street", "floor_unit": "3rd Floor", "size_sqft": 1200, "rent_pcm": 18000}],
+        }
+        raw_batch_2 = {
+            "provider": None, "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": None, "floor_unit": "5th Floor", "size_sqft": 900, "rent_pcm": 14000},
+                {"building": "40 Fenchurch Street", "floor_unit": "2nd Floor", "size_sqft": 2000, "rent_pcm": 22000},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini._MAX_BATCH_CHARS", 5), \
+             patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", side_effect=[raw_batch_1, raw_batch_2]):
+            rows, _ = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._two_run_sheet(), "file.xlsx — Sheet1", "file.xlsx",
+            )
+
+        self.assertEqual([r.building for r in rows], ["28 Lime Street", "28 Lime Street", "40 Fenchurch Street"])
+        self.assertEqual([r.floor_unit for r in rows], ["3rd Floor", "5th Floor", "2nd Floor"])
+
+    def test_fully_occupied_buildings_concatenate_across_batches(self):
+        raw_batch_1 = {
+            "provider": "Acme Flex", "contacts": None, "fully_occupied_buildings": ["50 Wells Street"],
+            "units": [{"building": "28 Lime Street", "floor_unit": "3rd Floor"}],
+        }
+        raw_batch_2 = {
+            "provider": None, "contacts": None, "fully_occupied_buildings": ["12 Old Street"],
+            "units": [{"building": "40 Fenchurch Street", "floor_unit": "2nd Floor"}],
+        }
+        with patch("extract_spreadsheet_gemini._MAX_BATCH_CHARS", 5), \
+             patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", side_effect=[raw_batch_1, raw_batch_2]):
+            _rows, fully_occupied = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._two_run_sheet(), "file.xlsx — Sheet1", "file.xlsx",
+            )
+
+        self.assertEqual(fully_occupied, [
+            {"provider": "Acme Flex", "building": "50 Wells Street"},
+            {"provider": "Acme Flex", "building": "12 Old Street"},
+        ])
+
+    def test_a_sheet_small_enough_to_fit_one_batch_makes_exactly_one_call(self):
+        # The real, default (unpatched) _MAX_BATCH_CHARS - confirms an
+        # ordinary small sheet keeps making exactly the single call it
+        # always has, with no behavior change from batching at all.
+        raw = {"provider": "Acme Flex", "contacts": None, "fully_occupied_buildings": [], "units": [
+            {"building": "28 Lime Street", "floor_unit": "3rd Floor"},
+        ]}
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw) as mock_call:
+            rows, _ = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                self._two_run_sheet(), "file.xlsx — Sheet1", "file.xlsx",
+            )
+
+        mock_call.assert_called_once()
+        self.assertEqual(len(rows), 1)
+
+    def test_deterministic_brochure_link_recovery_still_works_after_splitting(self):
+        # The real Copthall-style "Download Brochure" hyperlink convention
+        # (see DeterministicBrochureLinkForBuildingTests) - two separate
+        # building blocks, each with its own real Excel hyperlink, forced
+        # into two separate batches. Gemini's own two mocked responses
+        # deliberately return brochure_link=None for both units (as if it
+        # failed to read the link itself) - _apply_deterministic_brochure_
+        # links must still recover the correct, DIFFERENT link for each
+        # building from the FULL original sheet text after merging, not a
+        # per-batch slice that might not even contain that building's own
+        # hyperlink cell.
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Brochure"])
+        ws["F3"].hyperlink = "https://a.example.com/riverside-brochure.pdf"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        # A genuine row-number gap (skips a row) before the second block,
+        # so _split_text_into_batches has somewhere safe to split.
+        ws.cell(row=8, column=2, value="Oakwood House - Fenchurch St")
+        ws.cell(row=9, column=2, value="A tower near the station.")
+        ws.cell(row=10, column=6, value="Download Brochure")
+        ws["F10"].hyperlink = "https://b.example.com/oakwood-brochure.pdf"
+        ws.cell(row=11, column=2, value="Office"); ws.cell(row=11, column=3, value="Sq.Ft")
+        ws.cell(row=12, column=2, value="4th Floor"); ws.cell(row=12, column=3, value=2200.0)
+
+        raw_batch_1 = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [{"building": "Riverside Building", "floor_unit": "3rd Floor", "size_sqft": 1800.0, "brochure_link": None}],
+        }
+        raw_batch_2 = {
+            "provider": None, "contacts": None, "fully_occupied_buildings": [],
+            "units": [{"building": "Oakwood House", "floor_unit": "4th Floor", "size_sqft": 2200.0, "brochure_link": None}],
+        }
+        with patch("extract_spreadsheet_gemini._MAX_BATCH_CHARS", 5), \
+             patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", side_effect=[raw_batch_1, raw_batch_2]) as mock_call:
+            rows, _ = extract_spreadsheet_gemini.extract_sheet_with_metadata(ws, "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertEqual(mock_call.call_count, 2)
+        by_building = {r.building: r for r in rows}
+        self.assertEqual(by_building["Riverside Building"].brochure_link, "https://a.example.com/riverside-brochure.pdf")
+        self.assertEqual(by_building["Oakwood House"].brochure_link, "https://b.example.com/oakwood-brochure.pdf")
+
+
 class IsNonAuthoritativeRollupSheetTests(unittest.TestCase):
     """is_non_authoritative_rollup_sheet - confirmed against the real
     Copthall Estates Availability.xlsx: its "Portfolio" sheet is a hidden,
