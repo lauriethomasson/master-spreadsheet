@@ -393,6 +393,135 @@ class GroupHasGenuineConflictBrochureLinkOverrideTests(unittest.TestCase):
         self.assertTrue(master_merge._group_has_genuine_conflict(dicts))
 
 
+class GenuinelyDifferingFieldsTests(unittest.TestCase):
+    """
+    genuinely_differing_fields - the field list _group_has_genuine_
+    conflict is now defined in terms of (see that class's own tests above,
+    unaffected by this refactor), and that pages/2_Review_and_Master.py's
+    duplicate-listing review card uses directly to decide what to show a
+    reviewer (see ListingSummaryLinesTests below) - confirms the two never
+    disagree, which is the entire point of sharing this one function.
+    """
+
+    def test_identical_rows_have_no_differing_fields(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), [])
+
+    def test_rent_psf_only_conflict_returns_only_that_field(self):
+        # The real Kitt's "28 Bruton Street" shape: every other field
+        # agrees, only rent_psf genuinely disagrees (£310 vs £296) - the
+        # exact real gap the fixed five-field review card used to hide
+        # entirely (rent_psf was never one of the five).
+        dicts = [
+            {"building": "28 Bruton Street", "provider": "Kitt's", "floor_unit": "1st",
+             "size_sqft": 759.0, "rent_pcm": 18700.0, "rent_psf": 310.0, "state_of_space": "Partially Fitted"},
+            {"building": "28 Bruton Street", "provider": "Kitt's", "floor_unit": "1st",
+             "size_sqft": 759.0, "rent_pcm": 18700.0, "rent_psf": 296.0, "state_of_space": "Partially Fitted"},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["rent_psf"])
+
+    def test_floor_and_size_conflict_returns_exactly_those_two_fields(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "2nd", "size_sqft": 5000.0},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["floor_unit", "size_sqft"])
+
+    def test_reworded_compatible_special_features_is_not_a_differing_field(self):
+        # Mirrors GroupHasGenuineConflictTests' own equivalent case - the
+        # RISKY_TEXT_FIELDS reworded-but-compatible tolerance must apply
+        # here exactly as it does for _group_has_genuine_conflict, since
+        # this IS that function's own per-field logic now.
+        dicts = [
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th",
+             "special_features": "Fully fitted, meeting rooms, kitchen"},
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th",
+             "special_features": "Meeting rooms and a kitchen"},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), [])
+
+    def test_reworded_compatible_special_features_alongside_a_genuine_rent_conflict(self):
+        # Selectivity: the tolerant field is correctly excluded while a
+        # genuinely different field on the SAME pair still shows up.
+        dicts = [
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th", "rent_pcm": 10000.0,
+             "special_features": "Fully fitted, meeting rooms, kitchen"},
+            {"building": "107 Cannon Street", "provider": "UNION", "floor_unit": "4th", "rent_pcm": 15000.0,
+             "special_features": "Meeting rooms and a kitchen"},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["rent_pcm"])
+
+    def test_postcode_conflict_excused_by_shared_brochure_is_not_a_differing_field(self):
+        # Same override GroupHasGenuineConflictBrochureLinkOverrideTests
+        # covers for _group_has_genuine_conflict - it's the same check now.
+        dicts = [
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC4M 4AB", "brochure_link": "https://example.com/b.pdf"},
+            {"building": "Nexus Place", "provider": "UNION", "floor_unit": "5th",
+             "postcode": "EC1M 3HA", "brochure_link": "https://example.com/b.pdf"},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), [])
+
+    def test_hidden_fields_are_still_reported_here_filtering_is_the_callers_job(self):
+        # brochure_link_broken/brochure_link_is_floorplan/lat/lng are hidden
+        # from the REVIEW CARD (see DUPLICATE_CARD_HIDDEN_FIELDS), but this
+        # function itself must still report a genuine disagreement in one -
+        # _group_has_genuine_conflict needs to keep acting on it regardless
+        # of whether a human ever sees it named.
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "lat": 51.5},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "lat": 51.6},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["lat"])
+        self.assertIn("lat", master_merge.DUPLICATE_CARD_HIDDEN_FIELDS)
+
+
+class ListingSummaryLinesTests(unittest.TestCase):
+    """listing_summary_lines(row_dict, fields) - formats exactly the
+    requested fields, reusing this module's own pre-existing per-field
+    wording where one exists (see the function's own docstring)."""
+
+    def test_only_the_requested_field_is_shown_even_though_others_have_values(self):
+        row = {
+            "floor_unit": "1st", "size_sqft": 759.0, "rent_pcm": 18700.0,
+            "rent_psf": 310.0, "state_of_space": "Partially Fitted",
+        }
+        self.assertEqual(master_merge.listing_summary_lines(row, ["rent_psf"]), ["Rent per sq ft: £310"])
+
+    def test_floor_and_size_are_shown_using_the_pre_existing_wording(self):
+        row = {"floor_unit": "1st", "size_sqft": 759.0, "rent_pcm": 18700.0, "state_of_space": "Partially Fitted"}
+        lines = master_merge.listing_summary_lines(row, ["floor_unit", "size_sqft"])
+        self.assertEqual(lines, ["Floor/unit: 1st", "Size: 759 sq ft"])
+
+    def test_a_requested_field_blank_on_this_row_is_skipped(self):
+        row = {"floor_unit": "1st", "rent_psf": None}
+        self.assertEqual(master_merge.listing_summary_lines(row, ["floor_unit", "rent_psf"]), ["Floor/unit: 1st"])
+
+    def test_desks_shown_as_a_range_when_either_desks_field_is_requested(self):
+        row = {"desks_min": 5, "desks_max": 10}
+        self.assertEqual(master_merge.listing_summary_lines(row, ["desks_max"]), ["Desks: 5–10"])
+        self.assertEqual(master_merge.listing_summary_lines(row, ["desks_min"]), ["Desks: 5–10"])
+
+    def test_desks_shown_as_a_single_value_when_only_one_side_is_non_blank(self):
+        row = {"desks_min": None, "desks_max": 12}
+        self.assertEqual(master_merge.listing_summary_lines(row, ["desks_max"]), ["Desks: 12"])
+
+    def test_an_unmentioned_field_falls_back_to_a_plain_title_case_label(self):
+        row = {"submarket": "Mayfair"}
+        self.assertEqual(master_merge.listing_summary_lines(row, ["submarket"]), ["Submarket: Mayfair"])
+
+    def test_zero_requested_fields_present_on_this_row_returns_an_empty_list_not_a_crash(self):
+        # The page-level safeguard (pages/2_Review_and_Master.py) falls
+        # back to ["floor_unit"] when nothing genuinely differs, and shows
+        # a clear "these look identical" message when even THAT'S blank -
+        # this is the case that triggers it: must return [], never raise.
+        row = {"floor_unit": None}
+        self.assertEqual(master_merge.listing_summary_lines(row, ["floor_unit"]), [])
+
+
 class MergeUnmatchedGroupTests(unittest.TestCase):
     def _group(self, rows):
         return [master_merge.UnmatchedRow(r) for r in rows]

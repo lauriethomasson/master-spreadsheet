@@ -184,6 +184,26 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
     listing_summary_lines - reused so a reviewer sees the actual evidence,
     not an opaque source filename).
 
+    That "actual evidence" is now exactly the field(s) master_merge.
+    genuinely_differing_fields says genuinely disagree across this group -
+    never a fixed, hand-picked set. A card showing the same five fields
+    for every group regardless of WHY it was flagged is exactly what let a
+    real Kitt's "28 Bruton Street" pair look completely identical to a
+    reviewer (the actual disagreement was rent_psf, a field that fixed
+    set never included at all) while the app correctly insisted they
+    might be different listings - reusing genuinely_differing_fields
+    (rather than a second, separately-tuned "which fields to show" rule)
+    is what guarantees this card can never again disagree with the very
+    logic that decided this group needs a human at all.
+    DUPLICATE_CARD_HIDDEN_FIELDS are dropped from what's shown (internal
+    pipeline bookkeeping no reviewer needs to see - see that constant's
+    own docstring) even if one of them happens to be the genuine
+    disagreement; floor_unit is the fallback whenever nothing displayable
+    is left, so the card is never blank (see master_merge.
+    genuinely_differing_fields' own docstring on why a group can reach
+    this UI with no NON-hidden disagreement at all: rare, but not
+    provably impossible, so this never assumes it away).
+
     Three outcomes, one radio, matching the identity question directly:
     - "Keep {all/both} — separate listings" (the safe DEFAULT - selected
       with no interaction needed) - each row becomes its own new property.
@@ -197,6 +217,12 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
     listing_labels = [f"Listing {chr(65 + i)}" for i in range(len(dicts))]
     combined_source = " + ".join(d.get("source_file") or label for d, label in zip(dicts, listing_labels))
 
+    differing_fields = [
+        f for f in master_merge.genuinely_differing_fields(dicts) if f not in master_merge.DUPLICATE_CARD_HIDDEN_FIELDS
+    ]
+    if not differing_fields:
+        differing_fields = ["floor_unit"]
+
     with st.expander(
         f"⚠️ Possible duplicate listings — {display_utils.row_label(dicts[0])}",
         key=f"{key_prefix}_expander",
@@ -209,11 +235,12 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
         for col, label, d in zip(cols, listing_labels, dicts):
             with col:
                 st.markdown(f"**{label}**")
-                lines = master_merge.listing_summary_lines(d)
-                for line in lines:
-                    st.write(line)
+                lines = master_merge.listing_summary_lines(d, differing_fields)
                 if not lines:
-                    st.write("—")
+                    st.write("These look identical — see raw data.")
+                else:
+                    for line in lines:
+                        st.write(line)
 
         keep_separate_label = "Keep both — separate listings" if len(dicts) == 2 else "Keep all — separate listings"
         options = [keep_separate_label] + [f"Same listing — use {label}" for label in listing_labels]

@@ -36,6 +36,7 @@ import pandas as pd
 from house_number import LEADING_HOUSE_NUMBER_RE as _LEADING_HOUSE_NUMBER_RE
 from house_number import leading_house_number as _leading_house_number
 from schema import ListingRow
+from staging_writer import title_case_label
 from storage.file_store import clean_value
 
 # building/provider/floor_unit/postcode are matching keys, not excluded from
@@ -1298,33 +1299,66 @@ def default_merge_choice_index(values: list) -> int:
     return non_blank[0] if len(non_blank) == 1 else 0
 
 
-def listing_summary_lines(row_dict: dict) -> list:
+def listing_summary_lines(row_dict: dict, fields: list) -> list:
     """
-    A few short, human-readable lines summarizing a row's own key listing
-    facts (floor/unit, size, desks, rent, fit-out state) - used by the
-    Review UI's ambiguous-duplicate-listing prompt (see pages/2_Review_
-    and_Master.py's own _render_intra_batch_duplicate_group) so a reviewer
-    sees the actual evidence that makes two candidate listings look
-    different (or alike), rather than an opaque source filename. Skips any
-    field that's blank entirely - never a placeholder "—" line for a fact
-    this row simply doesn't state.
+    Human-readable "Label: value" lines for exactly `fields` (an ordered
+    subset of DIFF_FIELDS) - used by the Review UI's ambiguous-duplicate-
+    listing prompt (see pages/2_Review_and_Master.py's own _render_intra_
+    batch_duplicate_group) so a reviewer sees the actual evidence that
+    makes two candidate listings look different, not a fixed, arbitrary
+    set of fields that may not even include the one that's genuinely
+    different (see genuinely_differing_fields, whose result the caller is
+    expected to pass in here - one call per row in the group, same
+    `fields` list every time, so every listing's card names the same set
+    of facts). Skips any requested field that's blank on THIS row -
+    never a placeholder "—" line for a fact this row simply doesn't
+    state, even when it's in `fields` only because some OTHER row in the
+    group has a value for it.
+
+    desks_min/desks_max are handled together as a single "Desks" line (a
+    range when both are non-blank and differ, matching the pre-existing
+    convention) whenever EITHER is requested - using THIS row's own
+    actual values regardless of which one of the two was the one that
+    genuinely differed across the group, so a range is never shown half-
+    complete.
+
+    Every other requested field reuses this module's own pre-existing
+    per-field wording (floor/unit, size in sq ft, rent in £/pcm, rent in
+    £/psf, fit-out state) where one already exists; anything else (e.g.
+    building, submarket, brochure_link) falls back to a plain Title Case
+    label and the raw value - rare in practice (most of those are part of
+    the group's own matching identity and unlikely to genuinely differ),
+    but never raises just because a field this function doesn't have
+    bespoke wording for shows up in `fields`.
     """
+    remaining = set(fields)
     lines = []
-    if not _is_blank(row_dict.get("floor_unit")):
+
+    if "floor_unit" in remaining and not _is_blank(row_dict.get("floor_unit")):
         lines.append(f"Floor/unit: {row_dict['floor_unit']}")
-    if not _is_blank(row_dict.get("size_sqft")):
+    if "size_sqft" in remaining and not _is_blank(row_dict.get("size_sqft")):
         lines.append(f"Size: {row_dict['size_sqft']:,.0f} sq ft")
-    desks_min, desks_max = row_dict.get("desks_min"), row_dict.get("desks_max")
-    if not _is_blank(desks_min) and not _is_blank(desks_max) and desks_min != desks_max:
-        lines.append(f"Desks: {desks_min:,.0f}–{desks_max:,.0f}")
-    elif not _is_blank(desks_max):
-        lines.append(f"Desks: {desks_max:,.0f}")
-    elif not _is_blank(desks_min):
-        lines.append(f"Desks: {desks_min:,.0f}")
-    if not _is_blank(row_dict.get("rent_pcm")):
+    if "desks_min" in remaining or "desks_max" in remaining:
+        desks_min, desks_max = row_dict.get("desks_min"), row_dict.get("desks_max")
+        if not _is_blank(desks_min) and not _is_blank(desks_max) and desks_min != desks_max:
+            lines.append(f"Desks: {desks_min:,.0f}–{desks_max:,.0f}")
+        elif not _is_blank(desks_max):
+            lines.append(f"Desks: {desks_max:,.0f}")
+        elif not _is_blank(desks_min):
+            lines.append(f"Desks: {desks_min:,.0f}")
+    if "rent_pcm" in remaining and not _is_blank(row_dict.get("rent_pcm")):
         lines.append(f"Rent: £{row_dict['rent_pcm']:,.0f} pcm")
-    if not _is_blank(row_dict.get("state_of_space")):
+    if "rent_psf" in remaining and not _is_blank(row_dict.get("rent_psf")):
+        lines.append(f"Rent per sq ft: £{row_dict['rent_psf']:,.0f}")
+    if "state_of_space" in remaining and not _is_blank(row_dict.get("state_of_space")):
         lines.append(f"State: {row_dict['state_of_space']}")
+
+    handled = {"floor_unit", "size_sqft", "desks_min", "desks_max", "rent_pcm", "rent_psf", "state_of_space"}
+    for f in fields:
+        if f in handled or _is_blank(row_dict.get(f)):
+            continue
+        lines.append(f"{title_case_label(f)}: {row_dict[f]}")
+
     return lines
 
 
@@ -1542,17 +1576,45 @@ def matched_collision_field_choice(values: list, field_name: str = None) -> tupl
     return True, None
 
 
-def _group_has_genuine_conflict(dicts: list) -> bool:
+# DIFF_FIELDS fields that are internal pipeline bookkeeping, never
+# something a reviewer should be asked to eyeball on the duplicate-
+# listing comparison card (see pages/2_Review_and_Master.py's own
+# _render_intra_batch_duplicate_group, via listing_summary_lines).
+# property_id/source_file are already excluded from DIFF_FIELDS itself;
+# these four are the same idea for a value genuinely_differing_fields/
+# _group_has_genuine_conflict still legitimately checks for the ACTUAL
+# is-this-a-conflict decision - a genuine lat/lng or brochure_link_is_
+# floorplan disagreement is still real evidence worth flagging the group
+# for review over, it's only ever hidden from what gets SHOWN.
+DUPLICATE_CARD_HIDDEN_FIELDS = ("brochure_link_broken", "brochure_link_is_floorplan", "lat", "lng")
+
+
+def genuinely_differing_fields(dicts: list) -> list:
     """
-    True if any DIFF_FIELD has 2+ genuinely different non-blank values
-    across `dicts` (see matched_collision_field_choice, called with the
-    field name so RISKY_TEXT_FIELDS gets its own reworded-but-compatible
-    tolerance) - the single generic rule this module uses to decide
-    whether a group of rows claiming to be the same property/unit can be
-    safely auto-merged (see consolidate_unmatched_duplicates) or must be
-    left for a human: automatically combining them would only ever change
-    the DATA'S MEANING if some field genuinely disagrees, never merely
-    because there happen to be several source rows.
+    Every DIFF_FIELDS field (in DIFF_FIELDS' own declared order) with 2+
+    genuinely different non-blank values across `dicts` (see matched_
+    collision_field_choice, called with the field name so RISKY_TEXT_
+    FIELDS gets its own reworded-but-compatible tolerance) - the single
+    generic rule this module uses to decide whether a group of rows
+    claiming to be the same property/unit can be safely auto-merged (see
+    consolidate_unmatched_duplicates) or must be left for a human:
+    automatically combining them would only ever change the DATA'S
+    MEANING if some field genuinely disagrees, never merely because there
+    happen to be several source rows. _group_has_genuine_conflict is
+    defined directly in terms of THIS function's result (just "is it
+    non-empty") rather than a second, separately-tuned copy of the same
+    per-field rule - so does the duplicate-listing review card (pages/2_
+    Review_and_Master.py's _render_intra_batch_duplicate_group, via
+    listing_summary_lines), which is exactly why this is public and
+    returns the actual field list rather than a bare bool. Confirmed real
+    gap this closes: a Kitt's "28 Bruton Street" pair genuinely disagreed
+    only on rent_psf (£310 vs £296, from a currency-formatted source cell
+    that made it look blank and eligible for a second, disagreeing
+    brochure re-read - see extract_spreadsheet._coerce_numeric), but the
+    review card's own fixed five-field summary never included that field
+    at all, so the two listings looked completely identical to a
+    reviewer even though the app had correctly detected a real
+    difference between them.
 
     postcode AND address_1 get one narrow exception, mirroring
     _group_unmatched_duplicates' own grouping-stage override: a
@@ -1582,13 +1644,30 @@ def _group_has_genuine_conflict(dicts: list) -> bool:
     geocode.py, so a genuinely different property/unit still blocks
     auto-merge even if it happens to share a brochure_link - is checked
     with no such exception.
+
+    Includes every DIFF_FIELDS field, even ones the review card itself
+    chooses to hide from a human (see DUPLICATE_CARD_HIDDEN_FIELDS) -
+    filtering those out is the CALLER's own display decision, never this
+    function's: _group_has_genuine_conflict must keep acting on a genuine
+    disagreement in a hidden field regardless of whether anyone ever sees
+    it named on the card.
     """
     weak_geocoded_fields = ("postcode", "address_1")
+    differing = []
     for f in DIFF_FIELDS:
         needs_choice, _ = matched_collision_field_choice([d.get(f) for d in dicts], f)
         if needs_choice and not (f in weak_geocoded_fields and _brochure_link_identity_override(dicts)):
-            return True
-    return False
+            differing.append(f)
+    return differing
+
+
+def _group_has_genuine_conflict(dicts: list) -> bool:
+    """True if genuinely_differing_fields(dicts) is non-empty - see that
+    function's own docstring for the actual per-field rule (unchanged by
+    this refactor to a shared helper - see its own docstring for why the
+    duplicate-listing review card also needs the identical logic, not a
+    second, separately-tuned copy of it)."""
+    return bool(genuinely_differing_fields(dicts))
 
 
 def _merge_unmatched_group(group: list) -> ListingRow:
