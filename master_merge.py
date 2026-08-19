@@ -623,8 +623,26 @@ def _normalize_text(value) -> str:
     return re.sub(r"\s+", "", str(value).strip().lower())
 
 
-def _values_equal(old, new) -> bool:
+# Confirmed real case (Kitt's Availability file): rent_pcm/rent_psf
+# routinely come from two different sheets computed to different
+# precision - one sheet states rent_psf as 243.108108... (a live
+# rent_pcm/size_sqft division), the other has the SAME figure pre-rounded
+# to 243.0 - both display as the identical "£243" on screen (see
+# listing_summary_lines' own f"{value:,.0f}" rounding), but the default
+# 1e-6 tolerance below is far tighter than what a person can even see,
+# so this was flagging a genuine display-identical pair as a real
+# disagreement. Compared at that SAME whole-pound precision instead, for
+# these two fields only - desks_min/desks_max and size_sqft have no
+# confirmed case of this exact rounding-precision mismatch, and widening
+# tolerance for a field with no such confirmed need would be exactly the
+# kind of guess this module avoids elsewhere.
+_WHOLE_NUMBER_TOLERANCE_FIELDS = ("rent_pcm", "rent_psf")
+
+
+def _values_equal(old, new, field_name: str = None) -> bool:
     if isinstance(old, (int, float)) and isinstance(new, (int, float)):
+        if field_name in _WHOLE_NUMBER_TOLERANCE_FIELDS:
+            return round(float(old)) == round(float(new))
         return abs(float(old) - float(new)) < 1e-6
     return _normalize_text(old) == _normalize_text(new)
 
@@ -645,7 +663,7 @@ def diff_fields(old: dict, new: dict) -> dict:
         if _is_blank(new_val):
             continue
         old_val = old.get(f)
-        if _is_blank(old_val) or not _values_equal(old_val, new_val):
+        if _is_blank(old_val) or not _values_equal(old_val, new_val, f):
             diffs[f] = (old_val, new_val)
     return diffs
 
@@ -1257,7 +1275,7 @@ def _address_street_key(building) -> str:
     return " ".join(words)
 
 
-def merge_field_choice(values: list) -> tuple:
+def merge_field_choice(values: list, field_name: str = None) -> tuple:
     """
     For one field across a group of intra-batch duplicate rows (see
     _dedup_key/unmatched_collisions - pages/2_Review_and_Master.py calls
@@ -1277,11 +1295,17 @@ def merge_field_choice(values: list) -> tuple:
     reviewer can still deliberately pick "blank" if the one value present
     is actually wrong for the merged property, rather than that ever being
     silently decided for them).
+
+    field_name is optional and threaded straight through to _values_equal
+    (see its own whole-pound tolerance for rent_pcm/rent_psf) - a caller
+    that doesn't pass one keeps the exact prior byte/near-exact comparison
+    for every field, same opt-in principle as matched_collision_field_
+    choice's own field_name parameter.
     """
     classes = []  # one representative value per distinct class seen so far
     for v in values:
         blank = _is_blank(v)
-        if any(blank == _is_blank(rep) and (blank or _values_equal(v, rep)) for rep in classes):
+        if any(blank == _is_blank(rep) and (blank or _values_equal(v, rep, field_name)) for rep in classes):
             continue
         classes.append(v)
     if len(classes) <= 1:
@@ -1566,7 +1590,7 @@ def matched_collision_field_choice(values: list, field_name: str = None) -> tupl
     for v in values:
         if _is_blank(v):
             continue
-        if any(_values_equal(v, rep) for rep in classes):
+        if any(_values_equal(v, rep, field_name) for rep in classes):
             continue
         classes.append(v)
     if len(classes) <= 1:

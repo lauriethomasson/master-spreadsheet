@@ -129,6 +129,48 @@ class SuggestSimilarTests(unittest.TestCase):
         self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
 
 
+class ValuesEqualTests(unittest.TestCase):
+    """
+    _values_equal's own field-specific tolerance - real Kitt's
+    Availability case: rent_pcm/rent_psf routinely come from two
+    different sheets computed to different precision (a live division
+    vs the same figure pre-rounded), both displaying as the identical
+    "£243" (see listing_summary_lines' own f"{value:,.0f}" rounding) but
+    failing the default 1e-6 tolerance as if they genuinely disagreed.
+    """
+
+    def test_rent_psf_rounding_only_difference_is_equal_when_field_name_given(self):
+        self.assertTrue(master_merge._values_equal(243.108108, 243.0, "rent_psf"))
+
+    def test_rent_pcm_rounding_only_difference_is_equal_when_field_name_given(self):
+        self.assertTrue(master_merge._values_equal(18700.4, 18700.0, "rent_pcm"))
+
+    def test_rent_psf_genuinely_different_pounds_still_unequal(self):
+        # The tolerance is whole-POUND, not unlimited.
+        self.assertFalse(master_merge._values_equal(243.4, 244.0, "rent_psf"))
+
+    def test_rent_psf_without_field_name_keeps_the_strict_default_tolerance(self):
+        # Backward compatibility: an existing caller that doesn't pass
+        # field_name at all must see the exact prior behavior, even for
+        # a field that WOULD get the widened tolerance if named.
+        self.assertFalse(master_merge._values_equal(243.108108, 243.0))
+
+    def test_size_sqft_is_not_widened_even_when_named(self):
+        # Deliberately scoped to rent_pcm/rent_psf only.
+        self.assertFalse(master_merge._values_equal(1000.3, 1000.0, "size_sqft"))
+
+    def test_desks_max_is_not_widened_even_when_named(self):
+        self.assertFalse(master_merge._values_equal(12.4, 12.0, "desks_max"))
+
+    def test_text_fields_are_unaffected_by_field_name(self):
+        self.assertTrue(master_merge._values_equal("METSPACE", "Metspace", "provider"))
+        self.assertFalse(master_merge._values_equal("Fitted", "CAT A", "state_of_space"))
+
+    def test_exact_match_still_equal_with_or_without_field_name(self):
+        self.assertTrue(master_merge._values_equal(243.0, 243.0))
+        self.assertTrue(master_merge._values_equal(243.0, 243.0, "rent_psf"))
+
+
 class MergeFieldChoiceTests(unittest.TestCase):
     def test_all_equal_needs_no_choice(self):
         self.assertEqual(master_merge.merge_field_choice(["Fully Managed", "Fully Managed"]), (False, "Fully Managed"))
@@ -152,6 +194,19 @@ class MergeFieldChoiceTests(unittest.TestCase):
 
     def test_genuinely_different_values_need_a_choice(self):
         needs_choice, resolved = master_merge.merge_field_choice(["Fully Managed", "Fully Fitted"])
+        self.assertTrue(needs_choice)
+        self.assertIsNone(resolved)
+
+    def test_field_name_gives_rent_psf_the_widened_rounding_tolerance(self):
+        needs_choice, resolved = master_merge.merge_field_choice([243.108108, 243.0], "rent_psf")
+        self.assertFalse(needs_choice)
+        self.assertEqual(resolved, 243.108108)
+
+    def test_field_name_not_passed_keeps_the_strict_tolerance(self):
+        # Backward compatibility: no field_name means the exact prior
+        # behavior, even for a field that would otherwise get the
+        # widened tolerance.
+        needs_choice, resolved = master_merge.merge_field_choice([243.108108, 243.0])
         self.assertTrue(needs_choice)
         self.assertIsNone(resolved)
 
@@ -241,6 +296,26 @@ class MatchedCollisionFieldChoiceTests(unittest.TestCase):
         # tolerance is specifically about detail-loss on free-text lists,
         # never a general "these look similar" fuzzy match.
         needs_choice, value = master_merge.matched_collision_field_choice(["UNION", "Union Ltd"], "provider")
+        self.assertTrue(needs_choice)
+        self.assertIsNone(value)
+
+    def test_rent_psf_rounding_only_difference_needs_no_choice(self):
+        # Real Kitt's Availability shape (see ValuesEqualTests) - one
+        # sheet's live division vs the other's pre-rounded figure, both
+        # displaying as the same "£243".
+        needs_choice, value = master_merge.matched_collision_field_choice([243.108108, 243.0], "rent_psf")
+        self.assertFalse(needs_choice)
+        self.assertEqual(value, 243.108108)
+
+    def test_rent_pcm_genuinely_different_pounds_still_needs_a_choice(self):
+        needs_choice, value = master_merge.matched_collision_field_choice([18700.0, 18750.0], "rent_pcm")
+        self.assertTrue(needs_choice)
+        self.assertIsNone(value)
+
+    def test_rent_psf_rounding_tolerance_requires_field_name(self):
+        # Backward compatibility: a caller that doesn't pass field_name
+        # keeps the exact prior strict comparison for rent_psf too.
+        needs_choice, value = master_merge.matched_collision_field_choice([243.108108, 243.0])
         self.assertTrue(needs_choice)
         self.assertIsNone(value)
 
@@ -422,6 +497,44 @@ class GenuinelyDifferingFieldsTests(unittest.TestCase):
              "size_sqft": 759.0, "rent_pcm": 18700.0, "rent_psf": 296.0, "state_of_space": "Partially Fitted"},
         ]
         self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["rent_psf"])
+
+    def test_rounding_only_rent_psf_difference_is_not_a_differing_field(self):
+        # Real Kitt's Availability shape: one sheet states rent_psf as a
+        # live rent_pcm/size_sqft division (243.108108...), the other has
+        # the SAME figure pre-rounded to 243.0 - both display as the
+        # identical "£243", so this must NOT be flagged, unlike the
+        # genuinely different £310-vs-£296 case above.
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_psf": 243.108108},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_psf": 243.0},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), [])
+
+    def test_rounding_only_rent_pcm_difference_is_not_a_differing_field(self):
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_pcm": 18700.4},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_pcm": 18700.0},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), [])
+
+    def test_whole_pound_rent_psf_difference_still_counts_as_differing(self):
+        # The widened tolerance is whole-POUND, not unlimited - a real
+        # difference that rounds to two DIFFERENT pounds must still show.
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_psf": 243.4},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "rent_psf": 244.0},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["rent_psf"])
+
+    def test_size_sqft_rounding_is_not_widened(self):
+        # Deliberately scoped to rent_pcm/rent_psf only - size_sqft has no
+        # confirmed rounding-precision mismatch, so its existing strict
+        # (1e-6) tolerance must be completely unaffected.
+        dicts = [
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.3},
+            {"building": "1 Example Street", "provider": "UNION", "floor_unit": "1st", "size_sqft": 1000.0},
+        ]
+        self.assertEqual(master_merge.genuinely_differing_fields(dicts), ["size_sqft"])
 
     def test_floor_and_size_conflict_returns_exactly_those_two_fields(self):
         dicts = [
@@ -1741,6 +1854,25 @@ class DiffFieldsTests(unittest.TestCase):
     def test_tolerant_formatting_difference_is_not_a_diff(self):
         diffs = master_merge.diff_fields({"provider": "Metspace"}, {"provider": "METSPACE"})
         self.assertEqual(diffs, {})
+
+    def test_rent_psf_rounding_only_difference_is_not_a_diff(self):
+        # Real Kitt's Availability shape - diff_fields now passes the
+        # field name through to _values_equal, so this gets the same
+        # whole-pound tolerance as matched_collision_field_choice does.
+        diffs = master_merge.diff_fields({"rent_psf": 243.0}, {"rent_psf": 243.108108})
+        self.assertEqual(diffs, {})
+
+    def test_rent_pcm_rounding_only_difference_is_not_a_diff(self):
+        diffs = master_merge.diff_fields({"rent_pcm": 18700.0}, {"rent_pcm": 18700.4})
+        self.assertEqual(diffs, {})
+
+    def test_rent_psf_genuinely_different_pounds_is_still_a_diff(self):
+        diffs = master_merge.diff_fields({"rent_psf": 243.0}, {"rent_psf": 296.0})
+        self.assertEqual(diffs, {"rent_psf": (243.0, 296.0)})
+
+    def test_size_sqft_rounding_is_not_widened(self):
+        diffs = master_merge.diff_fields({"size_sqft": 1000.0}, {"size_sqft": 1000.3})
+        self.assertEqual(diffs, {"size_sqft": (1000.0, 1000.3)})
 
 
 class SilentFieldUpdatesTests(unittest.TestCase):
