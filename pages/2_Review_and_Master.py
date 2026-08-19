@@ -532,6 +532,19 @@ def _render_master_table(df: pd.DataFrame, key: str) -> None:
     st.session_state["export_selected_df"] = df.loc[selected_positions].reset_index(drop=True)
     _render_selection_actions(df, filtered_df, selected_positions, key)
 
+    # Sets expectations for a real, confirmed upstream quirk rather than
+    # fixing it (there's nothing in this file to fix - the row-selector's
+    # checkbox is drawn and hit-tested entirely inside Streamlit's own
+    # vendored glide-data-grid bundle, which only registers a click within
+    # a small radius of the checkbox glyph itself, not anywhere in its
+    # visually-highlighted cell; no Streamlit API exposes that hitbox for
+    # us to widen). Placed after _render_selection_actions so "the count
+    # above" is always literally true.
+    st.caption(
+        "Tip: clicking a row's checkbox needs to land squarely on it. If the count above "
+        "doesn't change after a click, click again a little more precisely on the checkbox."
+    )
+
 
 def _selector_widget_key(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> str:
     """
