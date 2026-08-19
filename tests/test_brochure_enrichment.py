@@ -1404,6 +1404,53 @@ class MatchUnitTests(unittest.TestCase):
 
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
 
+    def test_spelled_out_ordinal_brochure_label_resolves_a_numeral_row(self):
+        # The real Copthall Estates "28 King Street" case this fallback was
+        # extended for: the brochure spells every floor as a full word with
+        # no digit at all, so the exact-text tier can't match "3rd Floor"
+        # and the ORIGINAL digit-only floor-number tier couldn't either -
+        # now it can, via the spelled-out-ordinal fallback.
+        row = ListingRow(building="28 King Street", floor_unit="3rd Floor", size_sqft=927)
+        units = [
+            {"building": "28 King Street", "floor_unit": "Second Floor", "size_sqft": 915},
+            {"building": "28 King Street", "floor_unit": "Third Floor", "size_sqft": 927},
+            {"building": "28 King Street", "floor_unit": "Fourth Floor", "size_sqft": 930},
+        ]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["floor_unit"], "Third Floor")
+
+    def test_mixed_digit_and_word_ordinal_units_still_resolve_correctly(self):
+        # A single building whose own brochure labels some floors with a
+        # digit and others spelled out (a real possible shape, e.g. a
+        # renovated top floor labeled differently from the rest) - both
+        # forms must resolve through the same tier without interfering.
+        row_word = ListingRow(building="A", floor_unit="3rd Floor")
+        row_digit = ListingRow(building="A", floor_unit="5th Floor")
+        units = [
+            {"building": "A", "floor_unit": "Third Floor", "special_features": "Word-labeled"},
+            {"building": "A", "floor_unit": "5th Floor", "special_features": "Digit-labeled"},
+        ]
+
+        self.assertEqual(brochure_enrichment._match_unit(row_word, units)["special_features"], "Word-labeled")
+        self.assertEqual(brochure_enrichment._match_unit(row_digit, units)["special_features"], "Digit-labeled")
+
+    def test_two_units_sharing_the_same_spelled_out_ordinal_stay_ambiguous(self):
+        # Defensive case: two genuinely different units that both spell out
+        # the SAME word-number (e.g. "Third Floor" and "Third Floor Annex")
+        # must still stay an unresolved tie, never guessed - same
+        # conservative principle test_two_units_sharing_the_same_floor_
+        # number_stay_ambiguous already covers for the digit form.
+        row = ListingRow(building="A", floor_unit="3rd Floor")
+        units = [
+            {"building": "A", "floor_unit": "Third Floor", "special_features": "One"},
+            {"building": "A", "floor_unit": "Third Floor Annex", "special_features": "Two"},
+        ]
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
     def test_no_building_match_returns_none(self):
         row = ListingRow(building="Somewhere Else")
         units = [{"building": "28 Lime Street", "floor_unit": "4th Floor"}]
@@ -1692,6 +1739,43 @@ class FloorNumberTests(unittest.TestCase):
     def test_two_digit_number_not_confused_with_a_single_digit(self):
         self.assertEqual(brochure_enrichment._floor_number("15th Floor"), 15)
         self.assertNotEqual(brochure_enrichment._floor_number("15th Floor"), brochure_enrichment._floor_number("5th"))
+
+    def test_spelled_out_ordinal_word(self):
+        # Real confirmed gap: real Copthall Estates brochures ("28-King-
+        # Street-EC2-2026-March.pdf", "Copthall-House-Office-Feb-2026.pdf")
+        # spell every floor out as a full word with no digit at all.
+        self.assertEqual(brochure_enrichment._floor_number("Third Floor"), 3)
+        self.assertEqual(brochure_enrichment._floor_number("Fourth Floor"), 4)
+        self.assertEqual(brochure_enrichment._floor_number("First Floor"), 1)
+
+    def test_spelled_out_ordinal_is_case_insensitive(self):
+        for variant in ("THIRD FLOOR", "third floor", "Third floor", "ThIrD FlOoR"):
+            self.assertEqual(brochure_enrichment._floor_number(variant), 3, msg=f"variant={variant!r}")
+
+    def test_full_range_first_through_twentieth(self):
+        words = [
+            "First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth",
+            "Eleventh", "Twelfth", "Thirteenth", "Fourteenth", "Fifteenth", "Sixteenth", "Seventeenth",
+            "Eighteenth", "Nineteenth", "Twentieth",
+        ]
+        for expected, word in enumerate(words, start=1):
+            self.assertEqual(brochure_enrichment._floor_number(f"{word} Floor"), expected, msg=f"word={word!r}")
+
+    def test_bare_ordinal_word_with_no_floor_suffix(self):
+        self.assertEqual(brochure_enrichment._floor_number("Third"), 3)
+
+    def test_digit_form_wins_when_a_label_has_a_conflicting_word(self):
+        # Not a real expected shape, just confirms the digit tier is
+        # checked first and a differing word match never overrides it.
+        self.assertEqual(brochure_enrichment._floor_number("5th Floor (Third Suite)"), 5)
+
+    def test_ground_and_reception_style_labels_still_return_none(self):
+        # Deliberately NOT given an invented numeric mapping - see
+        # _ORDINAL_WORD_TO_NUMBER's own comment on why guessing "Ground" is
+        # floor 0 (or similar) risks a false match against a genuinely
+        # different numbered floor.
+        for label in ("Ground Floor", "Lower Ground Floor", "Basement", "Mezzanine", "Reception"):
+            self.assertIsNone(brochure_enrichment._floor_number(label), msg=f"label={label!r}")
 
 
 class ApplyUnitsToRowNonStringGuardTests(unittest.TestCase):

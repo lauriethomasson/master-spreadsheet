@@ -177,7 +177,10 @@ _ISSUE_LABELS = {
     STATUS_FETCH_FAILED: "The document couldn't be opened",
     STATUS_RENDER_FAILED: "The document couldn't be read",
     STATUS_EXTRACTION_FAILED: "Information couldn't be extracted from this document",
-    STATUS_EXTRACTED_BUT_AMBIGUOUS: "The document was read, but couldn't be safely matched to this property",
+    STATUS_EXTRACTED_BUT_AMBIGUOUS: (
+        "This document covers multiple floors — we couldn't confirm which one matches this listing, "
+        "so your data wasn't changed."
+    ),
 }
 
 # render_canva_page_async's own navigation-status check (canva_renderer/
@@ -582,24 +585,56 @@ _SIZE_MATCH_MIN_TOLERANCE_SQFT = 1.0
 # extraction routinely label the SAME floor differently in ways normalize_key
 # alone never reconciles ("5th" vs "5th Floor" vs "Floor 5" - confirmed: none
 # of these three normalize_key-equal each other) even though a human reading
-# both would recognize them as unambiguously the same floor. Digit-only
-# (never "fifth"/word ordinals) - deliberately narrow, same "start
-# conservative" precedent as brochure_link_resolver.py's own.
+# both would recognize them as unambiguously the same floor.
 _FLOOR_NUMBER_RE = re.compile(r"\d+")
+
+# Spelled-out numbered-floor ordinals, checked (case-insensitively, whole
+# word only) when _FLOOR_NUMBER_RE finds no digit at all - confirmed real
+# gap: real Copthall Estates brochures ("28-King-Street-EC2-2026-March.pdf",
+# "Copthall-House-Office-Feb-2026.pdf") spell every floor out as a full word
+# ("Third Floor", "Fourth Floor") with no digit anywhere in the label, which
+# defeated this fallback entirely even though the spreadsheet's own "3rd
+# Floor"/"4th Floor" would otherwise have resolved to a unique match. Scoped
+# narrowly to NUMBERED floors only, First through Twentieth - "Ground Floor",
+# "Lower Ground Floor", "Basement", "Mezzanine", "Reception" etc. are
+# deliberately NOT given an invented numeric mapping here (they still return
+# None, exactly as before) since there's no real confirmed case needing one
+# and a wrong guess (e.g. treating "Ground" as floor 0) risks a false match
+# against a genuinely different numbered floor.
+_ORDINAL_WORD_TO_NUMBER = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
+    "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
+    "nineteenth": 19, "twentieth": 20,
+}
+_ORDINAL_WORD_RE = re.compile(
+    r"\b(" + "|".join(_ORDINAL_WORD_TO_NUMBER) + r")\b", re.IGNORECASE
+)
 
 
 def _floor_number(floor_unit):
     """
     The leading digit run in `floor_unit` as an int (e.g. 5 from "5th
-    Floor"), or None if it's blank or has no digit at all (e.g. "Ground
-    Floor", "Reception") - those never participate in this fallback tier,
-    exactly as if it didn't exist for them (falls through to the existing
-    size-based tier, or no match, same as before this existed).
+    Floor"), or - when there's no digit at all - a recognized spelled-out
+    numbered-floor ordinal word (e.g. 3 from "Third Floor", case-
+    insensitive; see _ORDINAL_WORD_TO_NUMBER), or None if `floor_unit` is
+    blank or matches neither form (e.g. "Ground Floor", "Reception") -
+    those never participate in this fallback tier, exactly as if it didn't
+    exist for them (falls through to the existing size-based tier, or no
+    match, same as before either form of this existed). The digit form is
+    checked first and wins if present - a label with both a digit and a
+    coincidental word match is not a real case this needs to handle
+    specially.
     """
     if _is_blank(floor_unit):
         return None
-    match = _FLOOR_NUMBER_RE.search(str(floor_unit))
-    return int(match.group()) if match else None
+    text = str(floor_unit)
+    digit_match = _FLOOR_NUMBER_RE.search(text)
+    if digit_match:
+        return int(digit_match.group())
+    word_match = _ORDINAL_WORD_RE.search(text)
+    return _ORDINAL_WORD_TO_NUMBER[word_match.group(1).lower()] if word_match else None
 
 
 def _is_blank(value) -> bool:
