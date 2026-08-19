@@ -10,6 +10,14 @@ already-staged result exactly like an extract_spreadsheet.py/
 extract_spreadsheet_gemini.py/brochure_enrichment.py change already does -
 it simply never did.
 
+Also covers a second, later gap of the exact same shape: once email
+uploads started running automatic brochure enrichment too (see app.py's
+own is_email_source), a brochure_enrichment.py change had to start
+invalidating an already-staged EMAIL result the same way it already does
+for a spreadsheet upload - see PdfEmailContentHashCompositionTests below.
+Deliberately never folded in for a PDF upload, which still never runs
+automatic enrichment at all.
+
 Confirmed against a real report: after landing the geocoding postcode-
 validation fix (see geocode.py's own module docstring - rejecting a Places
 candidate that contradicts the source's own postcode evidence), re-
@@ -132,6 +140,57 @@ class FingerprintCompositionTests(unittest.TestCase):
         # different filenames for the same bytes throughout).
         import inspect
         self.assertNotIn("filename", inspect.signature(app._spreadsheet_content_hash).parameters)
+
+
+class PdfEmailContentHashCompositionTests(unittest.TestCase):
+    """
+    Pure, no upload involved - app._pdf_or_email_content_hash, the PDF/
+    email counterpart to _spreadsheet_content_hash above. Confirms
+    brochure_enrichment.py's own source is folded in for an email upload
+    (which now runs automatic brochure enrichment too - see app.py's own
+    is_email_source) but deliberately NOT for a PDF upload (which still
+    never runs it at all - see brochure_enrichment.py's own module
+    docstring), exactly mirroring why _SPREADSHEET_LOGIC_FINGERPRINT
+    already includes it unconditionally for every spreadsheet upload.
+    """
+
+    def test_email_hash_is_computed_from_brochure_enrichment_py_bytes_too(self):
+        file_bytes = b"pretend .eml bytes"
+        expected = hashlib.sha256(
+            app.EXTRACTION_VERSION.encode("utf-8") + b"\0" + file_bytes + b"\0"
+            + Path(geocode.__file__).read_bytes() + b"\0" + Path(app.brochure_enrichment.__file__).read_bytes()
+        ).hexdigest()
+        self.assertEqual(app._pdf_or_email_content_hash(".eml", file_bytes), expected)
+
+    def test_pdf_hash_never_includes_brochure_enrichment_py(self):
+        file_bytes = b"pretend .pdf bytes"
+        expected = hashlib.sha256(
+            app.EXTRACTION_VERSION.encode("utf-8") + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
+        ).hexdigest()
+        self.assertEqual(app._pdf_or_email_content_hash(".pdf", file_bytes), expected)
+
+    def test_pdf_and_email_hash_differently_for_the_exact_same_bytes(self):
+        # Since brochure_enrichment.py's bytes are only folded in for one
+        # of the two, the same underlying content must never collide
+        # between a PDF and an email upload.
+        file_bytes = b"identical bytes, different upload type"
+        self.assertNotEqual(
+            app._pdf_or_email_content_hash(".pdf", file_bytes),
+            app._pdf_or_email_content_hash(".eml", file_bytes),
+        )
+
+    def test_same_suffix_and_bytes_hash_identically_every_call(self):
+        file_bytes = b"pretend .eml bytes"
+        self.assertEqual(
+            app._pdf_or_email_content_hash(".eml", file_bytes),
+            app._pdf_or_email_content_hash(".eml", file_bytes),
+        )
+
+    def test_different_bytes_hash_differently(self):
+        self.assertNotEqual(
+            app._pdf_or_email_content_hash(".eml", b"one email"),
+            app._pdf_or_email_content_hash(".eml", b"a different email"),
+        )
 
 
 class UploadReuseAcrossAFingerprintChangeTests(unittest.TestCase):

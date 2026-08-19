@@ -465,6 +465,39 @@ def _spreadsheet_content_hash(file_bytes: bytes, decisions: dict) -> str:
     ).hexdigest()
 
 
+def _pdf_or_email_content_hash(suffix: str, file_bytes: bytes) -> str:
+    """
+    content_hash for a PDF/email upload - EXTRACTION_VERSION (a human-
+    maintained counter for extract.py's/extract_email.py's own logic - see
+    its own comment) + file_bytes + geocode.py's own source, automatically
+    folded in for the same reason _SPREADSHEET_LOGIC_FINGERPRINT already
+    folds it in for a spreadsheet upload (see that constant's own comment) -
+    geocode_rows() runs unconditionally right after extraction for BOTH
+    source types, so a geocoding-logic change must invalidate an already-
+    staged PDF/email result too, without relying on anyone remembering to
+    bump EXTRACTION_VERSION for a change that isn't really about extract.py/
+    extract_email.py at all.
+
+    brochure_enrichment.py's own source is ALSO folded in, but only for an
+    email upload (suffix == ".eml") - an email upload now runs automatic
+    brochure enrichment too (see app.py's own is_email_source), so a
+    brochure_enrichment.py change must invalidate an already-staged EMAIL
+    result automatically, exactly like it already does for a spreadsheet
+    upload (see _SPREADSHEET_LOGIC_FINGERPRINT's own inclusion of it).
+    Deliberately never folded in for a PDF upload, which still never runs
+    automatic enrichment at all (see brochure_enrichment.py's own module
+    docstring) - doing so anyway would only cause needless re-extraction of
+    a PDF on a brochure_enrichment.py change that could never actually
+    affect its result.
+    """
+    versioned_content = (
+        EXTRACTION_VERSION.encode("utf-8") + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
+    )
+    if suffix == ".eml":
+        versioned_content += b"\0" + Path(brochure_enrichment.__file__).read_bytes()
+    return hashlib.sha256(versioned_content).hexdigest()
+
+
 def _render_ambiguous_sheet_decision(filename: str, plan: dict, file_hash: str) -> None:
     """
     Renders the required decision control + explanatory copy for one
@@ -667,26 +700,7 @@ with page_setup.setup_page("upload"):
                             file_hash.encode("utf-8") + b"\0" + decisions_repr
                         ).hexdigest()
                     else:
-                        # geocode.py's own source is folded in here too, same
-                        # as _SPREADSHEET_LOGIC_FINGERPRINT above and for the
-                        # exact same reason (see that fingerprint's own
-                        # comment) - geocode_rows() runs unconditionally
-                        # right after extraction for PDF/email too (see the
-                        # else branch further down), so a geocoding-logic
-                        # change must invalidate an already-staged PDF/email
-                        # result exactly like a PDF/email extraction-logic
-                        # change (EXTRACTION_VERSION) already does, without
-                        # requiring anyone to remember to bump that manual
-                        # counter for a change that isn't actually about
-                        # extract.py/extract_email.py at all.
-                        versioned_content = (
-                            EXTRACTION_VERSION.encode("utf-8")
-                            + b"\0"
-                            + file_bytes
-                            + b"\0"
-                            + Path(geocode.__file__).read_bytes()
-                        )
-                        content_hash = hashlib.sha256(versioned_content).hexdigest()
+                        content_hash = _pdf_or_email_content_hash(suffix, file_bytes)
                         # Same idea as the spreadsheet branch above - the
                         # real bytes alone, no EXTRACTION_VERSION/geocode.py
                         # fingerprint, so a re-upload of the same PDF/email
