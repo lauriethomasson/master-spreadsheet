@@ -155,6 +155,114 @@ class EligibleBrochureUrlTests(unittest.TestCase):
     def test_social_profile_is_not_eligible(self):
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url("https://www.linkedin.com/company/x"))
 
+    def test_google_drive_folder_link_is_not_eligible(self):
+        # Real Kitt's Availability shape - a folder has no single document
+        # to fetch at all, just Google's own HTML folder-listing page, so
+        # a fetch attempt is structurally doomed the same way a Canva
+        # link's is.
+        self.assertFalse(
+            brochure_enrichment._is_eligible_brochure_url(
+                "https://drive.google.com/drive/folders/1Q9q4PTgZcJvhTMW3rVAzND3rVCQ6b9ra?usp=drive_link",
+            )
+        )
+
+    def test_google_drive_single_file_link_is_still_eligible(self):
+        # The real, supported shape (drive.google.com/file/d/{id}/...)
+        # must be completely unaffected by the new folder-link rejection.
+        self.assertTrue(
+            brochure_enrichment._is_eligible_brochure_url(
+                "https://drive.google.com/file/d/1EPO_g2beNdCQKTgHqVIVlaIZPvSjbudJ/view?usp=sharing",
+            )
+        )
+
+
+class EligibleFloorplanUrlTests(unittest.TestCase):
+    """_is_eligible_floorplan_url - mirrors EligibleBrochureUrlTests above,
+    for floorplan_link (see that function's own docstring for the one
+    real difference: a floorplan-shaped URL is expected here, never
+    rejected)."""
+
+    def test_direct_pdf_url_is_eligible(self):
+        self.assertTrue(brochure_enrichment._is_eligible_floorplan_url("https://example.com/floorplan.pdf"))
+
+    def test_blank_is_not_eligible(self):
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url(None))
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url(""))
+
+    def test_generic_homepage_is_not_eligible(self):
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url("https://www.someprovider.co.uk"))
+
+    def test_youtube_url_is_not_eligible(self):
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url("https://youtube.com/watch?v=abc123"))
+
+    def test_google_drive_folder_link_is_not_eligible(self):
+        # The real, confirmed gap: 20+ distinct Google Drive folder links
+        # used as floorplan_link across Kitt's Availability file's real
+        # rows previously fell straight through to a real, structurally-
+        # doomed fetch attempt (surfacing as a misleading "document
+        # couldn't be opened") rather than the accurate "unsupported link
+        # type" this now gives instead.
+        self.assertFalse(
+            brochure_enrichment._is_eligible_floorplan_url(
+                "https://drive.google.com/drive/folders/1Q9q4PTgZcJvhTMW3rVAzND3rVCQ6b9ra?usp=drive_link",
+            )
+        )
+        self.assertFalse(
+            brochure_enrichment._is_eligible_floorplan_url(
+                "https://drive.google.com/drive/u/0/folders/1P2Fwz5PCfJBu1tEc7ZJSPzLD-dtskanc",
+            )
+        )
+
+    def test_google_drive_single_file_link_is_still_eligible(self):
+        self.assertTrue(
+            brochure_enrichment._is_eligible_floorplan_url(
+                "https://drive.google.com/file/d/1UjN-Sdoz5H7AkEgf1RudQUsU-_Pu8Z2o/view?usp=drive_link",
+            )
+        )
+
+    def test_floorplan_shaped_url_is_still_eligible(self):
+        # Unlike brochure_link, a floorplan-shaped URL text is expected
+        # here, never a rejection reason - must remain unaffected.
+        self.assertTrue(brochure_enrichment._is_eligible_floorplan_url("https://app.box.com/s/my-floorplan"))
+
+
+class GoogleDriveFolderLinkTests(unittest.TestCase):
+    def test_bare_folder_link_matches(self):
+        self.assertTrue(
+            brochure_enrichment._is_google_drive_folder_link("https://drive.google.com/drive/folders/abc123"),
+        )
+
+    def test_folder_link_with_query_string_matches(self):
+        self.assertTrue(
+            brochure_enrichment._is_google_drive_folder_link(
+                "https://drive.google.com/drive/folders/abc123?usp=drive_link",
+            )
+        )
+
+    def test_signed_in_account_variant_matches(self):
+        self.assertTrue(
+            brochure_enrichment._is_google_drive_folder_link("https://drive.google.com/drive/u/0/folders/abc123"),
+        )
+
+    def test_case_insensitive(self):
+        self.assertTrue(
+            brochure_enrichment._is_google_drive_folder_link("HTTPS://DRIVE.GOOGLE.COM/drive/folders/abc123"),
+        )
+
+    def test_single_file_link_does_not_match(self):
+        self.assertFalse(
+            brochure_enrichment._is_google_drive_folder_link(
+                "https://drive.google.com/file/d/abc123/view?usp=sharing",
+            )
+        )
+
+    def test_blank_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_google_drive_folder_link(None))
+        self.assertFalse(brochure_enrichment._is_google_drive_folder_link(""))
+
+    def test_unrelated_url_does_not_match(self):
+        self.assertFalse(brochure_enrichment._is_google_drive_folder_link("https://example.com/brochure.pdf"))
+
 
 class FetchAndExtractTests(EnrichmentTestCase):
     # render_pages/render_and_extract, not extract_raw_units - _extract_
@@ -3982,6 +4090,26 @@ class ClassifyLinkEligibilityTests(unittest.TestCase):
 
     def test_a_normal_pdf_link_is_eligible(self):
         self.assertIsNone(brochure_enrichment.classify_link_eligibility("https://example.com/brochure.pdf"))
+
+    def test_google_drive_folder_link_is_unsupported_link_type(self):
+        # Real Kitt's Availability shape - previously fell through to a
+        # real, structurally-doomed fetch attempt (see EligibleFloorplanUrlTests/
+        # EligibleBrochureUrlTests' own equivalent tests for the actual
+        # fetch-gate half of this fix).
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(
+                "https://drive.google.com/drive/folders/1Q9q4PTgZcJvhTMW3rVAzND3rVCQ6b9ra?usp=drive_link",
+                reject_floorplan_shaped=False,
+            ),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+
+    def test_google_drive_single_file_link_is_unaffected(self):
+        self.assertIsNone(
+            brochure_enrichment.classify_link_eligibility(
+                "https://drive.google.com/file/d/1EPO_g2beNdCQKTgHqVIVlaIZPvSjbudJ/view?usp=sharing",
+            )
+        )
 
 
 class IneligibleLinkIssuesCanvaReasonTests(unittest.TestCase):

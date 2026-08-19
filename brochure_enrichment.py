@@ -247,12 +247,14 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
       social-profile domain, a video link, a Canva public "view" link - see
       brochure_link_resolver.is_canva_view_link's own docstring on why a
       plain HTTP fetch can never retrieve real content from one, confirmed
-      directly against a real example rather than assumed - or, only when
-      reject_floorplan_shaped, brochure_link's own rule, see _is_eligible_
-      brochure_url - a floor-plan-labeled link where a brochure was
-      expected; floorplan_link's own check, _is_eligible_floorplan_url,
-      passes reject_floorplan_shaped=False since that shape is exactly
-      what's expected there, never a rejection reason).
+      directly against a real example rather than assumed - a Google Drive
+      FOLDER share link, see _is_google_drive_folder_link's own docstring,
+      confirmed real against Kitt's Availability file's own floorplan_link
+      values - or, only when reject_floorplan_shaped, brochure_link's own
+      rule, see _is_eligible_brochure_url - a floor-plan-labeled link where
+      a brochure was expected; floorplan_link's own check, _is_eligible_
+      floorplan_url, passes reject_floorplan_shaped=False since that shape
+      is exactly what's expected there, never a rejection reason).
     """
     if _is_blank(url):
         return STATUS_NO_DOCUMENT
@@ -263,6 +265,8 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
     if is_generic_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if is_canva_view_link(url) and not _canva_renderer_configured():
+        return STATUS_UNSUPPORTED_LINK_TYPE
+    if _is_google_drive_folder_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if reject_floorplan_shaped and is_floorplan_not_brochure_url(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
@@ -840,7 +844,10 @@ def _is_eligible_brochure_url(url) -> bool:
     company homepage or known social/professional profile domain (see
     brochure_link_resolver.is_generic_link), a Canva public "view" link
     (see is_canva_view_link's own docstring - confirmed, not assumed, that
-    a plain fetch can never retrieve real content from one), and a URL
+    a plain fetch can never retrieve real content from one), a Google
+    Drive FOLDER share link (see _is_google_drive_folder_link - Google's
+    own HTML folder-listing page, not a document, so a fetch attempt is
+    structurally doomed the same way it is for a Canva link), and a URL
     whose own text already identifies it as a floor plan or a video rather
     than a document - never a fetch-then-guess; these are excluded by the
     URL alone, exactly like a human skimming a link list would.
@@ -852,6 +859,8 @@ def _is_eligible_brochure_url(url) -> bool:
     if is_generic_link(url):
         return False
     if is_canva_view_link(url) and not _canva_renderer_configured():
+        return False
+    if _is_google_drive_folder_link(url):
         return False
     if is_floorplan_not_brochure_url(url):
         return False
@@ -993,6 +1002,35 @@ def _google_drive_file_id(url: str):
     mirroring _box_share_token's own convention."""
     match = _GOOGLE_DRIVE_FILE_ID_RE.match(url)
     return match.group(1) if match else None
+
+
+# A Google Drive FOLDER share link ("drive.google.com/drive/folders/{id}",
+# or "drive.google.com/drive/u/{n}/folders/{id}" for a specific signed-in
+# account) - a genuinely different shape from the single-FILE share link
+# above, confirmed real: 20+ distinct folder links used as floorplan_link
+# across real rows in Kitt's Availability file. A folder has no single
+# document to fetch at all - just Google's own HTML folder-listing page -
+# so a plain HTTP GET can never retrieve real content from one the way it
+# can for a real file link; classify_link_eligibility rejects this shape
+# outright (STATUS_UNSUPPORTED_LINK_TYPE) rather than letting it fall
+# through to a real fetch attempt that's structurally guaranteed to fail,
+# which previously surfaced as a misleading "document couldn't be opened"
+# (a fetch-failure message) for a link shape this pipeline was never
+# built to read at all - same honest wording Canva links already get.
+# Classification only: this does NOT add real folder support (reading
+# whichever specific file inside the folder is the actual floor plan) -
+# that's a separate, bigger feature, not attempted here.
+_GOOGLE_DRIVE_FOLDER_RE = re.compile(r"^https?://drive\.google\.com/drive/(?:u/\d+/)?folders/", re.IGNORECASE)
+
+
+def _is_google_drive_folder_link(url: str) -> bool:
+    """True for a Google Drive FOLDER share link (see _GOOGLE_DRIVE_
+    FOLDER_RE's own comment) - never a fetch, matched against the URL's
+    own text only, same as is_canva_view_link/is_floorplan_not_brochure_
+    url's other use sites."""
+    if not url:
+        return False
+    return bool(_GOOGLE_DRIVE_FOLDER_RE.match(url.strip()))
 
 
 _BOX_PDF_ONLY_EXTENSIONS = ("pdf",)
@@ -2175,8 +2213,12 @@ def _is_eligible_floorplan_url(url) -> bool:
     scheme and rejects a bare company homepage/known social-profile domain
     (see is_generic_link), a Canva public "view" link (see is_canva_view_
     link's own docstring - a floor plan is never retrievable from one
-    either, for the same reason a brochure isn't), and a video link - a
-    floor plan is never hosted at either of those either.
+    either, for the same reason a brochure isn't), a Google Drive FOLDER
+    share link (see _is_google_drive_folder_link - confirmed real: 20+
+    distinct folder links used as floorplan_link in Kitt's Availability
+    file, previously falling through to a real fetch attempt structurally
+    guaranteed to fail), and a video link - a floor plan is never hosted
+    at either of those either.
     """
     if _is_blank(url):
         return False
@@ -2185,6 +2227,8 @@ def _is_eligible_floorplan_url(url) -> bool:
     if is_generic_link(url):
         return False
     if is_canva_view_link(url) and not _canva_renderer_configured():
+        return False
+    if _is_google_drive_folder_link(url):
         return False
     lowered = url.lower()
     return not any(bad in lowered for bad in ("youtube.com", "youtu.be"))
