@@ -339,7 +339,11 @@ def _warn_if_brochure_link_missing(rows: list[ListingRow], ws, sheet_label: str)
     if not rows:
         return
     text = extract_spreadsheet_gemini.render_sheet_as_text(ws)
-    units = [{"building": r.building, "brochure_link": r.brochure_link} for r in rows]
+    units = [
+        {"building": r.building, "brochure_link": r.brochure_link,
+         "brochure_link_is_floorplan": r.brochure_link_is_floorplan}
+        for r in rows
+    ]
     for building in extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units):
         st.warning(
             f"⚠️ {sheet_label}: {building} has a Download Brochure link in the source sheet, but no "

@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import fitz
 
@@ -196,6 +197,66 @@ class AttachPerRowPdfLinksTests(unittest.TestCase):
             self.assertEqual(units[1]["brochure_link"], "https://example.com/unit-b")
         finally:
             pdf_path.unlink(missing_ok=True)
+
+
+class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
+    """
+    brochure_link falls back to floorplan_link's own URL whenever finalize_
+    brochure_link ends up with nothing genuine but finalize_floorplan_link
+    found a real floor plan - the same fallback extract_spreadsheet_gemini.
+    py's own extract_sheet_with_metadata applies (see ListingRow.brochure_
+    link_is_floorplan's own schema.py docstring), added here identically so
+    all three extraction paths behave the same way.
+
+    Structural note specific to this (PDF) extraction path: finalize_
+    brochure_link's own rule 3 (is_pdf=True) already defaults brochure_link
+    to pdf_fallback_link (the uploaded PDF's own file) whenever nothing
+    genuine was found, so brochure_link is essentially never blank here in
+    ordinary use - this fallback exists purely for identical behavior
+    across all three paths, not because it's commonly reachable on this
+    one. Exercised below via an empty pdf_fallback_link (Path("") has an
+    empty .name, and no original_filename/brochure_url is given) - the one
+    way to genuinely reach a blank brochure_link on this path at all.
+    extract_raw_units (real PDF rendering + the Gemini vision call) is
+    mocked wholesale, same principle as every other test in this file/
+    module - no real PDF page rendering or network call involved.
+    """
+
+    def _extract(self, brochure_link, floorplan_link):
+        raw = {
+            "provider": "UNION", "contacts": None,
+            "units": [
+                {"building": "155 Fenchurch Street", "floor_unit": "7th",
+                 "brochure_link": brochure_link, "floorplan_link": floorplan_link},
+            ],
+        }
+        with patch("extract.extract_raw_units", return_value=raw):
+            rows = extract.extract(Path(""))
+        return rows[0]
+
+    def test_brochure_blank_floorplan_present_fills_in_and_flags_as_floorplan(self):
+        row = self._extract(
+            brochure_link=None,
+            floorplan_link="https://app.box.com/s/5cbox5mdsxeqe1jb26dgj1agx2e7kbmi",
+        )
+        self.assertEqual(row.brochure_link, "https://app.box.com/s/5cbox5mdsxeqe1jb26dgj1agx2e7kbmi")
+        self.assertEqual(row.floorplan_link, "https://app.box.com/s/5cbox5mdsxeqe1jb26dgj1agx2e7kbmi")
+        self.assertIs(row.brochure_link_is_floorplan, True)
+
+    def test_both_present_brochure_link_stays_genuine_and_unflagged(self):
+        row = self._extract(
+            brochure_link="https://example.com/brochure.pdf",
+            floorplan_link="https://app.box.com/s/floorplan-only",
+        )
+        self.assertEqual(row.brochure_link, "https://example.com/brochure.pdf")
+        self.assertEqual(row.floorplan_link, "https://app.box.com/s/floorplan-only")
+        self.assertIsNone(row.brochure_link_is_floorplan)
+
+    def test_both_blank_brochure_link_stays_blank(self):
+        row = self._extract(brochure_link=None, floorplan_link=None)
+        self.assertFalse(row.brochure_link)
+        self.assertIsNone(row.floorplan_link)
+        self.assertIsNone(row.brochure_link_is_floorplan)
 
 
 def _make_multi_link_column_pdf(rows: list) -> Path:

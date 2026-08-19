@@ -658,6 +658,18 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
         )
         unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
+        # No genuine brochure, but a real floor plan exists - shown as
+        # brochure_link too (see ListingRow.brochure_link_is_floorplan's
+        # own docstring) rather than silently hidden behind floorplan_link,
+        # which stays a hidden column by default. floorplan_link itself is
+        # untouched either way - this only ever ADDS a value to brochure_
+        # link, never replaces a genuine one (that case never reaches here:
+        # brochure_link is already non-blank).
+        brochure_link_is_floorplan = None
+        if not unit.get("brochure_link") and unit.get("floorplan_link"):
+            unit["brochure_link"] = unit["floorplan_link"]
+            brochure_link_is_floorplan = True
+
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)
         rows.append(
@@ -666,6 +678,7 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
                 lat=None,
                 lng=None,
                 source_file=filename,
+                brochure_link_is_floorplan=brochure_link_is_floorplan,
             )
         )
     return rows

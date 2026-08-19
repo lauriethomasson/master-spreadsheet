@@ -195,10 +195,11 @@ RANGE_COLUMNS = [
 # internal/traceability-only columns that never belong in front of Mark/Laurie
 # regardless of whether they have a value - still written to the underlying
 # .xlsx (see write_rows_to_xlsx), just never rendered here. brochure_link_broken
-# is pipeline diagnostics (see ListingRow.brochure_link_broken's own schema.py
-# docstring) - same reasoning as staging_writer.HIDDEN_COLUMNS, which hides it
-# from the exported file for the identical reason; kept as its own separate
-# list here since this one governs the on-screen review grid, not the .xlsx.
+# and brochure_link_is_floorplan are both pipeline diagnostics (see their own
+# schema.py docstrings) - same reasoning as staging_writer.HIDDEN_COLUMNS,
+# which hides them from the exported file for the identical reason; kept as
+# its own separate list here since this one governs the on-screen review
+# grid, not the .xlsx.
 # floorplan_link is a pure visibility change, not a data/logic one - the
 # field, its data, and its own enrichment (FLOORPLAN_PROMPT etc. in
 # brochure_enrichment.py) are all completely untouched; it's just no
@@ -207,6 +208,7 @@ ALWAYS_HIDDEN_COLUMNS = [
     "source_file",
     "property_id",
     "brochure_link_broken",
+    "brochure_link_is_floorplan",
     "floorplan_link",
 ]
 
@@ -281,6 +283,12 @@ _DISPLAY_LABEL_STRIP_RE = re.compile(r"[?&]display_label=[^&]*")
 # the same underlying brochure_link_broken fact.
 BROCHURE_LINK_WORKING_LABEL = LINK_DISPLAY_TEXT.get("brochure_link", "Open brochure")
 BROCHURE_LINK_BROKEN_LABEL = BROKEN_LINK_DISPLAY_TEXT
+# Reuses floorplan_link's OWN existing label text (never a separate
+# literal) for a row where brochure_link_is_floorplan is confirmed True -
+# see that field's own schema.py docstring. A brochure_link that's really
+# a floor plan under the hood must never read as "Open brochure", the
+# same misleading-label problem BROCHURE_LINK_BROKEN_LABEL exists to avoid.
+BROCHURE_LINK_FLOORPLAN_LABEL = LINK_DISPLAY_TEXT.get("floorplan_link", "Open floor plan")
 
 
 def _with_display_label(url, label: str) -> str:
@@ -295,15 +303,18 @@ def _with_display_label(url, label: str) -> str:
 def with_brochure_link_display_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     Returns a COPY of df where every non-blank brochure_link value has a
-    display_label query parameter appended - BROCHURE_LINK_BROKEN_LABEL
-    for a row whose brochure_link_broken is confirmed True, BROCHURE_
-    LINK_WORKING_LABEL (today's existing default) for every other row,
-    UNCONDITIONALLY - never left blank/absent, even when brochure_link_
-    broken isn't a column in df at all. That unconditional part matters:
+    display_label query parameter appended - BROCHURE_LINK_BROKEN_LABEL for
+    a row whose brochure_link_broken is confirmed True, else BROCHURE_LINK_
+    FLOORPLAN_LABEL for a row whose brochure_link_is_floorplan is confirmed
+    True, else BROCHURE_LINK_WORKING_LABEL (today's existing default) for
+    every other row, UNCONDITIONALLY - never left blank/absent, even when
+    neither column is present in df at all. That unconditional part matters:
     confirmed directly (real headless-browser render) that a URL with NO
     display_label param at all falls back to showing the RAW URL, not a
     blank cell or an error - a real regression from today's clean "Open
-    brochure" label if any row were ever left untransformed.
+    brochure" label if any row were ever left untransformed. broken takes
+    priority over is_floorplan when (in principle) both were ever true at
+    once - a confirmed-dead link is the more urgent fact to surface.
 
     A no-op (returns df completely UNCHANGED, not even a copy) when
     brochure_link isn't a column in df at all - nothing to transform.
@@ -322,13 +333,26 @@ def with_brochure_link_display_labels(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.copy()
     broken = df["brochure_link_broken"] if "brochure_link_broken" in df.columns else pd.Series(False, index=df.index)
+    is_floorplan = (
+        df["brochure_link_is_floorplan"] if "brochure_link_is_floorplan" in df.columns
+        else pd.Series(False, index=df.index)
+    )
 
-    def _label_for(url, is_broken):
+    def _label_for(url, is_broken, is_floorplan_fallback):
         if not url or (isinstance(url, float) and pd.isna(url)):
             return url
-        return _with_display_label(url, BROCHURE_LINK_BROKEN_LABEL if is_broken is True else BROCHURE_LINK_WORKING_LABEL)
+        if is_broken is True:
+            label = BROCHURE_LINK_BROKEN_LABEL
+        elif is_floorplan_fallback is True:
+            label = BROCHURE_LINK_FLOORPLAN_LABEL
+        else:
+            label = BROCHURE_LINK_WORKING_LABEL
+        return _with_display_label(url, label)
 
-    df["brochure_link"] = [_label_for(url, is_broken) for url, is_broken in zip(df["brochure_link"], broken)]
+    df["brochure_link"] = [
+        _label_for(url, is_broken, is_floorplan_fallback)
+        for url, is_broken, is_floorplan_fallback in zip(df["brochure_link"], broken, is_floorplan)
+    ]
     return df
 
 

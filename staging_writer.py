@@ -74,13 +74,18 @@ DATA_ROW_HEIGHT = 60
 # into silent_updates, never the reviewable diff) - a raw True/False/blank
 # column would otherwise expose that internal bookkeeping directly next to
 # brochure_link, which is exactly what BROKEN_LINK_DISPLAY_TEXT's own label
-# swap is meant to communicate instead. floorplan_link is a pure visibility
-# change, not a data/logic one - the field, its data, and its own
-# enrichment (FLOORPLAN_PROMPT etc. in brochure_enrichment.py) are all
-# completely untouched, still written into this file exactly as before and
-# still hyperlinked (see HYPERLINK_COLUMNS/LINK_DISPLAY_TEXT below, both
-# unaffected by this) - it just no longer shows as its own visible column.
-HIDDEN_COLUMNS = ["source_file", "property_id", "brochure_link_broken", "floorplan_link"]
+# swap is meant to communicate instead. brochure_link_is_floorplan is the
+# same idea for a different fact (see its own schema.py docstring) - its
+# own label swap below communicates it instead of a raw column. floorplan_
+# link is a pure visibility change, not a data/logic one - the field, its
+# data, and its own enrichment (FLOORPLAN_PROMPT etc. in brochure_
+# enrichment.py) are all completely untouched, still written into this
+# file exactly as before and still hyperlinked (see HYPERLINK_COLUMNS/
+# LINK_DISPLAY_TEXT below, both unaffected by this) - it just no longer
+# shows as its own visible column.
+HIDDEN_COLUMNS = [
+    "source_file", "property_id", "brochure_link_broken", "brochure_link_is_floorplan", "floorplan_link",
+]
 
 
 def title_case_label(field_name: str) -> str:
@@ -158,6 +163,9 @@ def write_rows_to_xlsx(rows: list[ListingRow], output) -> None:
                     if field == "brochure_link" and rows[row_idx - 2].brochure_link_broken:
                         cell.value = BROKEN_LINK_DISPLAY_TEXT
                         cell.font = BROKEN_LINK_FONT
+                    elif field == "brochure_link" and rows[row_idx - 2].brochure_link_is_floorplan:
+                        cell.value = LINK_DISPLAY_TEXT["floorplan_link"]
+                        cell.font = HYPERLINK_FONT
                     else:
                         cell.value = display_text
                         cell.font = HYPERLINK_FONT

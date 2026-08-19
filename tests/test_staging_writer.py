@@ -276,6 +276,94 @@ class BrokenBrochureLinkDisplayTests(unittest.TestCase):
         self.assertEqual(ws.cell(row=2, column=col_idx).hyperlink.target, "https://example.com/plan.pdf")
 
 
+class FloorplanFallbackBrochureLinkDisplayTests(unittest.TestCase):
+    """
+    A row whose brochure_link_is_floorplan is True (brochure_link had
+    nothing genuine of its own and was filled in from floorplan_link
+    instead - see schema.py's own docstring) must show "Open floor plan"
+    instead of the normal "Open brochure", same mechanism as
+    BrokenBrochureLinkDisplayTests above but for a different underlying
+    fact.
+    """
+
+    def _cell(self, row, field="brochure_link"):
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label(field)) + 1
+        return ws.cell(row=2, column=col_idx)
+
+    def test_floorplan_fallback_shows_the_floorplan_label_not_open_brochure(self):
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/plan.pdf", brochure_link_is_floorplan=True,
+        )
+        cell = self._cell(row)
+        self.assertEqual(cell.value, "Open floor plan")
+
+    def test_floorplan_fallback_still_uses_the_normal_hyperlink_font_not_broken(self):
+        # Not a broken link - just a different document, so the ordinary
+        # clickable blue/underlined font, never BROKEN_LINK_FONT.
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/plan.pdf", brochure_link_is_floorplan=True,
+        )
+        cell = self._cell(row)
+        self.assertEqual(cell.font.color.rgb, "000563C1")
+        self.assertTrue(cell.font.underline)
+
+    def test_a_genuine_brochure_is_unaffected(self):
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/fine.pdf", brochure_link_is_floorplan=None,
+        )
+        cell = self._cell(row)
+        self.assertEqual(cell.value, "Open brochure")
+
+    def test_broken_takes_priority_over_the_floorplan_fallback_label(self):
+        # A row could in principle be both (the substituted floorplan URL
+        # later confirmed dead) - the more urgent "Broken link" fact must
+        # win, same precedence as display_utils.with_brochure_link_display_
+        # labels applies on-screen.
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/plan.pdf",
+            brochure_link_is_floorplan=True, brochure_link_broken=True,
+        )
+        cell = self._cell(row)
+        self.assertEqual(cell.value, "Broken link")
+
+    def test_floorplan_link_cell_is_never_affected_by_brochure_link_is_floorplan(self):
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/plan.pdf", brochure_link_is_floorplan=True,
+            floorplan_link="https://example.com/plan.pdf",
+        )
+        cell = self._cell(row, field="floorplan_link")
+        self.assertEqual(cell.value, "Open floor plan")
+
+    def test_brochure_link_is_floorplan_column_is_hidden_not_shown_as_a_raw_flag(self):
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/plan.pdf", brochure_link_is_floorplan=True,
+        )
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("brochure_link_is_floorplan")) + 1
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        self.assertTrue(ws.column_dimensions[column_letter].hidden)
+
+    def test_floorplan_fallback_url_still_round_trips_correctly(self):
+        row = ListingRow(
+            building="A", brochure_link="https://example.com/plan.pdf", brochure_link_is_floorplan=True,
+        )
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        df = read_xlsx_with_hyperlinks(buffer.getvalue())
+        self.assertEqual(df.iloc[0]["brochure_link"], "https://example.com/plan.pdf")
+
+
 class LegacyColumnCompatibilityTests(unittest.TestCase):
     """Regression coverage for a real bug found while verifying this exact
     scenario against the real data/master.xlsx: that file predates the

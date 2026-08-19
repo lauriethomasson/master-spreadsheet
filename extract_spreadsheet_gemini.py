@@ -571,6 +571,18 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
         )
         unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
+        # No genuine brochure, but a real floor plan exists - shown as
+        # brochure_link too (see ListingRow.brochure_link_is_floorplan's
+        # own docstring) rather than silently hidden behind floorplan_link,
+        # which stays a hidden column by default. floorplan_link itself is
+        # untouched either way - this only ever ADDS a value to brochure_
+        # link, never replaces a genuine one (that case never reaches here:
+        # brochure_link is already non-blank).
+        brochure_link_is_floorplan = None
+        if not unit["brochure_link"] and unit["floorplan_link"]:
+            unit["brochure_link"] = unit["floorplan_link"]
+            brochure_link_is_floorplan = True
+
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)
         rows.append(
@@ -579,6 +591,7 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
                 lat=None,
                 lng=None,
                 source_file=sheet_label,
+                brochure_link_is_floorplan=brochure_link_is_floorplan,
             )
         )
 
@@ -955,7 +968,17 @@ def find_buildings_missing_brochure_link(raw_text: str, units: list[dict]) -> li
     hyperlink (see _BROCHURE_HYPERLINK_RE - a real inlined hyperlink
     target, per render_sheet_as_text, not just the bare word "brochure"
     appearing in running prose with no link at all) but where NONE of that
-    building's own extracted units carry a brochure_link.
+    building's own extracted units carry a GENUINE brochure_link - a unit
+    whose brochure_link is only present via the brochure_link_is_floorplan
+    fallback (see that field's own schema.py docstring; passed here via an
+    optional "brochure_link_is_floorplan" key, defaulting to falsy for a
+    caller that never sets it) never counts as "extracted" for this check.
+    A real, genuine "Download Brochure" link was still missed structurally
+    even though brochure_link ends up non-blank - showing a floor plan
+    document is strictly better than a blank cell, but it must never
+    silently mask the exact production failure mode this check exists to
+    catch (Gemini picking the wrong link, or dropping the right one,
+    between two candidates in the same block).
 
     Never the reverse: a building with no "Brochure"-labeled link in the
     source at all is not itself suspicious - not every provider supplies
@@ -979,7 +1002,10 @@ def find_buildings_missing_brochure_link(raw_text: str, units: list[dict]) -> li
         has_brochure_link_in_source = any(_BROCHURE_HYPERLINK_RE.search(line) for line in lines[start:end])
         if not has_brochure_link_in_source:
             continue
-        any_extracted = any(u.get("brochure_link") for u in units if u.get("building") == building)
+        any_extracted = any(
+            u.get("brochure_link") and not u.get("brochure_link_is_floorplan")
+            for u in units if u.get("building") == building
+        )
         if not any_extracted:
             missing.append(building)
     return missing

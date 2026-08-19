@@ -133,6 +133,10 @@ class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
         df = pd.DataFrame([{"building": "A", "floorplan_link": "https://example.com/plan.pdf"}])
         self.assertNotIn("floorplan_link", display_utils.visible_columns(df))
 
+    def test_brochure_link_is_floorplan_is_never_shown_on_the_review_grid(self):
+        df = pd.DataFrame([{"building": "A", "brochure_link_is_floorplan": True}])
+        self.assertNotIn("brochure_link_is_floorplan", display_utils.visible_columns(df))
+
     def test_an_ordinary_column_is_unaffected(self):
         df = pd.DataFrame([{"building": "A", "brochure_link_broken": True}])
         self.assertIn("building", display_utils.visible_columns(df))
@@ -180,6 +184,37 @@ class WithBrochureLinkDisplayLabelsTests(unittest.TestCase):
         # the same brochure_link_broken fact two different ways.
         from staging_writer import BROKEN_LINK_DISPLAY_TEXT
         self.assertEqual(display_utils.BROCHURE_LINK_BROKEN_LABEL, BROKEN_LINK_DISPLAY_TEXT)
+
+    def test_floorplan_fallback_row_gets_the_floorplan_label(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/plan.pdf", "brochure_link_is_floorplan": True}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Open+floor+plan", result["brochure_link"].iloc[0])
+
+    def test_genuine_brochure_with_is_floorplan_none_gets_the_default_label(self):
+        df = pd.DataFrame([{"brochure_link": "https://example.com/fine.pdf", "brochure_link_is_floorplan": None}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Open+brochure", result["brochure_link"].iloc[0])
+
+    def test_absent_brochure_link_is_floorplan_column_still_gets_the_default_label(self):
+        df = pd.DataFrame([{"building": "A", "brochure_link": "https://example.com/fine.pdf"}])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Open+brochure", result["brochure_link"].iloc[0])
+
+    def test_broken_takes_priority_over_the_floorplan_fallback_label(self):
+        df = pd.DataFrame([{
+            "brochure_link": "https://example.com/plan.pdf",
+            "brochure_link_broken": True,
+            "brochure_link_is_floorplan": True,
+        }])
+        result = display_utils.with_brochure_link_display_labels(df)
+        self.assertIn("display_label=Broken+link", result["brochure_link"].iloc[0])
+
+    def test_floorplan_label_matches_the_exported_xlsx_wording_exactly(self):
+        # Same wording as the real floorplan_link column's own label
+        # (staging_writer.LINK_DISPLAY_TEXT["floorplan_link"]) - never an
+        # independently-drifting literal.
+        from staging_writer import LINK_DISPLAY_TEXT
+        self.assertEqual(display_utils.BROCHURE_LINK_FLOORPLAN_LABEL, LINK_DISPLAY_TEXT["floorplan_link"])
 
     def test_a_url_with_no_existing_query_string_uses_a_question_mark(self):
         df = pd.DataFrame([{"brochure_link": "https://example.com/design/x/view", "brochure_link_broken": None}])

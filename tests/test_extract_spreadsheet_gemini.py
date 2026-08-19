@@ -641,6 +641,54 @@ class FindBuildingsMissingBrochureLinkTests(unittest.TestCase):
         )
         self.assertEqual(missing, [])
 
+    def test_still_flagged_when_the_only_brochure_link_is_really_the_floorplan_fallback(self):
+        # A genuine "Download Brochure" link exists in source but was never
+        # captured (e.g. two conflicting brochure candidates - see
+        # BrochureLinkFloorplanFallbackTests/ApplyDeterministicBrochureLinks
+        # EndToEndTests above) - brochure_link ends up non-blank purely via
+        # the brochure_link_is_floorplan fallback, which must never mask
+        # this exact structural failure the check exists to catch.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [
+                None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+                "Download Floorplans (https://a.example.com/floorplans)", None, None,
+                "Download Brochure (https://b.example.com/brochure.pdf)",
+            ],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+        units = [{
+            "building": "Riverside Building",
+            "brochure_link": "https://a.example.com/floorplans",
+            "brochure_link_is_floorplan": True,
+        }]
+
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units)
+
+        self.assertEqual(missing, ["Riverside Building"])
+
+    def test_a_genuine_brochure_link_still_clears_the_flag_regardless_of_the_new_key(self):
+        # Backward-compatible: a caller that never sets brochure_link_is_
+        # floorplan at all (the key is simply absent) behaves exactly as
+        # before - a genuine brochure_link still clears the check.
+        text = extract_spreadsheet_gemini.render_sheet_as_text(self._sheet([
+            [None, "Riverside Building - Southwark"],
+            [None, "A modern glass-fronted office building overlooking the Thames."],
+            [
+                None, "15 Riverside Walk, SE1 9EZ", None, None, None,
+                "Download Brochure (https://b.example.com/brochure.pdf)",
+            ],
+            [None, "Office", "Sq.Ft", "Rent PCM", "Available From"],
+            [None, "3rd Floor", 1800.0, 14000.0, "Now"],
+        ]))
+        units = [{"building": "Riverside Building", "brochure_link": "https://b.example.com/brochure.pdf"}]
+
+        missing = extract_spreadsheet_gemini.find_buildings_missing_brochure_link(text, units)
+
+        self.assertEqual(missing, [])
+
 
 class DeterministicBrochureLinkForBuildingTests(unittest.TestCase):
     """deterministic_brochure_link_for_building - reads the real Excel
@@ -973,7 +1021,16 @@ class ApplyDeterministicBrochureLinksEndToEndTests(unittest.TestCase):
         self.assertEqual(rows[0].brochure_link, "https://b.example.com/brochure.pdf")
         self.assertNotEqual(rows[0].brochure_link, "https://a.example.com/floorplans")
 
-    def test_no_source_brochure_link_never_fabricates_one(self):
+    def test_no_source_brochure_link_falls_back_to_the_recovered_floorplan_link(self):
+        # Deterministic recovery itself still never fabricates a brochure
+        # link out of a Floorplans-labeled one (see DeterministicBrochure
+        # LinkForBuildingTests.test_never_returns_the_floorplans_link) -
+        # brochure_link stays genuinely unset all the way through the
+        # override and finalize_brochure_link. What's different since the
+        # brochure_link_is_floorplan fallback was added (see extract_sheet_
+        # with_metadata's own comment): the separately-recovered, genuine
+        # floorplan_link now fills that gap instead of leaving brochure_
+        # link blank, clearly flagged rather than passed off as a real one.
         wb = Workbook()
         ws = wb.active
         ws.append([None, "Riverside Building - Southwark"])
@@ -993,9 +1050,11 @@ class ApplyDeterministicBrochureLinksEndToEndTests(unittest.TestCase):
              patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
             rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — City", "file.xlsx")
 
-        self.assertIsNone(rows[0].brochure_link)
+        self.assertEqual(rows[0].floorplan_link, "https://a.example.com/floorplans")
+        self.assertEqual(rows[0].brochure_link, "https://a.example.com/floorplans")
+        self.assertIs(rows[0].brochure_link_is_floorplan, True)
 
-    def test_conflicting_brochure_links_are_never_guessed(self):
+    def test_conflicting_brochure_links_are_never_guessed_but_the_floorplan_link_still_falls_back(self):
         wb = Workbook()
         ws = wb.active
         self._riverside_block(ws)
@@ -1014,10 +1073,17 @@ class ApplyDeterministicBrochureLinksEndToEndTests(unittest.TestCase):
              patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
             rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — City", "file.xlsx")
 
-        # Never guessed at from the conflicting pair - left exactly as Gemini
-        # (the best available signal here) extracted it, which in this case
-        # was nothing.
-        self.assertIsNone(rows[0].brochure_link)
+        # Deterministic recovery still never guesses between the two
+        # genuinely conflicting brochure candidates - brochure_link never
+        # comes from EITHER of them. But the single, unambiguous floorplan
+        # link is a completely separate recovery and is still genuinely
+        # unambiguous, so it falls back into brochure_link (flagged) rather
+        # than leaving a real document silently blank.
+        self.assertEqual(rows[0].floorplan_link, "https://a.example.com/floorplans")
+        self.assertEqual(rows[0].brochure_link, "https://a.example.com/floorplans")
+        self.assertNotEqual(rows[0].brochure_link, "https://b.example.com/brochure.pdf")
+        self.assertNotEqual(rows[0].brochure_link, "https://c.example.com/old-brochure.pdf")
+        self.assertIs(rows[0].brochure_link_is_floorplan, True)
 
     def test_does_not_replace_an_already_valid_link_with_a_wrong_neighbor(self):
         # A single-consistent-table sheet (shape (a)) has no "download" line
@@ -1040,6 +1106,98 @@ class ApplyDeterministicBrochureLinksEndToEndTests(unittest.TestCase):
             rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — Sheet1", "file.xlsx")
 
         self.assertEqual(rows[0].brochure_link, "https://provider.example.com/brochure.pdf")
+
+
+class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
+    """
+    brochure_link falls back to floorplan_link's own URL whenever finalize_
+    brochure_link ends up with nothing genuine but finalize_floorplan_link
+    found a real floor plan - see extract_sheet_with_metadata's own comment
+    just above the fallback. Real, confirmed gap this closes: a UNION
+    upload ("UNION Availability June 26.xlsx", "City" sheet, row 22, "155
+    Fenchurch Street" 7th floor) whose only real document was a Box-hosted
+    floor plan ended up with a completely blank brochure_link in master,
+    even though a real document existed - floorplan_link is a hidden
+    column by default, so nobody browsing the grid could see it at all.
+    floorplan_link itself is always left exactly as finalize_floorplan_link
+    produced it, fallback or not - this only ever ADDS a value to
+    brochure_link, never touches floorplan_link's own.
+    """
+
+    def _sheet(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "Office"
+        ws["A2"] = "4th Floor"
+        return ws
+
+    def _extract(self, brochure_link, floorplan_link):
+        raw = {
+            "provider": "UNION", "contacts": None,
+            "units": [
+                {"building": "155 Fenchurch Street", "floor_unit": "7th",
+                 "brochure_link": brochure_link, "floorplan_link": floorplan_link},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — City", "file.xlsx")
+        return rows[0]
+
+    def test_brochure_blank_floorplan_present_fills_in_and_flags_as_floorplan(self):
+        row = self._extract(
+            brochure_link=None,
+            floorplan_link="https://app.box.com/s/5cbox5mdsxeqe1jb26dgj1agx2e7kbmi",
+        )
+        self.assertEqual(row.brochure_link, "https://app.box.com/s/5cbox5mdsxeqe1jb26dgj1agx2e7kbmi")
+        self.assertEqual(row.floorplan_link, "https://app.box.com/s/5cbox5mdsxeqe1jb26dgj1agx2e7kbmi")
+        self.assertIs(row.brochure_link_is_floorplan, True)
+
+    def test_both_present_brochure_link_stays_genuine_and_unflagged(self):
+        row = self._extract(
+            brochure_link="https://example.com/brochure.pdf",
+            floorplan_link="https://app.box.com/s/floorplan-only",
+        )
+        self.assertEqual(row.brochure_link, "https://example.com/brochure.pdf")
+        self.assertEqual(row.floorplan_link, "https://app.box.com/s/floorplan-only")
+        self.assertIsNone(row.brochure_link_is_floorplan)
+
+    def test_both_blank_brochure_link_stays_blank(self):
+        row = self._extract(brochure_link=None, floorplan_link=None)
+        self.assertIsNone(row.brochure_link)
+        self.assertIsNone(row.floorplan_link)
+        self.assertIsNone(row.brochure_link_is_floorplan)
+
+    def test_combined_document_cell_is_unaffected_by_the_new_fallback(self):
+        # Real, common combined-document naming pattern ("Download
+        # Brochure and Floorplans") - is_floorplan_not_brochure_url backs
+        # off from nulling this out (see its own docstring, and
+        # CombinedBrochureAndFloorplanCellTests above), so brochure_link
+        # ends up genuinely populated via the deterministic override and
+        # the new fallback never even applies - exactly as before this
+        # change.
+        wb = Workbook()
+        ws = wb.active
+        ws.append([None, "Riverside Building - Southwark"])
+        ws.append([None, "A modern glass-fronted office building overlooking the Thames."])
+        ws.append([None, "15 Riverside Walk, SE1 9EZ", None, None, None, "Download Brochure and Floorplans"])
+        ws["F3"].hyperlink = "https://example.com/combined.pdf"
+        ws.append([None, "Office", "Sq.Ft", "Rent PCM", "Available From"])
+        ws.append([None, "3rd Floor", 1800.0, 14000.0, "Now"])
+        raw = {
+            "provider": "Copthall Estates", "contacts": None, "fully_occupied_buildings": [],
+            "units": [
+                {"building": "Riverside Building", "floor_unit": "3rd Floor",
+                 "size_sqft": 1800, "rent_pcm": 14000, "brochure_link": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(ws, "file.xlsx — City", "file.xlsx")
+
+        self.assertEqual(rows[0].brochure_link, "https://example.com/combined.pdf")
+        self.assertIsNone(rows[0].floorplan_link)
+        self.assertIsNone(rows[0].brochure_link_is_floorplan)
 
 
 class ExtractSheetWithMetadataTests(unittest.TestCase):

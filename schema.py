@@ -66,6 +66,22 @@ class ListingRow(BaseModel):
     rent_psf: Optional[float] = None
     brochure_link: Optional[str] = None
     floorplan_link: Optional[str] = None  # a genuinely different document from brochure_link - never a substitute
+    # True only when brochure_link has nothing genuine of its own and was
+    # filled in from floorplan_link instead - the same fallback applied
+    # identically by all three extraction paths (extract.py, extract_
+    # email.py, extract_spreadsheet_gemini.py's own extract_sheet_with_
+    # metadata) right after each one's own finalize_brochure_link/finalize_
+    # floorplan_link calls - so a real document is still shown rather than
+    # a blank column, but never indistinguishable from an actual brochure.
+    # floorplan_link itself is completely unaffected, still
+    # holding the exact same URL independently. Never explicitly False -
+    # left None whenever the fallback doesn't apply, same reasoning as
+    # brochure_link_broken above: a fresh row that didn't need the fallback
+    # this run must never overwrite a master row's existing True via master_
+    # merge.diff_fields' own blank-new-value-skip rule. Checked by display_
+    # utils.with_brochure_link_display_labels to swap brochure_link's own
+    # display label to "Open floor plan" instead of "Open brochure".
+    brochure_link_is_floorplan: Optional[bool] = None
     special_features: Optional[str] = None
     state_of_space: Optional[str] = None
     contacts: Optional[str] = None  # all contacts combined, one per line/semicolon, each as "Name, email, phone"
