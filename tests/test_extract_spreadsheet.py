@@ -619,6 +619,57 @@ class BuildRowsTests(unittest.TestCase):
         self.assertEqual(rows[0].lat, 51.5)
         self.assertEqual(rows[0].lng, -0.1)
 
+    def test_a_currency_formatted_cell_is_parsed_not_dropped_to_none(self):
+        # Grounded in a real Kitt's "Kitts Availability External.xlsx"
+        # row: its Source_Availability sheet's rent_psf column holds
+        # currency-formatted text ("£296") rather than a plain number for
+        # some rows - float("£296") raised ValueError and silently became
+        # None, indistinguishable from a genuinely blank cell (and, worse,
+        # made that row look eligible for automatic brochure re-enrichment,
+        # which came back with a different, disagreeing number and turned
+        # a units-formatting quirk into a false duplicate-review conflict).
+        df = pd.DataFrame([{"Building": "28 Bruton Street", "Psf": "£296"}])
+        mapping = {"Building": "building", "Psf": "rent_psf"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="kitts.xlsx")
+
+        self.assertEqual(rows[0].rent_psf, 296.0)
+
+    def test_a_currency_formatted_cell_with_thousands_comma_is_parsed_correctly(self):
+        # The same Source_Availability sheet's rent_pcm column has the same
+        # gap combined with a thousands-separator comma ("£48,400") -
+        # both the currency symbol and the comma must be stripped, not just
+        # one or the other.
+        df = pd.DataFrame([{"Building": "28 Bruton Street", "Pcm": "£48,950"}])
+        mapping = {"Building": "building", "Pcm": "rent_pcm"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="kitts.xlsx")
+
+        self.assertEqual(rows[0].rent_pcm, 48950.0)
+
+    def test_dollar_and_euro_formatted_cells_are_also_parsed_correctly(self):
+        # Not just £ - the same gap applies to any of the common currency
+        # symbols a provider spreadsheet might use.
+        df = pd.DataFrame([{"Building": "A", "Psf": "$1,200"}])
+        mapping = {"Building": "building", "Psf": "rent_psf"}
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
+        self.assertEqual(rows[0].rent_psf, 1200.0)
+
+        df = pd.DataFrame([{"Building": "A", "Psf": "€500"}])
+        mapping = {"Building": "building", "Psf": "rent_psf"}
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
+        self.assertEqual(rows[0].rent_psf, 500.0)
+
+    def test_a_plain_comma_formatted_number_is_still_unaffected(self):
+        # Pre-existing behavior (no currency symbol at all) must stay
+        # exactly as it was.
+        df = pd.DataFrame([{"Building": "A", "Pcm": "48,400"}])
+        mapping = {"Building": "building", "Pcm": "rent_pcm"}
+
+        rows = extract_spreadsheet.build_rows(df, mapping, source_file="a.xlsx")
+
+        self.assertEqual(rows[0].rent_pcm, 48400.0)
+
     def test_unmapped_columns_never_reach_listingrow(self):
         # A column mapped to None (or simply absent from the mapping dict)
         # must never surface as an unexpected kwarg - ListingRow's own

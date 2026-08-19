@@ -847,14 +847,32 @@ def _coerce_numeric(value, kind: str):
     which - like the lat/lng case above - would otherwise abort the WHOLE
     file's extraction over one cell; a rounded desk count is a far better
     outcome than that.
+
+    Currency symbols (£/$/€) are stripped alongside the thousands-separator
+    comma already handled below - confirmed real gap against the actual
+    Kitt's "Kitts Availability External.xlsx" file: its Source_Availability
+    sheet's rent_psf/rent_pcm cells are sometimes currency-formatted text
+    ("£296", "£48,400") rather than a plain number, which used to raise
+    ValueError and silently become None - indistinguishable from a
+    genuinely blank cell. That false blank has real downstream cost beyond
+    just the missing number: brochure_enrichment.py treats a blank
+    ENRICHABLE_FIELDS value as eligible for automatic re-enrichment from
+    the brochure document itself, which can (and did, for this exact "28
+    Bruton Street" row) come back with a different, disagreeing number -
+    turning a units-formatting quirk into a false "needs your decision"
+    duplicate-review conflict against the same building's OTHER sheet,
+    which had no such formatting issue.
     """
     if value is None:
         numeric = None
     elif isinstance(value, (int, float)):
         numeric = value
     else:
+        cleaned = str(value)
+        for symbol in (",", "£", "$", "€"):
+            cleaned = cleaned.replace(symbol, "")
         try:
-            numeric = float(str(value).replace(",", "").strip())
+            numeric = float(cleaned.strip())
         except ValueError:
             numeric = None
 
