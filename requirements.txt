@@ -3,7 +3,7 @@ google-genai
 google-cloud-storage
 pydantic
 openpyxl
-streamlit==1.60.0
+streamlit==1.61.1
 # Streamlit declares starlette<2,>=0.40.0 (a very wide, unpinned transitive
 # range) but its own bundled GZip middleware wrapper (streamlit/web/server/
 # starlette/starlette_gzip_middleware.py) is only actually compatible with

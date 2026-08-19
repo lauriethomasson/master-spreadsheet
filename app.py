@@ -665,7 +665,7 @@ with page_setup.setup_page("upload"):
                         # superseding an earlier, stale pending copy.
                         source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
 
-                    previous_staging_path = find_previous_upload_by_hash(content_hash)
+                    previous_staging_path = find_previous_upload_by_hash(content_hash, source_identity_hash)
                     fully_occupied_buildings = []
                     # Set below ONLY when previous_staging_path's own
                     # enrichment was left incomplete - see its own use at

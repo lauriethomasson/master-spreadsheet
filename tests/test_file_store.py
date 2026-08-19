@@ -120,6 +120,88 @@ class ContentHashDedupTests(IsolatedCwdTestCase):
         self.assertEqual(found, second)
 
 
+class SourceIdentityHashFallbackDedupTests(IsolatedCwdTestCase):
+    """
+    find_previous_upload_by_hash's own real, confirmed gap: content_hash
+    ALONE bakes in the current code's own extraction-logic fingerprint
+    (_SPREADSHEET_LOGIC_FINGERPRINT/EXTRACTION_VERSION + geocode.py, see
+    app.py), so re-uploading the exact same source file after ANY change
+    to that logic produced a genuinely different content_hash and this
+    lookup wrongly returned None - the file was re-extracted from scratch
+    instead of reusing the cached rows. group_pending_by_content_hash/
+    active_and_superseded_staging_files (see ActiveAndSupersededStaging
+    FilesTests above) already had this exact fallback via _grouping_hash;
+    these mirror that class's own "different content_hash, same source_
+    identity_hash" tests, but for THIS lookup specifically.
+    """
+
+    def test_different_content_hash_but_same_source_identity_hash_still_matches(self):
+        rows = [ListingRow(building="A", provider="P1")]
+        staging_path = file_store.save_staging_file(
+            rows, "a.pdf", content_hash="fingerprint-1-bytes", source_identity_hash="same-real-file",
+        )
+
+        # Simulates a real fix landing in extract_spreadsheet.py/geocode.py
+        # between the two uploads - the fingerprint-dependent content_hash
+        # is now genuinely different, but the real file bytes (and
+        # therefore source_identity_hash) haven't changed at all.
+        found = file_store.find_previous_upload_by_hash("fingerprint-2-bytes", "same-real-file")
+
+        self.assertEqual(found, staging_path)
+
+    def test_three_reuploads_across_three_fingerprints_all_resolve_to_the_latest(self):
+        rows = [ListingRow(building="A", provider="P1")]
+        file_store.save_staging_file(rows, "a1.pdf", content_hash="fingerprint-1", source_identity_hash="same-real-file")
+        file_store.save_staging_file(rows, "a2.pdf", content_hash="fingerprint-2", source_identity_hash="same-real-file")
+        third = file_store.save_staging_file(
+            rows, "a3.pdf", content_hash="fingerprint-3", source_identity_hash="same-real-file",
+        )
+
+        found = file_store.find_previous_upload_by_hash("fingerprint-4", "same-real-file")
+
+        self.assertEqual(found, third)
+
+    def test_different_source_identity_hash_never_matches_even_with_no_content_hash_overlap_either(self):
+        # Two genuinely different real files must never be treated as the
+        # same upload merely because BOTH happen to have gone through the
+        # source_identity_hash path.
+        file_store.save_staging_file(
+            [ListingRow(building="A")], "a.pdf", content_hash="hash-a", source_identity_hash="file-a-bytes",
+        )
+
+        found = file_store.find_previous_upload_by_hash("hash-b", "file-b-bytes")
+
+        self.assertIsNone(found)
+
+    def test_omitting_source_identity_hash_preserves_the_exact_prior_content_hash_only_behavior(self):
+        # Backward compatibility for any caller not yet updated to pass
+        # source_identity_hash (the default is None) - must behave
+        # EXACTLY like the pre-fix content_hash-only lookup.
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A")], "a.pdf", content_hash="hash-a", source_identity_hash="file-a-bytes",
+        )
+
+        found = file_store.find_previous_upload_by_hash("hash-a")  # no source_identity_hash passed at all
+
+        self.assertEqual(found, staging_path)
+
+    def test_legacy_entry_with_no_source_identity_hash_still_falls_back_to_content_hash(self):
+        # A staging entry written before source_identity_hash existed at
+        # all (never recorded) must keep matching on content_hash alone,
+        # exactly as it always did - no backfill needed for old history.
+        staging_path = file_store.save_staging_file(
+            [ListingRow(building="A")], "a.pdf", content_hash="hash-a-legacy",
+        )
+
+        # A caller that HAS started passing source_identity_hash for new
+        # uploads must still find this pre-existing legacy entry by its
+        # own content_hash, since it never recorded a source_identity_hash
+        # to compare against in the first place.
+        found = file_store.find_previous_upload_by_hash("hash-a-legacy", "some-new-uploads-source-hash")
+
+        self.assertEqual(found, staging_path)
+
+
 class RealPdfContentHashDedupTests(IsolatedCwdTestCase):
     """
     The tests above all use a literal synthetic content_hash string (e.g.

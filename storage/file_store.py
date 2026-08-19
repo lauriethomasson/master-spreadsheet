@@ -329,13 +329,16 @@ def get_staging_fully_occupied_buildings(path: str) -> list:
     return _read_meta(path).get("fully_occupied_buildings", [])
 
 
-def find_previous_upload_by_hash(content_hash: str) -> str:
+def find_previous_upload_by_hash(content_hash: str, source_identity_hash: str = None) -> str:
     """
-    The staging path of the most recent previously-processed upload with
-    this exact content_hash (see app.py, which hashes the raw uploaded
-    bytes before extraction), or None if this exact file content has never
-    been uploaded before. Searches every staging entry regardless of status
-    - pending or already approved - since staging .xlsx files are kept
+    The staging path of the most recent previously-processed upload
+    identified by `source_identity_hash` if given (the real uploaded
+    bytes alone - see save_staging_file's own docstring), else by
+    `content_hash` (see app.py, which hashes the raw uploaded bytes
+    BEFORE extraction, folded together with the current code's own
+    extraction-logic fingerprint) - or None if this upload has never been
+    seen before. Searches every staging entry regardless of status -
+    pending or already approved - since staging .xlsx files are kept
     forever (see module docstring), making this a permanent ledger rather
     than something that only catches a re-upload while the first one is
     still awaiting review.
@@ -347,24 +350,59 @@ def find_previous_upload_by_hash(content_hash: str) -> str:
     hasn't actually changed at all, which would otherwise show up as a
     spurious diff with nothing real behind it.
 
-    Entries written before this existed have no "content_hash" key at all
+    Real, confirmed gap this closes (the SAME one group_pending_by_
+    content_hash/active_and_superseded_staging_files already fixed via
+    _grouping_hash, which this function now reuses rather than
+    duplicating its own copy of the same fallback logic): content_hash
+    ALONE bakes in the current code's own extraction-logic fingerprint
+    (_SPREADSHEET_LOGIC_FINGERPRINT/EXTRACTION_VERSION + geocode.py, see
+    app.py), so re-uploading the exact same source file after ANY change
+    to that logic produces a different content_hash and this lookup
+    wrongly returned None - the file was re-extracted from scratch
+    instead of reusing the cached rows, even though nothing about the
+    actual source document had changed at all. Passing the caller's own
+    source_identity_hash through closes that gap the same way grouping
+    already does; omitting it (the default) preserves the exact prior
+    content_hash-only behavior for any caller that hasn't been updated.
+
+    Entries written before either hash existed have neither key at all
     (None via .get()), so they simply never match a fresh hash - no
     backfill needed for old history to behave correctly.
     """
     if not content_hash:
         return None
-    return _find_previous_upload_by_hash_cached(content_hash, _staging_signature())
+    return _find_previous_upload_by_hash_cached(content_hash, source_identity_hash, _staging_signature())
 
 
 @st.cache_data(max_entries=8, ttl=3600, show_spinner="Checking for a previous upload of this file...")
-def _find_previous_upload_by_hash_cached(content_hash: str, signature: tuple) -> str:
+def _find_previous_upload_by_hash_cached(content_hash: str, source_identity_hash: str, signature: tuple) -> str:
+    # The SAME "source_identity_hash if present, else content_hash"
+    # preference _grouping_hash already applies to a STORED entry's own
+    # meta, applied here to THIS upload's own freshly-computed hashes too
+    # - but NOT as the only comparison: a stored entry's PREFERRED hash
+    # (_grouping_hash(meta)) is compared against this upload's preferred
+    # hash, OR its plain content_hash is compared directly against this
+    # upload's content_hash, independent of either side's preference.
+    # That second, always-on check is required - confirmed directly by a
+    # real test failure while writing this fix - because relying on
+    # _grouping_hash ALONE breaks the exact-content_hash-match case
+    # whenever only ONE side happens to carry a source_identity_hash the
+    # other has nothing to compare it against: e.g. this upload's own
+    # caller omits source_identity_hash (the documented backward-
+    # compatible default) against an entry that DOES have one recorded -
+    # _grouping_hash(meta) would then prefer THAT entry's source_identity_
+    # hash, which this upload's own preferred value (its plain
+    # content_hash, since it has no source_identity_hash of its own to
+    # prefer) would never equal, even though the two content_hash values
+    # are byte-for-byte identical.
+    preferred_target = source_identity_hash or content_hash
     matches = []
     for xlsx_path, _ in blob_store.list_with_mtimes(STAGING_PREFIX, ".xlsx"):
         try:
             meta = _read_meta(xlsx_path)
         except FileNotFoundError:
             continue
-        if meta.get("content_hash") == content_hash:
+        if _grouping_hash(meta) == preferred_target or meta.get("content_hash") == content_hash:
             matches.append((meta.get("timestamp", ""), xlsx_path))
 
     if not matches:
