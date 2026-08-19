@@ -985,6 +985,25 @@ def merge_compatible_text(old_val, new_val, field_name: str = None) -> str:
     return "; ".join(merged) if merged else str(new_val)
 
 
+def draft_merge_text(values: list) -> str:
+    """
+    Plain starting draft for a reviewer-edited RISKY_TEXT_FIELDS merge box
+    (see pages/2_Review_and_Master.py's own _render_intra_batch_duplicate_
+    group "Same listing — merge" choice) - every non-blank value in
+    `values` (listing order), joined with "; ", the field's own documented
+    canonical separator (see merge_compatible_text/_detail_items).
+
+    Deliberately NOT merge_compatible_text - this is a genuine conflict
+    (_text_variants_compatible already said no, or the review card
+    wouldn't be showing a merge box for it at all), so there's no
+    confirmed-non-conflicting "newest wins, append only what's missing"
+    resolution to fall back on here; a straightforward, uncleaned
+    concatenation is deliberately all this offers - the reviewer edits it
+    into its own final wording themselves, this is never the final value.
+    """
+    return "; ".join(str(v) for v in values if not _is_blank(v))
+
+
 # Threshold for is_richness_regression - a new value under HALF of the old
 # value's word count is flagged for review even when is_detail_loss finds no
 # missing item. Matches ITEM_SIMILARITY_THRESHOLD's own 0.5, for the same
@@ -2350,6 +2369,25 @@ def _listing_evidence_richness(d: dict) -> int:
     both existing at once (e.g. an old, not-yet-superseded pending upload
     alongside a freshly re-uploaded one)."""
     return sum(1 for f in _LISTING_DIFFERENCE_FIELDS if not _is_blank(d.get(f)))
+
+
+def richest_listing_index(dicts: list) -> int:
+    """
+    Index of `dicts`' own member with the most non-blank _LISTING_
+    DIFFERENCE_FIELDS (see _listing_evidence_richness) - the same richness
+    tie-break _partition_by_listing_evidence already trusts to pick a more
+    reliable cluster anchor over a sparser row, reused here (rather than a
+    second, separately-invented tie-break) to pick the base row for pages/
+    2_Review_and_Master.py's own _render_intra_batch_duplicate_group
+    "Same listing — merge" choice: every field the reviewer isn't
+    explicitly overriding in a text box comes from THIS row, unchanged.
+
+    Ties (equal richness) resolve to the EARLIEST index - max() only ever
+    replaces its current pick on a strictly greater score, never an equal
+    one - so this is stable and deterministic rather than arbitrary when
+    two candidates are equally rich.
+    """
+    return max(range(len(dicts)), key=lambda i: _listing_evidence_richness(dicts[i]))
 
 
 def _best_listing_evidence_match(new_dict: dict, candidates: list) -> int:

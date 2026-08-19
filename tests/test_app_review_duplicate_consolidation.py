@@ -342,5 +342,134 @@ class OliverYardListingIdentityTests(IsolatedCwdTestCase):
         self.assertEqual([e for e in at.expander if "Possible duplicate" in (e.label or "")], [])
 
 
+class MergeDuplicateListingsTests(IsolatedCwdTestCase):
+    """
+    The "Same listing — merge" choice on the duplicate-listing review card
+    (pages/2_Review_and_Master.py's _render_intra_batch_duplicate_group) -
+    for a group whose only genuine disagreement is a RISKY_TEXT_FIELDS
+    field, lets a reviewer combine both texts into one edited value instead
+    of being forced to discard one wholesale.
+    """
+
+    def test_special_features_disagreement_offers_merge_and_produces_combined_row(self):
+        # The real confirmed Kitt's case ("8 Laurence Pountney Hill — G"): a
+        # bare YouTube link vs prose mentioning "Space video" share no
+        # actual text at all, so the existing auto-merge check
+        # (master_merge._text_variants_compatible) correctly refuses to
+        # silently combine them - but a human can tell they're the same
+        # video, so this needs a way to combine the two texts rather than
+        # forcing a wholesale pick of one over the other.
+        save_staging_file(
+            [
+                ListingRow(
+                    building="8 Laurence Pountney Hill", provider="Kitt's", floor_unit="G",
+                    special_features="https://www.youtube.com/watch?v=DbjHrR1fQF4",
+                ),
+                ListingRow(
+                    building="8 Laurence Pountney Hill", provider="Kitt's", floor_unit="G",
+                    special_features="Free communal meeting rooms and business lounge; Space video",
+                ),
+            ],
+            "kitts.xlsx", content_hash="kitts-hash",
+        )
+
+        at = _run_review_page()
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+
+        radio = next(r for r in at.radio if r.label == "What are these?")
+        self.assertIn("Same listing — merge the two", radio.options)
+        radio.set_value("Same listing — merge the two")
+        at.run()
+        self.assertFalse(at.exception)
+
+        # Pre-filled with a plain, uncleaned join of both listings' own
+        # values - never auto-deduplicated - the reviewer edits it in.
+        text_areas = [t for t in at.text_area if t.label == "Special Features"]
+        self.assertEqual(len(text_areas), 1)
+        self.assertEqual(
+            text_areas[0].value,
+            "https://www.youtube.com/watch?v=DbjHrR1fQF4; "
+            "Free communal meeting rooms and business lounge; Space video",
+        )
+        text_areas[0].set_value(
+            "Free communal meeting rooms and business lounge "
+            "(https://www.youtube.com/watch?v=DbjHrR1fQF4)"
+        )
+        at.run()
+        self.assertFalse(at.exception)
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+        self.assertFalse(at.exception)
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 1)
+        self.assertEqual(
+            master_df.iloc[0]["special_features"],
+            "Free communal meeting rooms and business lounge (https://www.youtube.com/watch?v=DbjHrR1fQF4)",
+        )
+        self.assertEqual(master_df.iloc[0]["building"], "8 Laurence Pountney Hill")
+
+    def test_non_text_field_disagreement_offers_no_merge_option(self):
+        # rent_psf disagreeing is a genuine conflict (see master_merge.
+        # genuinely_differing_fields), but it isn't a RISKY_TEXT_FIELDS
+        # field - merging free text isn't a meaningful operation for it, so
+        # the merge choice must never even be offered here.
+        save_staging_file(
+            [
+                ListingRow(building="28 Bruton Street", provider="Kitt's", floor_unit="4th", rent_psf=45.0),
+                ListingRow(building="28 Bruton Street", provider="Kitt's", floor_unit="4th", rent_psf=60.0),
+            ],
+            "kitts_rent.xlsx", content_hash="kitts-rent-hash",
+        )
+
+        at = _run_review_page()
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+
+        radio = next(r for r in at.radio if r.label == "What are these?")
+        self.assertEqual(radio.options, [
+            "Keep both — separate listings", "Same listing — use Listing A", "Same listing — use Listing B",
+        ])
+        self.assertEqual([t for t in at.text_area if t.label in ("Special Features", "Contacts")], [])
+
+    def test_two_differing_text_fields_show_two_separate_boxes(self):
+        save_staging_file(
+            [
+                ListingRow(
+                    building="1 Example Street", provider="UNION", floor_unit="1st",
+                    special_features="Rooftop terrace with panoramic views",
+                    contacts="Alice Smith, alice@firmone.co.uk, 07111 111111",
+                ),
+                ListingRow(
+                    building="1 Example Street", provider="UNION", floor_unit="1st",
+                    special_features="Bike storage and shower facilities",
+                    contacts="Bob Jones, bob@differentco.com, 07222 222222",
+                ),
+            ],
+            "two_fields.xlsx", content_hash="two-fields-hash",
+        )
+
+        at = _run_review_page()
+        self.assertIn("⚠️ Needs your decision", [s.value for s in at.subheader])
+
+        radio = next(r for r in at.radio if r.label == "What are these?")
+        self.assertIn("Same listing — merge the two", radio.options)
+        radio.set_value("Same listing — merge the two")
+        at.run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(len([t for t in at.text_area if t.label == "Special Features"]), 1)
+        self.assertEqual(len([t for t in at.text_area if t.label == "Contacts"]), 1)
+        special_box = next(t for t in at.text_area if t.label == "Special Features")
+        contacts_box = next(t for t in at.text_area if t.label == "Contacts")
+        self.assertEqual(
+            special_box.value, "Rooftop terrace with panoramic views; Bike storage and shower facilities",
+        )
+        self.assertEqual(
+            contacts_box.value,
+            "Alice Smith, alice@firmone.co.uk, 07111 111111; Bob Jones, bob@differentco.com, 07222 222222",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

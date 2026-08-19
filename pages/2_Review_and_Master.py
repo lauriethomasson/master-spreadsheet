@@ -204,7 +204,7 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
     this UI with no NON-hidden disagreement at all: rare, but not
     provably impossible, so this never assumes it away).
 
-    Three outcomes, one radio, matching the identity question directly:
+    Four outcomes, one radio, matching the identity question directly:
     - "Keep {all/both} — separate listings" (the safe DEFAULT - selected
       with no interaction needed) - each row becomes its own new property.
     - "Same listing — use Listing X" - exactly ONE of the group's own rows
@@ -212,6 +212,21 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
       discarded entirely, deliberately no per-field cherry-picking here -
       if the reviewer can tell these are the same listing, they can also
       tell which one is the correct/more complete row to keep.
+    - "Same listing — merge {the two/them all}" - offered ONLY when at
+      least one of differing_fields is a RISKY_TEXT_FIELDS field (see
+      mergeable_text_fields below); for a disagreement on any OTHER kind
+      of field (rent_psf, floor_unit, ...), merging free text isn't a
+      meaningful operation, so this choice simply never appears. Reveals
+      one editable text box per such field (pre-filled with master_merge.
+      draft_merge_text's plain, uncleaned join of every listing's own
+      value - the reviewer edits it into its real final wording
+      themselves, never auto-cleaned further here) - every OTHER field
+      comes from whichever one of the group's rows master_merge.
+      richest_listing_index picks as the base, completely unchanged (the
+      same richness tie-break already trusted elsewhere in this module,
+      not a second, separately-invented one) - only the field(s) shown in
+      a box get the reviewer's own typed value instead of that base row's
+      own value for exactly that field.
     """
     dicts = [u.new_row.model_dump() for u in group]
     listing_labels = [f"Listing {chr(65 + i)}" for i in range(len(dicts))]
@@ -222,6 +237,7 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
     ]
     if not differing_fields:
         differing_fields = ["floor_unit"]
+    mergeable_text_fields = [f for f in differing_fields if f in master_merge.RISKY_TEXT_FIELDS]
 
     with st.expander(
         f"⚠️ Possible duplicate listings — {display_utils.row_label(dicts[0])}",
@@ -243,13 +259,27 @@ def _render_intra_batch_duplicate_group(group: list, key_prefix: str, new_rows_f
                         st.write(line)
 
         keep_separate_label = "Keep both — separate listings" if len(dicts) == 2 else "Keep all — separate listings"
+        merge_label = "Same listing — merge the two" if len(dicts) == 2 else "Same listing — merge them all"
         options = [keep_separate_label] + [f"Same listing — use {label}" for label in listing_labels]
+        if mergeable_text_fields:
+            options.append(merge_label)
         choice = st.radio("What are these?", options, key=f"{key_prefix}_choice")
 
         if choice == keep_separate_label:
             new_rows_final.extend(
                 u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in group
             )
+        elif choice == merge_label:
+            text_overrides = {}
+            for f in mergeable_text_fields:
+                draft = master_merge.draft_merge_text([d.get(f) for d in dicts])
+                text_overrides[f] = st.text_area(
+                    title_case_label(f), value=draft, key=f"{key_prefix}_merge_{f}",
+                )
+            base = dict(dicts[master_merge.richest_listing_index(dicts)])
+            base.update(text_overrides)
+            base.update({"property_id": str(uuid.uuid4()), "source_file": combined_source})
+            new_rows_final.append(ListingRow(**base))
         else:
             chosen = group[options.index(choice) - 1]
             new_rows_final.append(
