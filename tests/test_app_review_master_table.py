@@ -550,6 +550,86 @@ class StaleSelectionArchitectureTests(unittest.TestCase):
 
         self.assertEqual(_selector_key(at), key_before)
 
+    # Real production report: "Clear selection" correctly zeroed the
+    # tracked "N of M selected" count and disabled the Export/Edit
+    # buttons, but the row checkboxes in the table itself stayed visually
+    # ticked. Root cause: df/filtered_df don't change across this click,
+    # so the property_id-fingerprint half of _selector_widget_key was
+    # byte-identical before and after - deleting session_state's entry
+    # for that (unchanged) key resets Streamlit's own server-side record
+    # of the widget's value, but the frontend only mounts a genuinely new
+    # widget instance (with no inherited canvas-rendered checkbox state)
+    # when the KEY STRING itself changes. The fix: a per-widget selection
+    # epoch (see _selection_epoch_key), bumped on every clear and folded
+    # into the key's own fingerprint, so the key differs even when the
+    # row set doesn't.
+    def test_selector_key_changes_after_clear_selection(self):
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        self._select_rows(at, [0, 1])
+        at.run()
+        key_before = _selector_key(at)
+
+        clear_btn = next(b for b in at.button if b.label == "Clear selection")
+        clear_btn.click().run()
+        self.assertFalse(at.exception)
+
+        key_after = _selector_key(at)
+        self.assertNotEqual(key_before, key_after)
+
+    def test_clear_selection_actually_resets_the_widgets_own_checkbox_state(self):
+        # Not just a different key in the abstract - the NEW widget
+        # instance's own reported selection (what the checkboxes actually
+        # show) must be genuinely empty, which is only true because it's
+        # a fresh mount seeded by selection_default rather than a stale
+        # frontend instance nobody ever remounted.
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        key_before = _selector_key(at)
+        self._select_rows(at, [0, 1])
+        at.run()
+        self.assertEqual(at.session_state[key_before]["selection"]["rows"], [0, 1])
+
+        clear_btn = next(b for b in at.button if b.label == "Clear selection")
+        clear_btn.click().run()
+        self.assertFalse(at.exception)
+
+        # The old key's own entry is gone entirely (hygiene, matching the
+        # removal case's existing behavior) - the genuinely fresh widget
+        # lives under a different key with its own, correctly-empty state.
+        self.assertNotIn(key_before, at.session_state)
+        key_after = _selector_key(at)
+        self.assertEqual(at.session_state[key_after]["selection"]["rows"], [])
+
+    def test_selector_key_still_changes_across_a_second_clear_in_the_same_session(self):
+        # The epoch must keep incrementing, not just flip once - a second
+        # "Clear selection" click (after selecting again) must still force
+        # a genuinely new key, not accidentally cycle back to a key
+        # already used earlier this session.
+        self._write_rows(3)
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+
+        self._select_rows(at, [0])
+        at.run()
+        clear_btn = next(b for b in at.button if b.label == "Clear selection")
+        clear_btn.click().run()
+        self.assertFalse(at.exception)
+        key_after_first_clear = _selector_key(at)
+
+        self._select_rows(at, [1])
+        at.run()
+        clear_btn = next(b for b in at.button if b.label == "Clear selection")
+        clear_btn.click().run()
+        self.assertFalse(at.exception)
+        key_after_second_clear = _selector_key(at)
+
+        self.assertNotEqual(key_after_first_clear, key_after_second_clear)
+
     # 15. Selection state is not overwritten/reset on an ordinary rerun.
     def test_selection_persists_across_an_unrelated_rerun(self):
         self._write_rows(3)

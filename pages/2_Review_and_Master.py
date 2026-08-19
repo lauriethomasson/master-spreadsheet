@@ -533,11 +533,17 @@ def _render_master_table(df: pd.DataFrame, key: str) -> None:
     _render_selection_actions(df, filtered_df, selected_positions, key)
 
 
+def _selection_epoch_key(key: str) -> str:
+    return f"{key}_selection_epoch"
+
+
 def _selector_widget_key(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) -> str:
     """
     The main table's own st.dataframe selection widget key, suffixed with a
     short fingerprint of the property_id sequence CURRENTLY backing it
-    (filtered_df's own row order, resolved to df's property_id column).
+    (filtered_df's own row order, resolved to df's property_id column) AND
+    the current selection epoch (see _selection_epoch_key/_clear_row_
+    selection).
 
     Position (selection["selection"]["rows"], returned by that widget) is
     only ever meaningful relative to whatever exact rows/order it was
@@ -558,22 +564,39 @@ def _selector_widget_key(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
     widget's real starting state again rather than being silently ignored
     in favor of a carried-over one.
 
+    The epoch component exists for a DIFFERENT real, confirmed gap the
+    property_id fingerprint alone never covers: "Clear selection" (see
+    _clear_row_selection) doesn't change which rows are visible at all, so
+    that fingerprint is byte-identical before and after the click -
+    deleting st.session_state's own entry for the (unchanged) key string
+    resets Streamlit's server-side record of the widget's value, but the
+    KEY STRING passed to the component is what actually decides whether
+    the browser mounts a genuinely new frontend widget instance or keeps
+    the existing one; an unchanged key keeps the existing instance, which
+    keeps its own internal (glide-data-grid canvas) checkbox state
+    regardless of anything deleted server-side - the real reason the
+    checkboxes stayed visually ticked after a clear even though the
+    tracked selection was correctly empty. Bumping the epoch on every
+    clear guarantees a genuinely different key string even when the row
+    set itself hasn't moved.
+
     Deliberately UNCHANGED across a rerun that doesn't alter which
-    property_ids are visible or their order (typing in an unrelated
-    widget elsewhere on the page, an unrelated button click) - remounting
-    the widget on every such rerun would itself be a bug: a genuine
-    in-flight browser click needs its target widget instance to survive
-    from the click to the next rerun uninterrupted to be reliably
-    recorded at all, and gratuitous remounts are exactly the kind of race
-    a real user's light/quick trackpad tap can lose (see this module's
-    prior, already-fixed report of a similar race - _render_row_selector's
-    own docstring).
+    property_ids are visible or their order AND doesn't bump the epoch
+    (typing in an unrelated widget elsewhere on the page, an unrelated
+    button click) - remounting the widget on every such rerun would
+    itself be a bug: a genuine in-flight browser click needs its target
+    widget instance to survive from the click to the next rerun
+    uninterrupted to be reliably recorded at all, and gratuitous remounts
+    are exactly the kind of race a real user's light/quick trackpad tap
+    can lose (see this module's prior, already-fixed report of a similar
+    race - _render_row_selector's own docstring).
     """
     if "property_id" in df.columns:
         ids = tuple(df.loc[filtered_df.index, "property_id"])
     else:
         ids = tuple(filtered_df.index)
-    fingerprint = hashlib.sha256(repr(ids).encode("utf-8")).hexdigest()[:16]
+    epoch = st.session_state.get(_selection_epoch_key(key), 0)
+    fingerprint = hashlib.sha256(repr((ids, epoch)).encode("utf-8")).hexdigest()[:16]
     return f"{key}_selector_{fingerprint}"
 
 
@@ -687,20 +710,30 @@ def _clear_row_selection(df: pd.DataFrame, filtered_df: pd.DataFrame, key: str) 
     _render_row_selector - needed to compute the exact same fingerprinted
     key that widget instance was actually mounted under (see
     _selector_widget_key), since a plain constant key no longer matches
-    what's really in st.session_state. For the "Clear selection" case, df/
-    filtered_df are unchanged, so this key is the same one the very next
-    render will recompute and reuse - deleting it here is what makes that
-    next render see a genuinely fresh widget rather than one whose cached
-    positions still reflect the pre-clear selection. For the successful-
-    removal case, master itself is about to shrink, so the NEXT render
-    will compute a different fingerprint (and therefore a different key)
-    regardless - deleting this now-orphaned entry is just hygiene, not
-    load-bearing for that case, but costs nothing to do uniformly."""
+    what's really in st.session_state. Deleting that entry is hygiene for
+    the now-orphaned old key either way, but is NOT what actually resets
+    the on-screen checkboxes - deleting a key's session_state entry only
+    resets Streamlit's own server-side record of that widget's value, it
+    does not by itself change the KEY STRING the component is mounted
+    under, and an unchanged key string means the browser keeps the SAME
+    frontend widget instance (with its own internal, canvas-rendered
+    checkbox state) rather than mounting a fresh one (real, confirmed
+    report: "Clear selection" correctly zeroed the tracked count, but the
+    row checkboxes stayed visually ticked). For the successful-removal
+    case, master itself is about to shrink, so the NEXT render already
+    computes a different property_id fingerprint (and therefore a
+    different key) regardless. For the "Clear selection" case, df/
+    filtered_df are unchanged, so that fingerprint alone is byte-identical
+    before and after this call - the epoch bump below is what forces a
+    genuinely different key string in THAT case too, so both paths mount
+    a truly fresh widget instance with no inherited frontend state."""
     st.session_state["export_selected_property_ids"] = set()
     st.session_state["export_selected_df"] = df.iloc[0:0].reset_index(drop=True)
     selector_key = _selector_widget_key(df, filtered_df, key)
     if selector_key in st.session_state:
         del st.session_state[selector_key]
+    epoch_key = _selection_epoch_key(key)
+    st.session_state[epoch_key] = st.session_state.get(epoch_key, 0) + 1
 
 
 def _editing_property_id_key(key: str) -> str:
