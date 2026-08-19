@@ -1,18 +1,22 @@
 """
 brochure_enrichment.py
 
-Secondary enrichment for spreadsheet-extracted ListingRows - fetches a
-row's OWN brochure_link and reads it (reusing extract.py's exact PDF-vision
-extraction pipeline via extract_raw_units) purely to fill fields the
-original spreadsheet source left genuinely blank. The original upload is
-always the source of truth: enrichment only ever fills a field that is
-currently blank, never overwrites a populated one, and any fetch/parse
-failure simply leaves the row exactly as extracted - it must never fail the
-surrounding upload.
+Secondary enrichment for spreadsheet- and email-extracted ListingRows -
+fetches a row's OWN brochure_link and reads it (reusing extract.py's exact
+PDF-vision extraction pipeline via extract_raw_units) purely to fill fields
+the original source left genuinely blank. The original upload is always
+the source of truth: enrichment only ever fills a field that is currently
+blank, never overwrites a populated one, and any fetch/parse failure simply
+leaves the row exactly as extracted - it must never fail the surrounding
+upload.
 
-Deliberately scoped to spreadsheet rows only - a PDF upload is already
-extracted from the actual brochure (enriching it from itself would be
-circular and pointless), and email rows are left for a later change.
+Deliberately scoped to spreadsheet AND email rows only, never a PDF upload -
+a PDF is already extracted from the actual brochure itself (enriching it
+from itself would be circular and pointless). Every field-scope/matching
+rule below (see needs_enrichment/_match_unit/_apply_units_to_row) operates
+purely on a ListingRow's own field values - it has no notion of which
+upload type a row came from at all; app.py's own upload loop is the only
+place that decides WHICH rows this module ever gets called on.
 
 Field scope is deliberately explicit and categorized (see PROPERTY_LEVEL_
 FIELDS/BUILDING_LEVEL_FIELDS/UNIT_LEVEL_FIELDS/HIGH_RISK_UNIT_LEVEL_FIELDS
@@ -93,9 +97,10 @@ Two entry points, for two different callers:
   dispatched, never from relying on either the cache or a lock to catch a
   race after the fact.
 
-Runs automatically, immediately after a spreadsheet upload's base rows are
-staged (see app.py's spreadsheet branch and save_staging_file) - NOT a
-separate, later, user-triggered action any more. The base rows are staged
+Runs automatically, immediately after a spreadsheet OR email upload's base
+rows are staged (see app.py's own is_spreadsheet_source/is_email_source and
+save_staging_file) - NOT a separate, later, user-triggered action any
+more. The base rows are staged
 FIRST, with zero brochure/Gemini calls, specifically so that if enrichment
 then crashes, times out, or is interrupted, the original extraction already
 exists safely on disk; enrichment only ever REWRITES that same staging file

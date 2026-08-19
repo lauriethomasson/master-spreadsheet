@@ -206,9 +206,9 @@ def _run_automatic_brochure_enrichment(
     floorplan_already_processed: dict = None, row_count: int = None,
 ) -> list[ListingRow]:
     """
-    Runs immediately after a FRESH spreadsheet upload's base rows are
-    already staged at staging_path (see save_staging_file, called by the
-    caller strictly BEFORE this) - automatic, not a separate action the
+    Runs immediately after a FRESH spreadsheet OR email upload's base rows
+    are already staged at staging_path (see save_staging_file, called by
+    the caller strictly BEFORE this) - automatic, not a separate action the
     user has to remember to trigger. That ordering is what keeps the base
     extraction safe even if this crashes, times out, or is interrupted (see
     brochure_enrichment.py's own module docstring): the rows already exist
@@ -602,6 +602,13 @@ with page_setup.setup_page("upload"):
                     # AND automatic brochure enrichment (fresh extraction
                     # only, see below) need to know this.
                     is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
+                    # Automatic brochure enrichment now also runs for an
+                    # email upload (see the row_count/enrichment gates
+                    # below and brochure_enrichment.py's own module
+                    # docstring) - deliberately NOT a PDF upload, which is
+                    # already extracted from the actual brochure itself
+                    # (enriching it from itself would be circular).
+                    is_email_source = suffix == ".eml"
 
                     # Hashed before anything else, from the bytes already in
                     # memory - a byte-identical re-upload (same content, any
@@ -944,26 +951,26 @@ with page_setup.setup_page("upload"):
                     # immediately, that the row count is already real and
                     # saved, before any further (potentially slow) step
                     # runs, without a second, separate caption alongside it.
-                    row_count = len(rows) if is_spreadsheet_source and not reused else None
+                    row_count = len(rows) if (is_spreadsheet_source or is_email_source) and not reused else None
 
-                    # Automatic - for a fresh spreadsheet extraction always,
-                    # and ALSO for a reused (byte-identical previous
+                    # Automatic - for a fresh spreadsheet OR email extraction
+                    # always, and ALSO for a reused (byte-identical previous
                     # upload) result whose own matched entry's enrichment
                     # was left incomplete (resume_already_processed is then
                     # non-None - see its own assignment above), so THIS
                     # staging entry continues that progress rather than
                     # staying frozen at it forever. A reused result whose
                     # match was already complete still skips this entirely -
-                    # nothing left to do. Never for PDF/email (see
-                    # brochure_enrichment.py's own module docstring on why
-                    # those are out of scope). Wrapped in its own try/
-                    # except, on top of enrich_rows_grouped's own internal
-                    # per-brochure exception handling - the base extraction
-                    # above is ALREADY staged by this point, so an
-                    # unexpected bug here must never surface as "extraction
-                    # failed" for a file whose real extraction genuinely
-                    # succeeded.
-                    if is_spreadsheet_source and (not reused or resume_already_processed is not None):
+                    # nothing left to do. Never for PDF (see brochure_
+                    # enrichment.py's own module docstring on why that stays
+                    # out of scope - already extracted from the actual
+                    # brochure itself). Wrapped in its own try/except, on
+                    # top of enrich_rows_grouped's own internal per-brochure
+                    # exception handling - the base extraction above is
+                    # ALREADY staged by this point, so an unexpected bug
+                    # here must never surface as "extraction failed" for a
+                    # file whose real extraction genuinely succeeded.
+                    if (is_spreadsheet_source or is_email_source) and (not reused or resume_already_processed is not None):
                         try:
                             rows = _run_automatic_brochure_enrichment(
                                 rows, staging_path, already_processed=resume_already_processed,
