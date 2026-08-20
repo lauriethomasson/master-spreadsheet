@@ -732,7 +732,20 @@ _PROVIDER_GUESS_STOPWORDS = frozenset({
 # predictable. A provider name, unlike a London area name, is a small,
 # slow-growing set - once it's here, no future filename from that provider
 # needs fixing again, regardless of what area/date/wording follows it.
-_KNOWN_PROVIDER_NAMES = ("UNION", "Kitt's")
+#
+# "Workplace Plus" hit the exact same failure UNION did: a filename like
+# "Workplace Plus - London.xlsx" left "London" unstripped (it's a real city/
+# area word, not a generic boilerplate word in _PROVIDER_GUESS_STOPWORDS),
+# guessing "Workplace Plus London" - a literal string distinct from
+# "Workplace Plus" everywhere downstream (canonicalize_provider_name only
+# recognizes already-known spelling variants, never reconciles an extra
+# word) - while a same-provider file named "Workplace Plus Availability.xlsx"
+# guessed the bare "Workplace Plus" instead ("Availability" IS a stopword).
+# Since provider is a required-exact-match component of every master_merge.py
+# matching key (_primary_key/_fallback_key/_fuzzy_anchor_key), that one-word
+# difference alone was enough to send an otherwise-identical re-upload row to
+# "unmatched" against its own existing master record.
+_KNOWN_PROVIDER_NAMES = ("UNION", "Kitt's", "Workplace Plus")
 
 
 def _leading_known_provider(words: list) -> str:

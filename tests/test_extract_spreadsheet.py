@@ -789,6 +789,28 @@ class GuessProviderNameTests(unittest.TestCase):
             "Unionville Estates",
         )
 
+    def test_workplace_plus_guesses_the_same_provider_regardless_of_filename(self):
+        # The real, confirmed regression this closes: "Workplace Plus" hit
+        # the exact same failure UNION did before being added to
+        # _KNOWN_PROVIDER_NAMES - "London" is a real area word, not on
+        # _PROVIDER_GUESS_STOPWORDS, so a "... - London.xlsx" filename
+        # previously guessed "Workplace Plus London" while a "...
+        # Availability.xlsx" filename (where "Availability" IS a stopword)
+        # guessed the bare "Workplace Plus" instead - two different literal
+        # provider strings for the exact same real provider, which then
+        # never matched each other in master_merge.py's own matching keys
+        # (provider must match exactly there, with no reconciliation).
+        cases = [
+            "Workplace Plus - London.xlsx",
+            "Workplace Plus - London .xlsx",
+            "Workplace Plus Availability.xlsx",
+            "Workplace Plus.xlsx",
+            "Workplace Plus - Manchester.xlsx",
+        ]
+        for filename in cases:
+            with self.subTest(filename=filename):
+                self.assertEqual(extract_spreadsheet.guess_provider_name(filename), "Workplace Plus")
+
 
 class ParseXludfFallbackTests(unittest.TestCase):
     """
