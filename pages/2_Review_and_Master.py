@@ -482,6 +482,40 @@ def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix:
     return "remove" if choice.startswith("Remove") else "keep"
 
 
+def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
+    """
+    Like _render_let_status_decision, for a genuinely NEW property (see
+    master_merge.UnmatchedRow.let_status_fields) rather than a matched one -
+    there is no existing master record here at all, so that function's own
+    "remove property"/"keep current information" choices don't apply
+    (there's nothing in master yet to remove or to leave untouched); the
+    only real decision is whether to add this property to master at all,
+    given its own text already says it's no longer available. A dedicated
+    function rather than a parameterized variant of _render_let_status_
+    decision, same precedent as _render_stale_candidate_decision already
+    being its own sibling rather than a reuse of that one - the two share
+    no rendering logic once "there's an old value to show" is gone.
+    """
+    row_dict = u.new_row.model_dump()
+    label = display_utils.row_label(row_dict)
+    provider = u.new_row.provider or "This upload"
+    # The status text(s) that actually triggered this - see
+    # master_merge.LET_STATUS_FIELDS - shown verbatim, never invented.
+    status_text = "; ".join(getattr(u.new_row, f) for f in u.let_status_fields)
+
+    st.warning(f"**{label}**\n\n{provider} lists this brand-new property as **{status_text}**.")
+
+    choice = st.radio(
+        "What would you like to do?",
+        [
+            "Add anyway — add this property to master despite the status.",
+            "Don't add — skip this property, it won't be added.",
+        ],
+        key=f"{key_prefix}_new_let_decision",
+    )
+    return "skip" if choice.startswith("Don't add") else "add"
+
+
 # Search fields for the one master search bar - this used to be two
 # independent lists (_MASTER_SEARCH_COLUMNS and a Remove-rows-only
 # _REMOVAL_SEARCH_COLUMNS adding postcode - a duplicate-row cleanup is often
@@ -1709,7 +1743,14 @@ def _render_pending_review(pending: list):
 
     collision_ids = {id(u) for group in plan.unmatched_collisions for u in group}
     near_miss = [u for u in plan.unmatched if id(u) not in collision_ids and u.suggestions]
-    plain_new = [u for u in plan.unmatched if id(u) not in collision_ids and not u.suggestions]
+    plain_new_candidates = [u for u in plan.unmatched if id(u) not in collision_ids and not u.suggestions]
+    # See master_merge.UnmatchedRow.let_status_fields - a genuinely new
+    # property whose own special_features/state_of_space already says
+    # "Under Offer"/"Let"/etc. gets pulled into its own decision below,
+    # exactly like a matched row's let_status_fields already does (see
+    # let_status_ids above) - never silently added via plain_new.
+    decision_new_property_let_status = [u for u in plain_new_candidates if u.let_status_fields]
+    plain_new = [u for u in plain_new_candidates if not u.let_status_fields]
 
     matched_master_indices = {m.master_index for m in plan.matched_changed} | {
         m.master_index for m in plan.matched_unchanged
@@ -1720,7 +1761,7 @@ def _render_pending_review(pending: list):
 
     any_decisions = bool(
         decision_let_status or decision_collision_groups or decision_solo_collision or decision_risky
-        or near_miss or plan.unmatched_collisions or stale_indices
+        or near_miss or plan.unmatched_collisions or stale_indices or decision_new_property_let_status
     )
 
     # ==== 1. Needs your decision - every genuinely manual property-level
@@ -1738,6 +1779,13 @@ def _render_pending_review(pending: list):
                 entry.update({f: new_val for f, (old_val, new_val) in m.diffs.items()})
                 entry["source_file"] = m.new_row.source_file
             # "ignore" - this update contributes nothing for this row at all.
+            st.divider()
+
+        for i, u in enumerate(decision_new_property_let_status):
+            decision = _render_new_property_let_status_decision(u, f"new_let_status_{i}")
+            if decision == "add":
+                new_rows_final.append(u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}))
+            # "skip" - never added to master at all.
             st.divider()
 
         for i, group in enumerate(decision_collision_groups):

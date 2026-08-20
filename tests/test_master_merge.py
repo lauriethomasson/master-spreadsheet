@@ -3131,10 +3131,16 @@ class BuildMergePlanLetStatusTests(unittest.TestCase):
 
         self.assertEqual(plan.matched_changed[0].let_status_fields, frozenset())
 
-    def test_new_unmatched_property_is_never_flagged(self):
-        # A brand-new listing has no "let status change" concept - only
-        # MatchedRow carries let_status_fields at all, and this must land
-        # in plan.unmatched, not plan.matched_changed.
+    def test_new_unmatched_property_with_let_status_wording_is_flagged_too(self):
+        # Real gap this closes: a brand-new listing (no master match at
+        # all) whose own text ALREADY says "Let"/"Under Offer"/etc. is
+        # exactly as much in need of a human decision as an existing
+        # property just updated to say so - UnmatchedRow now carries its
+        # own let_status_fields (see _new_row_let_status_fields), computed
+        # directly from the row's own text since there's no before/after
+        # pair to diff against. Still correctly lands in plan.unmatched,
+        # never plan.matched_changed - only WHICH bucket carries the flag
+        # changed, not the matching outcome itself.
         master_df = _master_df([{"building": "Somewhere Else", "provider": "Other Provider"}])
         new_row = ListingRow(building="1 Example Street", provider="Test Provider", special_features="Let")
 
@@ -3143,6 +3149,15 @@ class BuildMergePlanLetStatusTests(unittest.TestCase):
         self.assertEqual(len(plan.matched_changed), 0)
         self.assertEqual(len(plan.unmatched), 1)
         self.assertIs(plan.unmatched[0].new_row, new_row)
+        self.assertIn("special_features", plan.unmatched[0].let_status_fields)
+
+    def test_new_unmatched_property_without_let_status_wording_is_not_flagged(self):
+        master_df = _master_df([{"building": "Somewhere Else", "provider": "Other Provider"}])
+        new_row = ListingRow(building="1 Example Street", provider="Test Provider", special_features="Bike racks")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(plan.unmatched[0].let_status_fields, frozenset())
 
 
 class ApplyMergeRemovalTests(unittest.TestCase):

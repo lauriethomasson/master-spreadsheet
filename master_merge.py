@@ -302,6 +302,27 @@ def mentions_let_status(text) -> bool:
             return True
     return False
 
+
+def _new_row_let_status_fields(new_row) -> frozenset:
+    """
+    Mirrors MatchedRow.let_status_fields' own computation (see build_merge_
+    plan) for a row with no master record to diff against at all - a
+    genuinely new property has no before/after pair, only its own current
+    text, so this checks new_row's own LET_STATUS_FIELDS values directly via
+    mentions_let_status. Used to build every UnmatchedRow's own let_status_
+    fields (see that dataclass).
+
+    Real gap this closes: previously, "does this text say Under Offer/Let/
+    no longer available" was only ever checked for a row that matched an
+    EXISTING master record and changed - a brand-new property (no master
+    match at all) whose own special_features/state_of_space ALREADY states
+    this sailed straight through with no decision prompt at all, even
+    though a reviewer is exactly as likely to want a say over adding a
+    property that's already unavailable as over updating one to say so.
+    """
+    return frozenset(f for f in LET_STATUS_FIELDS if mentions_let_status(getattr(new_row, f)))
+
+
 # Threshold for _items_similar - a review trigger, not a block, so this is
 # deliberately lenient (a genuinely shorter-but-current update still goes
 # through once a human confirms it in manual review). Expressed as a
@@ -1533,6 +1554,9 @@ class MatchedRow:
 class UnmatchedRow:
     new_row: ListingRow
     suggestions: list = field(default_factory=list)
+    # see _new_row_let_status_fields/mentions_let_status - forces manual
+    # review for a genuinely new property, same as MatchedRow's own field
+    let_status_fields: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -1803,7 +1827,7 @@ def consolidate_unmatched_duplicates(plan: MergePlan) -> MergePlan:
                 if id(s) not in seen_ids:
                     seen_ids.add(id(s))
                     suggestions.append(s)
-        merged_rows.append(UnmatchedRow(merged_row, suggestions))
+        merged_rows.append(UnmatchedRow(merged_row, suggestions, _new_row_let_status_fields(merged_row)))
 
     new_unmatched = [u for u in plan.unmatched if id(u) not in safe_member_ids] + merged_rows
 
@@ -2242,7 +2266,9 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             )
             (matched_changed if diffs else matched_unchanged).append(matched)
         else:
-            unmatched.append(UnmatchedRow(new_row, _suggest_similar(new_dict, master_records)))
+            unmatched.append(
+                UnmatchedRow(new_row, _suggest_similar(new_dict, master_records), _new_row_let_status_fields(new_row))
+            )
 
     # Two incoming rows can independently match the SAME master row via
     # building/provider/floor identity alone (the matching tiers above have
@@ -2528,7 +2554,11 @@ def _resolve_listing_evidence_conflicts(matched_changed: list, unmatched: list, 
     kept_ids = {id(m) for m in kept}  # identity, not dataclass equality - avoids comparing diffs dicts wholesale
     new_matched_changed = [m for m in matched_changed if id(m) in kept_ids]
     new_unmatched = list(unmatched) + [
-        UnmatchedRow(m.new_row, _suggest_similar(m.new_row.model_dump(), master_records)) for m in demoted
+        UnmatchedRow(
+            m.new_row, _suggest_similar(m.new_row.model_dump(), master_records),
+            _new_row_let_status_fields(m.new_row),
+        )
+        for m in demoted
     ]
     return new_matched_changed, new_unmatched
 
