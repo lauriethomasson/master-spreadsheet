@@ -16,7 +16,6 @@ import extract_spreadsheet
 import extract_spreadsheet_gemini
 import page_flow
 import page_setup
-from brochure_link_resolver import looks_like_url
 from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 import geocode
@@ -550,63 +549,6 @@ with page_setup.setup_page("upload"):
         type=["pdf", "eml", "xlsx", "csv"],
         accept_multiple_files=True,
     )
-
-    st.divider()
-    st.subheader("Or paste a document link")
-    st.caption(
-        "For a brochure the system can already fetch (a real PDF link, Box, Dropbox, or a "
-        "Canva \"view\" link) - every property/unit in the document is extracted directly, "
-        "with no file upload needed."
-    )
-    pasted_link = st.text_input(
-        "Document link", key="pasted_brochure_link", label_visibility="collapsed", placeholder="https://...",
-    )
-    if st.button("Extract from link", disabled=not pasted_link):
-        if not looks_like_url(pasted_link):
-            st.error("That doesn't look like a real link.")
-        else:
-            with st.spinner("Extracting from the link..."):
-                # extract_rows_from_link reuses the exact same document-
-                # reading pipeline brochure ENRICHMENT already uses for an
-                # existing row's own brochure_link (see its own docstring) -
-                # every unit the document actually has becomes its own row
-                # here, with brochure_link set to this exact pasted URL for
-                # all of them.
-                link_rows = brochure_enrichment.extract_rows_from_link(pasted_link)
-            if not link_rows:
-                st.error(
-                    "Nothing could be extracted from that link - check it's a real, "
-                    "directly-fetchable document (a Pitch/GPE-style viewer link isn't "
-                    "supported yet)."
-                )
-            else:
-                geocode_rows(link_rows)
-                # Same spelling-drift fix every other upload path already
-                # gets - see canonicalize_providers' own docstring.
-                canonicalize_providers(link_rows)
-                # No real file bytes to hash here - the pasted URL itself is
-                # this "upload"'s own content identity, same role file_bytes'
-                # hash plays for an ordinary file upload (see the Extract
-                # loop below's own content_hash/source_identity_hash).
-                link_hash = hashlib.sha256(pasted_link.encode("utf-8")).hexdigest()
-                staging_path = save_staging_file(
-                    link_rows, pasted_link, content_hash=link_hash, source_identity_hash=link_hash,
-                )
-                st.session_state["recent_uploads"].insert(
-                    0,
-                    {
-                        "filename": pasted_link,
-                        "n_rows": len(link_rows),
-                        "staging_path": staging_path,
-                        "reused": False,
-                        "timestamp": datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M %Z"),
-                    },
-                )
-                st.success(
-                    f"Extracted and staged {len(link_rows)} row(s) from the link. "
-                    "Go to Review & Master to check them."
-                )
-    st.divider()
 
     # Column mapping itself is fully automatic (see suggest_mapping). A
     # genuinely CRITICAL field (extract_spreadsheet.CRITICAL_FIELDS) going
