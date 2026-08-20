@@ -129,13 +129,14 @@ import streamlit as st
 
 import extract
 from brochure_link_resolver import (
-    REQUEST_TIMEOUT, USER_AGENT, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link,
-    looks_like_url, resolve_brochure_link,
+    REQUEST_TIMEOUT, USER_AGENT, finalize_floorplan_link, is_canva_view_link, is_floorplan_not_brochure_url,
+    is_generic_link, looks_like_url, resolve_brochure_link,
 )
 import geocode
+from gemini_client import compute_rent
 from house_number import leading_house_number
 from master_merge import normalize_key
-from schema import ListingRow
+from schema import ExtractedFields, ListingRow
 from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
 
 # --- Document processing status vocabulary ---------------------------------
@@ -1719,11 +1720,22 @@ class _BrochureUnits(list):
     getattr(units, "property_features", None) check below with None,
     exactly as if that brochure had stated nothing at that level - so none
     of those mocks needed to change for this.
+
+    provider is read the exact same way - extract.py's own PROMPT already
+    asks for it at the document level (raw.get("provider") - see
+    extract.extract()'s own identical read for the uploaded-PDF path), but
+    _extract_brochure_units previously never carried it past this point at
+    all, since ordinary brochure ENRICHMENT (an existing row's own
+    brochure_link, read to fill in blanks) never needed a document-level
+    provider - the row already has one from its real source. extract_
+    rows_from_link (a "paste a document link directly" upload, with no
+    other source to have a provider from) does need it.
     """
 
     property_features = None
     contacts = None
     building_features = None
+    provider = None
 
 
 def _images_from_fetched_document(data):
@@ -1827,6 +1839,8 @@ def _extract_brochure_units(url: str):
     units.property_features = property_features if isinstance(property_features, str) else None
     contacts = raw.get("contacts")
     units.contacts = contacts if isinstance(contacts, str) else None
+    provider = raw.get("provider")
+    units.provider = provider if isinstance(provider, str) else None
     # Raw Gemini JSON, same as units above - never schema-validated before
     # reaching here, so a malformed entry (missing/non-string "building" or
     # "features") is simply excluded rather than raising (see _match_unit's
@@ -1855,6 +1869,92 @@ def _extract_brochure_units(url: str):
             file=sys.stderr,
         )
     return units
+
+
+def extract_rows_from_link(url: str, source_label: str = None) -> list[ListingRow]:
+    """
+    Every unit _extract_brochure_units finds at `url`, converted directly
+    into ListingRow objects - the "paste a document link" upload path's
+    own conversion step (see app.py), reusing the exact same real-
+    document-reading pipeline brochure ENRICHMENT already uses for an
+    existing row's own brochure_link, rather than a second,
+    independently-drifting extraction implementation. Works for every link
+    shape _extract_brochure_units already handles (a real PDF, Box/
+    Dropbox, a Canva "view" link) - deliberately NOT the Pitch/GPE viewer
+    shape, which needs real headless-browser rendering support that
+    doesn't exist yet (see brochure_link_resolver/canva_renderer - this
+    function only ever sees what _extract_brochure_units can already
+    fetch).
+
+    Field conversion mirrors extract.py's own extract() (the uploaded-PDF
+    path) exactly: ExtractedFields(**brochure, **unit).model_dump() then
+    compute_rent(...) - the SAME schema-driven spread, so every field a
+    unit's own dict actually has (floor_unit/size_sqft/special_features/
+    state_of_space/desks_min/desks_max/rent_pcm/rent_psf/etc.) carries
+    straight through with no separately-maintained field list here that
+    could drift out of sync with ExtractedFields' own declared fields.
+
+    brochure_link is set to `url` itself, verbatim, for EVERY row this
+    returns - deliberately never run through finalize_brochure_link's
+    generic-link/landing-page-resolution rules the way a per-unit link
+    Gemini merely read out of unrelated text elsewhere in this module is:
+    the user explicitly pasted this exact URL as THIS document's own
+    link, so there is nothing to second-guess or resolve.
+
+    provider/internal_ref come from whatever this document's own
+    extraction found at the document level (see _BrochureUnits.provider) -
+    left blank for the reviewer to fill in at review time when the
+    document doesn't state one, exactly like extract.py's own PDF-upload
+    path already leaves a landlord-direct brochure's blank provider
+    alone rather than guessing one.
+
+    A unit with no building at all inherits the previous unit's own
+    building (same rule extract.py's own extract() already applies for a
+    document covering several buildings/units); a unit with NEITHER its
+    own building NOR a prior one to inherit (only possible for the very
+    first unit) is skipped with a stderr warning - the one case with
+    nothing safe to attach it to at all. Every other unit always becomes
+    its own row - never silently dropped for any other reason.
+
+    Returns [] (never raises) when _extract_brochure_units found nothing
+    at all (a fetch/parse failure, or a document with no real units) -
+    app.py is responsible for telling the user nothing was extracted.
+    """
+    units = _extract_brochure_units(url)
+    if not units:
+        return []
+
+    label = source_label or url
+    brochure = {
+        "internal_ref": units.provider,
+        "provider": units.provider,
+        "contacts": units.contacts,
+    }
+
+    rows = []
+    last_building = None
+    for i, unit in enumerate(units):
+        if not isinstance(unit, dict):
+            continue
+        unit = dict(unit)
+        if not unit.get("building"):
+            if not last_building:
+                print(
+                    f"Warning: {label} unit {i} has no building and no prior "
+                    "unit to inherit one from — skipping this unit.",
+                    file=sys.stderr,
+                )
+                continue
+            unit["building"] = last_building
+        last_building = unit["building"]
+
+        unit["brochure_link"] = url
+        unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
+
+        fields = ExtractedFields(**brochure, **unit).model_dump()
+        fields = compute_rent(fields)
+        rows.append(ListingRow(**fields, lat=None, lng=None, source_file=label))
+    return rows
 
 
 def _match_unit(row: ListingRow, units: list):

@@ -26,7 +26,7 @@ import brochure_enrichment
 from schema import ListingRow
 
 
-def _brochure_units(units, property_features=None, contacts=None, building_features=None):
+def _brochure_units(units, property_features=None, contacts=None, building_features=None, provider=None):
     """A _BrochureUnits (see brochure_enrichment.py's own class) built from
     plain test data - the real shape _extract_brochure_units returns,
     used here so tests exercising the property/building-level fallbacks
@@ -37,6 +37,7 @@ def _brochure_units(units, property_features=None, contacts=None, building_featu
     result.property_features = property_features
     result.contacts = contacts
     result.building_features = building_features or []
+    result.provider = provider
     return result
 
 
@@ -357,6 +358,143 @@ class FetchAndExtractTests(EnrichmentTestCase):
             brochure_enrichment._extract_brochure_units("https://example.com/brochure.pdf")
 
         mock_tmp.assert_not_called()
+
+
+class ExtractRowsFromLinkTests(EnrichmentTestCase):
+    """extract_rows_from_link - the "paste a document link directly"
+    upload path's own conversion step (see app.py): every unit
+    _extract_brochure_units finds becomes its own ListingRow, with every
+    field the extraction actually found carried straight through."""
+
+    def test_multi_building_document_produces_one_row_per_unit_with_every_field_intact(self):
+        # The real scenario this feature exists for: one document covering
+        # several UNRELATED properties - every unit becomes its own row,
+        # each with its own building, not collapsed or cross-contaminated.
+        units = _brochure_units(
+            [
+                {
+                    "building": "28 Lime Street", "address_1": "28 Lime Street", "postcode": "EC3M 7HD",
+                    "submarket": "City", "floor_unit": "4th Floor", "size_sqft": 1915.0,
+                    "desks_min": 18, "desks_max": 24, "rent_pcm": 23200.0, "rent_psf": None,
+                    "special_features": "Bike racks; showers", "state_of_space": "CAT A",
+                },
+                {
+                    "building": "40 Fenchurch Street", "address_1": "40 Fenchurch Street", "postcode": "EC3M 4DT",
+                    "submarket": "Aldgate", "floor_unit": "2nd Floor", "size_sqft": 2200.0,
+                    "desks_min": 20, "desks_max": 28, "rent_pcm": None, "rent_psf": 65.0,
+                    "special_features": "Roof terrace", "state_of_space": "Fitted",
+                },
+                {
+                    "building": "160 Blackfriars Road", "address_1": "160 Blackfriars Road", "postcode": "SE1 8EZ",
+                    "submarket": "Southwark", "floor_unit": "3rd Floor", "size_sqft": 11785.0,
+                    "desks_min": None, "desks_max": 103, "rent_pcm": 137492.0, "rent_psf": 140.0,
+                    "special_features": "Typical floor", "state_of_space": "CAT A",
+                },
+            ],
+            property_features="WiredScore Platinum", contacts="Jane Smith, jane@agent.com",
+            provider="Test Agency",
+        )
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        self.assertEqual(len(rows), 3)
+        by_building = {r.building: r for r in rows}
+        self.assertEqual(set(by_building), {"28 Lime Street", "40 Fenchurch Street", "160 Blackfriars Road"})
+
+        lime = by_building["28 Lime Street"]
+        self.assertEqual(lime.address_1, "28 Lime Street")
+        self.assertEqual(lime.postcode, "EC3M 7HD")
+        self.assertEqual(lime.submarket, "City")
+        self.assertEqual(lime.floor_unit, "4th Floor")
+        self.assertEqual(lime.size_sqft, 1915.0)
+        self.assertEqual(lime.desks_min, 18)
+        self.assertEqual(lime.desks_max, 24)
+        self.assertEqual(lime.rent_pcm, 23200.0)
+        self.assertEqual(lime.special_features, "Bike racks; showers")
+        self.assertEqual(lime.state_of_space, "CAT A")
+
+        fenchurch = by_building["40 Fenchurch Street"]
+        self.assertEqual(fenchurch.rent_psf, 65.0)
+        self.assertEqual(fenchurch.state_of_space, "Fitted")
+
+        # provider/contacts are document-level, not per-unit - every row
+        # gets the SAME value, exactly like extract.py's own PDF-upload
+        # path already does for a document with no explicit per-unit
+        # source of either.
+        for r in rows:
+            self.assertEqual(r.provider, "Test Agency")
+            self.assertEqual(r.internal_ref, "Test Agency")
+            self.assertEqual(r.contacts, "Jane Smith, jane@agent.com")
+
+    def test_brochure_link_is_the_pasted_url_verbatim_for_every_row_never_resolved(self):
+        units = _brochure_units([
+            {"building": "A", "floor_unit": "1st"},
+            {"building": "B", "floor_unit": "2nd"},
+        ])
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units), \
+             patch("brochure_enrichment.resolve_brochure_link") as mock_resolve:
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        mock_resolve.assert_not_called()
+        for r in rows:
+            self.assertEqual(r.brochure_link, "https://example.com/schedule.pdf")
+
+    def test_provider_is_blank_when_the_document_does_not_state_one(self):
+        units = _brochure_units([{"building": "A", "floor_unit": "1st"}])  # provider left at its own default (None)
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        self.assertIsNone(rows[0].provider)
+
+    def test_a_unit_with_no_building_inherits_the_previous_units_building(self):
+        units = _brochure_units([
+            {"building": "28 Lime Street", "floor_unit": "4th Floor"},
+            {"building": None, "floor_unit": "5th Floor"},
+        ])
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        self.assertEqual([r.building for r in rows], ["28 Lime Street", "28 Lime Street"])
+
+    def test_a_leading_unit_with_no_building_and_nothing_to_inherit_is_skipped(self):
+        units = _brochure_units([
+            {"building": None, "floor_unit": "Ground Floor"},
+            {"building": "28 Lime Street", "floor_unit": "4th Floor"},
+        ])
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "28 Lime Street")
+
+    def test_no_units_at_all_returns_an_empty_list_not_none_or_raise(self):
+        with patch("brochure_enrichment._extract_brochure_units", return_value=None):
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        self.assertEqual(rows, [])
+
+    def test_source_file_defaults_to_the_url_when_no_label_is_given(self):
+        units = _brochure_units([{"building": "A", "floor_unit": "1st"}])
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            rows = brochure_enrichment.extract_rows_from_link("https://example.com/schedule.pdf")
+
+        self.assertEqual(rows[0].source_file, "https://example.com/schedule.pdf")
+
+    def test_source_file_uses_the_given_label_when_provided(self):
+        units = _brochure_units([{"building": "A", "floor_unit": "1st"}])
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            rows = brochure_enrichment.extract_rows_from_link(
+                "https://example.com/schedule.pdf", source_label="Pasted link: schedule.pdf",
+            )
+
+        self.assertEqual(rows[0].source_file, "Pasted link: schedule.pdf")
 
 
 def _box_share_html(shared_name="abc123", extension="pdf", can_download=True, name="16 Dufour's Place Brochure.pdf"):
