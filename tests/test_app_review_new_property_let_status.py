@@ -78,6 +78,25 @@ class NewPropertyLetStatusDecisionTests(IsolatedCwdTestCase):
         self.assertIn("9 Example Yard", warning_text)
         self.assertIn("Under Offer", warning_text)
 
+    def test_only_the_trigger_phrase_is_shown_not_the_whole_field(self):
+        # Real Workplace Plus shape: "U/O" buried in a long amenity list -
+        # same fix as the matched-row prompt (see master_merge.
+        # let_status_display_text), applied consistently here too.
+        save_staging_file(
+            [ListingRow(
+                building="11 Example Yard", provider="Test Provider",
+                special_features="52 + 2 MR + 3 PB + BR; U/O; term 2 - 5 years",
+            )],
+            "new_uo.xlsx", content_hash="new-property-buried-phrase-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("U/O", warning_text)
+        self.assertNotIn("52 + 2 MR + 3 PB + BR", warning_text)
+        self.assertNotIn("term 2 - 5 years", warning_text)
+
     def test_two_choices_offered_not_the_matched_row_three(self):
         # "Remove property"/"Keep current information" both presuppose an
         # existing master record - neither applies to a brand-new property.

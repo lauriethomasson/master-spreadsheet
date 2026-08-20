@@ -3067,6 +3067,59 @@ class MentionsLetStatusTests(unittest.TestCase):
         self.assertFalse(master_merge.mentions_let_status(""))
 
 
+class MatchedLetStatusPhrasesTests(unittest.TestCase):
+    """matched_let_status_phrases/let_status_display_text - the display-
+    only follow-up: a decision prompt shows just the trigger phrase(s),
+    never a flagged field's entire text, built on the exact same match
+    logic mentions_let_status itself uses (see _let_status_matches)."""
+
+    def test_returns_the_single_matched_phrase(self):
+        self.assertEqual(master_merge.matched_let_status_phrases("Under Offer"), ["Under Offer"])
+
+    def test_exact_source_casing_and_punctuation_is_preserved_not_lowered(self):
+        # The real gap this closes: a flagged field's own trigger phrase
+        # buried in a long amenity list, in its own real casing - "U/O"
+        # must come back exactly as "U/O", never lowercased "u/o".
+        phrases = master_merge.matched_let_status_phrases(
+            "52 + 2 MR + 3 PB + BR; U/O; term 2 - 5 years",
+        )
+        self.assertEqual(phrases, ["U/O"])
+
+    def test_multiple_distinct_matches_are_all_returned(self):
+        phrases = master_merge.matched_let_status_phrases("Let; also U/O and Withdrawn")
+        self.assertEqual(phrases, ["Let", "U/O", "Withdrawn"])
+
+    def test_a_repeated_phrase_is_returned_once_not_duplicated(self):
+        phrases = master_merge.matched_let_status_phrases("Let; some notes; Let again")
+        self.assertEqual(phrases, ["Let"])
+
+    def test_no_match_returns_an_empty_list(self):
+        self.assertEqual(master_merge.matched_let_status_phrases("Bike racks; showers"), [])
+        self.assertEqual(master_merge.matched_let_status_phrases(None), [])
+
+    def test_pre_let_style_exclusions_still_apply_to_phrase_extraction(self):
+        # The exact same "let" exclusion mentions_let_status itself uses -
+        # a "pre-let"/"re-let"/"sub-let" compound must never be extracted
+        # as a trigger phrase either.
+        self.assertEqual(master_merge.matched_let_status_phrases("80% pre-let at Elsley"), [])
+
+    def test_display_text_joins_multiple_phrases(self):
+        text = master_merge.let_status_display_text("Let; also U/O and Withdrawn")
+        self.assertEqual(text, "Let; U/O; Withdrawn")
+
+    def test_display_text_shows_only_the_phrase_not_the_full_field(self):
+        text = master_merge.let_status_display_text(
+            "52 + 2 MR + 3 PB + BR; U/O; term 2 - 5 years",
+        )
+        self.assertEqual(text, "U/O")
+
+    def test_display_text_falls_back_to_the_full_original_text_when_nothing_matches(self):
+        # The safety net: display code must never surface a blank/broken
+        # message even in the (should-never-happen) case of no match.
+        text = master_merge.let_status_display_text("Bike racks; showers")
+        self.assertEqual(text, "Bike racks; showers")
+
+
 class BuildMergePlanLetStatusTests(unittest.TestCase):
     """The exact scenario this feature exists for: a re-upload's wording
     implies a matched property is no longer available."""

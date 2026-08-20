@@ -270,6 +270,53 @@ LET_STATUS_KEYWORDS = (
 )
 
 
+def _let_status_pattern(kw: str) -> str:
+    """The word-boundary regex pattern for one LET_STATUS_KEYWORDS entry -
+    factored out so mentions_let_status/_let_status_matches build their
+    match from the exact same pattern, never two independently-drifting
+    copies of it. "let" specifically excludes the "pre-let"/"re-let"/
+    "sub-let" compound forms (see mentions_let_status's own docstring)."""
+    pattern = rf"\b{re.escape(kw)}\b"
+    if kw == "let":
+        pattern = r"(?<!pre-)(?<!re-)(?<!sub-)" + pattern
+    return pattern
+
+
+def _let_status_matches(text) -> list:
+    """
+    Every substring of `text` matching one of LET_STATUS_KEYWORDS, in the
+    ORIGINAL text's own casing/punctuation - never lowered, e.g. a real
+    "U/O" cell stays "U/O", not "u/o" - via re.IGNORECASE rather than
+    lower()'ing text first (which would only ever hand back the lowered
+    substring). The single shared implementation mentions_let_status/
+    matched_let_status_phrases both build on, so a future change to the
+    matching rule (a new keyword, a new exclusion) can never update one
+    without the other. May contain duplicates (e.g. the same keyword
+    appearing twice) - see matched_let_status_phrases for the de-duplicated,
+    display-ready version; this one is just the raw match list, ordered by
+    each match's own real position in `text` (never by LET_STATUS_KEYWORDS'
+    own list order - two different keywords both matching the same text
+    must come back in reading order, not in whatever order this module
+    happens to list keywords in).
+
+    Returns [] for blank text or no match at all.
+    """
+    if _is_blank(text):
+        return []
+    text = str(text)
+    found = []  # (start_position, matched_text) - sorted below into real text order
+    for kw in LET_STATUS_KEYWORDS:
+        for m in re.finditer(_let_status_pattern(kw), text, re.IGNORECASE):
+            found.append((m.start(), m.group(0)))
+    # Sorted by position, not by LET_STATUS_KEYWORDS' own list order - two
+    # different keywords matching the same text (e.g. "Withdrawn" and
+    # "U/O" in the same field) must come back in the order a reviewer
+    # would actually read them, not in whatever order this tuple happens
+    # to list keywords in.
+    found.sort(key=lambda pair: pair[0])
+    return [matched_text for _start, matched_text in found]
+
+
 def mentions_let_status(text) -> bool:
     """
     True if text contains wording suggesting the property is no longer on
@@ -291,16 +338,60 @@ def mentions_let_status(text) -> bool:
     word character) nor "u/office" (no boundary right after "o", since "f"
     immediately after it is also a word character) matches.
     """
-    if _is_blank(text):
-        return False
-    lowered = str(text).lower()
-    for kw in LET_STATUS_KEYWORDS:
-        pattern = rf"\b{re.escape(kw)}\b"
-        if kw == "let":
-            pattern = r"(?<!pre-)(?<!re-)(?<!sub-)" + pattern
-        if re.search(pattern, lowered):
-            return True
-    return False
+    return bool(_let_status_matches(text))
+
+
+def matched_let_status_phrases(text) -> list:
+    """
+    The actual phrase(s) within `text` that make mentions_let_status(text)
+    True, in their ORIGINAL source casing/punctuation (see
+    _let_status_matches) - distinct phrases only, first-seen order (a field
+    mentioning "Let" twice returns it once). Built on the exact same regex/
+    word-boundary/pre-let-exclusion logic mentions_let_status itself uses,
+    so the two can never drift apart into disagreeing about which text
+    counts.
+
+    Real gap this closes: a decision prompt previously showed a flagged
+    field's ENTIRE text verbatim - e.g. a real Workplace Plus special_
+    features value burying "U/O" inside a long amenity list - forcing a
+    reviewer to hunt for the actual trigger. This returns just the
+    trigger(s).
+
+    Returns [] when text has no match at all - genuinely correct for text
+    mentions_let_status already returned False for, but ALSO the honest
+    answer if ever called on text that somehow contains no match despite
+    mentions_let_status being True for it (shouldn't happen, since both
+    share _let_status_matches, but never assumed) - see let_status_display_
+    text for the display-safe wrapper that falls back to the full text
+    rather than ever showing a caller something blank.
+    """
+    seen = []
+    for m in _let_status_matches(text):
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
+def let_status_display_text(text) -> str:
+    """
+    Display-ready text for one let-status-flagged field's value: just the
+    matched trigger phrase(s) (see matched_let_status_phrases), "; "-joined
+    when there's more than one, in their original casing - never the
+    field's entire text. Shared by both _render_let_status_decision
+    (matched rows) and _render_new_property_let_status_decision (brand-new
+    rows) in pages/2_Review_and_Master.py, so the two decision prompts stay
+    consistent rather than drifting into two independent implementations.
+
+    Falls back to `text` itself, completely unchanged, whenever matched_
+    let_status_phrases comes up empty - genuinely should never happen for
+    a field mentions_let_status already confirmed True for before either
+    caller ever reaches this, but this is display code, reached only AFTER
+    that confirmation already happened elsewhere; a defensive fallback to
+    the full original text is far safer than ever surfacing a blank or
+    broken message to a reviewer.
+    """
+    phrases = matched_let_status_phrases(text)
+    return "; ".join(phrases) if phrases else str(text)
 
 
 def _new_row_let_status_fields(new_row) -> frozenset:

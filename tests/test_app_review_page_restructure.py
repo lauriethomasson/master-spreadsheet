@@ -304,6 +304,34 @@ class LetStatusThreeChoiceTests(IsolatedCwdTestCase):
         self.assertTrue(any(o.startswith("Remove property") for o in options))
         self.assertTrue(any(o.startswith("Keep current information") for o in options))
 
+    def test_only_the_trigger_phrase_is_shown_not_the_whole_field(self):
+        # Real Workplace Plus shape: "U/O" buried in a long amenity list -
+        # the warning must show just the trigger phrase, in its own real
+        # casing, never the field's entire text (see master_merge.
+        # let_status_display_text).
+        master_writer.write_master([
+            ListingRow(
+                building="15 Hatfields", provider="Knotel", floor_unit="3rd Floor",
+                special_features="Available", property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="15 Hatfields", provider="Knotel", floor_unit="3rd Floor",
+                special_features="52 + 2 MR + 3 PB + BR; U/O; term 2 - 5 years",
+            )],
+            "knotel_uo.xlsx", content_hash="let-status-buried-phrase-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("U/O", warning_text)
+        self.assertNotIn("52 + 2 MR + 3 PB + BR", warning_text)
+        self.assertNotIn("term 2 - 5 years", warning_text)
+        options = next(r for r in at.radio if r.label == "What would you like to do?").options
+        self.assertTrue(any(o.startswith("Keep as U/O") for o in options))
+
     def test_under_offer_does_not_default_to_remove(self):
         # Approving without ever touching the radio must apply the new
         # status, never silently remove the property.

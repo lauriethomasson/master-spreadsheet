@@ -436,9 +436,11 @@ def _render_let_status_decision(m, key_prefix: str) -> str:
     """
     label = display_utils.row_label(m.new_row.model_dump())
     provider = m.new_row.provider or "The latest update"
-    # The new status text(s) that actually triggered this - see
-    # LET_STATUS_FIELDS - shown verbatim, never invented; normally just one.
-    status_text = "; ".join(m.diffs[f][1] for f in m.let_status_fields)
+    # Just the actual trigger phrase(s) (e.g. "U/O"), never the flagged
+    # field's ENTIRE text - see master_merge.let_status_display_text's own
+    # docstring for why a field's full value (often a long amenity list
+    # with the real trigger buried in it) is the wrong thing to show here.
+    status_text = "; ".join(master_merge.let_status_display_text(m.diffs[f][1]) for f in m.let_status_fields)
 
     st.warning(f"**{label}**\n\n{provider} now lists this space as **{status_text}**.")
     for f in m.let_status_fields:
@@ -499,9 +501,11 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
     row_dict = u.new_row.model_dump()
     label = display_utils.row_label(row_dict)
     provider = u.new_row.provider or "This upload"
-    # The status text(s) that actually triggered this - see
-    # master_merge.LET_STATUS_FIELDS - shown verbatim, never invented.
-    status_text = "; ".join(getattr(u.new_row, f) for f in u.let_status_fields)
+    # Just the actual trigger phrase(s), never the flagged field's ENTIRE
+    # text - see master_merge.let_status_display_text's own docstring, and
+    # _render_let_status_decision's own identical use of it above (kept
+    # consistent between the two decision prompts deliberately).
+    status_text = "; ".join(master_merge.let_status_display_text(getattr(u.new_row, f)) for f in u.let_status_fields)
 
     st.warning(f"**{label}**\n\n{provider} lists this brand-new property as **{status_text}**.")
 
