@@ -260,8 +260,13 @@ LET_STATUS_FIELDS = ("special_features", "state_of_space")
 # pdf), and Breezblok.pdf's own brochure states "The centre is now 100%
 # Occupied" - the exact live scenario this feature exists for: a
 # re-upload's wording implying a unit is no longer genuinely available.
+# "U/O" is the literal abbreviation Workplace Plus's own real spreadsheet
+# uses instead of spelling "Under Offer" out (confirmed present in 14 real
+# rows) - the word-boundary match on "under offer" alone never catches this,
+# so a re-upload showing "U/O" for a property already in master previously
+# passed through with no review prompt at all.
 LET_STATUS_KEYWORDS = (
-    "let", "leased", "no longer available", "withdrawn", "under offer", "occupied",
+    "let", "leased", "no longer available", "withdrawn", "under offer", "occupied", "u/o",
 )
 
 
@@ -275,6 +280,16 @@ def mentions_let_status(text) -> bool:
     overall leasing momentum) - those describe a leasing trend, not this
     specific unit's own current availability, and would otherwise be a
     false positive on real data.
+
+    "u/o"'s own word-boundary check still does real work despite the "/"
+    in the middle: \b only requires a word/non-word transition at the
+    pattern's own start and end, so standalone "U/O" (or wrapped in
+    punctuation/whitespace, e.g. "(U/O)") matches, while it stays correctly
+    excluded when "u"/"o" are themselves part of a longer alphanumeric run
+    with no real boundary on that side - e.g. neither "flu/office" (no
+    boundary right before "u", since "l" immediately before it is also a
+    word character) nor "u/office" (no boundary right after "o", since "f"
+    immediately after it is also a word character) matches.
     """
     if _is_blank(text):
         return False

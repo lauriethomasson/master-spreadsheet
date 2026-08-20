@@ -3034,6 +3034,23 @@ class MentionsLetStatusTests(unittest.TestCase):
         self.assertTrue(master_merge.mentions_let_status("UNDER OFFER"))
         self.assertTrue(master_merge.mentions_let_status("withdrawn"))
 
+    def test_workplace_plus_u_o_abbreviation(self):
+        # Workplace Plus's own real spreadsheet uses the literal
+        # abbreviation "U/O" instead of ever spelling "Under Offer" out
+        # (confirmed present in 14 real rows) - the word-boundary match on
+        # "under offer" alone never catches this on its own.
+        self.assertTrue(master_merge.mentions_let_status("U/O"))
+        self.assertTrue(master_merge.mentions_let_status("u/o"))
+        self.assertTrue(master_merge.mentions_let_status("Status: U/O"))
+        self.assertTrue(master_merge.mentions_let_status("(U/O)"))
+
+    def test_u_o_word_boundary_does_not_match_inside_an_unrelated_token(self):
+        # "u"/"o" with no real boundary on the relevant side must not
+        # register as this abbreviation just because the 3-character
+        # sequence appears as a substring.
+        self.assertFalse(master_merge.mentions_let_status("flu/office refurbishment"))
+        self.assertFalse(master_merge.mentions_let_status("u/officeplan"))
+
     def test_pre_let_and_similar_compounds_are_not_false_positives(self):
         # GPE.eml's real wording: "high pre-let demand" / "pre-let at
         # Elsley" describes a BUILDING's overall leasing momentum, not this
@@ -3071,6 +3088,26 @@ class BuildMergePlanLetStatusTests(unittest.TestCase):
         self.assertIn("special_features", matched.let_status_fields)
         # Still a real diff, exactly like risky_fields - the safeguard forces
         # manual review, it never makes the change disappear.
+        self.assertIn("special_features", matched.diffs)
+
+    def test_workplace_plus_u_o_value_flags_the_matched_row(self):
+        # The exact real gap this closes: Workplace Plus's own re-upload
+        # states "U/O" (never the spelled-out "Under Offer") for a property
+        # already in master - this must trigger the same review prompt.
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "Workplace Plus", "floor_unit": "1st Floor",
+            "postcode": "EC1A 1AA", "special_features": "Bike racks; showers",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="Workplace Plus", floor_unit="1st Floor",
+            postcode="EC1A 1AA", special_features="U/O",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.let_status_fields)
         self.assertIn("special_features", matched.diffs)
 
     def test_state_of_space_mentioning_withdrawn_flags_the_matched_row(self):
