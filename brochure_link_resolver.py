@@ -156,6 +156,30 @@ def is_canva_view_link(url: str) -> bool:
     return bool(_CANVA_VIEW_URL_RE.match(url)) or bool(_CANVA_SHORT_LINK_RE.match(url))
 
 
+# A Pitch.com public "view" link (e.g. "https://pitch.com/v/1-finsbury-
+# brochure-4jnj9d") - real, confirmed shape used by GPE, Knotel, and
+# MetSpace to share brochures/availability decks. Same category of
+# problem as Canva's own "view" link (see _CANVA_VIEW_URL_RE's own
+# docstring): a plain HTTP GET returns only an empty client-side-rendered
+# shell (Pitch's own SPA, confirmed directly via a throwaway Playwright
+# recon script - no login/email gate, real content renders correctly in
+# a real browser), never the actual content. canva_renderer/ (see that
+# service's own README/module docstring) now handles Pitch too, reusing
+# the exact same architecture it already had for Canva.
+_PITCH_VIEW_URL_RE = re.compile(r"^https?://(?:[\w-]+\.)*pitch\.com/v/[^/\s?#]+(?:[/?#].*)?$", re.IGNORECASE)
+
+
+def is_pitch_view_link(url: str) -> bool:
+    """True for a real Pitch.com public-share "view" link - see
+    _PITCH_VIEW_URL_RE's own docstring for why this is unsupported by
+    default, and how canva_renderer/ opts a deployment into real support.
+    Never a fetch - matched against the URL's own text only, same as
+    is_canva_view_link."""
+    if not url:
+        return False
+    return bool(_PITCH_VIEW_URL_RE.match(url.strip()))
+
+
 def looks_like_url(value) -> bool:
     """
     True only when `value` is genuinely shaped like a URL, as opposed to a

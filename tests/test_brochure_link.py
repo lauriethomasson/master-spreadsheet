@@ -20,7 +20,8 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brochure_link_resolver import (
-    finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, looks_like_url,
+    finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, is_pitch_view_link,
+    looks_like_url,
 )
 from storage import blob_store, file_store
 
@@ -301,6 +302,25 @@ class IsCanvaViewLinkTests(unittest.TestCase):
 
     def test_an_unrelated_dot_link_domain_is_not_matched(self):
         self.assertFalse(is_canva_view_link("https://example.link/45k34aansogxr2a"))
+
+
+class IsPitchViewLinkTests(unittest.TestCase):
+    def test_real_gpe_style_view_links_are_recognised(self):
+        self.assertTrue(is_pitch_view_link("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+        self.assertTrue(is_pitch_view_link("https://pitch.com/v/hallmark-6th-floor-jdfuuc"))
+
+    def test_a_bare_pitch_homepage_is_not_a_view_link(self):
+        self.assertFalse(is_pitch_view_link("https://pitch.com/"))
+
+    def test_an_unrelated_domain_is_never_matched(self):
+        self.assertFalse(is_pitch_view_link("https://example.com/v/abc"))
+
+    def test_a_canva_link_is_not_a_pitch_link(self):
+        self.assertFalse(is_pitch_view_link("https://www.canva.com/design/abc/def/view"))
+
+    def test_blank_is_not_a_view_link(self):
+        self.assertFalse(is_pitch_view_link(None))
+        self.assertFalse(is_pitch_view_link(""))
 
 
 class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):

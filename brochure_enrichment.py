@@ -130,7 +130,7 @@ import streamlit as st
 import extract
 from brochure_link_resolver import (
     REQUEST_TIMEOUT, USER_AGENT, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link,
-    looks_like_url, resolve_brochure_link,
+    is_pitch_view_link, looks_like_url, resolve_brochure_link,
 )
 import geocode
 from house_number import leading_house_number
@@ -252,11 +252,14 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
       "Coming Soon" and similar provider placeholders meaning "none yet";
     - STATUS_UNSUPPORTED_LINK_TYPE: a real URL, but one of the shapes this
       pipeline already knows it can't use (a bare generic homepage/known
-      social-profile domain, a video link, a Canva public "view" link - see
-      brochure_link_resolver.is_canva_view_link's own docstring on why a
-      plain HTTP fetch can never retrieve real content from one, confirmed
-      directly against a real example rather than assumed - a Google Drive
-      FOLDER share link, see _is_google_drive_folder_link's own docstring,
+      social-profile domain, a video link, a Canva public "view" link or a
+      Pitch.com public "view" link - see brochure_link_resolver.is_canva_
+      view_link/is_pitch_view_link's own docstrings on why a plain HTTP
+      fetch can never retrieve real content from either, confirmed
+      directly against real examples rather than assumed, UNLESS
+      _canva_renderer_configured (that service now handles both) - a
+      Google Drive FOLDER share link, see _is_google_drive_folder_link's
+      own docstring,
       confirmed real against Kitt's Availability file's own floorplan_link
       values - or, only when reject_floorplan_shaped, brochure_link's own
       rule, see _is_eligible_brochure_url - a floor-plan-labeled link where
@@ -272,7 +275,7 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if is_generic_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
-    if is_canva_view_link(url) and not _canva_renderer_configured():
+    if (is_canva_view_link(url) or is_pitch_view_link(url)) and not _canva_renderer_configured():
         return STATUS_UNSUPPORTED_LINK_TYPE
     if _is_google_drive_folder_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
@@ -936,13 +939,16 @@ def _is_eligible_brochure_url(url) -> bool:
     fetchable_document for the one made after fetching). Rejects: blank/
     non-URL text, a bare
     company homepage or known social/professional profile domain (see
-    brochure_link_resolver.is_generic_link), a Canva public "view" link
-    (see is_canva_view_link's own docstring - confirmed, not assumed, that
-    a plain fetch can never retrieve real content from one), a Google
+    brochure_link_resolver.is_generic_link), a Canva OR Pitch.com public
+    "view" link (see is_canva_view_link/is_pitch_view_link's own
+    docstrings - confirmed, not assumed, that a plain fetch can never
+    retrieve real content from either - UNLESS _canva_renderer_configured,
+    which now handles both), a Google
     Drive FOLDER share link (see _is_google_drive_folder_link - Google's
     own HTML folder-listing page, not a document, so a fetch attempt is
-    structurally doomed the same way it is for a Canva link), and a URL
-    whose own text already identifies it as a floor plan or a video rather
+    structurally doomed the same way it is for a Canva/Pitch link), and a
+    URL whose own text already identifies it as a floor plan or a video
+    rather
     than a document - never a fetch-then-guess; these are excluded by the
     URL alone, exactly like a human skimming a link list would.
     """
@@ -952,7 +958,7 @@ def _is_eligible_brochure_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
-    if is_canva_view_link(url) and not _canva_renderer_configured():
+    if (is_canva_view_link(url) or is_pitch_view_link(url)) and not _canva_renderer_configured():
         return False
     if _is_google_drive_folder_link(url):
         return False
@@ -1332,6 +1338,13 @@ _CANVA_RENDERER_RETRY_BACKOFF_SECONDS = 2
 # even after the renderer itself was raised to capture it.
 _CANVA_MAX_PAGES_ACCEPTED = 30
 
+# Same defense-in-depth concept, for a Pitch presentation - see
+# _CANVA_MAX_PAGES_ACCEPTED's own docstring. Must be kept in lockstep with
+# canva_renderer/app.py's own MAX_PITCH_PAGES, same reason as the Canva
+# pair (see tests.test_canva_renderer.MaxPagesCapsStayInSyncTests for the
+# analogous pairing test this constant needs too).
+_PITCH_MAX_PAGES_ACCEPTED = 30
+
 # Same idea as the renderer's own _MAX_REASON_LENGTH (canva_renderer/app.py)
 # applied here too - this app never assumes the renderer's own truncation
 # actually ran (again: a separately deployed, separately versioned service),
@@ -1404,19 +1417,28 @@ def _canva_renderer_auth_headers(renderer_url: str) -> dict:
         return {}
 
 
-def _fetch_canva_rendered_page(url: str):
+def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: int):
     """
-    PNG bytes for every page `url` (a public Canva "view" link) renders to,
-    in page order, obtained from the separate Canva-rendering service (see
-    canva_renderer/README.md) - never attempted at all unless
-    CANVA_RENDERER_URL is configured (see _canva_renderer_configured's own
-    docstring); classify_link_eligibility/_is_eligible_brochure_url/_is_
-    eligible_floorplan_url already reject a Canva URL before it ever
-    reaches this function in that case, exactly like before this feature
-    existed. Chromium itself never runs in this app's own process/
-    container - see that service's own README for why this separation
-    exists (a stuck/misbehaving Canva page or a Chromium OOM must never be
-    able to affect this app's own memory budget or uptime).
+    PNG bytes for every page `url` (a public Canva OR Pitch.com "view"
+    link) renders to, in page order, obtained from the separate rendering
+    service (see canva_renderer/README.md - the SAME service handles
+    both platforms now) - never attempted at all unless CANVA_RENDERER_URL
+    is configured (see _canva_renderer_configured's own docstring);
+    classify_link_eligibility/_is_eligible_brochure_url/_is_eligible_
+    floorplan_url already reject a Canva/Pitch URL before it ever reaches
+    this function in that case. Chromium itself never runs in this app's
+    own process/container - see that service's own README for why this
+    separation exists (a stuck/misbehaving page or a Chromium OOM must
+    never be able to affect this app's own memory budget or uptime).
+
+    The one shared implementation _fetch_canva_rendered_page/_fetch_
+    pitch_rendered_page both call (with their own platform_label/
+    max_pages_accepted) - every retry/error-handling/response-parsing
+    rule below applies identically to both platforms; only the LOG TEXT
+    (via platform_label) and the defense-in-depth page-count cap (via
+    max_pages_accepted, since canva_renderer/app.py's own MAX_CANVA_
+    PAGES/MAX_PITCH_PAGES are tracked separately - see that module's own
+    docstrings) differ between them at all.
 
     A transient HTTP 502/503 from the renderer (Cloud Run's own
     infrastructure or its own busy-semaphore giving up on the request
@@ -1444,24 +1466,24 @@ def _fetch_canva_rendered_page(url: str):
       STATUS_RENDER_FAILED with the HTTP status/reason (same generic
       fallback path as any other bad response, see below);
     - the renderer itself reports a clean, safe failure - a malformed
-      Canva URL, a private/login-required design, a page that never
-      finished loading - recorded as STATUS_RENDER_FAILED with the
-      renderer's own short, non-sensitive reason string (never a raw
-      exception, stack trace, or URL with a query string).
+      URL, a private/login-required design, a page that never finished
+      loading - recorded as STATUS_RENDER_FAILED with the renderer's own
+      short, non-sensitive reason string (never a raw exception, stack
+      trace, or URL with a query string).
 
     Otherwise returns a non-empty list[bytes], ALWAYS at least one page (the
     renderer itself never returns an empty "pages" list on a 200 - see its
-    own app.py) - a genuinely multi-page Canva brochure's OTHER pages are
+    own app.py) - a genuinely multi-page brochure/deck's OTHER pages are
     now included too (see canva_renderer/README.md's "Multi-page capture"),
-    up to whatever that service's own MAX_CANVA_PAGES allowed, further
-    capped here at _CANVA_MAX_PAGES_ACCEPTED as defense-in-depth against a
+    up to whatever that service's own page cap allowed, further capped
+    here at `max_pages_accepted` as defense-in-depth against a
     misbehaving/compromised renderer response (that service is a separately
     deployed, separately versioned service - this app never assumes its own
     cap is what actually ran on the other side). This list feeds into
     extract.images_from_png_pages/render_and_extract exactly like a multi-
     page PDF's own per-page images already do (see _fetch_pdf_bytes' own
-    Canva branch below) - no separate Canva extraction system, no change to
-    matching/enrichment rules.
+    Canva/Pitch branches below) - no separate extraction system, no change
+    to matching/enrichment rules.
     """
     renderer_url = os.environ.get(CANVA_RENDERER_URL_ENV_VAR, "").rstrip("/")
     connect_exception = None
@@ -1483,8 +1505,8 @@ def _fetch_canva_rendered_page(url: str):
             break  # a real answer - success or a non-transient failure - stop retrying
         if attempt < _CANVA_RENDERER_MAX_ATTEMPTS:
             print(
-                f"[brochure_enrichment] Canva renderer returned a transient HTTP {response.status_code} for "
-                f"{url!r} on attempt {attempt}/{_CANVA_RENDERER_MAX_ATTEMPTS} - retrying "
+                f"[brochure_enrichment] {platform_label} renderer returned a transient HTTP {response.status_code} "
+                f"for {url!r} on attempt {attempt}/{_CANVA_RENDERER_MAX_ATTEMPTS} - retrying "
                 f"after {_CANVA_RENDERER_RETRY_BACKOFF_SECONDS}s.",
                 file=sys.stderr,
             )
@@ -1492,11 +1514,11 @@ def _fetch_canva_rendered_page(url: str):
 
     if response is None:
         print(
-            f"[brochure_enrichment] Canva renderer unreachable for {url!r} ({connect_exception!r}) — "
+            f"[brochure_enrichment] {platform_label} renderer unreachable for {url!r} ({connect_exception!r}) — "
             "skipping enrichment.",
             file=sys.stderr,
         )
-        _record_status(STATUS_FETCH_FAILED, f"Canva renderer unreachable ({connect_exception!r})")
+        _record_status(STATUS_FETCH_FAILED, f"{platform_label} renderer unreachable ({connect_exception!r})")
         return None
 
     if response.status_code in (401, 403):
@@ -1509,37 +1531,38 @@ def _fetch_canva_rendered_page(url: str):
         # yet-propagated Cloud Run Invoker binding) would otherwise look
         # identical to "the renderer just couldn't render this page".
         print(
-            f"[brochure_enrichment] Canva renderer rejected the request for {url!r} with "
+            f"[brochure_enrichment] {platform_label} renderer rejected the request for {url!r} with "
             f"HTTP {response.status_code} (authentication failed - check the main app's service account has "
             f"the Cloud Run Invoker role on the renderer, and that CANVA_RENDERER_URL exactly matches its "
             f"own URL) — skipping enrichment.",
             file=sys.stderr,
         )
-        _record_status(STATUS_FETCH_FAILED, "Canva renderer authentication failed")
+        _record_status(STATUS_FETCH_FAILED, f"{platform_label} renderer authentication failed")
         return None
 
     content_type = response.headers.get("content-type", "")
     if response.status_code == 200 and "application/json" not in content_type and "image/" in content_type:
         # Distinguished from every other failure shape below - a 200 with
         # an image/* content-type is exactly what the OLD, single-page-only
-        # renderer returned (see this repo's history before multi-page
-        # capture: canva_renderer/app.py used to respond with a raw PNG
-        # body, not the {"pages": [...]} JSON this app now expects). This
-        # is the one failure shape that means "the two services are on
-        # mismatched versions", not "Canva/the render itself failed" - a
-        # genuine render failure never returns 200 with image bytes at all.
-        # Loud and specific on purpose: this is the single most likely
-        # cause of "Canva enrichment silently does nothing in production
-        # despite the multi-page code being merged" - the canva-renderer
-        # Cloud Run service simply hasn't been redeployed with it yet.
+        # Canva-only renderer returned (see this repo's history before
+        # multi-page capture: canva_renderer/app.py used to respond with a
+        # raw PNG body, not the {"pages": [...]} JSON this app now
+        # expects). This is the one failure shape that means "the two
+        # services are on mismatched versions", not "the render itself
+        # failed" - a genuine render failure never returns 200 with image
+        # bytes at all. Loud and specific on purpose: this is the single
+        # most likely cause of "enrichment silently does nothing in
+        # production despite the multi-page code being merged" - the
+        # canva-renderer Cloud Run service simply hasn't been redeployed
+        # with it yet.
         print(
-            f"[brochure_enrichment] Canva renderer for {url!r} returned an OLD-FORMAT single-image "
+            f"[brochure_enrichment] {platform_label} renderer for {url!r} returned an OLD-FORMAT single-image "
             f"response (content-type {content_type!r}) instead of the expected JSON {{'pages': [...]}} "
             "body — the canva-renderer Cloud Run service needs redeploying with the current multi-page "
             "code (see canva_renderer/README.md) — skipping enrichment.",
             file=sys.stderr,
         )
-        _record_status(STATUS_RENDER_FAILED, "Canva renderer is running an outdated single-page image response")
+        _record_status(STATUS_RENDER_FAILED, f"{platform_label} renderer is running an outdated single-page image response")
         return None
 
     if response.status_code != 200 or "application/json" not in content_type:
@@ -1555,8 +1578,8 @@ def _fetch_canva_rendered_page(url: str):
         # (e.g. "HTTP 503"), which hid whatever the renderer itself saw
         # (a browser launch failure, a navigation timeout, ...). This is
         # deliberately the one log line to grep for that question.
-        print(f"[brochure_enrichment] Canva renderer failed for {url!r}: {reason}", file=sys.stderr)
-        _record_status(STATUS_RENDER_FAILED, f"Canva render failed: {reason}")
+        print(f"[brochure_enrichment] {platform_label} renderer failed for {url!r}: {reason}", file=sys.stderr)
+        _record_status(STATUS_RENDER_FAILED, f"{platform_label} render failed: {reason}")
         return None
 
     try:
@@ -1567,7 +1590,7 @@ def _fetch_canva_rendered_page(url: str):
             raise ValueError("empty pages list")
     except Exception as e:
         print(
-            f"[brochure_enrichment] Canva renderer returned a malformed response for {url!r} ({e!r}) — "
+            f"[brochure_enrichment] {platform_label} renderer returned a malformed response for {url!r} ({e!r}) — "
             "skipping enrichment.",
             file=sys.stderr,
         )
@@ -1575,30 +1598,46 @@ def _fetch_canva_rendered_page(url: str):
         return None
 
     detected_total = payload.get("page_count_detected")
-    if len(pages) > _CANVA_MAX_PAGES_ACCEPTED:
+    if len(pages) > max_pages_accepted:
         print(
-            f"[brochure_enrichment] Canva renderer returned {len(pages)} pages for {url!r}, "
-            f"truncating to this app's own cap of {_CANVA_MAX_PAGES_ACCEPTED}.",
+            f"[brochure_enrichment] {platform_label} renderer returned {len(pages)} pages for {url!r}, "
+            f"truncating to this app's own cap of {max_pages_accepted}.",
             file=sys.stderr,
         )
-        pages = pages[:_CANVA_MAX_PAGES_ACCEPTED]
+        pages = pages[:max_pages_accepted]
 
     # The ONE clear, positive confirmation the whole authenticated round
     # trip actually worked - main app -> ID token -> Cloud Run IAM ->
     # renderer -> Chromium -> pages back. Every failure mode above already
     # prints its own distinct message; this is deliberately the only
-    # SUCCESS line for Canva specifically, so grepping Cloud Run logs for
-    # "Canva render succeeded" is a single, unambiguous way to confirm
-    # rendering itself worked for a given URL, separate from whether the
-    # subsequent Gemini extraction (see _extract_brochure_units) then
-    # found anything useful in it.
+    # SUCCESS line for this platform specifically, so grepping Cloud Run
+    # logs for "<Platform> render succeeded" is a single, unambiguous way
+    # to confirm rendering itself worked for a given URL, separate from
+    # whether the subsequent Gemini extraction (see _extract_brochure_
+    # units) then found anything useful in it.
     detected_str = f"{detected_total} detected" if detected_total else "total unknown"
     print(
-        f"[brochure_enrichment] Canva render succeeded for {url!r}: {len(pages)} page(s) captured "
+        f"[brochure_enrichment] {platform_label} render succeeded for {url!r}: {len(pages)} page(s) captured "
         f"({detected_str}) — handing off to the existing extraction pipeline.",
         file=sys.stderr,
     )
     return pages
+
+
+def _fetch_canva_rendered_page(url: str):
+    """Canva's own thin wrapper over _fetch_rendered_page - see that
+    function's own docstring for the full contract."""
+    return _fetch_rendered_page(url, platform_label="Canva", max_pages_accepted=_CANVA_MAX_PAGES_ACCEPTED)
+
+
+def _fetch_pitch_rendered_page(url: str):
+    """Pitch's own thin wrapper over _fetch_rendered_page - see that
+    function's own docstring for the full contract. Identical mechanism
+    to _fetch_canva_rendered_page, just calling the same renderer service
+    for a Pitch.com "view" link instead (see canva_renderer/app.py's own
+    render_pitch_page_async) and its own, separately-tracked max_pages_
+    accepted cap."""
+    return _fetch_rendered_page(url, platform_label="Pitch", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED)
 
 
 def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_image_formats: bool = False):
@@ -1637,26 +1676,29 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     extension is fetched as-is, otherwise resolve_brochure_link's one-hop
     landing-page scan is tried first.
 
-    A Canva "view" link (see is_canva_view_link) is read via the separate
-    Canva-rendering service instead (see _fetch_canva_rendered_page), but
-    ONLY when CANVA_RENDERER_URL is actually configured (see
-    _canva_renderer_configured) - classify_link_eligibility/_is_eligible_
-    brochure_url/_is_eligible_floorplan_url already reject a Canva URL
-    before it gets here at all in that case, so this check is normally
-    redundant, but this function's own direct callers (e.g. a diagnostic
-    script, or a test exercising this layer directly) don't necessarily
-    go through that eligibility gate first - falling through to the exact
-    same generic fetch path as any other URL when unconfigured, rather
-    than attempting a renderer call this deployment was never told about,
+    A Canva "view" link (see is_canva_view_link) OR a Pitch.com "view"
+    link (see is_pitch_view_link) is read via the separate rendering
+    service instead (see _fetch_canva_rendered_page/_fetch_pitch_
+    rendered_page - the same deployed service handles both), but ONLY
+    when CANVA_RENDERER_URL is actually configured (see _canva_renderer_
+    configured) - classify_link_eligibility/_is_eligible_brochure_url/
+    _is_eligible_floorplan_url already reject either URL before it gets
+    here at all in that case, so this check is normally redundant, but
+    this function's own direct callers (e.g. a diagnostic script, or a
+    test exercising this layer directly) don't necessarily go through
+    that eligibility gate first - falling through to the exact same
+    generic fetch path as any other URL when unconfigured, rather than
+    attempting a renderer call this deployment was never told about,
     keeps this function's own behavior correct independent of whether a
     caller already checked eligibility.
 
-    The Canva branch is the ONE case this function returns list[bytes]
-    (one PNG per page, see _fetch_canva_rendered_page) rather than a single
-    bytes object - every other branch/URL shape is unaffected. Both callers
-    (_extract_brochure_units/_extract_floorplan_units) branch on this via
-    _images_from_fetched_document, so neither needs its own isinstance
-    check duplicated.
+    The Canva/Pitch branches are the ONE case this function returns
+    list[bytes] (one PNG per page, see _fetch_canva_rendered_page/_fetch_
+    pitch_rendered_page) rather than a single bytes object - every other
+    branch/URL shape is unaffected. Both callers (_extract_brochure_
+    units/_extract_floorplan_units) branch on this via _images_from_
+    fetched_document, so neither needs its own isinstance check
+    duplicated.
     """
     if _box_share_token(url):
         return _fetch_box_shared_pdf(
@@ -1665,6 +1707,9 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
 
     if is_canva_view_link(url) and _canva_renderer_configured():
         return _fetch_canva_rendered_page(url)
+
+    if is_pitch_view_link(url) and _canva_renderer_configured():
+        return _fetch_pitch_rendered_page(url)
 
     direct_extensions = (".pdf", ".png", ".jpg", ".jpeg") if accept_image_formats else (".pdf",)
     try:
@@ -1838,17 +1883,18 @@ def _extract_brochure_units(url: str):
     ]
     has_data = bool(units) or bool(units.property_features) or bool(units.contacts) or bool(units.building_features)
     _record_status(STATUS_EXTRACTED_SUCCESSFULLY if has_data else STATUS_EXTRACTED_NO_USEFUL_DATA)
-    if is_canva_view_link(url):
-        # Canva-specific diagnostic only (never printed for the PDF/Box/
-        # Dropbox/GDrive paths, which already have years of production
+    if is_canva_view_link(url) or is_pitch_view_link(url):
+        # Canva/Pitch-specific diagnostic only (never printed for the PDF/
+        # Box/Dropbox/GDrive paths, which already have years of production
         # history without this) - shows exactly what Gemini's raw JSON
         # contained for this brochure, one level BEFORE matching/
         # _apply_units_to_row ever runs, so "Gemini extracted nothing
         # useful" and "matching/apply rejected what Gemini found" are never
         # ambiguous with each other in the logs. Field NAMES only, never
         # the actual extracted text (which could be long/PII-bearing).
+        platform_label = "Pitch" if is_pitch_view_link(url) else "Canva"
         print(
-            f"[brochure_enrichment] Canva extraction for {url!r}: {len(units)} unit(s), "
+            f"[brochure_enrichment] {platform_label} extraction for {url!r}: {len(units)} unit(s), "
             f"property_features={'present' if units.property_features else 'absent'}, "
             f"contacts={'present' if units.contacts else 'absent'}, "
             f"building_features={len(units.building_features)}.",
@@ -2321,9 +2367,10 @@ def _is_eligible_floorplan_url(url) -> bool:
     that shape is exactly what's EXPECTED here, unlike for brochure_link
     where it's a rejection reason. Still requires an explicit http(s)
     scheme and rejects a bare company homepage/known social-profile domain
-    (see is_generic_link), a Canva public "view" link (see is_canva_view_
-    link's own docstring - a floor plan is never retrievable from one
-    either, for the same reason a brochure isn't), a Google Drive FOLDER
+    (see is_generic_link), a Canva OR Pitch.com public "view" link (see
+    is_canva_view_link/is_pitch_view_link's own docstrings - a floor plan
+    is never retrievable from either, for the same reason a brochure
+    isn't, unless _canva_renderer_configured), a Google Drive FOLDER
     share link (see _is_google_drive_folder_link - confirmed real: 20+
     distinct folder links used as floorplan_link in Kitt's Availability
     file, previously falling through to a real fetch attempt structurally
@@ -2336,7 +2383,7 @@ def _is_eligible_floorplan_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
-    if is_canva_view_link(url) and not _canva_renderer_configured():
+    if (is_canva_view_link(url) or is_pitch_view_link(url)) and not _canva_renderer_configured():
         return False
     if _is_google_drive_folder_link(url):
         return False
@@ -3028,17 +3075,19 @@ def enrich_rows_grouped(
                     new_row = new_row.model_copy(update={"brochure_link_broken": link_broken_update})
                 current[i] = new_row
                 if fields:
-                    if is_canva_view_link(url):
-                        # Distinct, greppable confirmation that a Canva-
-                        # sourced render made it all the way through the
-                        # existing extraction pipeline AND actually
+                    if is_canva_view_link(url) or is_pitch_view_link(url):
+                        # Distinct, greppable confirmation that a Canva/
+                        # Pitch-sourced render made it all the way through
+                        # the existing extraction pipeline AND actually
                         # produced usable field values on a real row - the
                         # final link in the chain _fetch_canva_rendered_
-                        # page's own "Canva render succeeded" log confirms
-                        # only the rendering half of (see this module's own
-                        # "prove Canva end-to-end" verification).
+                        # page's/_fetch_pitch_rendered_page's own "<Platform>
+                        # render succeeded" log confirms only the rendering
+                        # half of (see this module's own "prove end-to-end"
+                        # verification).
+                        platform_label = "Pitch" if is_pitch_view_link(url) else "Canva"
                         print(
-                            f"[brochure_enrichment] Canva enrichment applied {fields} to "
+                            f"[brochure_enrichment] {platform_label} enrichment applied {fields} to "
                             f"{new_row.building!r} ({new_row.floor_unit!r}).",
                             file=sys.stderr,
                         )
@@ -3067,9 +3116,9 @@ def enrich_rows_grouped(
                             "building": new_row.building, "floor_unit": new_row.floor_unit,
                             "status": STATUS_EXTRACTED_BUT_AMBIGUOUS,
                         })
-                    if is_canva_view_link(url):
-                        # Canva-specific diagnostic only - the document read
-                        # fine (see the Canva extraction log above) but this
+                    if is_canva_view_link(url) or is_pitch_view_link(url):
+                        # Canva/Pitch-specific diagnostic only - the document
+                        # read fine (see the extraction log above) but this
                         # ROW still has blank fields afterward; names the
                         # exact fields and whether an ambiguous/rent-conflict
                         # match was the reason, so "Gemini found nothing for
@@ -3077,8 +3126,9 @@ def enrich_rows_grouped(
                         # the rent guard rejected it" are never conflated.
                         still_blank = [f for f in ENRICHABLE_FIELDS if _is_blank(getattr(new_row, f))]
                         reason = "ambiguous/rent-conflicting match" if ambiguous else "no confident match for this row"
+                        platform_label = "Pitch" if is_pitch_view_link(url) else "Canva"
                         print(
-                            f"[brochure_enrichment] Canva extraction read fine for {new_row.building!r} "
+                            f"[brochure_enrichment] {platform_label} extraction read fine for {new_row.building!r} "
                             f"({new_row.floor_unit!r}) but left {still_blank} blank — {reason}.",
                             file=sys.stderr,
                         )

@@ -68,12 +68,27 @@ class IsRecognizedCanvaUrlTests(unittest.TestCase):
         self.assertFalse(canva_renderer._is_recognized_canva_url("https://www.canva.com/"))
 
 
+class IsRecognizedPitchUrlTests(unittest.TestCase):
+    def test_real_view_link_is_recognized(self):
+        self.assertTrue(canva_renderer._is_recognized_pitch_url("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+        self.assertTrue(canva_renderer._is_recognized_pitch_url("https://pitch.com/v/hallmark-6th-floor-jdfuuc"))
+
+    def test_non_pitch_url_is_rejected(self):
+        self.assertFalse(canva_renderer._is_recognized_pitch_url("https://example.com/brochure.pdf"))
+
+    def test_canva_url_is_not_recognized_as_pitch(self):
+        self.assertFalse(canva_renderer._is_recognized_pitch_url("https://www.canva.com/design/x/y/view"))
+
+    def test_pitch_homepage_is_rejected(self):
+        self.assertFalse(canva_renderer._is_recognized_pitch_url("https://pitch.com/"))
+
+
 class HostAllowedSsrfTests(unittest.TestCase):
     """
     The renderer's core SSRF defense - a strict allow-list, not a
-    denylist. Rejecting everything that isn't canva.com/canva.link
-    inherently rejects localhost/private IPs/file:///custom schemes too,
-    with no separate IP-range logic to keep correct.
+    denylist. Rejecting everything that isn't canva.com/canva.link/
+    pitch.com inherently rejects localhost/private IPs/file:///custom
+    schemes too, with no separate IP-range logic to keep correct.
     """
 
     def test_canva_com_is_allowed(self):
@@ -81,6 +96,12 @@ class HostAllowedSsrfTests(unittest.TestCase):
 
     def test_canva_link_is_allowed(self):
         self.assertTrue(canva_renderer._host_allowed("https://canva.link/abc"))
+
+    def test_pitch_com_is_allowed(self):
+        self.assertTrue(canva_renderer._host_allowed("https://pitch.com/v/abc"))
+
+    def test_pitch_lookalike_domain_is_rejected(self):
+        self.assertFalse(canva_renderer._host_allowed("https://pitch.com.evil.com/v/abc"))
 
     def test_lookalike_domain_is_rejected(self):
         # "canva.com.evil.com" must NOT match ".canva.com".
@@ -342,6 +363,86 @@ def _make_async_browser(context):
     browser = MagicMock()
     browser.new_context = AsyncMock(return_value=context)
     return browser
+
+
+def _make_async_pitch_page(
+    final_url="https://pitch.com/v/1-finsbury-brochure-4jnj9d",
+    goto_side_effect=None,
+    goto_response_status=200,
+    screenshots=(b"\x89PNG fake",),
+    next_disabled_sequence=(True,),
+    next_button_raises=False,
+    next_button_count=1,
+    click_advances_page=True,
+):
+    """
+    Pitch's own counterpart to _make_async_page (see that fixture's own
+    docstring for the full shape this mirrors) - the one real difference
+    is next_disabled_sequence's own values: a plain bool (True = the
+    `disabled` attribute is present, False = absent/None) rather than
+    Canva's own literal "true"/"false" ARIA string values, matching
+    render_pitch_page_async's own `get_attribute("disabled", ...) is not
+    None` check (never Canva's own `== "true"` string comparison).
+    """
+    page = MagicMock()
+    page.url = final_url
+    page.set_default_navigation_timeout = MagicMock()
+    page.set_default_timeout = MagicMock()
+    page.route = AsyncMock()
+    page.goto = (
+        AsyncMock(side_effect=goto_side_effect) if goto_side_effect
+        else AsyncMock(return_value=MagicMock(status=goto_response_status))
+    )
+    page.close = AsyncMock()
+    cookie_locator = MagicMock()
+    cookie_locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
+    page.get_by_text = MagicMock(return_value=cookie_locator)
+    page.wait_for_timeout = AsyncMock()
+
+    import itertools
+    screenshot_iter = itertools.cycle(screenshots)
+
+    async def _screenshot(*args, **kwargs):
+        return next(screenshot_iter)
+
+    page.screenshot = AsyncMock(side_effect=_screenshot)
+
+    advance_state = {"page": 1}
+
+    async def _evaluate(script):
+        return f"content-page-{advance_state['page']}"
+
+    page.evaluate = AsyncMock(side_effect=_evaluate)
+
+    next_button = MagicMock()
+    next_button.count = AsyncMock(return_value=next_button_count)
+    if next_button_raises:
+        next_button.get_attribute = AsyncMock(side_effect=Exception("Next button not found"))
+    else:
+        disabled_iter = itertools.cycle(next_disabled_sequence)
+
+        async def _get_attribute(name, timeout=None):
+            # Mirrors the real HTML boolean attribute: present (an empty
+            # string, never None) when disabled, absent (None) otherwise -
+            # never a literal "true"/"false" string the way Canva's own
+            # aria-disabled is.
+            return "" if next(disabled_iter) else None
+
+        next_button.get_attribute = AsyncMock(side_effect=_get_attribute)
+
+    async def _default_click(*args, **kwargs):
+        if click_advances_page:
+            advance_state["page"] += 1
+
+    next_button.click = AsyncMock(side_effect=_default_click)
+
+    def _get_by_role(role, name=None, **kwargs):
+        if name == "Next":
+            return next_button
+        return MagicMock()
+
+    page.get_by_role = MagicMock(side_effect=_get_by_role)
+    return page
 
 
 class _ResetGlobalBrowserStateTestCase(unittest.TestCase):
@@ -801,6 +902,157 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         starter.start.assert_awaited_once()  # never launched a second browser
 
 
+class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
+    """Unit-level tests against render_pitch_page_async directly - mirrors
+    RenderCanvaPageAsyncTests' own coverage for the shared loop shape, plus
+    the two genuine differences confirmed via recon (see that function's
+    own docstring): the `disabled` HTML attribute instead of aria-disabled,
+    and the "Next" button name instead of "Next page"."""
+
+    def _patch_browser(self, page):
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        return patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser)), context
+
+    def test_non_pitch_url_raises_before_touching_the_browser(self):
+        mock_get_browser = AsyncMock()
+        with patch.object(canva_renderer, "_get_browser_async", mock_get_browser):
+            with self.assertRaises(canva_renderer.RenderError):
+                _run(canva_renderer.render_pitch_page_async("https://example.com/x"))
+        mock_get_browser.assert_not_called()
+
+    def test_successful_render_returns_png_bytes(self):
+        page = _make_async_pitch_page(screenshots=(b"\x89PNG real bytes",))
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, detected_total = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG real bytes"])
+        self.assertIsNone(detected_total)
+        context.close.assert_awaited_once()
+
+    def test_initial_navigation_waits_for_networkidle_not_load(self):
+        # The one deliberate divergence from Canva - see render_pitch_
+        # page_async's own docstring point 1 for why (Pitch's own initial
+        # HTML is a genuinely empty shell with no persistent background
+        # traffic problem the way Canva's heavy SPA has).
+        page = _make_async_pitch_page(screenshots=(b"\x89PNG real bytes",))
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+        self.assertEqual(page.goto.call_args.kwargs["wait_until"], "networkidle")
+
+    def test_single_page_deck_with_no_pagination_ui_returns_one_page(self):
+        page = _make_async_pitch_page(screenshots=(b"\x89PNG only page",), next_button_raises=True)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG only page"])
+        context.close.assert_awaited_once()
+
+    def test_multi_page_deck_captures_every_page_in_order(self):
+        page = _make_async_pitch_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"),
+            next_disabled_sequence=(False, False, True),
+        )
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])
+        context.close.assert_awaited_once()
+
+    def test_disabled_attribute_present_as_empty_string_still_stops_the_loop(self):
+        # The real, confirmed HTML boolean attribute semantics (see recon):
+        # `disabled=""` (present, even with an empty value) means disabled -
+        # never Canva's own literal aria-disabled="true" STRING comparison.
+        # _make_async_pitch_page's own get_attribute fake already returns
+        # "" (not None) for a disabled state - this test exists specifically
+        # to pin that "" must be treated as disabled, not accidentally
+        # falsy-compared against a bare boolean the way a lazy `if value:`
+        # check would get wrong (`if "":` is falsy in Python).
+        page = _make_async_pitch_page(screenshots=(b"\x89PNG p1",), next_disabled_sequence=(True,))
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _ = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(len(pages), 1)
+        context.close.assert_awaited_once()
+
+    def test_page_limit_is_enforced_even_if_next_button_never_reports_disabled(self):
+        screenshots = tuple(f"\x89PNG p{i}".encode() for i in range(1, 8))
+        page = _make_async_pitch_page(screenshots=screenshots, next_disabled_sequence=[False] * 10)
+        patcher, context = self._patch_browser(page)
+        with patch.object(canva_renderer, "MAX_PITCH_PAGES", 5), patcher:
+            pages, _ = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(len(pages), 5)
+        context.close.assert_awaited_once()
+
+    def test_navigation_failure_raises_render_error(self):
+        page = _make_async_pitch_page(goto_side_effect=Exception("Timeout 30000ms exceeded"))
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError):
+                _run(canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+    def test_dead_link_status_raises_render_error_with_navigation_returned_http_marker(self):
+        # Same marker text as Canva's own identical check - the main app's
+        # _is_confirmed_dead_canva_link matches on this literal substring
+        # regardless of which platform produced it (see render_pitch_page_
+        # async's own docstring).
+        page = _make_async_pitch_page(goto_response_status=404)
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError) as ctx:
+                _run(canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+        self.assertIn("navigation returned HTTP", str(ctx.exception))
+
+
+class RenderPageDispatchTests(unittest.TestCase):
+    """render_page - the one call site Handler.do_POST uses, dispatching
+    to whichever platform's own renderer a URL shape recognizes."""
+
+    def test_canva_url_dispatches_to_render_canva_page(self):
+        with patch.object(canva_renderer, "render_canva_page", return_value=([b"x"], 1)) as mock_canva, \
+             patch.object(canva_renderer, "render_pitch_page") as mock_pitch:
+            result = canva_renderer.render_page("https://www.canva.com/design/x/y/view")
+
+        self.assertEqual(result, ([b"x"], 1))
+        mock_canva.assert_called_once_with("https://www.canva.com/design/x/y/view")
+        mock_pitch.assert_not_called()
+
+    def test_pitch_url_dispatches_to_render_pitch_page(self):
+        with patch.object(canva_renderer, "render_canva_page") as mock_canva, \
+             patch.object(canva_renderer, "render_pitch_page", return_value=([b"x"], 1)) as mock_pitch:
+            result = canva_renderer.render_page("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+
+        self.assertEqual(result, ([b"x"], 1))
+        mock_pitch.assert_called_once_with("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+        mock_canva.assert_not_called()
+
+    def test_unrecognized_url_raises_render_error_without_calling_either(self):
+        with patch.object(canva_renderer, "render_canva_page") as mock_canva, \
+             patch.object(canva_renderer, "render_pitch_page") as mock_pitch:
+            with self.assertRaises(canva_renderer.RenderError):
+                canva_renderer.render_page("https://example.com/brochure.pdf")
+
+        mock_canva.assert_not_called()
+        mock_pitch.assert_not_called()
+
+
 class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
     """
     Exercises the REAL sync-to-async bridge (render_canva_page -> the
@@ -1044,7 +1296,14 @@ class RenderHandlerTests(unittest.TestCase):
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])  # untouched
 
     def test_render_error_returns_422_with_reason(self):
-        handler = self._make_handler(json.dumps({"url": "https://example.com/x"}).encode())
+        # A real Canva-shaped URL, not an arbitrary one - do_POST now
+        # dispatches through render_page (see that function's own
+        # docstring), which picks render_canva_page/render_pitch_page
+        # based on the URL's own shape BEFORE either mock below is ever
+        # reached; an unrecognized URL would raise render_page's own
+        # "not a recognized public Canva or Pitch URL" error first,
+        # never exercising this test's own render_canva_page mock at all.
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
         with patch.object(
             canva_renderer, "render_canva_page", side_effect=canva_renderer.RenderError("not allowed"),
         ):
@@ -1377,6 +1636,17 @@ class MaxPagesCapsStayInSyncTests(unittest.TestCase):
             canva_renderer.MAX_CANVA_PAGES,
             brochure_enrichment._CANVA_MAX_PAGES_ACCEPTED,
             "canva_renderer.MAX_CANVA_PAGES and brochure_enrichment._CANVA_MAX_PAGES_ACCEPTED "
+            "must be raised together - a mismatch means the main app silently truncates pages "
+            "the renderer was just raised to capture.",
+        )
+
+    def test_pitch_renderer_and_main_app_page_caps_are_equal(self):
+        # Same pairing requirement, for Pitch's own independent cap pair -
+        # see brochure_enrichment._PITCH_MAX_PAGES_ACCEPTED's own docstring.
+        self.assertEqual(
+            canva_renderer.MAX_PITCH_PAGES,
+            brochure_enrichment._PITCH_MAX_PAGES_ACCEPTED,
+            "canva_renderer.MAX_PITCH_PAGES and brochure_enrichment._PITCH_MAX_PAGES_ACCEPTED "
             "must be raised together - a mismatch means the main app silently truncates pages "
             "the renderer was just raised to capture.",
         )

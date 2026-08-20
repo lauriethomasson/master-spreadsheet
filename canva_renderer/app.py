@@ -2,35 +2,40 @@
 canva_renderer/app.py
 
 Small, isolated HTTP service whose only job is: given a public Canva
-"view" URL, render it in a real headless Chromium (a plain HTTP fetch of
-this URL returns Canva's own "Unsupported client" shell instead of the
-actual design - confirmed directly, see the main app's brochure_link_
-resolver.is_canva_view_link docstring) and return a single PNG screenshot
-of whatever page that URL lands on.
+"view" URL OR a public Pitch.com "view" URL, render it in a real headless
+Chromium (a plain HTTP fetch of either URL shape returns only an empty/
+"Unsupported client" shell instead of the actual content - confirmed
+directly, see the main app's brochure_link_resolver.is_canva_view_link/
+is_pitch_view_link docstrings) and return one PNG screenshot per page.
+Pitch support was added second, reusing this exact same architecture
+(browser lifecycle, SSRF allow-list, pagination-capture loop shape) - see
+render_pitch_page_async's own docstring for the two genuine, confirmed
+differences from Canva's own render_canva_page_async.
 
 Deliberately NEVER runs inside the main spreadsheet app's own container/
-process - a stuck/misbehaving Canva page or a Chromium OOM here must never
-be able to affect the main app's own memory budget or uptime. This is the
+process - a stuck/misbehaving page or a Chromium OOM here must never be
+able to affect the main app's own memory budget or uptime. This is the
 ONLY reason this service exists as a separate deployable: everything else
 (URL recognition, matching, enrichment rules) stays in the main app.
 
 Deliberately NOT a general-purpose URL renderer - this is the main SSRF
-defense. Every request is validated against a small Canva-only hostname
-allow-list (_ALLOWED_HOST_SUFFIXES) TWICE: once on the caller-supplied URL
-before a browser page is ever created, and again at the network-request
-level for every single request a loaded page tries to make (navigation,
-redirect, or sub-resource - see _install_host_guard). Rather than trying
-to enumerate every private IP range/scheme a malicious or redirected URL
-could point at (file://, localhost, 169.254.169.254, custom schemes,
-...), this service simply never lets the browser talk to anything that
-isn't canva.com/canva.link in the first place - those all fail the same
-one allow-list check, by construction, with no separate denylist logic to
-keep in sync.
+defense. Every request is validated against a small hostname allow-list
+(_ALLOWED_HOST_SUFFIXES: canva.com, canva.link, pitch.com) TWICE: once on
+the caller-supplied URL before a browser page is ever created, and again
+at the network-request level for every single request a loaded page
+tries to make (navigation, redirect, or sub-resource - see
+_install_host_guard). Rather than trying to enumerate every private IP
+range/scheme a malicious or redirected URL could point at (file://,
+localhost, 169.254.169.254, custom schemes, ...), this service simply
+never lets the browser talk to anything outside that allow-list in the
+first place - those all fail the same one allow-list check, by
+construction, with no separate denylist logic to keep in sync.
 
-Captures EVERY page of a multi-page brochure, up to MAX_CANVA_PAGES - see
-render_canva_page_async's own docstring for how (Canva's own accessible
-"Next page" button/aria-disabled state, confirmed directly against a real
-multi-page brochure - never a CSS-class-dependent scrape), with a bounded
+Captures EVERY page of a multi-page brochure/deck, up to MAX_CANVA_PAGES/
+MAX_PITCH_PAGES - see render_canva_page_async's/render_pitch_page_async's
+own docstrings for how (each platform's own accessible Next-page control
+and its own disabled-state signal, confirmed directly against a real
+multi-page example - never a CSS-class-dependent scrape), with a bounded
 retry against a freshly re-acquired button locator on a transient click
 failure (see MAX_NEXT_CLICK_ATTEMPTS) before giving up on pagination and
 keeping whatever was already captured.
@@ -94,12 +99,26 @@ _CANVA_VIEW_URL_RE = re.compile(
 )
 _CANVA_SHORT_LINK_RE = re.compile(r"^https?://canva\.link/[^/\s?#]+(?:[/?#].*)?$", re.IGNORECASE)
 
+# Mirrors brochure_link_resolver.is_pitch_view_link's own narrow shape in
+# the main app - a Pitch.com public "view" link (e.g. "https://pitch.com/
+# v/1-finsbury-brochure-4jnj9d"), confirmed directly against real GPE/
+# Knotel/MetSpace brochure links via a throwaway Playwright recon script:
+# a plain HTTP GET returns only an empty client-side-rendered shell (same
+# category of problem as Canva's own "Unsupported client" page - see
+# _CANVA_VIEW_URL_RE's own docstring), but real content DOES render
+# correctly in a real headless browser, with no login/email gate. Kept as
+# an independent copy here for the same reason _CANVA_VIEW_URL_RE is: this
+# is a separately deployed service with its own repo/container boundary,
+# not a shared import.
+_PITCH_VIEW_URL_RE = re.compile(r"^https?://(?:[\w-]+\.)*pitch\.com/v/[^/\s?#]+(?:[/?#].*)?$", re.IGNORECASE)
+
 # The ONLY hostnames this service's browser is ever allowed to talk to -
 # see the module's own SSRF docstring above. Exact-or-subdomain match
 # only, same principle as the main app's own is_generic_link
 # KNOWN_NON_BROCHURE_DOMAINS check - "canva.com.evil.com" does NOT match
-# ".canva.com".
-_ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link")
+# ".canva.com". pitch.com added alongside canva.com/canva.link - same
+# service, same allow-list mechanism, one more recognized platform.
+_ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link", "pitch.com")
 
 # Real production evidence this covers: `Page.goto: Timeout 15000ms
 # exceeded` on a genuine public Canva "view" link that DOES eventually
@@ -126,6 +145,14 @@ MAX_CONCURRENT_RENDERS = int(os.environ.get("MAX_CONCURRENT_RENDERS", "2"))
 # defense-in-depth cap truncates whatever this service returns, so raising
 # this one alone would silently keep losing page 29.
 MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "30"))
+# Same cap concept, for a Pitch presentation - see render_pitch_page_async.
+# No production evidence yet of a Pitch deck anywhere near this size (the
+# real ones checked during recon were 13-14 pages), but the SAME "a
+# malformed/huge public deck must never make one /render call consume
+# unbounded time/memory" reasoning applies regardless of platform, so this
+# gets its own bounded cap rather than an implicit assumption. Same default
+# as MAX_CANVA_PAGES - no evidence yet a different value is warranted.
+MAX_PITCH_PAGES = int(os.environ.get("MAX_PITCH_PAGES", "30"))
 # Settle time after each Next-page click, before that page's own
 # screenshot - shorter than the initial-load SETTLE_MS above since the
 # Canva app/design is already warm; still enough for that page's own
@@ -194,15 +221,21 @@ _NEXT_BUTTON_PRESENCE_TIMEOUT_MS = 3_000
 # exception, not the per-page norm.
 _PER_PAGE_TIMEOUT_BUDGET_S = 8
 # Overall budget for one render's whole async round trip (navigation +
-# settle + cookie-dismiss + screenshot + up to MAX_CANVA_PAGES-1 further
-# page transitions), enforced from the OUTSIDE via concurrent.futures' own
+# settle + cookie-dismiss + screenshot + up to max_pages-1 further page
+# transitions), enforced from the OUTSIDE via concurrent.futures' own
 # timeout - comfortably above every internal timeout combined so a render
 # that's genuinely progressing is never cut off before its own internal
 # timeouts would have ended it anyway; this is the backstop for a hang none
-# of those internal timeouts catches.
-RENDER_TIMEOUT_SECONDS = (
-    (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10 + (MAX_CANVA_PAGES - 1) * _PER_PAGE_TIMEOUT_BUDGET_S
-)
+# of those internal timeouts catches. Factored out so both platforms'
+# render_*_page sync wrappers size their own future.result(timeout=...)
+# from the SAME formula, just against their own respective page cap -
+# never two independently-drifting copies of this arithmetic.
+def _render_timeout_seconds(max_pages: int) -> float:
+    return (NAV_TIMEOUT_MS + SETTLE_MS) / 1000 + 10 + (max_pages - 1) * _PER_PAGE_TIMEOUT_BUDGET_S
+
+
+RENDER_TIMEOUT_SECONDS = _render_timeout_seconds(MAX_CANVA_PAGES)
+PITCH_RENDER_TIMEOUT_SECONDS = _render_timeout_seconds(MAX_PITCH_PAGES)
 
 # Cloud Run's own hard ceiling on a single HTTP response body - confirmed
 # directly via real production evidence: Cloud Run's own platform-level
@@ -298,6 +331,10 @@ def _host_allowed(url: str) -> bool:
 def _is_recognized_canva_url(url: str) -> bool:
     url = url.strip()
     return bool(_CANVA_VIEW_URL_RE.match(url)) or bool(_CANVA_SHORT_LINK_RE.match(url))
+
+
+def _is_recognized_pitch_url(url: str) -> bool:
+    return bool(_PITCH_VIEW_URL_RE.match(url.strip()))
 
 
 def _run_loop_forever():
@@ -428,13 +465,24 @@ class RenderError(Exception):
 
 async def _read_current_and_total_pages(page, timeout_ms: int = 2_000) -> tuple:
     """
-    Best-effort "current / total" page indicator from Canva's own
-    accessible "Go to page" button (e.g. "1 / 7") - the SAME read
+    Best-effort "current / total" page indicator - the SAME read
     _detect_page_count has always used for its own diagnostic-only total,
-    generalized here to also expose the CURRENT page number, which
-    render_canva_page_async's own pagination loop uses (when available)
-    to verify a "Next page" click actually advanced anything, rather than
-    inventing a second, differently-shaped selector just for that check.
+    generalized here to also expose the CURRENT page number, which both
+    render_canva_page_async's and render_pitch_page_async's own pagination
+    loops use (when available) to verify a "Next page" click actually
+    advanced anything, rather than inventing a second, differently-shaped
+    selector just for that check.
+
+    Tries Canva's own accessible "Go to page" button first (its exact
+    accessible name, e.g. inner text "1 / 7"); if that isn't present/
+    readable at all, falls back to a plain text-content match for the same
+    "current / total" shape anywhere on the page - confirmed directly via
+    a throwaway Playwright recon script that this is exactly how Pitch's
+    own equivalent counter renders (plain text in its bottom bar, e.g.
+    "1 / 13", not inside a button by any particular accessible name).
+    Either strategy degrades the exact same safe way: (None, None) when
+    neither is found - a normal outcome for many real designs/decks (see
+    _detect_page_count's own docstring), not a failure.
 
     `timeout_ms` defaults to _detect_page_count's own original one-time-
     per-render budget, but _page_advance_signature (called up to twice
@@ -445,15 +493,18 @@ async def _read_current_and_total_pages(page, timeout_ms: int = 2_000) -> tuple:
     one-time initial check this constant was originally sized for.
 
     Returns (None, None) - never raises - whenever this indicator isn't
-    present/readable at all, a normal outcome for many real designs (see
-    _detect_page_count's own docstring); a caller checking `current is
-    not None` before trusting it is what makes this safe to treat as
-    optional everywhere it's used.
+    present/readable at all; a caller checking `current is not None`
+    before trusting it is what makes this safe to treat as optional
+    everywhere it's used.
     """
+    text = None
     try:
         text = await page.get_by_role("button", name="Go to page").inner_text(timeout=timeout_ms)
     except Exception:
-        return None, None
+        try:
+            text = await page.get_by_text(_PAGE_COUNT_RE).first.inner_text(timeout=timeout_ms)
+        except Exception:
+            return None, None
     match = _PAGE_COUNT_RE.search(re.sub(r"\s+", " ", text))
     if not match:
         return None, None
@@ -828,6 +879,243 @@ def render_canva_page(url: str) -> tuple[list[bytes], int]:
         raise RenderError("render timed out")
 
 
+async def render_pitch_page_async(url: str) -> tuple[list[bytes], int]:
+    """
+    Pitch.com's own counterpart to render_canva_page_async - see that
+    function's own docstring for the shared shape (browser/context setup,
+    navigation, settle, best-effort cookie-dismiss, and a bounded
+    pagination-capture loop with retry + page-cap + advance-verification,
+    all confirmed to work the same way for Pitch via a throwaway Playwright
+    recon script run directly against real GPE/Knotel/MetSpace brochure
+    links before this was written). Two genuine, confirmed differences
+    from Canva, both from that same recon:
+
+    1. Navigation waits for "networkidle", not "load" - the OPPOSITE of
+       Canva's own choice (see render_canva_page_async's own docstring on
+       why Canva avoids networkidle: a heavy SPA with persistent
+       background traffic that never goes idle). Pitch showed no such
+       problem in either real recon run (networkidle reached in 1-4s, both
+       times) - and unlike Canva, Pitch's initial HTML is a genuinely
+       empty shell (`<div id="app">` plus a handful of `<script>` tags, no
+       content of its own at all) that only ever gets real content once
+       its OWN JS has fetched and rendered it, so waiting for network
+       activity to genuinely settle is the more reliable signal here, not
+       a needless risk the way it would be for Canva.
+    2. The Next/Previous controls are named "Next"/"Previous" (confirmed
+       via their own accessible aria-label), not "Next page", and their
+       disabled state is conveyed via the plain HTML boolean `disabled`
+       attribute - present (even as an empty string) when there is no
+       further page, absent (None) otherwise - never Canva's own ARIA
+       aria-disabled="true"/"false" string values. Confirmed directly:
+       clicking "Next" advances the deck and the "disabled" attribute
+       reflects this correctly on both the "Next" and "Previous" controls
+       as the deck is paged through end to end.
+
+    Every other timing budget/retry/cap constant is reused UNCHANGED from
+    Canva's own (NAV_TIMEOUT_MS, SETTLE_MS, COOKIE_DISMISS_TIMEOUT_MS,
+    NEXT_PAGE_CLICK_TIMEOUT_MS, MAX_NEXT_CLICK_ATTEMPTS,
+    _PAGE_ADVANCE_INDICATOR_TIMEOUT_MS, _NEXT_BUTTON_PRESENCE_TIMEOUT_MS) -
+    the real recon timing (1-4s networkidle, well within these existing
+    budgets) gave no reason to invent new ones; only MAX_PITCH_PAGES is a
+    distinct constant (see its own docstring for why, even though it
+    currently shares the same default value).
+
+    Returns/raises exactly like render_canva_page_async - see that
+    function's own docstring for the full contract.
+    """
+    if not _is_recognized_pitch_url(url):
+        raise RenderError("not a recognized public Pitch URL")
+    if not _host_allowed(url):
+        raise RenderError("host not allowed")
+
+    browser = await _get_browser_async()
+    context = await browser.new_context(viewport=VIEWPORT)
+    page = None
+    try:
+        page = await context.new_page()
+        page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+        page.set_default_timeout(NAV_TIMEOUT_MS)
+
+        async def _guard(route):
+            if _host_allowed(route.request.url):
+                await route.continue_()
+            else:
+                await route.abort()
+
+        await page.route("**/*", _guard)
+
+        try:
+            # "networkidle", not "load" - see this function's own
+            # docstring point 1 above for why this is the right choice
+            # for Pitch specifically, unlike for Canva.
+            response = await page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+        except Exception as e:
+            raise RenderError(f"navigation failed or timed out ({e!r})")
+
+        # Same dead/expired-link detection as Canva's own (see render_
+        # canva_page_async's own identical check) - kept as the exact same
+        # message shape ("navigation returned HTTP {status} ...") on
+        # purpose, since the main app's own _is_confirmed_dead_canva_link
+        # matches on that literal substring regardless of which platform
+        # produced it.
+        if response is not None and not (200 <= response.status < 300):
+            raise RenderError(f"navigation returned HTTP {response.status} (design not found or inaccessible)")
+
+        if not _host_allowed(page.url):
+            raise RenderError("navigation left the allowed Pitch host")
+
+        await page.wait_for_timeout(SETTLE_MS)
+
+        # Best-effort only, same as Canva's own - not confirmed present on
+        # either real recon URL, but costs nothing to also attempt here if
+        # a cookie-consent banner shows up on some Pitch deployments.
+        for label in ("Reject all cookies", "Accept all cookies"):
+            try:
+                await page.get_by_text(label, exact=True).click(timeout=COOKIE_DISMISS_TIMEOUT_MS)
+                await page.wait_for_timeout(500)
+                break
+            except Exception:
+                continue
+
+        pages = [await page.screenshot(type="png")]
+        detected_total = await _detect_page_count(page)
+
+        # Identical loop shape to render_canva_page_async's own (see that
+        # function's own docstring for the full rationale on every piece
+        # of this: bounded retry with a freshly re-acquired locator,
+        # advance verification via _page_advance_signature/_page_has_
+        # advanced, the page-cap "is there genuinely more" check) - only
+        # the button's own accessible name and disabled-state attribute
+        # differ (see this function's own docstring points 1-2 above).
+        while len(pages) < MAX_PITCH_PAGES:
+            try:
+                next_button = page.get_by_role("button", name="Next")
+                if await next_button.get_attribute("disabled", timeout=_NEXT_BUTTON_PRESENCE_TIMEOUT_MS) is not None:
+                    break
+            except Exception as e:
+                print(
+                    f"[canva_renderer] Pitch pagination ended for {url!r}: 'Next' button not found or not "
+                    f"readable ({e!r}) - {len(pages)} page(s) captured, keeping them.",
+                    file=sys.stderr,
+                )
+                break
+
+            advanced = False
+            last_error = None
+            signature_after = (None, "")
+            for attempt in range(1, MAX_NEXT_CLICK_ATTEMPTS + 1):
+                signature_before = await _page_advance_signature(page)
+                try:
+                    next_button = page.get_by_role("button", name="Next")
+                    await next_button.click(timeout=NEXT_PAGE_CLICK_TIMEOUT_MS)
+                except Exception as e:
+                    last_error = e
+                    print(
+                        f"[canva_renderer] Pitch pagination click failed for {url!r} on attempt "
+                        f"{attempt}/{MAX_NEXT_CLICK_ATTEMPTS} (page before: {signature_before[0]!r}) - "
+                        f"{e!r}.",
+                        file=sys.stderr,
+                    )
+                    if attempt < MAX_NEXT_CLICK_ATTEMPTS:
+                        await page.wait_for_timeout(400 * attempt)
+                    continue
+
+                await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+
+                signature_after = await _page_advance_signature(page)
+                if _page_has_advanced(signature_before, signature_after):
+                    pages.append(await page.screenshot(type="png"))
+                    advanced = True
+                    break
+
+                last_error = "click completed but the page did not advance"
+                print(
+                    f"[canva_renderer] Pitch pagination click for {url!r} on attempt "
+                    f"{attempt}/{MAX_NEXT_CLICK_ATTEMPTS} completed but the page did not advance "
+                    f"(page before: {signature_before[0]!r}, after: {signature_after[0]!r}).",
+                    file=sys.stderr,
+                )
+                if attempt < MAX_NEXT_CLICK_ATTEMPTS:
+                    await page.wait_for_timeout(400 * attempt)
+
+            if advanced and attempt > 1:
+                print(
+                    f"[canva_renderer] Pitch pagination click recovered on attempt {attempt}/"
+                    f"{MAX_NEXT_CLICK_ATTEMPTS} for {url!r} (page now: {signature_after[0]!r}) - "
+                    f"{len(pages)} page(s) captured so far.",
+                    file=sys.stderr,
+                )
+            if not advanced:
+                print(
+                    f"[canva_renderer] Pitch pagination failure for {url!r}: gave up after "
+                    f"{MAX_NEXT_CLICK_ATTEMPTS} attempts (last: {last_error!r}) - stopped at "
+                    f"{len(pages)} page(s) captured (detected total: {detected_total!r}), keeping them.",
+                    file=sys.stderr,
+                )
+                break
+        else:
+            if len(pages) >= MAX_PITCH_PAGES:
+                next_page_still_available = False
+                try:
+                    next_button = page.get_by_role("button", name="Next")
+                    if await next_button.count() > 0:
+                        disabled = await next_button.get_attribute(
+                            "disabled", timeout=_NEXT_BUTTON_PRESENCE_TIMEOUT_MS,
+                        )
+                        next_page_still_available = disabled is None
+                except Exception:
+                    next_page_still_available = False
+
+                if next_page_still_available:
+                    print(
+                        f"[canva_renderer] Pitch pagination capped for {url!r}: reached MAX_PITCH_PAGES="
+                        f"{MAX_PITCH_PAGES} with 'Next' still available (detected total: "
+                        f"{detected_total!r}) - stopping here with {len(pages)} page(s) captured; "
+                        "this presentation may have more pages than were captured.",
+                        file=sys.stderr,
+                    )
+
+        return pages, detected_total
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        await context.close()
+
+
+def render_pitch_page(url: str) -> tuple[list[bytes], int]:
+    """Sync-facing entry point for Pitch, mirroring render_canva_page's
+    own thread-bridging (see that function's own docstring) - the only
+    difference is its own PITCH_RENDER_TIMEOUT_SECONDS budget, sized off
+    MAX_PITCH_PAGES rather than MAX_CANVA_PAGES."""
+    loop = _ensure_loop()
+    future = asyncio.run_coroutine_threadsafe(render_pitch_page_async(url), loop)
+    try:
+        return future.result(timeout=PITCH_RENDER_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise RenderError("render timed out")
+
+
+def render_page(url: str) -> tuple[list[bytes], int]:
+    """
+    Dispatches to whichever platform's own renderer a `url` shape
+    recognizes (see _is_recognized_canva_url/_is_recognized_pitch_url) -
+    the one call site Handler.do_POST actually needs, so it never has to
+    know which platform-specific render function to call itself. Raises
+    RenderError (never any other exception) when `url` matches neither
+    shape - the same "clean, expected failure" contract every other
+    rejection path in this module already uses.
+    """
+    if _is_recognized_canva_url(url):
+        return render_canva_page(url)
+    if _is_recognized_pitch_url(url):
+        return render_pitch_page(url)
+    raise RenderError("not a recognized public Canva or Pitch URL")
+
+
 def _reencode_as_jpeg(page_bytes: bytes) -> bytes:
     """
     Re-encodes one already-captured screenshot (PNG, from page.screenshot)
@@ -906,7 +1194,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             try:
-                pages, detected_total = render_canva_page(url)
+                pages, detected_total = render_page(url)
             except RenderError as e:
                 # e.reason is already _safe_reason'd at RenderError's own
                 # construction time (see that class's own docstring) -
@@ -925,13 +1213,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # A single concise line whether this was one page or several -
-            # see this service's own module docstring on "Canva render
+            # see this service's own module docstring on "<Platform> render
             # succeeded" being the one unambiguous line to grep Cloud Run
-            # logs for to confirm rendering itself worked.
+            # logs for to confirm rendering itself worked. platform_label
+            # is a cheap, purely-cosmetic re-check of the URL's own shape
+            # (render_page above already dispatched on the exact same
+            # check) - never a second network call or render attempt.
+            platform_label = "Pitch" if _is_recognized_pitch_url(url) else "Canva"
             detected_str = f"{detected_total} detected" if detected_total else "total unknown"
             page_count = len(pages)
             print(
-                f"[canva_renderer] Canva render succeeded for {url!r}: "
+                f"[canva_renderer] {platform_label} render succeeded for {url!r}: "
                 f"{page_count} page(s) captured ({detected_str}).",
                 file=sys.stderr,
             )

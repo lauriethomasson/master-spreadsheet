@@ -744,6 +744,29 @@ class CanvaRendererConfiguredEligibilityTests(EnrichmentTestCase):
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url(_CANVA_URL))
 
 
+_PITCH_URL = "https://pitch.com/v/1-finsbury-brochure-4jnj9d"
+
+
+class PitchRendererConfiguredEligibilityTests(EnrichmentTestCase):
+    """Mirrors CanvaRendererConfiguredEligibilityTests exactly, for a Pitch
+    view link - same CANVA_RENDERER_URL env var gates both, since it's the
+    same deployed service (see _canva_renderer_configured's own
+    docstring)."""
+
+    def test_pitch_stays_ineligible_without_the_env_var(self):
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(_PITCH_URL), brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+        self.assertFalse(brochure_enrichment._is_eligible_brochure_url(_PITCH_URL))
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url(_PITCH_URL))
+
+    def test_pitch_becomes_eligible_when_renderer_is_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}):
+            self.assertIsNone(brochure_enrichment.classify_link_eligibility(_PITCH_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_brochure_url(_PITCH_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_PITCH_URL))
+
+
 def _canva_pages_response(pages, page_count_detected=None, status_code=200):
     """A MagicMock httpx.Response shaped like the renderer's own new JSON
     multi-page format (see canva_renderer/app.py's Handler.do_POST) -
@@ -990,6 +1013,133 @@ class FetchCanvaRenderedPageTests(EnrichmentTestCase):
         logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
         self.assertIn("OLD-FORMAT", logged)
         self.assertIn("needs redeploying", logged)
+
+
+class FetchPitchRenderedPageTests(EnrichmentTestCase):
+    """_fetch_pitch_rendered_page - a thin wrapper over the exact same
+    _fetch_rendered_page implementation _fetch_canva_rendered_page calls
+    (see that shared function's own docstring) - this class only re-
+    checks the pieces that could plausibly differ per platform
+    (platform_label in log text, its own max_pages_accepted cap); every
+    retry/error-handling rule already covered by FetchCanvaRenderedPageTests
+    applies identically here since it's the same code path."""
+
+    def test_successful_render_returns_png_bytes(self):
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        self.assertEqual(result, [b"\x89PNG real bytes"])
+        mock_post.assert_called_once()
+        self.assertEqual(mock_post.call_args.kwargs["json"], {"url": _PITCH_URL})
+
+    def test_successful_render_with_multiple_pages_preserves_order(self):
+        pages = [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"]
+        response = _canva_pages_response(pages, page_count_detected=3)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        self.assertEqual(result, pages)
+
+    def test_response_with_more_pages_than_the_main_apps_own_cap_is_truncated(self):
+        # Uses _PITCH_MAX_PAGES_ACCEPTED specifically, NOT _CANVA_MAX_
+        # PAGES_ACCEPTED - the two are tracked independently (see that
+        # constant's own docstring), so this proves the Pitch wrapper
+        # passes its own cap through, not Canva's.
+        pages = [f"\x89PNG p{i}".encode() for i in range(1, 30)]
+        response = _canva_pages_response(pages, page_count_detected=29)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch.object(brochure_enrichment, "_PITCH_MAX_PAGES_ACCEPTED", 5), \
+                patch.object(brochure_enrichment, "_CANVA_MAX_PAGES_ACCEPTED", 999):
+            result = brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result, pages[:5])
+
+    def test_successful_render_logs_pitch_not_canva_in_the_success_line(self):
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Pitch render succeeded", logged)
+        self.assertNotIn("Canva render succeeded", logged)
+
+    def test_renderer_unreachable_returns_none_and_records_fetch_failed(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", side_effect=httpx.ConnectError("dns failure")):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+        self.assertIn("Pitch renderer unreachable", sink["detail"])
+
+    def test_renderer_reports_safe_failure_returns_none_with_pitch_labeled_reason(self):
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"error": "render_failed", "reason": "private design"}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIn("Pitch render failed", sink["detail"])
+        self.assertIn("private design", sink["detail"])
+
+    def test_malformed_pages_payload_returns_none_and_records_render_failed(self):
+        response = MagicMock(
+            status_code=200, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"not_pages": []}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_pitch_rendered_page(_PITCH_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+
+
+class FetchPdfBytesPitchDispatchTests(EnrichmentTestCase):
+    """_fetch_pdf_bytes's own Pitch dispatch branch - mirrors whatever
+    coverage exists for its Canva branch (see FetchPdfBytesCanvaRoutingTests
+    if present) at the one new call site this feature adds."""
+
+    def test_pitch_url_is_routed_to_the_pitch_renderer_when_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_pitch_rendered_page", return_value=[b"\x89PNG"]) as mock_fetch, \
+                patch("brochure_enrichment._fetch_canva_rendered_page") as mock_canva_fetch:
+            result = brochure_enrichment._fetch_pdf_bytes(_PITCH_URL)
+
+        self.assertEqual(result, [b"\x89PNG"])
+        mock_fetch.assert_called_once_with(_PITCH_URL)
+        mock_canva_fetch.assert_not_called()
+
+    def test_pitch_url_falls_through_to_generic_fetch_when_unconfigured(self):
+        # Same "correct independent of configuration" contract Canva's own
+        # branch already has (see _fetch_pdf_bytes' own docstring) - never
+        # attempts a renderer call this deployment was never told about.
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("brochure_enrichment._fetch_pitch_rendered_page") as mock_fetch, \
+                patch("brochure_enrichment.resolve_brochure_link", return_value=_PITCH_URL), \
+                patch("brochure_enrichment.httpx.get", side_effect=httpx.ConnectError("dns failure")):
+            brochure_enrichment._fetch_pdf_bytes(_PITCH_URL)
+
+        mock_fetch.assert_not_called()
 
 
 class TransientRendererRetryTests(EnrichmentTestCase):
