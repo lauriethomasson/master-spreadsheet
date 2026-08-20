@@ -204,6 +204,76 @@ _MAX_BATCH_CHARS = 12000
 
 _LINE_ROW_NUMBER_RE = re.compile(r"^Row (\d+):")
 
+# Matches a rendered line establishing what a hyperlinked column means for
+# whatever comes after it (see _carry_forward_link_context) - deliberately
+# the same generic set _building_block_bounds already looks for ("download"),
+# widened to also catch a bare "Brochure"/"Floorplan(s)"/"Floor Plan" column
+# heading with no "Download" wording at all (the real Workplace Plus LONDON
+# sheet's own per-submarket "BROCHURES" section header, confirmed against the
+# live file, is exactly this shape - a shared heading for several buildings'
+# worth of bare hyperlinked building-name cells underneath it, not a per-
+# building "Download Brochure" cell of its own).
+_LINK_CONTEXT_LINE_RE = re.compile(r"brochure|floorplan|floor plan|download", re.IGNORECASE)
+
+
+def _carry_forward_link_context(batches: list) -> list:
+    """
+    Prepends the most recently seen link-column-context line (see
+    _LINK_CONTEXT_LINE_RE) to any batch that doesn't already contain one of
+    its own, tracked across batches in original sheet order - the same
+    "inherit from what came before" pattern extract_sheet_with_metadata's own
+    last_building loop already applies to a unit's building field, applied
+    here one step earlier, to the raw text a batch's own Gemini call actually
+    sees.
+
+    Real, confirmed regression this fixes: Workplace Plus's LONDON sheet
+    doesn't label its brochure link per building at all - one submarket
+    section states it ONCE, in a shared column header several rows above
+    (e.g. "Row 625: | NORTH | ... | BROCHURES"), covering every building
+    underneath it, each just a bare hyperlinked building-name cell with no
+    "brochure"/"download" wording of its own on that row. _split_text_into_
+    batches' own no-mid-block-split guarantee already keeps one BUILDING'S
+    block from ever being split - but it never protected a whole SECTION
+    (one shared header covering several buildings' worth of blocks) from
+    landing in an earlier batch than its own buildings. Confirmed live: batch
+    4 held that header line, batch 5 held that section's own last four
+    buildings' rows with none of it - so batch 5's own Gemini call had no way
+    to know what its own hyperlinked column even meant, and came back with
+    brochure_link=null for all four despite the real Drive links sitting
+    right there in the text it WAS given.
+
+    Only ever prepends a line that already appeared earlier in the same
+    sheet, verbatim - never invents or guesses one. A batch that already has
+    a context line of its own (the common case - most batches do) is
+    returned completely unchanged. The very first batch can never inherit
+    anything (nothing came before it), so it's left as-is if it lacks one.
+
+    The prepended line is marked with its own leading label, on its own
+    line, specifically so Gemini never mistakes it for one of this batch's
+    OWN data rows (it carries no "Row N:" prefix consistent with the rest of
+    this batch's real row numbers, which would otherwise look like a data
+    row out of sequence).
+    """
+    last_context_line = None
+    result = []
+    for batch in batches:
+        lines = batch.splitlines()
+        has_own_context = any(_LINK_CONTEXT_LINE_RE.search(line) for line in lines)
+        if has_own_context:
+            result.append(batch)
+        elif last_context_line is not None:
+            result.append(
+                "[Context carried forward from earlier in this sheet, establishing what a hyperlinked "
+                f"column below refers to - not one of this batch's own rows] {last_context_line}\n{batch}"
+            )
+        else:
+            result.append(batch)
+
+        for line in lines:
+            if _LINK_CONTEXT_LINE_RE.search(line):
+                last_context_line = line
+    return result
+
 
 def _split_text_into_batches(text: str, max_batch_chars: int = _MAX_BATCH_CHARS) -> list:
     """
@@ -236,6 +306,14 @@ def _split_text_into_batches(text: str, max_batch_chars: int = _MAX_BATCH_CHARS)
     genuinely contiguous) has nowhere safe to split at all, and comes
     back as a single batch no matter how large - this only ever helps a
     genuinely block-structured (shape (b)) sheet.
+
+    Once split, _carry_forward_link_context runs over the resulting
+    batches - a per-building block can never be split in half (see above),
+    but a whole SECTION sharing one link-column header across several
+    buildings' worth of blocks can still land split across batches; this
+    repairs that by giving a batch with no link-column-context line of its
+    own the most recent one seen earlier in the sheet (see its own
+    docstring for the real, confirmed case this fixes).
 
     Returns [text] unchanged - a single batch - whenever the whole text
     already fits under max_batch_chars, which is every sheet this module
@@ -272,7 +350,7 @@ def _split_text_into_batches(text: str, max_batch_chars: int = _MAX_BATCH_CHARS)
             current = candidate
     if current:
         batches.append("\n".join(current))
-    return batches
+    return _carry_forward_link_context(batches)
 
 
 def _merge_batch_results(results: list) -> dict:

@@ -1306,6 +1306,68 @@ class SplitTextIntoBatchesTests(unittest.TestCase):
         # adding the third run would exceed it, so it starts a new batch.
         self.assertEqual(batches, ["Row 1: AA\nRow 5: BB", "Row 9: CC"])
 
+    def test_a_batch_without_its_own_link_context_line_inherits_the_last_one_seen(self):
+        # Mirrors the real Workplace Plus LONDON sheet: a submarket section's
+        # OWN "BROCHURES" column header (row 625) sits in an earlier batch
+        # than that section's own buildings' bare hyperlinked rows (rows
+        # 694-712) - split apart by a genuine row-number gap, exactly like
+        # _building_block_bounds' own "download" line note describes, just
+        # a whole SECTION's header rather than one building's own link line.
+        # The second batch has no link-column-context line of its own at
+        # all, so without carrying row 625's header forward, its own Gemini
+        # call has no way to know what its own hyperlinked column means.
+        text = (
+            "Row 625: | NORTH | | | | | | | BROCHURES\n"
+            "Row 712: | | 3rd Floor | 5126.0 | | | | The Chiswick Building "
+            "(https://drive.google.com/thechiswick)"
+        )
+        batches = extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=10)
+
+        self.assertEqual(len(batches), 2)
+        # First batch already has its own context line - left unchanged.
+        self.assertEqual(batches[0], "Row 625: | NORTH | | | | | | | BROCHURES")
+        # Second batch's own real data row is untouched, still present
+        # verbatim...
+        self.assertIn(
+            "Row 712: | | 3rd Floor | 5126.0 | | | | The Chiswick Building "
+            "(https://drive.google.com/thechiswick)",
+            batches[1],
+        )
+        # ...but now also carries row 625's header forward, on its own line,
+        # clearly marked so it isn't mistaken for one of THIS batch's own
+        # rows.
+        self.assertIn("Row 625: | NORTH | | | | | | | BROCHURES", batches[1])
+        self.assertNotEqual(batches[1].splitlines()[0], "Row 625: | NORTH | | | | | | | BROCHURES")
+        self.assertIn("carried forward", batches[1].splitlines()[0].lower())
+
+    def test_a_batch_with_its_own_context_line_is_left_unchanged(self):
+        # A batch that already restates its own building's "Download
+        # Brochure" line has everything its own Gemini call needs - nothing
+        # should be prepended, even though an earlier batch also had one.
+        text = (
+            "Row 1: | Building A | Download Brochure (https://a.example.com)\n"
+            "Row 20: | Building B | Download Brochure (https://b.example.com)"
+        )
+        batches = extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=10)
+        self.assertEqual(batches, [
+            "Row 1: | Building A | Download Brochure (https://a.example.com)",
+            "Row 20: | Building B | Download Brochure (https://b.example.com)",
+        ])
+
+    def test_the_most_recently_seen_context_line_wins_over_an_older_one(self):
+        # Three batches, only the first two have their own context line -
+        # the third must inherit the SECOND one (the most recent), not the
+        # first.
+        text = (
+            "Row 1: | SOUTH | BROCHURES\n"
+            "Row 20: | NORTH | BROCHURES\n"
+            "Row 40: | | Some Building (https://example.com/x)"
+        )
+        batches = extract_spreadsheet_gemini._split_text_into_batches(text, max_batch_chars=10)
+        self.assertEqual(len(batches), 3)
+        self.assertIn("Row 20: | NORTH | BROCHURES", batches[2])
+        self.assertNotIn("Row 1: | SOUTH | BROCHURES", batches[2])
+
 
 class MergeBatchResultsTests(unittest.TestCase):
     """_merge_batch_results - recombining N independent per-batch Gemini
@@ -1517,6 +1579,63 @@ class BatchedExtractionEndToEndTests(unittest.TestCase):
         by_building = {r.building: r for r in rows}
         self.assertEqual(by_building["Riverside Building"].brochure_link, "https://a.example.com/riverside-brochure.pdf")
         self.assertEqual(by_building["Oakwood House"].brochure_link, "https://b.example.com/oakwood-brochure.pdf")
+
+    def test_brochure_link_recovers_when_a_shared_section_header_falls_in_an_earlier_batch(self):
+        # Real Workplace Plus LONDON regression: unlike the Copthall-style
+        # convention above, this sheet has no per-building "Download
+        # Brochure" cell at all - one submarket section ("NORTH") states its
+        # brochure column ONCE, in a shared header several rows above, and
+        # each of that section's own buildings is just a bare hyperlinked
+        # building-name cell with no "brochure" wording of its own. That
+        # means _apply_deterministic_brochure_links can't recover this one
+        # either (deterministic_brochure_link_for_building looks for a cell
+        # whose OWN text says "brochure" - the building-name cell never
+        # does) - Gemini reading the nearby header is genuinely the only way
+        # this ever gets extracted, which is exactly what _split_text_into_
+        # batches' own carry-forward fix protects.
+        #
+        # call_gemini is faked to mirror the real, confirmed live behavior:
+        # it correctly reads brochure_link off the hyperlinked building-name
+        # cell ONLY when its own batch text also contains the "BROCHURES"
+        # header establishing what that column means - null otherwise. This
+        # proves the fix, not just that the header text is textually
+        # present: without _carry_forward_link_context, this fake would
+        # still return null for the second batch, exactly reproducing the
+        # live bug.
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=625, column=2, value="NORTH")
+        ws.cell(row=625, column=8, value="BROCHURES")
+        ws.cell(row=712, column=3, value="3rd Floor")
+        ws.cell(row=712, column=4, value=5126.0)
+        link_cell = ws.cell(row=712, column=8, value="The Chiswick Building")
+        link_cell.hyperlink = "https://drive.google.com/thechiswick.pdf"
+
+        def fake_call_gemini(client, prompt, parts):
+            batch_text = parts[0]
+            has_context = "BROCHURES" in batch_text
+            units = []
+            if "The Chiswick Building" in batch_text:
+                units.append({
+                    "building": "The Chiswick Building", "floor_unit": "3rd Floor", "size_sqft": 5126.0,
+                    "brochure_link": "https://drive.google.com/thechiswick.pdf" if has_context else None,
+                })
+            return {
+                "provider": "Workplace Plus" if "NORTH" in batch_text else None,
+                "contacts": None, "fully_occupied_buildings": [], "units": units,
+            }
+
+        with patch("extract_spreadsheet_gemini._MAX_BATCH_CHARS", 10), \
+             patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", side_effect=fake_call_gemini) as mock_call:
+            rows, _ = extract_spreadsheet_gemini.extract_sheet_with_metadata(
+                ws, "Workplace Plus Availability.xlsx — LONDON", "Workplace Plus Availability.xlsx",
+            )
+
+        self.assertEqual(mock_call.call_count, 2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "The Chiswick Building")
+        self.assertEqual(rows[0].brochure_link, "https://drive.google.com/thechiswick.pdf")
 
 
 class IsNonAuthoritativeRollupSheetTests(unittest.TestCase):
