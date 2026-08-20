@@ -6,7 +6,10 @@ fetches a row's OWN brochure_link and reads it (reusing extract.py's exact
 PDF-vision extraction pipeline via extract_raw_units) purely to fill fields
 the original source left genuinely blank. The original upload is always
 the source of truth: enrichment only ever fills a field that is currently
-blank, never overwrites a populated one, and any fetch/parse failure simply
+blank, never overwrites a populated one - special_features is the one
+exception (see _apply_units_to_row's own docstring): a non-blank value is
+kept as the first, most-specific segment of a combined value, never
+discarded or overwritten outright - and any fetch/parse failure simply
 leaves the row exactly as extracted - it must never fail the surrounding
 upload.
 
@@ -2038,16 +2041,19 @@ def _apply_units_to_row(row: ListingRow, units):
     narrower source OVERWRITES the same key in `updates` set by an earlier,
     wider one when both apply, since a more specific value is always
     preferred over a less specific one. special_features is the one
-    exception: whichever of the three tiers below are genuinely present
-    are instead COMBINED into one value, specific-to-general (unit, then
-    building, then property), "; "-joined - a unit's own stated features
-    are never allowed to silently discard a real building- or property-
-    wide amenity just because a narrower tier also happened to say
-    something. No deduplication between tiers (a unit's own text may
-    legitimately restate a building-wide detail Gemini already saw) -
-    deliberately not attempted here; a bad dedup rule risks stripping
-    something real, a worse failure mode than an occasional repeated
-    phrase.
+    exception: whichever of the row's own existing value and the three
+    tiers below are genuinely present are instead COMBINED into one value,
+    most-specific-to-least (row's own, then unit, then building, then
+    property), "; "-joined - a unit's own stated features are never
+    allowed to silently discard a real building- or property-wide amenity
+    just because a narrower tier also happened to say something, and the
+    row's own pre-existing value (even a non-descriptive one like a bare
+    status marker) is never silently discarded either, since this combine
+    is attempted regardless of whether that value was blank to begin with.
+    No deduplication between tiers (a unit's own text may legitimately
+    restate a building-wide detail Gemini already saw) - deliberately not
+    attempted here; a bad dedup rule risks stripping something real, a
+    worse failure mode than an occasional repeated phrase.
 
     1. DOCUMENT-level (PROPERTY_LEVEL_FIELDS - contacts, special_features's
        property_features fallback - see units.property_features/units.
@@ -2100,29 +2106,36 @@ def _apply_units_to_row(row: ListingRow, units):
         if _is_blank(row.contacts) and isinstance(contacts, str) and not _is_blank(contacts):
             updates["contacts"] = contacts
 
-        if _is_blank(row.special_features):
-            # Combines every tier actually present, specific-to-general
-            # (unit, then building, then property) - deliberately NOT the
-            # old "narrowest present tier wins outright, the wider ones are
-            # simply dropped" behavior (still true for every OTHER field's
-            # own property/building/unit fallback - this is a special_
-            # features-only change). No deduplication against overlapping
-            # phrasing between tiers (e.g. a unit's own text already
-            # echoing a building-wide amenity) - deliberately out of scope,
-            # see this change's own commit message for why a dedup rule
-            # is its own, separate risk (wrongly stripping something real)
-            # not worth taking on here.
-            unit_features = _coerced_unit_value("special_features", unit.get("special_features")) if unit else None
-            building_features = _match_building_feature(row, units)
-            if not (isinstance(building_features, str) and not _is_blank(building_features)):
-                building_features = None
-            property_features = getattr(units, "property_features", None)
-            if not (isinstance(property_features, str) and not _is_blank(property_features)):
-                property_features = None
+        # Combines every tier actually present, most-specific-to-least
+        # (the row's OWN existing value first, if any, then unit, then
+        # building, then property) - deliberately NOT the old "narrowest
+        # present tier wins outright, the wider ones are simply dropped"
+        # behavior (still true for every OTHER field's own property/
+        # building/unit fallback - this is a special_features-only change).
+        # Always attempted, never gated on row.special_features being blank
+        # first - a row whose own spreadsheet already put something non-
+        # descriptive there (e.g. a bare "U/O" status marker sitting in an
+        # unlabeled column, confirmed present in real Workplace Plus rows)
+        # must still get the brochure's real amenity info appended, not be
+        # treated as "already has special_features, nothing to add" just
+        # because that cell wasn't genuinely blank. No deduplication against
+        # overlapping phrasing between tiers (e.g. a unit's own text already
+        # echoing a building-wide amenity) - deliberately out of scope, see
+        # this change's own commit message for why a dedup rule is its own,
+        # separate risk (wrongly stripping something real) not worth taking
+        # on here.
+        row_features = row.special_features if isinstance(row.special_features, str) and not _is_blank(row.special_features) else None
+        unit_features = _coerced_unit_value("special_features", unit.get("special_features")) if unit else None
+        building_features = _match_building_feature(row, units)
+        if not (isinstance(building_features, str) and not _is_blank(building_features)):
+            building_features = None
+        property_features = getattr(units, "property_features", None)
+        if not (isinstance(property_features, str) and not _is_blank(property_features)):
+            property_features = None
 
-            combined = "; ".join(seg for seg in (unit_features, building_features, property_features) if seg)
-            if combined:
-                updates["special_features"] = combined
+        combined = "; ".join(seg for seg in (row_features, unit_features, building_features, property_features) if seg)
+        if combined and combined != row.special_features:
+            updates["special_features"] = combined
 
         for field in BUILDING_LEVEL_FIELDS:
             if not _is_blank(getattr(row, field)):

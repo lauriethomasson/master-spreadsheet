@@ -2192,7 +2192,13 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(new_row.special_features, "Exposed beams")
 
-    def test_existing_special_features_never_overwritten_by_any_level(self):
+    def test_existing_special_features_is_kept_as_the_first_segment_when_combined(self):
+        # A row whose own spreadsheet already put something in special_
+        # features (e.g. a bare "U/O" status marker, confirmed present in
+        # real Workplace Plus rows) must still get the brochure's real
+        # amenity info appended - the combine is attempted regardless of
+        # whether this value was blank to begin with, with the row's own
+        # value kept as the first, most-specific segment, never discarded.
         row = ListingRow(
             building="The Canal Building", floor_unit="5th Floor", special_features="Genuine provider text",
         )
@@ -2201,6 +2207,24 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
             property_features="WiredScore Platinum",
             building_features=[{"building": "The Canal Building", "features": "Exposed beams"}],
         )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(
+            new_row.special_features, "Genuine provider text; Includes mezzanine; Exposed beams; WiredScore Platinum",
+        )
+        self.assertEqual(fields, ["special_features"])
+
+    def test_existing_special_features_unchanged_when_no_wider_tier_applies(self):
+        # Same starting value, but nothing new to combine with (no unit
+        # match, no building_features, no property_features) - the combine
+        # is still attempted, but produces the exact same value, so this
+        # must be recognized as a no-op: no field listed as changed, and
+        # the exact same row object returned (never a needless model_copy).
+        row = ListingRow(
+            building="The Canal Building", floor_unit="5th Floor", special_features="Genuine provider text",
+        )
+        units = _brochure_units([])
 
         new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
 
@@ -2956,7 +2980,13 @@ class EnrichRowTests(EnrichmentTestCase):
         self.assertEqual(new_row.special_features, "Private terrace; showers; cycle storage")
         self.assertEqual(fields, ["special_features"])
 
-    def test_populated_special_features_not_overwritten(self):
+    def test_populated_special_features_gets_brochure_text_appended(self):
+        # A row's pre-existing special_features (even something non-
+        # descriptive, e.g. a bare "U/O" status marker in some real
+        # provider files) is kept as the first, most-specific segment and
+        # combined with the brochure's own text, rather than the brochure
+        # combine being skipped entirely just because the field wasn't
+        # blank to begin with.
         row = ListingRow(
             building="16 Dufour's Place", floor_unit="3rd Floor",
             brochure_link="https://example.com/brochure.pdf",
@@ -2970,9 +3000,8 @@ class EnrichRowTests(EnrichmentTestCase):
         with self._mock_units(units):
             new_row, fields = brochure_enrichment.enrich_row(row)
 
-        self.assertEqual(new_row.special_features, "Existing genuine description")
-        self.assertEqual(fields, [])
-        self.assertIs(new_row, row)
+        self.assertEqual(new_row.special_features, "Existing genuine description; Completely different brochure text")
+        self.assertEqual(fields, ["special_features"])
 
     def test_blank_state_of_space_filled_from_explicit_wording(self):
         row = ListingRow(
@@ -4645,6 +4674,13 @@ class RealNashHouseBrochureFieldFallbackTests(EnrichmentTestCase):
         self.assertTrue(new_row.state_of_space)
 
     def test_already_populated_fields_are_never_overwritten(self):
+        # address_1/postcode are never-overwrite fields, full stop -
+        # special_features is the one deliberate exception (see
+        # _apply_units_to_row's own docstring): its existing value is kept,
+        # never discarded, but the real brochure's own text for this exact
+        # unit is still combined onto it rather than the whole combine step
+        # being skipped just because the field wasn't blank to begin with -
+        # covered separately below since it's governed by a different rule.
         row = ListingRow(
             building="Nash House", floor_unit="2nd Floor",
             address_1="Provider-stated address", postcode="EC1A 1AA", special_features="Provider-stated text",
@@ -4654,10 +4690,23 @@ class RealNashHouseBrochureFieldFallbackTests(EnrichmentTestCase):
 
         self.assertEqual(new_row.address_1, "Provider-stated address")
         self.assertEqual(new_row.postcode, "EC1A 1AA")
-        self.assertEqual(new_row.special_features, "Provider-stated text")
         self.assertNotIn("address_1", fields)
         self.assertNotIn("postcode", fields)
-        self.assertNotIn("special_features", fields)
+
+    def test_already_populated_special_features_gets_the_real_brochure_text_appended(self):
+        row = ListingRow(
+            building="Nash House", floor_unit="2nd Floor", special_features="Provider-stated text",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, self.units)
+
+        # The row's own pre-existing value is kept as the first segment,
+        # never discarded or overwritten outright...
+        self.assertTrue(new_row.special_features.startswith("Provider-stated text; "))
+        # ...but the real brochure's own text for this exact unit is no
+        # longer silently dropped just because the field wasn't blank.
+        self.assertGreater(len(new_row.special_features), len("Provider-stated text"))
+        self.assertIn("special_features", fields)
 
 
 if __name__ == "__main__":
