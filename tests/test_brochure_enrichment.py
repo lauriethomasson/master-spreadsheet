@@ -1438,6 +1438,31 @@ class MatchUnitTests(unittest.TestCase):
 
         self.assertEqual(matched["special_features"], "Right floor")
 
+    def test_real_friars_yard_shape_matches_via_address_1_fallback(self):
+        # Synthetic reproduction of the real, confirmed production case:
+        # UNION's own spreadsheet states this property's plain street
+        # address as its ENTIRE building field (no name at all), while the
+        # real Friars Yard brochure is branded under a marketing name that
+        # shares no words with the address - building-to-building matching
+        # (tiers 1-3) can never bridge this; the row must fall through to
+        # the address_1 fallback (tier 4) to reach a confident single-unit
+        # match at all, at which point floor disambiguates normally.
+        row = ListingRow(building="160 Blackfriars Road", floor_unit="4th Floor")
+        units = [
+            {
+                "building": "Friars Yard", "address_1": "160 Blackfriars Road",
+                "floor_unit": "4th Floor", "state_of_space": "Partially Fitted",
+            },
+            {
+                "building": "Friars Yard", "address_1": "160 Blackfriars Road",
+                "floor_unit": "3rd Floor", "state_of_space": "CAT A",
+            },
+        ]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["state_of_space"], "Partially Fitted")
+
     def test_size_match_disambiguates_when_floor_label_differs(self):
         row = ListingRow(building="28 Lime Street", floor_unit="Suite A", size_sqft=2000)
         units = [
@@ -1756,6 +1781,81 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         # different, unrelated buildings) would both reduce to "" and
         # incorrectly match each other.
         indices = brochure_enrichment._building_identity_matches("Court", ["Road"])
+        self.assertEqual(indices, [])
+
+    def test_tier_4a_exact_address_match_is_accepted(self):
+        # The real, confirmed gap this tier closes: a provider's own
+        # spreadsheet states a property's plain street address as its
+        # ENTIRE building field (no name at all) while the real brochure
+        # for that property (the actual "Friars Yard" / "160 Blackfriars
+        # Road" document) is branded under a marketing name sharing no
+        # words with the address at all - tiers 1-3 (building-to-building)
+        # can never bridge that, no matter how much suffix-stripping is
+        # tried. Both the 3rd and 4th floor units in the real document
+        # share this identical address_1 - both indices must be returned,
+        # not treated as ambiguous (see _distinct_building_group).
+        indices = brochure_enrichment._building_identity_matches(
+            "160 Blackfriars Road",
+            ["Friars Yard", "Friars Yard"],
+            ["160 Blackfriars Road", "160 Blackfriars Road"],
+        )
+        self.assertEqual(indices, [0, 1])
+
+    def test_tier_4a_rejects_when_the_address_is_shared_by_different_buildings(self):
+        # Unlike the same-building case above, matching indices naming
+        # TWO DIFFERENT buildings for the same address text is a genuine,
+        # unresolvable conflict - _distinct_building_group must reject it,
+        # not just count raw indices.
+        indices = brochure_enrichment._building_identity_matches(
+            "160 Blackfriars Road",
+            ["Friars Yard", "Other Tower"],
+            ["160 Blackfriars Road", "160 Blackfriars Road"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_tier_4b_suffix_stripped_address_with_matching_house_number_is_accepted(self):
+        # row_building omits the trailing street-type word its own address
+        # states - same class of gap tier 3 already closes for building-to-
+        # building text, extended here to building-vs-address.
+        indices = brochure_enrichment._building_identity_matches(
+            "160 Blackfriars", ["Friars Yard"], ["160 Blackfriars Road"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_tier_4b_rejects_when_the_house_number_disagrees(self):
+        # The stripped text alone ("blackfriars") is never sufficient for
+        # tier 4b - a DIFFERENT house number on the same street is a real,
+        # confirmed-different address, not the same building.
+        indices = brochure_enrichment._building_identity_matches(
+            "162 Blackfriars", ["Friars Yard"], ["160 Blackfriars Road"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_tier_4_is_never_tried_once_an_earlier_tier_already_resolved(self):
+        # A real building-name match (tier 1 here) is always more specific
+        # evidence than a cross-field address match - tier 4 must never
+        # even be consulted once an earlier tier already found something,
+        # regardless of what candidate_addresses says.
+        indices = brochure_enrichment._building_identity_matches(
+            "Friars Yard", ["Friars Yard"], ["Something Entirely Unrelated"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_tier_4_is_skipped_entirely_when_no_address_data_is_available(self):
+        # _match_building_feature's own building_features entries carry no
+        # address_1 at all - candidate_addresses defaults to None, and tier
+        # 4 must never be attempted (never raise, never guess) when there's
+        # nothing to compare against.
+        indices = brochure_enrichment._building_identity_matches("160 Blackfriars Road", ["Friars Yard"])
+        self.assertEqual(indices, [])
+
+    def test_tier_4b_never_applies_when_row_building_has_no_leading_house_number(self):
+        # A name-only row_building (no house number of its own to
+        # corroborate against) must never match via the suffix-stripped
+        # address tier - there's nothing to guard the comparison with.
+        indices = brochure_enrichment._building_identity_matches(
+            "Blackfriars", ["Friars Yard"], ["160 Blackfriars Road"],
+        )
         self.assertEqual(indices, [])
 
 
@@ -2103,6 +2203,27 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertIsNone(new_row.special_features)
         self.assertEqual(new_row.floor_unit, "Ground Floor")
         self.assertEqual(fields, ["floor_unit"])
+
+    def test_address_only_building_field_still_fills_state_of_space_end_to_end(self):
+        # End-to-end (through _apply_units_to_row, not just _match_unit in
+        # isolation) reproduction of the real Friars Yard case: row.building
+        # is plain address text with no name at all, the brochure's own
+        # building is a marketing name sharing no words with it - the new
+        # address_1 fallback tier is what lets state_of_space (a UNIT_LEVEL_
+        # FIELD, only ever filled via a confident _match_unit result) reach
+        # the row at all.
+        row = ListingRow(building="160 Blackfriars Road", floor_unit="4th Floor", state_of_space=None)
+        units = _brochure_units([
+            {
+                "building": "Friars Yard", "address_1": "160 Blackfriars Road",
+                "floor_unit": "4th Floor", "state_of_space": "Partially Fitted",
+            },
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.state_of_space, "Partially Fitted")
+        self.assertIn("state_of_space", fields)
 
     def test_floor_specific_feature_never_leaks_to_a_different_floor(self):
         row_5th = ListingRow(building="The Canal Building", floor_unit="5th Floor", special_features=None)

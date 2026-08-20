@@ -739,12 +739,36 @@ def _strip_trailing_street_suffix_word(key: str) -> str:
     return key
 
 
-def _building_identity_matches(row_building, candidate_buildings: list) -> list:
+def _distinct_building_group(indices: list, candidate_buildings: list) -> list:
+    """
+    `indices` unchanged if every one of them shares the SAME candidate
+    building identity (normalize_key(candidate_buildings[i]) is identical
+    across all of them), else [] - the right granularity for tier 4's own
+    uniqueness check (see _building_identity_matches), where several
+    matching INDICES sharing one real building (e.g. that building's own
+    several floors, each its own unit entry, all carrying the identical
+    address_1) is the expected, unambiguous case - not a conflict the way
+    two matching indices naming two DIFFERENT buildings would be. Mirrors
+    tier 1's own "every exact match returned, even several, for the SAME
+    building" allowance, just checked explicitly here since tier 4 matches
+    on a DIFFERENT field (address_1) than the one being grouped by
+    (building), so several matching indices no longer implies they share
+    one building the way it did for tiers 1-3's own building-to-building
+    comparisons.
+    """
+    if not indices:
+        return []
+    building_keys = {normalize_key(candidate_buildings[i]) for i in indices}
+    return indices if len(building_keys) == 1 else []
+
+
+def _building_identity_matches(row_building, candidate_buildings: list, candidate_addresses: list = None) -> list:
     """
     Indices into `candidate_buildings` (a list of raw building-name strings,
     e.g. one per brochure unit/building_features entry) that confidently
     identify the SAME building as `row_building` - never a fuzzy/similarity
-    match, only exact-string comparisons at three tiers:
+    match, only exact-string comparisons, tried in order until one tier
+    finds something:
 
     1. EXACT (both sides' own normalize_key, no suffix stripped) - always
        sufficient identity evidence by itself. Every exact match is
@@ -780,6 +804,44 @@ def _building_identity_matches(row_building, candidate_buildings: list) -> list:
        baking a full address onto a building name, the other is one side
        simply omitting a trailing street-type word) and neither building's
        real text needs both stripped at once for any case seen so far.
+    4. BUILDING-VS-ADDRESS (row_building compared against each candidate's
+       own address_1, via `candidate_addresses` - a parallel list, one
+       entry per candidate_buildings, or None from a caller with no address
+       data available at all, e.g. _match_building_feature's building_
+       features entries, which skips this tier entirely). Real, confirmed
+       gap this closes: a provider's own spreadsheet sometimes states a
+       property's plain street address as its ENTIRE building field (no
+       name at all - confirmed common shape, see _ADDRESS_LIKE_RE's own
+       comment), while a brochure for that same property is branded under
+       a marketing name that shares no words with the address at all (e.g.
+       row_building "160 Blackfriars Road" vs the real Friars Yard
+       brochure's own building "Friars Yard", address_1 "160 Blackfriars
+       Road") - tiers 1-3 all compare building-to-building text and can
+       never bridge that, no matter how much suffix-stripping is tried,
+       since the two sides share no vocabulary whatsoever.
+       a. EXACT address (row_building's own key against candidate_
+          addresses[i]'s key) - always sufficient alone, same as tier 1:
+          two full address strings landing on the byte-identical
+          normalized text is already strong, specific evidence.
+       b. TRAILING-STREET-SUFFIX-STRIPPED address (e.g. row_building "160
+          Blackfriars" vs address_1 "160 Blackfriars Road") - weaker,
+          same coincidental-collision risk tier 3's own stripping has, so
+          ALSO requires row_building's own leading house number (see
+          house_number.leading_house_number) to equal the candidate
+          address's leading house number, a second, independent, already-
+          trusted corroboration signal (the same parser _strip_building_
+          address_suffix already relies on) - never accepted on the
+          stripped text match alone.
+       Both of tier 4's own sub-tiers use _distinct_building_group, not a
+       raw index count, for their own uniqueness check: several matching
+       indices that all name the SAME candidate building (e.g. that
+       building's own several floors, each restating the identical
+       address_1) is the expected case, not an ambiguity - only 2+ matching
+       indices naming DIFFERENT buildings is rejected as genuinely
+       unresolvable. Tried strictly after tiers 1-3 both find nothing at
+       all - a real building-name match is always more specific evidence
+       than a cross-field address match, so tier 4 never competes with or
+       overrides one.
 
     Returns [] when row_building has no genuine key at all (blank/
     whitespace-only).
@@ -806,7 +868,31 @@ def _building_identity_matches(row_building, candidate_buildings: list) -> list:
         i for i, c in enumerate(candidate_buildings)
         if _strip_trailing_street_suffix_word(normalize_key(c)) == row_street_key
     ]
-    return street_suffix if len(street_suffix) == 1 else []
+    if len(street_suffix) == 1:
+        return street_suffix
+
+    if candidate_addresses is None:
+        return []
+
+    addr_exact = _distinct_building_group(
+        [i for i, a in enumerate(candidate_addresses) if normalize_key(a) == row_key],
+        candidate_buildings,
+    )
+    if addr_exact:
+        return addr_exact
+
+    row_house_number = leading_house_number(row_building)
+    if row_house_number is None:
+        return []
+    addr_street_suffix = _distinct_building_group(
+        [
+            i for i, a in enumerate(candidate_addresses)
+            if _strip_trailing_street_suffix_word(normalize_key(a)) == row_street_key
+            and leading_house_number(a) == row_house_number
+        ],
+        candidate_buildings,
+    )
+    return addr_street_suffix
 
 
 def needs_enrichment(row: ListingRow) -> bool:
@@ -1823,7 +1909,9 @@ def _match_unit(row: ListingRow, units: list):
     # function's own caller in enrich_rows_grouped for the belt-and-
     # braces try/except around this too).
     units = [u for u in units if isinstance(u, dict)]
-    match_indices = _building_identity_matches(row.building, [u.get("building") for u in units])
+    match_indices = _building_identity_matches(
+        row.building, [u.get("building") for u in units], [u.get("address_1") for u in units],
+    )
     building_matches = [units[i] for i in match_indices]
     if not building_matches:
         return None
@@ -1878,7 +1966,9 @@ def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
     if not units:
         return False
     plain_units = [u for u in units if isinstance(u, dict)]
-    match_indices = _building_identity_matches(row.building, [u.get("building") for u in plain_units])
+    match_indices = _building_identity_matches(
+        row.building, [u.get("building") for u in plain_units], [u.get("address_1") for u in plain_units],
+    )
     return len(match_indices) >= 2 and _match_unit(row, units) is None
 
 
@@ -1950,7 +2040,9 @@ def _match_building_value(row: ListingRow, units, field: str):
     if not normalize_key(row.building):
         return None
     plain_units = [u for u in units if isinstance(u, dict)]
-    match_indices = _building_identity_matches(row.building, [u.get("building") for u in plain_units])
+    match_indices = _building_identity_matches(
+        row.building, [u.get("building") for u in plain_units], [u.get("address_1") for u in plain_units],
+    )
     if not match_indices:
         return None
 
