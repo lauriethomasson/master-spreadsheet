@@ -619,7 +619,8 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
 
     st.warning(f"**{label}**\n\n{provider} lists this brand-new property as **{status_text}**.")
     if master_merge.new_property_missing_location(row_dict):
-        st.caption("📍 Address, postcode & map location not found — added anyway")
+        missing = ", ".join(master_merge.missing_location_labels(row_dict))
+        st.caption(f"📍 Missing: {missing} — added anyway")
 
     choice = st.radio(
         "What would you like to do?",
@@ -2199,8 +2200,10 @@ def _render_pending_review(pending: list):
             labels = master_merge.new_property_labels([u.new_row for u in plain_new])
             for label, u in zip(labels, plain_new):
                 st.write(label)
-                if master_merge.new_property_missing_location(u.new_row.model_dump()):
-                    st.caption("📍 Address, postcode & map location not found — added anyway")
+                row_dict = u.new_row.model_dump()
+                if master_merge.new_property_missing_location(row_dict):
+                    missing = ", ".join(master_merge.missing_location_labels(row_dict))
+                    st.caption(f"📍 Missing: {missing} — added anyway")
         new_rows_final.extend(
             u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
         )

@@ -1571,17 +1571,43 @@ def new_property_labels(rows: list) -> list:
     return labels
 
 
-# Checked together, never individually - a new property missing ONLY its
-# postcode (say) still has an address_1 or lat/lng a reviewer can act on;
-# this is specifically the "nothing geographic came through at all" case.
+# The four fields that together make up a new property's own "location"
+# for this check - see new_property_missing_location/missing_location_
+# labels below. lat/lng collapse into a single "map location" label when
+# displayed (see missing_location_labels) - a reviewer thinks of them as
+# one thing (a pin on a map), never as two independently-missing values.
 NEW_PROPERTY_LOCATION_FIELDS = ("address_1", "postcode", "lat", "lng")
+
+_MISSING_LOCATION_FIELD_LABELS = {"address_1": "address", "postcode": "postcode"}
 
 
 def new_property_missing_location(row_dict: dict) -> bool:
-    """True when address_1, postcode, lat, AND lng are all blank on a
+    """True when ANY of address_1, postcode, lat, or lng is blank on a
     genuinely new property - purely informational (see the Review page's
-    own "added anyway" note), never a reason to withhold the row itself."""
-    return all(_is_blank(row_dict.get(f)) for f in NEW_PROPERTY_LOCATION_FIELDS)
+    own "added anyway" note, which names specifically which of these are
+    missing via missing_location_labels), never a reason to withhold the
+    row itself."""
+    return any(_is_blank(row_dict.get(f)) for f in NEW_PROPERTY_LOCATION_FIELDS)
+
+
+def missing_location_labels(row_dict: dict) -> list:
+    """
+    Which of NEW_PROPERTY_LOCATION_FIELDS are blank on `row_dict`, as
+    short, user-facing labels (never raw field names) for the Review
+    page's own "added anyway" note - address_1/postcode each get their
+    own label; lat/lng collapse into one "map location" label, listed
+    once if EITHER half is blank (see NEW_PROPERTY_LOCATION_FIELDS' own
+    comment on why). Order is always address, postcode, map location -
+    never dependent on dict iteration order. Returns [] when nothing is
+    missing (new_property_missing_location is False).
+    """
+    labels = [
+        label for field, label in _MISSING_LOCATION_FIELD_LABELS.items()
+        if _is_blank(row_dict.get(field))
+    ]
+    if _is_blank(row_dict.get("lat")) or _is_blank(row_dict.get("lng")):
+        labels.append("map location")
+    return labels
 
 
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
