@@ -768,6 +768,38 @@ class ExtractFromPngPagesTests(unittest.TestCase):
 
         self.assertEqual(rows[0].brochure_link, "pasted.pdf")
 
+    def test_page_indices_attribute_mirrors_each_units_own_page_index(self):
+        # app._propagate_validated_links_within_page (Upload page) relies on
+        # this parallel attribute to group rows by originating page - never
+        # a real ListingRow field (page_index isn't part of the persisted
+        # schema, see _rows_from_raw's own docstring).
+        raw = {
+            "provider": None, "contacts": None,
+            "units": [
+                {"building": "A", "floor_unit": "1st", "brochure_link": None, "page_index": 2},
+                {"building": "A", "floor_unit": "2nd", "brochure_link": None, "page_index": 2},
+                {"building": "B", "floor_unit": "1st", "brochure_link": None},  # no page_index at all
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="deck.pdf")
+
+        self.assertEqual(len(rows), 3)  # still a plain list a caller can iterate/index/len() normally
+        self.assertEqual(rows.page_indices, [2, 2, None])
+
+    def test_extract_itself_has_no_page_indices_attribute(self):
+        # extract() (the real-PDF-upload path) never needs a row's own
+        # page_index once _attach_per_row_pdf_links has already consumed
+        # and popped it - keeps returning a bare list[ListingRow].
+        raw = {"provider": None, "contacts": None, "units": [{"building": "X", "brochure_link": None}]}
+        with patch("extract.extract_raw_units", return_value=raw), \
+                patch("extract._attach_per_row_pdf_links"):
+            rows = extract.extract(Path("irrelevant.pdf"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(hasattr(rows, "page_indices"))
+
 
 if __name__ == "__main__":
     unittest.main()

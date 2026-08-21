@@ -24,7 +24,7 @@ from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 import geocode
 from geocode import geocode_rows
-from master_merge import canonicalize_providers
+from master_merge import canonicalize_providers, normalize_key
 from schema import ListingRow
 from storage.file_store import (
     dataframe_to_listing_rows,
@@ -709,6 +709,66 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
             row.brochure_link = shared_fallback_link
 
 
+def _propagate_validated_links_within_page(rows: list, page_indices: list, shared_fallback_link: str) -> None:
+    """
+    Mutates each row's own brochure_link in place - only ever called right
+    after _validate_pasted_link_brochure_links, on the same rows. Gemini's
+    own per-row link attribution (see extract.extract_from_png_pages/
+    images_from_png_pages's own page_links param) sometimes only tags the
+    FIRST row of a multi-row same-building group that all share one page,
+    leaving every other row on that page/building on the shared document-
+    level fallback even though they're unambiguously the same real
+    property - not the multi-building-per-page case that justifies
+    trusting Gemini's own per-row pick over a plain page/building grouping
+    in the first place. This backfills that gap: for every group of rows
+    sharing the SAME page_index and the SAME building (see normalize_key),
+    if exactly one of them ends up with a genuine, validated per-unit link
+    - i.e. its own brochure_link survived _validate_pasted_link_brochure_
+    links rather than being replaced by shared_fallback_link - that same
+    link is copied onto the other rows in that group still sitting on the
+    fallback.
+
+    page_indices is extract_from_png_pages's own `.page_indices` attribute
+    (a parallel list, same order/length as rows, of each row's own raw
+    unit's page_index - see extract._rows_from_raw) - None (no page_index
+    data at all, e.g. rows that didn't come through extract_from_png_pages)
+    makes this a no-op. A row whose own page_index couldn't be determined,
+    or whose building is blank, never groups with anything else, including
+    another such row - a blank is never evidence of being the same page/
+    building. A row with brochure_link_is_floorplan set is excluded from
+    both sides of the group - a floorplan-substituted link is a different
+    kind of fact (see finalize_brochure_link/schema.py's own docstring),
+    never something to propagate FROM, and never something to overwrite.
+
+    Deliberately conservative like every other tier in this feature:
+    two or more rows in the same group with their own DIFFERENT validated
+    links is left alone entirely (genuinely ambiguous - never guessed at),
+    same as zero rows with one.
+    """
+    if not page_indices:
+        return
+
+    groups = {}
+    for row, page_index in zip(rows, page_indices):
+        if page_index is None or not row.building:
+            continue
+        groups.setdefault((page_index, normalize_key(row.building)), []).append(row)
+
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        validated = [
+            row for row in group
+            if row.brochure_link and row.brochure_link != shared_fallback_link and not row.brochure_link_is_floorplan
+        ]
+        if len(validated) != 1:
+            continue
+        real_link = validated[0].brochure_link
+        for row in group:
+            if row.brochure_link == shared_fallback_link and not row.brochure_link_is_floorplan:
+                row.brochure_link = real_link
+
+
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
 
@@ -1201,6 +1261,18 @@ with page_setup.setup_page("upload"):
                                     # the working shared link instead of
                                     # silently staging a dead one.
                                     _validate_pasted_link_brochure_links(rows, brochure_url)
+                                    # Gemini's own per-row attribution
+                                    # sometimes only tags the FIRST row of
+                                    # a multi-row same-building group
+                                    # sharing one page, leaving the rest on
+                                    # the shared fallback even though
+                                    # they're unambiguously the same real
+                                    # link - backfill that here, now that
+                                    # each row's own pick has already been
+                                    # validated above.
+                                    _propagate_validated_links_within_page(
+                                        rows, getattr(rows, "page_indices", None), brochure_url,
+                                    )
                                 else:
                                     rows = extract.extract(
                                         tmp_path, original_filename=uploaded_file.name, brochure_url=brochure_url,

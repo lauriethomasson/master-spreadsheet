@@ -675,7 +675,8 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
     # this doesn't apply to is completely unaffected either way.
     _attach_per_row_pdf_links(pdf_path, raw.get("units", []))
 
-    return _rows_from_raw(raw, filename, pdf_fallback_link)
+    rows, _ = _rows_from_raw(raw, filename, pdf_fallback_link)
+    return rows
 
 
 def extract_from_png_pages(
@@ -700,25 +701,48 @@ def extract_from_png_pages(
     brochure_link already applies for an ordinary PDF upload with no
     per-unit link of its own.
 
-    Returns rows exactly like extract() does - a caller wanting to
-    validate/replace a per-unit brochure_link this produced (see the
-    Review page's own paste-a-link validation, comparing each row's
-    brochure_link against the same brochure_url passed in here) does so
-    afterward, on the returned rows; this function itself never fetches
-    anything over the network.
+    Returns rows exactly like extract() does, as a plain list[ListingRow] a
+    caller can iterate/index/len() exactly like any other - EXCEPT this one
+    also carries a `.page_indices` attribute (a parallel list, same order/
+    length as the rows themselves, each entry the originating raw Gemini
+    unit's own page_index, or None) - see _ExtractedRows below. A caller
+    wanting to validate/replace a per-unit brochure_link this produced (see
+    the Review page's own paste-a-link validation, comparing each row's
+    brochure_link against the same brochure_url passed in here), or to
+    backfill a validated per-unit link across other rows sharing the same
+    page/building (see app.py's own _propagate_validated_links_within_page),
+    does so afterward, on the returned rows; this function itself never
+    fetches anything over the network.
     """
     client = get_client()
     images = images_from_png_pages(png_pages, page_links=page_links)
     raw = render_and_extract(images, client=client)
-    return _rows_from_raw(raw, original_filename, brochure_url or original_filename)
+    rows, page_indices = _rows_from_raw(raw, original_filename, brochure_url or original_filename)
+    result = _ExtractedRows(rows)
+    result.page_indices = page_indices
+    return result
 
 
-def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> list[ListingRow]:
+class _ExtractedRows(list):
+    """
+    A plain list[ListingRow] that ALSO carries the originating page_index
+    for each row (see extract_from_png_pages's own docstring) as a PARALLEL
+    list - `.page_indices`, never a new list element - same idiom as
+    brochure_enrichment._BrochureUnits, for the same reason: every existing
+    caller that already treats this as a plain list (truthiness, len(),
+    iteration, indexing) is completely unaffected, since it genuinely IS
+    one; only code that explicitly asks for .page_indices sees it.
+    """
+
+    page_indices = None
+
+
+def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[list[ListingRow], list]:
     """
     The raw Gemini JSON's own "units" (plus document-level provider/
-    contacts) turned into ListingRows - shared by extract() (a real PDF
-    file) and extract_from_png_pages() (an already-rendered page-image
-    source, e.g. a pasted Canva/Pitch link) so there is only ONE such
+    contacts) turned into (rows, page_indices) - rows shared by extract() (a
+    real PDF file) and extract_from_png_pages() (an already-rendered page-
+    image source, e.g. a pasted Canva/Pitch link) so there is only ONE such
     conversion, never two independently-drifting implementations. Each
     caller is responsible for whatever page-specific per-unit link
     attachment applies to ITS OWN source BEFORE calling this (see
@@ -728,6 +752,16 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> list[Lis
     reaches here, each unit's own "brochure_link" is already whatever
     that source-specific step (or Gemini's own vision-only guess) left
     it as.
+
+    page_indices is a plain list, same order/length as rows, of each row's
+    own raw unit's page_index (or None - either never stated, or already
+    popped by extract()'s own _attach_per_row_pdf_links, which runs BEFORE
+    this and has no further use for it once a per-row PDF link search has
+    already consumed it). page_index itself is never part of ExtractedFields/
+    ListingRow's own declared schema (never written to the staging file or
+    shown in the Review UI) - read directly off the raw unit dict here,
+    before it's discarded, purely so extract_from_png_pages's own caller can
+    still group rows by originating page after the fact.
     """
     brochure = {
         "internal_ref": raw.get("provider"),
@@ -736,6 +770,7 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> list[Lis
     }
 
     rows = []
+    page_indices = []
     last_building = None
     for i, unit in enumerate(raw.get("units", [])):
         if not unit.get("building"):
@@ -748,6 +783,10 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> list[Lis
                 continue
             unit["building"] = last_building
         last_building = unit["building"]
+
+        page_index = unit.get(PAGE_INDEX_KEY)
+        if not isinstance(page_index, int):
+            page_index = None
 
         unit["brochure_link"] = finalize_brochure_link(
             unit.get("brochure_link"), is_pdf=True, pdf_fallback_link=pdf_fallback_link
@@ -777,7 +816,8 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> list[Lis
                 brochure_link_is_floorplan=brochure_link_is_floorplan,
             )
         )
-    return rows
+        page_indices.append(page_index)
+    return rows, page_indices
 
 
 def main():

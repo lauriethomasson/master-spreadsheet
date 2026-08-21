@@ -493,7 +493,8 @@ class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
                 ), \
                 patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw), \
-                patch("brochure_enrichment._fetch_pdf_bytes", side_effect=fake_validate_fetch):
+                patch("brochure_enrichment._fetch_pdf_bytes", side_effect=fake_validate_fetch), \
+                patch("geocode.geocode_rows"):
             at = _run_upload_page()
             _add_link(at, url)
             self.assertFalse(at.exception)
@@ -519,6 +520,109 @@ class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
         # its own genuine per-property link, not the shared fallback.
         self.assertEqual(by_building["27-29 Gloucester Place"], "https://blob.example.com/gloucester.pdf")
         self.assertNotEqual(by_building["27-29 Gloucester Place"], by_building["Kingsland House"])
+
+
+class PropagateValidatedLinksWithinPageTests(unittest.TestCase):
+    """
+    app._propagate_validated_links_within_page - the deterministic backfill
+    that runs right after _validate_pasted_link_brochure_links. Real,
+    confirmed gap: against the real Colliers deck, Gemini sometimes only
+    attributes a page's own real link to the FIRST of several rows sharing
+    the same building on the same page, leaving the rest on the shared
+    document-level fallback even though they're unambiguously the same
+    property - not the multi-building-per-page case that justifies trusting
+    Gemini's own per-row pick in the first place. Uses the real building
+    name/link from that deck's own "27-29 Gloucester Place" page.
+    """
+
+    FALLBACK = "https://storage.example/colliers-deck.pdf"
+    REAL_LINK = (
+        "https://listingsprod.blob.core.windows.net/ourlistings-gbr/"
+        "530d3baf-4d77-4824-be42-adb15270c44b/0d33a8d7-3b7c-4ef5-b1a0-c314926f1605"
+    )
+
+    def _row(self, building, floor_unit, brochure_link, brochure_link_is_floorplan=None):
+        return ListingRow(
+            building=building, floor_unit=floor_unit, brochure_link=brochure_link,
+            brochure_link_is_floorplan=brochure_link_is_floorplan,
+        )
+
+    def test_backfills_the_other_four_rows_when_only_one_of_five_got_the_real_link(self):
+        rows = [
+            self._row("27-29 Gloucester Place", "2nd (Office 6)", self.REAL_LINK),
+            self._row("27-29 Gloucester Place", "2nd (Office 7)", self.FALLBACK),
+            self._row("27-29 Gloucester Place", "3rd (Office 8)", self.FALLBACK),
+            self._row("27-29 Gloucester Place", "3rd (Office 9)", self.FALLBACK),
+            self._row("27-29 Gloucester Place", "4th (Office 11)", self.FALLBACK),
+        ]
+        page_indices = [4, 4, 4, 4, 4]
+
+        app._propagate_validated_links_within_page(rows, page_indices, self.FALLBACK)
+
+        self.assertTrue(all(row.brochure_link == self.REAL_LINK for row in rows))
+
+    def test_never_propagates_across_different_pages(self):
+        rows = [
+            self._row("27-29 Gloucester Place", "2nd", self.REAL_LINK),
+            self._row("27-29 Gloucester Place", "3rd", self.FALLBACK),
+        ]
+        page_indices = [4, 9]  # same building, but NOT the same page - unrelated to each other
+
+        app._propagate_validated_links_within_page(rows, page_indices, self.FALLBACK)
+
+        self.assertEqual(rows[1].brochure_link, self.FALLBACK)
+
+    def test_never_propagates_across_different_buildings_on_the_same_page(self):
+        rows = [
+            self._row("27-29 Gloucester Place", "2nd", self.REAL_LINK),
+            self._row("3 Fitzhardinge Street", "3rd", self.FALLBACK),
+        ]
+        page_indices = [4, 4]  # same page, but a genuinely different building
+
+        app._propagate_validated_links_within_page(rows, page_indices, self.FALLBACK)
+
+        self.assertEqual(rows[1].brochure_link, self.FALLBACK)
+
+    def test_ambiguous_group_with_two_different_validated_links_is_left_alone(self):
+        other_real_link = "https://blob.example.com/other-office.pdf"
+        rows = [
+            self._row("27-29 Gloucester Place", "2nd", self.REAL_LINK),
+            self._row("27-29 Gloucester Place", "3rd", other_real_link),
+            self._row("27-29 Gloucester Place", "4th", self.FALLBACK),
+        ]
+        page_indices = [4, 4, 4]
+
+        app._propagate_validated_links_within_page(rows, page_indices, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.REAL_LINK)
+        self.assertEqual(rows[1].brochure_link, other_real_link)
+        self.assertEqual(rows[2].brochure_link, self.FALLBACK)
+
+    def test_floorplan_substituted_link_is_excluded_from_both_sides(self):
+        rows = [
+            self._row("27-29 Gloucester Place", "2nd", self.REAL_LINK),
+            self._row(
+                "27-29 Gloucester Place", "3rd", "https://blob.example.com/floorplan.pdf",
+                brochure_link_is_floorplan=True,
+            ),
+        ]
+        page_indices = [4, 4]
+
+        app._propagate_validated_links_within_page(rows, page_indices, self.FALLBACK)
+
+        # Never overwritten - a floorplan substitution is a different kind
+        # of fact, not a row still "on the fallback" waiting to be filled.
+        self.assertEqual(rows[1].brochure_link, "https://blob.example.com/floorplan.pdf")
+
+    def test_no_page_indices_is_a_no_op(self):
+        rows = [
+            self._row("27-29 Gloucester Place", "2nd", self.REAL_LINK),
+            self._row("27-29 Gloucester Place", "3rd", self.FALLBACK),
+        ]
+
+        app._propagate_validated_links_within_page(rows, None, self.FALLBACK)
+
+        self.assertEqual(rows[1].brochure_link, self.FALLBACK)
 
 
 if __name__ == "__main__":
