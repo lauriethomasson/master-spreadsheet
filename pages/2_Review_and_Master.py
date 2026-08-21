@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import html
 import uuid
@@ -50,6 +51,42 @@ def _risky_field_reason(field: str) -> str:
     return "Existing value differs from the new upload"
 
 
+def _word_diff_highlight(old_val: str, new_val: str) -> tuple:
+    """
+    Word-level diff between `old_val` and `new_val` (split on whitespace,
+    via difflib.SequenceMatcher) - returns (before_markdown, after_
+    markdown): the OLD text with every removed/changed word bolded+
+    colored red, and the NEW text with every added/changed word bolded+
+    colored green, using Streamlit's own :color[...] markdown syntax (no
+    unsafe_allow_html needed). A contiguous run of changed words gets ONE
+    highlighted span, never one per word, so a multi-word phrase reads as
+    a single change rather than a string of individually-marked words.
+
+    Only meaningful for two genuinely comparable free-text values (see
+    _render_field_rows' own is_text_diff check) - a long field like
+    special_features often changes by only a phrase buried in a
+    paragraph, and showing two full undifferentiated blocks of text
+    makes that real change easy to miss.
+    """
+    old_words = old_val.split()
+    new_words = new_val.split()
+    matcher = difflib.SequenceMatcher(None, old_words, new_words, autojunk=False)
+
+    before_parts = []
+    after_parts = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            before_parts.extend(old_words[i1:i2])
+            after_parts.extend(new_words[j1:j2])
+            continue
+        if i1 != i2:
+            before_parts.append(f"**:red[{' '.join(old_words[i1:i2])}]**")
+        if j1 != j2:
+            after_parts.append(f"**:green[{' '.join(new_words[j1:j2])}]**")
+
+    return " ".join(before_parts), " ".join(after_parts)
+
+
 def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset()) -> dict:
     """
     Renders one compact row per field that genuinely needs a reviewer's
@@ -84,27 +121,57 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
     Returns only the fields whose checkbox is checked (or bundled as
     safe), using whatever value is currently entered - letting a reviewer
     correct a value, not just accept/reject it verbatim.
+
+    "Current"/"New" header captions above before_col/after_col (rendered
+    once, above the loop - same convention as _render_near_miss_
+    comparison_table's own "IN MASTER"/"THIS UPLOAD" header) - only when
+    there's at least one row to head. For a field where both old_val and
+    new_val are genuinely non-blank strings (covers special_features and
+    other free-text fields - see _word_diff_highlight), the before
+    caption highlights the removed words in place, and a small extra
+    caption right below the editable "after" input highlights the added
+    words - the live input widget itself is never touched, since a plain
+    st.text_area/st.text_input can't render rich-text highlighting.
     """
     approved = {}
     bundle_safe_fields = default_checked
     individually_rendered = [f for f in diffs if f in risky_fields or not bundle_safe_fields]
     bundled_fields = [f for f in diffs if f not in risky_fields and bundle_safe_fields]
 
+    if individually_rendered:
+        _, current_header_col, new_header_col, _ = st.columns([2, 2, 3, 1])
+        with current_header_col:
+            st.caption("Current")
+        with new_header_col:
+            st.caption("New")
+
     for f in individually_rendered:
         old_val, new_val = diffs[f]
         is_risky = f in risky_fields
         kind = master_merge.field_kind(f)
+        is_text_diff = (
+            isinstance(old_val, str) and old_val.strip() and isinstance(new_val, str) and new_val.strip()
+        )
+        before_highlight = after_highlight = None
+        if is_text_diff:
+            before_highlight, after_highlight = _word_diff_highlight(old_val, new_val)
+
         label_col, before_col, after_col, apply_col = st.columns([2, 2, 3, 1])
         with label_col:
             st.markdown(f"**{display_utils.friendly_field_label(f)}**")
             if is_risky:
                 st.caption(f"⚠️ {_risky_field_reason(f)}")
         with before_col:
-            st.caption(display_utils.format_field_value_for_display(f, old_val))
+            if is_text_diff:
+                st.caption(before_highlight)
+            else:
+                st.caption(display_utils.format_field_value_for_display(f, old_val))
         with after_col:
             value = display_utils.render_new_value_input(
                 new_val, kind, key=f"{key_prefix}_{f}_value", multiline=f in display_utils.WIDE_TEXT_COLUMNS,
             )
+            if is_text_diff:
+                st.caption(after_highlight)
         with apply_col:
             apply_field = st.checkbox(
                 "Apply", value=default_checked and not is_risky, key=f"{key_prefix}_{f}_apply",
