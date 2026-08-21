@@ -220,7 +220,7 @@ class UncommonLiverpoolStStyleCompactDecisionTests(IsolatedCwdTestCase):
     def test_safe_fields_are_bundled_not_individually_rendered(self):
         at = self._staged_uncommon_liverpool_st()
         caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("3 other safe changes will be applied automatically.", caption_text)
+        self.assertIn("3 other changes (Size, Maximum desks, Rent PCM) will apply automatically.", caption_text)
         # No individual "Apply" checkbox for the 3 safe fields - only the
         # one risky field (address) gets a checkbox at all.
         apply_checkboxes = [c for c in at.checkbox if c.label == "Apply"]

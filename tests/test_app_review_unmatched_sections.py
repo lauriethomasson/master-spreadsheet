@@ -204,9 +204,11 @@ class BehaviorUnchangedAfterRestructureTests(IsolatedCwdTestCase):
         )
 
         at = _run_review_page()
-        selectbox = at.selectbox(key="near_miss_0_choice")
-        link_option = next(o for o in selectbox.options if o != "— add as new —")
-        selectbox.select(link_option).run()
+        # Only one master property exists at all, so this near-miss has
+        # exactly one suggestion - the Yes/No button pair (see pages/2_
+        # Review_and_Master.py's near-miss redesign), not the dropdown.
+        yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
+        yes_button.click().run()
         self.assertFalse(at.exception)
 
         approve_buttons = [b for b in at.button if b.label == "Approve → Master"]

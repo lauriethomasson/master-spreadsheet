@@ -44,6 +44,8 @@ def _risky_field_reason(field: str) -> str:
         return "Existing address would be replaced"
     if field in master_merge.GEOCODE_RISK_FIELDS:
         return "Existing location would be replaced"
+    if field in master_merge.RISKY_TEXT_FIELDS:
+        return "New text looks shorter than what's there now — may be missing detail, not just an update."
     return "Existing value differs from the new upload"
 
 
@@ -114,7 +116,13 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
             kind = master_merge.field_kind(f)
             approved[f] = display_utils.coerced_new_value(diffs[f][1], kind)
         n = len(bundled_fields)
-        st.caption(f"✓ {n} other safe change{'s' if n != 1 else ''} will be applied automatically.")
+        # Names a few of the actual bundled fields (never a generic count
+        # alone) so this line still means something on its own - up to 3,
+        # since that's plenty to convey "what kind of thing", with an
+        # "etc." for however many more there are.
+        shown_labels = [display_utils.friendly_field_label(f) for f in bundled_fields[:3]]
+        names = ", ".join(shown_labels) + (", etc." if n > len(shown_labels) else "")
+        st.caption(f"✓ {n} other change{'s' if n != 1 else ''} ({names}) will apply automatically.")
 
     return approved
 
@@ -1607,6 +1615,153 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
             _render_single_file_discard(path, label=discard_label)
 
 
+# The near-miss card's own comparison fields - deliberately a SUBSET of
+# DIFF_FIELDS, not every field: these 5 are what actually establishes
+# "is this plausibly the same property" (identity + rough size), never
+# free-text fields like special_features/contacts which say nothing about
+# identity and would just add noise to a card that's already asking a
+# reviewer to make one focused decision.
+_NEAR_MISS_COMPARISON_FIELDS = ("building", "provider", "floor_unit", "address_1", "size_sqft")
+
+# Short, lowercase, plain-English nouns for the near-miss summary SENTENCE
+# specifically - display_utils.friendly_field_label's own labels (e.g.
+# "Floor / Unit") read fine as a table header (see _render_near_miss_
+# comparison_table) but awkwardly mid-sentence ("same building, provider,
+# floor / unit, ..."), so the sentence uses this separate, shorter set.
+_NEAR_MISS_FIELD_NOUNS = {
+    "building": "building",
+    "provider": "provider",
+    "floor_unit": "floor",
+    "address_1": "address",
+    "size_sqft": "size",
+}
+
+
+def _near_miss_matching_and_differing(old_rec: dict, row_dict: dict) -> tuple:
+    """
+    Splits _NEAR_MISS_COMPARISON_FIELDS into (matching, differing) between
+    `old_rec` (the closest master suggestion) and `row_dict` (the new
+    upload row) - reuses master_merge.diff_fields' own blank-skip/
+    tolerant-equality rules rather than a separate equality check, so this
+    card's own "what differs" can never disagree with what "would change"
+    already means everywhere else changes are reviewed on this page.
+    """
+    diffs = master_merge.diff_fields(old_rec, row_dict)
+    matching = [f for f in _NEAR_MISS_COMPARISON_FIELDS if f not in diffs]
+    differing = [f for f in _NEAR_MISS_COMPARISON_FIELDS if f in diffs]
+    return matching, differing
+
+
+def _oxford_join(items: list) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _render_near_miss_summary(old_rec: dict, row_dict: dict, matching: list, differing: list) -> None:
+    """
+    One short sentence, above the full comparison table, comparing
+    `row_dict` against its closest suggestion `old_rec` across
+    _NEAR_MISS_COMPARISON_FIELDS - names whatever matches, then whatever
+    differs. A single differing field gets its own actual before/after
+    values inline (short enough to stay one sentence); 2+ differing
+    fields are just named, not spelled out one by one, to keep this
+    genuinely short either way.
+    """
+    matching_nouns = [_NEAR_MISS_FIELD_NOUNS[f] for f in matching]
+    if matching_nouns:
+        sentence = f"This looks like a property already in master — same {_oxford_join(matching_nouns)}."
+    else:
+        sentence = "This looks like a property already in master."
+
+    if differing:
+        if len(differing) == 1:
+            field = differing[0]
+            noun = _NEAR_MISS_FIELD_NOUNS[field]
+            old_display = display_utils.format_field_value_for_display(field, old_rec.get(field))
+            new_display = display_utils.format_field_value_for_display(field, row_dict.get(field))
+            old_phrase = "master has none recorded" if old_display == "—" else f"master says '{old_display}'"
+            sentence += f" The only thing different is the {noun}: {old_phrase}, this upload says '{new_display}'."
+        else:
+            differing_nouns = [_NEAR_MISS_FIELD_NOUNS[f] for f in differing]
+            sentence += f" The things that differ are {_oxford_join(differing_nouns)}."
+
+    st.write(sentence)
+
+
+def _render_near_miss_comparison_table(old_rec: dict, row_dict: dict, differing: list) -> None:
+    """
+    Full "In master" / "This upload" comparison across
+    _NEAR_MISS_COMPARISON_FIELDS, replacing the old plain-text "Possible
+    near-misses already in the master: ..." caption - same friendly-label/
+    value formatting the rest of the page already uses (see display_
+    utils.friendly_field_label/format_field_value_for_display), so this
+    never introduces a second, inconsistent way of showing a field's
+    value. Whichever field(s) `differing` names get a bold, background-
+    tinted row so the one thing actually worth checking stands out from
+    everything that already matches.
+    """
+    _, old_header_col, new_header_col = st.columns([2, 3, 3])
+    with old_header_col:
+        st.caption("IN MASTER")
+    with new_header_col:
+        st.caption("THIS UPLOAD")
+
+    for field in _NEAR_MISS_COMPARISON_FIELDS:
+        label = display_utils.friendly_field_label(field)
+        old_display = display_utils.format_field_value_for_display(field, old_rec.get(field))
+        new_display = display_utils.format_field_value_for_display(field, row_dict.get(field))
+        label_col, old_col, new_col = st.columns([2, 3, 3])
+        if field in differing:
+            with label_col:
+                st.markdown(f"**:orange-background[{label}]**")
+            with old_col:
+                st.markdown(f"**:orange-background[{old_display}]**")
+            with new_col:
+                st.markdown(f"**:orange-background[{new_display}]**")
+        else:
+            with label_col:
+                st.write(label)
+            with old_col:
+                st.write(old_display)
+            with new_col:
+                st.write(new_display)
+
+
+def _render_near_miss_link_diff(u, row_dict: dict, target_index: int, plan, key_prefix: str, decision_updates: dict) -> None:
+    """
+    Shared by both the single-suggestion Yes/No path and the multiple-
+    suggestion dropdown path once a target master property has been
+    chosen - computes the full field-level diff against that target and
+    renders the same field-review UI a matched row's own manual review
+    already uses (see _render_field_rows), recording anything the
+    reviewer approves into decision_updates exactly as before this
+    redesign. `diffs` can genuinely be empty (the linked property turns
+    out to differ on nothing at all once blank/tolerant fields are
+    excluded) - handled the same as always, a plain "0 field(s) would
+    change" caption with nothing further to render.
+    """
+    old_rec = plan.master_records[target_index]
+    diffs = master_merge.diff_fields(old_rec, row_dict)
+    st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
+    if diffs:
+        risky_fields = frozenset(
+            f for f in diffs
+            if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
+        )
+        approved_fields = _render_field_rows(
+            diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
+        )
+        if approved_fields:
+            entry = decision_updates.setdefault(target_index, {})
+            entry.update(approved_fields)
+            entry["source_file"] = u.new_row.source_file
+
+
 def _render_pending_review(pending: list):
     # Splits `pending` into active vs superseded BEFORE anything else reads
     # rows from it - see active_and_superseded_staging_files' own docstring
@@ -1857,48 +2012,76 @@ def _render_pending_review(pending: list):
             for i, u in enumerate(near_miss):
                 row_dict = u.new_row.model_dump()
                 key_prefix = f"near_miss_{i}"
+                closest = u.suggestions[0]
+                matching, differing = _near_miss_matching_and_differing(closest, row_dict)
+
                 with st.expander(f"⚠️ {display_utils.row_label(row_dict)}", key=f"{key_prefix}_expander"):
-                    st.caption(
-                        "Possible near-misses already in the master: "
-                        + ", ".join(display_utils.row_label(s) for s in u.suggestions)
-                    )
+                    _render_near_miss_summary(closest, row_dict, matching, differing)
+                    _render_near_miss_comparison_table(closest, row_dict, differing)
 
-                    choice_label = st.selectbox(
-                        "What should happen with this row?",
-                        list(master_options.keys()),
-                        key=f"{key_prefix}_choice",
-                    )
-                    linked_property_id = master_options[choice_label]
+                    if len(u.suggestions) == 1:
+                        # The common case - a plain Yes/No beats a dropdown
+                        # whose only real choices are "this one property" or
+                        # "add as new" anyway. 2+ suggestions (below) still
+                        # need the dropdown - a button pair can't offer a
+                        # choice between more than two things.
+                        decision_key = f"{key_prefix}_yesno_decision"
+                        if decision_key not in st.session_state:
+                            # Matches the OLD selectbox's own default ("— add
+                            # as new —" pre-selected until a reviewer acts) -
+                            # never linked unless the reviewer explicitly says so.
+                            st.session_state[decision_key] = "new"
+                        same_property = st.session_state[decision_key] == "same"
 
-                    if linked_property_id is None:
-                        # "— add as new —" is the default selectbox choice, so this is
-                        # already the no-action outcome - no extra checkbox needed to
-                        # confirm it. A reviewer who believes this IS the near-miss
-                        # property says so by picking it from the dropdown above, which
-                        # routes into the `else` branch instead.
-                        new_rows_final.append(
-                            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
-                        )
+                        yes_col, no_col = st.columns(2)
+                        with yes_col:
+                            if st.button(
+                                "✓ Yes, same property", key=f"{key_prefix}_yes",
+                                type="primary" if same_property else "secondary",
+                            ):
+                                st.session_state[decision_key] = "same"
+                                st.rerun()
+                        with no_col:
+                            if st.button(
+                                "Add as new instead", key=f"{key_prefix}_no",
+                                type="primary" if not same_property else "secondary",
+                            ):
+                                st.session_state[decision_key] = "new"
+                                st.rerun()
+
+                        if same_property:
+                            target_index = next(
+                                idx for idx, rec in enumerate(plan.master_records)
+                                if rec["property_id"] == closest["property_id"]
+                            )
+                            _render_near_miss_link_diff(u, row_dict, target_index, plan, key_prefix, decision_updates)
+                        else:
+                            new_rows_final.append(
+                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
+                            )
                     else:
-                        target_index = next(
-                            idx for idx, rec in enumerate(plan.master_records)
-                            if rec["property_id"] == linked_property_id
+                        choice_label = st.selectbox(
+                            "What should happen with this row?",
+                            list(master_options.keys()),
+                            key=f"{key_prefix}_choice",
                         )
-                        old_rec = plan.master_records[target_index]
-                        diffs = master_merge.diff_fields(old_rec, row_dict)
-                        st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
-                        if diffs:
-                            risky_fields = frozenset(
-                                f for f in diffs
-                                if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
+                        linked_property_id = master_options[choice_label]
+
+                        if linked_property_id is None:
+                            # "— add as new —" is the default selectbox choice, so this is
+                            # already the no-action outcome - no extra checkbox needed to
+                            # confirm it. A reviewer who believes this IS the near-miss
+                            # property says so by picking it from the dropdown above, which
+                            # routes into the `else` branch instead.
+                            new_rows_final.append(
+                                u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
                             )
-                            approved_fields = _render_field_rows(
-                                diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
+                        else:
+                            target_index = next(
+                                idx for idx, rec in enumerate(plan.master_records)
+                                if rec["property_id"] == linked_property_id
                             )
-                            if approved_fields:
-                                entry = decision_updates.setdefault(target_index, {})
-                                entry.update(approved_fields)
-                                entry["source_file"] = u.new_row.source_file
+                            _render_near_miss_link_diff(u, row_dict, target_index, plan, key_prefix, decision_updates)
 
         # Intra-batch duplicates: two or more pending rows independently
         # failing to match master, but matching EACH OTHER (see
