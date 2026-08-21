@@ -1610,6 +1610,58 @@ def missing_location_labels(row_dict: dict) -> list:
     return labels
 
 
+def _dict_location_hint(row: dict):
+    """
+    geocode.extract_postcode_hint's own postcode-district hint for `row`
+    (a plain dict, master_merge's own row shape - never a ListingRow),
+    checked in the exact same postcode/address_1/building priority
+    geocode._source_location_hint already uses for a ListingRow - a local
+    import (never a module-level one) because geocode.py itself imports
+    normalize_key FROM this module, so a module-level "import geocode"
+    here would be a circular import; deferred to call time, well after
+    both modules have already finished loading, this is safe.
+    """
+    import geocode
+
+    for field in ("postcode", "address_1", "building"):
+        hint = geocode.extract_postcode_hint(row.get(field))
+        if hint:
+            return hint
+    return None
+
+
+def _address_conflicts(new_dict: dict, candidate: dict) -> bool:
+    """
+    True only when BOTH new_dict and candidate state a real, parseable
+    postcode-district hint (see _dict_location_hint) and those hints
+    genuinely disagree (different district) - the same conflict
+    definition geocode.py's own _postcode_hint_conflicts already uses for
+    the equivalent geocoding-acceptance check, reused here rather than a
+    second, independently-drifting comparison. Never true when either
+    side has nothing parseable to compare (an absent/unparseable hint is
+    a reason to trust the fuzzy building-name match, not a reason to
+    reject it) - this only ever EXCLUDES a candidate that already passed
+    _suggest_similar's own fuzzy name/provider checks, never adds a new
+    requirement for one that didn't.
+
+    Confirmed real gap this closes: a master "City Tower"/GPE record
+    whose own address_1/postcode state a real Canary Wharf address (3
+    Limeharbour, E14 - a genuinely different, unrelated building) was
+    spuriously suggested for a "City Tower"/GPE upload whose own address_1/
+    postcode state GPE's actual managed office building at 40 Basinghall
+    Street, EC2V - purely because the building NAME string is identical
+    and both share the same provider, despite the two real addresses
+    having nothing to do with each other.
+    """
+    new_hint = _dict_location_hint(new_dict)
+    if not new_hint:
+        return False
+    candidate_hint = _dict_location_hint(candidate)
+    if not candidate_hint:
+        return False
+    return new_hint["district"] != candidate_hint["district"]
+
+
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
     """Cheap, stdlib-only fuzzy hint for the "no match" review section - not
     part of matching itself, just reduces manual searching when a near-miss
@@ -1645,7 +1697,22 @@ def _suggest_similar(new_dict: dict, master_records: list) -> list:
     match would already exclude on the real matching tier. A different
     provider is never the same listing (see this module's own module-level
     identity principle), so it must never be suggested as a possible one,
-    even as a hint a human is still free to dismiss."""
+    even as a hint a human is still free to dismiss.
+
+    Also excludes any candidate whose own address genuinely conflicts with
+    new_dict's (see _address_conflicts) - the opposite failure mode from
+    _building_has_no_digits' own numbered-address exclusion: a generic,
+    non-numbered building NAME shared by two genuinely different real
+    buildings, rather than two numbered addresses that merely look
+    similar. Confirmed real gap this closes: a master "City Tower"/GPE
+    record at 3 Limeharbour (Canary Wharf, E14 - a real, unrelated
+    residential building) was spuriously suggested for a "City Tower"/GPE
+    upload describing GPE's own actual managed office building at 40
+    Basinghall Street, EC2V, purely because the building name string is
+    identical and both share the same provider. Only ever excludes a
+    candidate that already passed every check above - never a new
+    requirement for one whose address can't be compared at all (see
+    _address_conflicts' own permissive "nothing to compare" default)."""
     target_building = new_dict.get("building")
     if not _building_has_no_digits(target_building):
         return []
@@ -1655,7 +1722,9 @@ def _suggest_similar(new_dict: dict, master_records: list) -> list:
     target_provider = normalize_key(new_dict.get("provider"))
     candidates = [
         r for r in master_records
-        if normalize_key(r.get("provider")) == target_provider and _building_has_no_digits(r.get("building"))
+        if normalize_key(r.get("provider")) == target_provider
+        and _building_has_no_digits(r.get("building"))
+        and not _address_conflicts(new_dict, r)
     ]
     keys = [normalize_key(r.get("building")) for r in candidates]
     close = set(difflib.get_close_matches(target, keys, n=3, cutoff=BUILDING_FUZZY_MATCH_THRESHOLD))

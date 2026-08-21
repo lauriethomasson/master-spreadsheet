@@ -128,6 +128,47 @@ class SuggestSimilarTests(unittest.TestCase):
         new_dict = {"building": "Thirty Lightman", "provider": "MetSpace"}
         self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
 
+    def test_same_name_same_provider_but_conflicting_real_address_is_never_suggested(self):
+        # Real confirmed false positive: master's "City Tower"/GPE record
+        # is a real, unrelated residential building at 3 Limeharbour,
+        # Canary Wharf (E14) - a completely different real "City Tower" at
+        # 40 Basinghall Street, EC2V (GPE's own actual managed office
+        # building) must never be suggested against it, despite the
+        # identical building-name string and shared provider.
+        master_records = [{
+            "building": "City Tower", "provider": "GPE", "floor_unit": "2nd",
+            "address_1": "3 Limeharbour", "postcode": "E14 9SH",
+        }]
+        new_dict = {
+            "building": "City Tower", "provider": "GPE",
+            "address_1": "40 Basinghall Street", "postcode": "EC2V 5DE",
+        }
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
+
+    def test_same_name_same_provider_matching_addresses_still_suggested(self):
+        # The opposite of the conflicting-address case above - a genuine
+        # near-miss where both sides agree on location (same postcode
+        # district) must still be suggested, same as before this fix.
+        master_records = [{
+            "building": "City Towr", "provider": "GPE", "floor_unit": "2nd",
+            "address_1": "40 Basinghall Street", "postcode": "EC2V 5DE",
+        }]
+        new_dict = {
+            "building": "City Tower", "provider": "GPE",
+            "address_1": "40 Basinghall Street", "postcode": "EC2V 5DE",
+        }
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), master_records)
+
+    def test_same_name_same_provider_blank_addresses_on_both_sides_still_suggested(self):
+        # No address on either side at all - nothing to compare, so this
+        # new guard must never block a genuine near-miss just because
+        # neither side happens to state a location (see
+        # test_genuine_name_only_typo_still_suggested for the same
+        # principle with an actual typo pair).
+        master_records = [{"building": "City Tower", "provider": "GPE", "floor_unit": "2nd"}]
+        new_dict = {"building": "City Towr", "provider": "GPE"}
+        self.assertEqual(len(master_merge._suggest_similar(new_dict, master_records)), 1)
+
 
 class ValuesEqualTests(unittest.TestCase):
     """
