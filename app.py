@@ -2,10 +2,13 @@ import hashlib
 import json
 import re
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
 
+import fitz  # PyMuPDF
 import streamlit as st
 from openpyxl import load_workbook
 
@@ -16,6 +19,7 @@ import extract_spreadsheet
 import extract_spreadsheet_gemini
 import page_flow
 import page_setup
+from brochure_link_resolver import looks_like_url
 from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 import geocode
@@ -539,6 +543,106 @@ def _render_ambiguous_sheet_decision(filename: str, plan: dict, file_hash: str) 
         )
 
 
+# Shown inline under a pasted link's own entry in the "ready to extract"
+# list whenever none of _fetch_pasted_link's three strategies (direct PDF,
+# Canva/Pitch render, resolve_brochure_link's landing-page scan) produced
+# real document bytes - deliberately ONE generic message covering every
+# such failure (a dead link, a private/unshared file, a page gated behind
+# a sign-in/email form) rather than a separate detection mechanism per
+# cause: none of those three strategies can ever distinguish "this is a
+# login form" from "this just isn't a readable document" without actually
+# filling in and submitting a form, which this deliberately never does.
+PASTED_LINK_UNREADABLE_MESSAGE = (
+    "⚠️ Couldn't read this link — it looks like it needs a sign-in or email first. "
+    "Save it as a PDF and upload that instead."
+)
+
+
+class _PastedLinkFile:
+    """
+    Minimal file-like stand-in for a pasted link's own fetched PDF bytes -
+    exposes exactly .name/.getvalue(), the only two attributes the Extract
+    loop below ever reads off an uploaded_file, so a successfully-fetched
+    link can sit in the exact same uploaded_files list as a real st.
+    file_uploader UploadedFile and flow through hashing/staging/brochure
+    enrichment completely unchanged.
+    """
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def _filename_from_url(url: str) -> str:
+    """A sensible, always-.pdf-suffixed filename derived from `url` - the
+    URL's own last path segment when it already looks like a real
+    filename (the common case: a direct document link, or a resolved
+    landing-page link), otherwise the host plus whatever slug the path
+    offers (a Canva/Pitch "view" link's own path is never a filename)."""
+    parsed = urlparse(url)
+    base = Path(parsed.path).name
+    if base.lower().endswith(".pdf"):
+        return base
+    host = (parsed.netloc or "link").replace(":", "_")
+    return f"{host}_{base}.pdf" if base else f"{host}.pdf"
+
+
+def _pdf_bytes_from_png_pages(png_pages: list) -> bytes:
+    """
+    Assembles `png_pages` (page-ordered PNG bytes, e.g. from a Canva/Pitch
+    render - see brochure_enrichment._fetch_canva_rendered_page/_fetch_
+    pitch_rendered_page) into a single in-memory PDF, one page per image,
+    each page sized to match its own image - so a multi-page design
+    becomes one ordinary multi-page PDF, indistinguishable downstream from
+    any other uploaded PDF.
+    """
+    doc = fitz.open()
+    try:
+        for png_bytes in png_pages:
+            img_doc = fitz.open(stream=png_bytes, filetype="png")
+            try:
+                img_pdf = fitz.open("pdf", img_doc.convert_to_pdf())
+                try:
+                    doc.insert_pdf(img_pdf)
+                finally:
+                    img_pdf.close()
+            finally:
+                img_doc.close()
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
+def _fetch_pasted_link(url: str):
+    """
+    Real PDF bytes for a pasted link, wrapped as a _PastedLinkFile, or None
+    on any failure. Reuses brochure_enrichment._fetch_pdf_bytes wholesale -
+    it already implements exactly the precedence this needs (a direct
+    document link fetched as-is; a Canva/Pitch "view" link read via the
+    existing render service, when configured; anything else resolved one
+    hop via resolve_brochure_link's landing-page scan) for any brochure_
+    link fetch already, so this never duplicates that logic.
+
+    The ONE case _fetch_pdf_bytes itself returns something other than
+    real PDF bytes: a Canva/Pitch link renders to list[bytes] (PNG pages,
+    never a PDF) - assembled into one here via _pdf_bytes_from_png_pages
+    so every caller of this function gets the same PDF-bytes contract
+    regardless of which of the three strategies actually produced it.
+    """
+    data = brochure_enrichment._fetch_pdf_bytes(url)
+    if data is None:
+        return None
+    if isinstance(data, list):
+        try:
+            data = _pdf_bytes_from_png_pages(data)
+        except Exception:
+            return None
+    return _PastedLinkFile(_filename_from_url(url), data)
+
+
 with page_setup.setup_page("upload"):
     st.title("Upload Brochure")
 
@@ -549,6 +653,92 @@ with page_setup.setup_page("upload"):
         type=["pdf", "eml", "xlsx", "csv"],
         accept_multiple_files=True,
     )
+
+    # Pasted links live in their own session_state list, independent of
+    # uploaded_files (a real st.file_uploader value, which Streamlit itself
+    # owns and re-supplies every rerun) - each entry is fetched EAGERLY,
+    # right when "Add link" is clicked, not deferred to Extract time, so a
+    # failure (see PASTED_LINK_UNREADABLE_MESSAGE) shows inline in the
+    # "ready to extract" list below well before Extract is ever clicked.
+    # excluded_upload_file_ids is the parallel mechanism for an UPLOADED
+    # file's own "remove" button - st.file_uploader has no API to drop one
+    # file from an existing multi-file selection, so a removed file simply
+    # stays selected in the widget itself but is filtered out everywhere
+    # below by its own stable .file_id.
+    st.session_state.setdefault("pasted_links", [])
+    st.session_state.setdefault("excluded_upload_file_ids", set())
+    st.session_state.setdefault("paste_link_input_epoch", 0)
+
+    link_input_col, add_link_col = st.columns([5, 1])
+    with link_input_col:
+        pasted_link_text = st.text_input(
+            "Or paste a link to a brochure (a PDF, or a Canva/Pitch view link)",
+            key=f"paste_link_input_{st.session_state['paste_link_input_epoch']}",
+        )
+    with add_link_col:
+        st.write("")  # vertical alignment with the text_input's own label row
+        add_link_clicked = st.button("Add link")
+
+    if add_link_clicked:
+        candidate = pasted_link_text.strip()
+        if not candidate:
+            st.warning("Paste a link first.")
+        elif not looks_like_url(candidate):
+            st.warning("That doesn't look like a valid link.")
+        else:
+            with st.spinner(f"Fetching {candidate}..."):
+                fetched = _fetch_pasted_link(candidate)
+            st.session_state["pasted_links"].append({"id": str(uuid.uuid4()), "url": candidate, "wrapper": fetched})
+            # A fresh widget key next render clears the input - see
+            # _selection_epoch_key in pages/2_Review_and_Master.py for the
+            # same "bump a counter to force a new key" idiom already used
+            # elsewhere in this app for exactly this reason.
+            st.session_state["paste_link_input_epoch"] += 1
+            st.rerun()
+
+    # The unified "ready to extract" list - every uploaded file not
+    # excluded, plus every pasted link (successful or not - a failed one
+    # still shows here with its own warning, per PASTED_LINK_UNREADABLE_
+    # MESSAGE, purely so a reviewer can see it and remove it; it never
+    # contributes to ready_link_files below). One remove control per
+    # entry, regardless of which kind it is.
+    ready_uploaded_files = [
+        f for f in (uploaded_files or []) if f.file_id not in st.session_state["excluded_upload_file_ids"]
+    ]
+    ready_link_files = [
+        entry["wrapper"] for entry in st.session_state["pasted_links"] if entry["wrapper"] is not None
+    ]
+
+    if ready_uploaded_files or st.session_state["pasted_links"]:
+        st.markdown("**Ready to extract:**")
+        for f in ready_uploaded_files:
+            entry_col, remove_col = st.columns([6, 1])
+            with entry_col:
+                st.write(f"📄 {f.name}")
+            with remove_col:
+                if st.button("✕", key=f"remove_upload_{f.file_id}"):
+                    st.session_state["excluded_upload_file_ids"].add(f.file_id)
+                    st.rerun()
+        for entry in st.session_state["pasted_links"]:
+            entry_col, remove_col = st.columns([6, 1])
+            with entry_col:
+                label = entry["wrapper"].name if entry["wrapper"] is not None else entry["url"]
+                st.write(f"🔗 {label}")
+                if entry["wrapper"] is None:
+                    st.warning(PASTED_LINK_UNREADABLE_MESSAGE)
+            with remove_col:
+                if st.button("✕", key=f"remove_link_{entry['id']}"):
+                    st.session_state["pasted_links"] = [
+                        e for e in st.session_state["pasted_links"] if e["id"] != entry["id"]
+                    ]
+                    st.rerun()
+
+    # From here on, uploaded_files IS the combined, filtered "ready" list -
+    # every existing use below (spreadsheet-sheet scanning, the Extract
+    # button's own disabled/total-count logic, the Extract loop itself)
+    # needs no further change at all, since a pasted link's own
+    # _PastedLinkFile already exposes exactly what an UploadedFile does.
+    uploaded_files = ready_uploaded_files + ready_link_files
 
     # Column mapping itself is fully automatic (see suggest_mapping). A
     # genuinely CRITICAL field (extract_spreadsheet.CRITICAL_FIELDS) going
