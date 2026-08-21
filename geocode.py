@@ -609,6 +609,63 @@ def _best_places_result(query: str, source_hint: dict) -> dict:
     return last
 
 
+def _submarket_query_variants(submarket: str) -> list:
+    """
+    Submarket text for a Places Text Search query, as one or two variants
+    to try in order. The NO-SPACE variant is tried FIRST, the submarket
+    exactly as extracted/normalized (never altered - that normalization
+    is correct and untouched by this) SECOND, as one additional fallback,
+    never a replacement - see below for why this order, specifically, is
+    the only one that actually changes anything. Returns [None] for a row
+    with no submarket at all (geocode_row's own query-building already
+    treats None as "omit this segment"), or [submarket] alone (no second
+    variant) when stripping spaces changes nothing.
+
+    General on purpose - strips whatever submarket string is actually
+    present, never a hardcoded "Midtown" special case, so any other
+    multi-word submarket whose no-space form happens to disambiguate
+    better gets the same chance.
+
+    Confirmed real case this exists for: a real MetSpace email lists
+    "Adler House" under its own "MID TOWN" section header, with no
+    address_1/postcode stated anywhere - Tier 2's building-only fallback
+    is the only path available. Querying the real Places API directly:
+    "Adler House, Mid Town, London, UK" (the stated, correct two-word
+    submarket) returns 9 ambiguous candidates, including two different
+    wrong buildings (one of which a real upload actually geocoded to);
+    "Adler House, Midtown, London, UK" (no space) returns exactly ONE
+    candidate - the real Adler House in Holborn. Google's Text Search
+    appears to match "Mid Town" against an unrelated place literally
+    named "Midtown" (20 Procter St) among the 9, diluting the result set
+    in a way the single-word form doesn't.
+
+    Why no-space has to go FIRST, not merely be appended as a fallback
+    tried only once the spaced version fails: a row with no source-stated
+    postcode/address hint at all (exactly the Adler House shape) has
+    nothing for _postcode_hint_conflicts to check a candidate against, so
+    _best_places_result accepts the FIRST in-bbox candidate a query
+    returns, unconditionally - confirmed directly, this is exactly what
+    already (wrongly) geocodes Adler House today. The spaced query's own
+    first candidate is always comfortably within the London bbox, so it
+    is always accepted on the spot; a same-candidate no-space attempt
+    tried only AFTER that would therefore never even run for this shape
+    of row. Trying no-space first costs nothing when it isn't needed (a
+    single-word or absent submarket returns no second variant at all, see
+    above; a multi-word submarket that already resolves correctly today
+    is not touched by this module's own extraction/normalization, only by
+    which STRING gets sent to Places first) and is the only ordering that
+    lets the more discriminating query actually get first use of that
+    same "accept the first in-bbox candidate" rule, before a noisier
+    spaced query result claims it instead.
+    """
+    if not submarket:
+        return [None]
+    no_space = submarket.replace(" ", "")
+    if no_space != submarket:
+        return [no_space, submarket]
+    return [submarket]
+
+
 def _fallback_query_texts(row: ListingRow, source_hint: dict) -> list:
     """
     Additional building-text variants to try in Places Text Search if every
@@ -687,16 +744,31 @@ def geocode_row(row: ListingRow) -> ListingRow:
         # from stronger source evidence - see _fallback_query_texts) is
         # tried before giving up - never "candidate 1 conflicts -> blank"
         # while a safer variant remains untried.
+        #
+        # Each candidate is itself tried against every _submarket_query_
+        # variants() variant (a no-space submarket variant first, then the
+        # submarket exactly as extracted/normalized - see that function's
+        # own docstring for why THAT specific order is the only one that
+        # changes anything) before moving on to the next candidate - same
+        # "keep trying safer/differently-phrased queries before giving up"
+        # principle, one level deeper. Same OK-and-in-bbox acceptance check
+        # either way; a submarket variant is never given any different
+        # treatment than the base query once it's built.
         result = {"status": "ZERO_RESULTS"}
         for candidate in query_variants:
-            query_parts = [candidate]
-            if row.submarket:
-                query_parts.append(row.submarket)
-            query_parts.append("London, UK")
-            query = ", ".join(query_parts)
+            matched = False
+            for submarket_text in _submarket_query_variants(row.submarket):
+                query_parts = [candidate]
+                if submarket_text:
+                    query_parts.append(submarket_text)
+                query_parts.append("London, UK")
+                query = ", ".join(query_parts)
 
-            result = _best_places_result(query, source_hint)
-            if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
+                result = _best_places_result(query, source_hint)
+                if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
+                    matched = True
+                    break
+            if matched:
                 break
 
         if result["status"] == "OK" and within_london_bbox(result["lat"], result["lng"]):
