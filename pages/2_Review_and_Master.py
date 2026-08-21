@@ -141,6 +141,37 @@ def _render_compact_diff_table(diff_rows: list) -> None:
         display_utils.render_compact_before_after_row(d["field"], d["old"], d["new"])
 
 
+def _render_auto_updates_diff(plan, auto_updates: dict, key_prefix: str) -> set:
+    """
+    Like _render_compact_diff_table, but specifically for the "Automatic
+    updates" -> "View changes" expander: each property gets its own "Don't
+    apply this update" checkbox, so a reviewer can opt one property back
+    out of the auto-applied set before Approve, without needing to review
+    or re-accept any of its individual fields. Nothing is written to master
+    until Approve is clicked (see the `updates` dict built right before that
+    button), so excluding a property here just means it never enters that
+    dict at all - its OLD master values are left exactly as they were,
+    never a real reversal of anything already on disk.
+
+    Returns the set of master_index values the reviewer chose to exclude -
+    the caller pops those out of auto_updates before merging it into
+    `updates`.
+    """
+    excluded = set()
+    for master_index, fields in auto_updates.items():
+        old_rec = plan.master_records[master_index]
+        st.markdown(f"**{display_utils.row_label(old_rec)}**")
+        if st.checkbox(
+            "↩ Don't apply this update", key=f"{key_prefix}_{master_index}_exclude",
+        ):
+            excluded.add(master_index)
+        for field_name, new_val in fields.items():
+            if field_name == "source_file":
+                continue
+            display_utils.render_compact_before_after_row(field_name, old_rec.get(field_name), new_val)
+    return excluded
+
+
 def _render_merge_field_choice(field_name: str, values: list, labels: list, key: str):
     """
     One field's peer-value comparison for the intra-batch duplicate merge UI
@@ -508,6 +539,8 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
     status_text = "; ".join(master_merge.let_status_display_text(getattr(u.new_row, f)) for f in u.let_status_fields)
 
     st.warning(f"**{label}**\n\n{provider} lists this brand-new property as **{status_text}**.")
+    if master_merge.new_property_missing_location(row_dict):
+        st.caption("📍 Address, postcode & map location not found — added anyway")
 
     choice = st.radio(
         "What would you like to do?",
@@ -1893,12 +1926,15 @@ def _render_pending_review(pending: list):
     # "View changes" expander; no field-by-field Apply buttons for changes
     # already considered safe. ====
     if auto_updates:
-        n = len(auto_updates)
         st.subheader("✅ Automatic updates")
-        st.info(f"{n} existing propert{'y' if n == 1 else 'ies'} will be updated automatically.")
         with st.expander("View changes"):
-            auto_diff_rows, _, _ = master_merge.build_approval_summary(plan, auto_updates, [], frozenset())
-            _render_compact_diff_table(auto_diff_rows)
+            excluded_auto_indices = _render_auto_updates_diff(plan, auto_updates, "auto_update")
+        for idx in excluded_auto_indices:
+            auto_updates.pop(idx, None)
+        # Counted AFTER exclusion, so a checked "Don't apply this update"
+        # box is reflected here too - not just in the final `updates` merge.
+        n = len(auto_updates)
+        st.info(f"{n} existing propert{'y' if n == 1 else 'ies'} will be updated automatically.")
 
     # ==== 3. New properties ====
     if plain_new:
@@ -1906,8 +1942,11 @@ def _render_pending_review(pending: list):
         st.subheader("📄 New properties")
         st.info(f"{n} new propert{'y' if n == 1 else 'ies'} will be added.")
         with st.expander("View new properties"):
-            for label in master_merge.new_property_labels([u.new_row for u in plain_new]):
+            labels = master_merge.new_property_labels([u.new_row for u in plain_new])
+            for label, u in zip(labels, plain_new):
                 st.write(label)
+                if master_merge.new_property_missing_location(u.new_row.model_dump()):
+                    st.caption("📍 Address, postcode & map location not found — added anyway")
         new_rows_final.extend(
             u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
         )

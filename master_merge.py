@@ -1571,6 +1571,19 @@ def new_property_labels(rows: list) -> list:
     return labels
 
 
+# Checked together, never individually - a new property missing ONLY its
+# postcode (say) still has an address_1 or lat/lng a reviewer can act on;
+# this is specifically the "nothing geographic came through at all" case.
+NEW_PROPERTY_LOCATION_FIELDS = ("address_1", "postcode", "lat", "lng")
+
+
+def new_property_missing_location(row_dict: dict) -> bool:
+    """True when address_1, postcode, lat, AND lng are all blank on a
+    genuinely new property - purely informational (see the Review page's
+    own "added anyway" note), never a reason to withhold the row itself."""
+    return all(_is_blank(row_dict.get(f)) for f in NEW_PROPERTY_LOCATION_FIELDS)
+
+
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
     """Cheap, stdlib-only fuzzy hint for the "no match" review section - not
     part of matching itself, just reduces manual searching when a near-miss
