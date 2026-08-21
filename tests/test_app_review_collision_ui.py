@@ -97,18 +97,19 @@ class CollisionGroupRendersAsOneDecisionTests(unittest.TestCase):
         # no need to simulate opening it.
         self.assertTrue(any(e.label == "View changes" for e in at.expander))
         markdown_text = "".join(m.value or "" for m in at.markdown)
-        # The property name appears exactly ONCE as its own compact-table
-        # group header (see _render_compact_diff_table) - confirms the
+        # The property name appears exactly ONCE as its own full-width
+        # divider row (see _diff_table_divider_row_html) - confirms the
         # group was consolidated into a single property's worth of
-        # changes, not double-counted, rather than counting one repeated
-        # "**Copthall House** — field" header per field as the old
-        # one-big-card-per-field layout did.
-        self.assertEqual(markdown_text.count("**Copthall House — Copthall Estates — 4th Floor**"), 1)
-        # Every changed field appears as its own compact "Field: before ->
-        # after" line. address_1 isn't here - it's identical to what
-        # master already had, so it's not a change at all.
+        # changes, not double-counted, rather than a divider row per field
+        # as the old one-big-card-per-field layout would have produced.
+        self.assertEqual(
+            markdown_text.count('<td colspan="3">Copthall House — Copthall Estates — 4th Floor</td>'), 1,
+        )
+        # Every changed field appears as its own Field/Current/New table
+        # row. address_1 isn't here - it's identical to what master
+        # already had, so it's not a change at all.
         for label in ("Submarket", "Lat", "Lng", "Special Features", "Contacts"):
-            self.assertIn(f"{label}:", markdown_text)
+            self.assertIn(f"<td>{label}</td>", markdown_text)
 
     def test_one_field_disagreement_still_forces_only_that_one_choice(self):
         master_writer.write_master([

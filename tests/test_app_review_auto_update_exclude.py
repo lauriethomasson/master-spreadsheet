@@ -91,6 +91,21 @@ class AutoUpdateExcludeCheckboxTests(IsolatedCwdTestCase):
         exclude_checkboxes = [c for c in view_changes[0].checkbox if c.label == _DONT_APPLY]
         self.assertEqual(len(exclude_checkboxes), 2)
 
+    def test_view_changes_renders_the_new_html_diff_table_per_property(self):
+        # Same Field/Current/New table styling as _render_compact_diff_
+        # table (see _diff_table_divider_row_html/_diff_table_row_html) -
+        # one small table per property here (a live checkbox can't live
+        # inside static HTML), each with its own divider-style header row.
+        at = self._two_pentonville_style_auto_updates()
+        view_changes = [e for e in at.expander if e.label == "View changes"][0]
+        markdown_text = "".join(m.value or "" for m in view_changes.markdown)
+
+        self.assertEqual(markdown_text.count('<table class="diff-table">'), 4)  # 2 divider tables + 2 field tables
+        self.assertIn('<td colspan="3">44 Pentonville Road — MetSpace</td>', markdown_text)
+        self.assertIn('<td colspan="3">50 Pentonville Road — MetSpace</td>', markdown_text)
+        self.assertIn("<td>Special Features</td>", markdown_text)
+        self.assertIn("<td>4 MR + 3 PB; Available: December</td>", markdown_text)
+
     def test_checking_it_excludes_only_that_property_on_approve(self):
         at = self._two_pentonville_style_auto_updates()
         view_changes = [e for e in at.expander if e.label == "View changes"][0]

@@ -1,4 +1,5 @@
 import hashlib
+import html
 import uuid
 
 import pandas as pd
@@ -127,26 +128,76 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
     return approved
 
 
+# Shared styling for every real HTML diff table on this page (see
+# _render_compact_diff_table/_render_auto_updates_diff below) - a plain
+# <table>, never st.dataframe/st.table, specifically so a property's own
+# name can be a genuine full-width divider row spanning all 3 columns
+# (colspan="3"), which neither Streamlit table widget supports at all.
+# rgba-based shading (not a hardcoded hex color) so the divider row reads
+# correctly against both a light and a dark Streamlit theme.
+_DIFF_TABLE_CSS = """
+<style>
+.diff-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.diff-table th, .diff-table td { padding: 4px 10px; text-align: left; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }
+.diff-table th { font-weight: 600; }
+.diff-table tr.diff-table-divider td { font-weight: 700; background-color: rgba(128, 128, 128, 0.15); }
+</style>
+"""
+
+_DIFF_TABLE_HEADER_ROW = "<tr><th>Field</th><th>Current</th><th>New</th></tr>"
+
+
+def _diff_table_divider_row_html(label: str) -> str:
+    """One property's own full-width, bold, shaded divider row - see
+    _DIFF_TABLE_CSS - standing in for the separate bold heading this page
+    used to render above each property's own block of plain-text lines.
+    html.escape guards `label` (a real row_label()/property string) since
+    this is genuine unsafe_allow_html markup."""
+    return f'<tr class="diff-table-divider"><td colspan="3">{html.escape(label)}</td></tr>'
+
+
+def _diff_table_row_html(field: str, old_val, new_val) -> str:
+    """One Field/Current/New row - the same friendly_field_label/format_
+    field_value_for_display formatting every other diff display on this
+    page already uses. html.escape guards every value: a free-text field
+    (special_features/contacts) can contain arbitrary extracted text, and
+    this is genuine unsafe_allow_html markup."""
+    label = html.escape(display_utils.friendly_field_label(field))
+    old_display = html.escape(display_utils.format_field_value_for_display(field, old_val))
+    new_display = html.escape(display_utils.format_field_value_for_display(field, new_val))
+    return f"<tr><td>{label}</td><td>{old_display}</td><td>{new_display}</td></tr>"
+
+
 def _render_compact_diff_table(diff_rows: list) -> None:
     """
     Compact, read-only rendering of a list of {"property", "field", "old",
     "new"} dicts (see master_merge.build_approval_summary's own return
-    shape) - the property name is shown once per group (consecutive rows
-    for the same property, exactly how build_approval_summary already
-    produces them - one master_index's fields appended together, never
-    interleaved with another's), followed by one compact "Field: before →
-    after" line per field (see display_utils.render_compact_before_after_
-    row) instead of a large bordered box per field. Used for every purely-
-    confirmatory diff display on this page (automatic updates, a post-
-    approval summary, a manual cell-edit confirmation) - never a decision
-    UI, so there is nothing to check/apply here, only to read.
+    shape) as ONE continuous Field/Current/New HTML table (see _DIFF_
+    TABLE_CSS - real markup via st.markdown(unsafe_allow_html=True), never
+    st.dataframe/st.table, neither of which supports a spanning divider
+    row) - the property name is shown once per group (consecutive rows for
+    the same property, exactly how build_approval_summary already produces
+    them - one master_index's fields appended together, never interleaved
+    with another's) as its own full-width divider row (see _diff_table_
+    divider_row_html) rather than a separate heading above a block of
+    plain-text lines. Used for every purely-confirmatory diff display on
+    this page (a post-approval summary, a manual cell-edit confirmation) -
+    never a decision UI, so there is nothing to check/apply here, only to
+    read.
     """
+    if not diff_rows:
+        return
+    body_rows = []
     last_property = None
     for d in diff_rows:
         if d["property"] != last_property:
-            st.markdown(f"**{d['property']}**")
+            body_rows.append(_diff_table_divider_row_html(d["property"]))
             last_property = d["property"]
-        display_utils.render_compact_before_after_row(d["field"], d["old"], d["new"])
+        body_rows.append(_diff_table_row_html(d["field"], d["old"], d["new"]))
+    st.markdown(
+        _DIFF_TABLE_CSS + f'<table class="diff-table">{_DIFF_TABLE_HEADER_ROW}{"".join(body_rows)}</table>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_auto_updates_diff(plan, auto_updates: dict, key_prefix: str) -> set:
@@ -161,22 +212,42 @@ def _render_auto_updates_diff(plan, auto_updates: dict, key_prefix: str) -> set:
     dict at all - its OLD master values are left exactly as they were,
     never a real reversal of anything already on disk.
 
+    Same Field/Current/New HTML table styling as _render_compact_diff_
+    table (see _DIFF_TABLE_CSS/_diff_table_divider_row_html/_diff_table_
+    row_html) for visual consistency across the page, but split into one
+    small table PER property rather than a single continuous one - a real
+    st.checkbox is a live widget, which can never be embedded inside
+    static unsafe_allow_html markup, so it's rendered as an ordinary
+    Streamlit widget alongside each property's own divider row (via
+    st.columns) rather than inside the table itself.
+
     Returns the set of master_index values the reviewer chose to exclude -
     the caller pops those out of auto_updates before merging it into
     `updates`.
     """
     excluded = set()
+    if auto_updates:
+        st.markdown(_DIFF_TABLE_CSS, unsafe_allow_html=True)
     for master_index, fields in auto_updates.items():
         old_rec = plan.master_records[master_index]
-        st.markdown(f"**{display_utils.row_label(old_rec)}**")
-        if st.checkbox(
-            "↩ Don't apply this update", key=f"{key_prefix}_{master_index}_exclude",
-        ):
-            excluded.add(master_index)
-        for field_name, new_val in fields.items():
-            if field_name == "source_file":
-                continue
-            display_utils.render_compact_before_after_row(field_name, old_rec.get(field_name), new_val)
+        label = display_utils.row_label(old_rec)
+        header_col, checkbox_col = st.columns([5, 2])
+        with header_col:
+            st.markdown(
+                f'<table class="diff-table">{_diff_table_divider_row_html(label)}</table>',
+                unsafe_allow_html=True,
+            )
+        with checkbox_col:
+            if st.checkbox("↩ Don't apply this update", key=f"{key_prefix}_{master_index}_exclude"):
+                excluded.add(master_index)
+        field_rows = "".join(
+            _diff_table_row_html(field_name, old_rec.get(field_name), new_val)
+            for field_name, new_val in fields.items() if field_name != "source_file"
+        )
+        st.markdown(
+            f'<table class="diff-table">{_DIFF_TABLE_HEADER_ROW}{field_rows}</table>',
+            unsafe_allow_html=True,
+        )
     return excluded
 
 

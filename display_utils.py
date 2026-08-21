@@ -93,22 +93,6 @@ def format_field_value_for_display(field: str, value) -> str:
     return str(value)
 
 
-def render_compact_before_after_row(field: str, old_val, new_val) -> None:
-    """
-    One compact, read-only "Field: before → after" line - the non-
-    editable counterpart to render_new_value_input's own compact row (see
-    pages/2_Review_and_Master.py's _render_field_rows), used wherever a
-    diff is shown purely for confirmation (already-
-    applied automatic updates, a post-approval summary, a manual cell-edit
-    confirmation) rather than a decision still to be made. Deliberately no
-    bordered box/bare caption pair - see render_before_after's own
-    docstring for the large-card layout this replaces.
-    """
-    old_display = format_field_value_for_display(field, old_val)
-    new_display = format_field_value_for_display(field, new_val)
-    st.write(f"{friendly_field_label(field)}: {old_display} → {new_display}")
-
-
 def render_before_after(old_val, new_val) -> None:
     """
     Side-by-side Before/After display for one changed field's old and new

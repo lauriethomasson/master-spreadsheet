@@ -129,6 +129,27 @@ class EditPropertyFormTests(unittest.TestCase):
         self.assertEqual(log[-1]["source"], "manual_edit")
         self.assertEqual(log[-1]["fields_changed"], 1)
 
+    # The save confirmation's own diff (_render_manual_edit_confirmation ->
+    # _render_compact_diff_table) renders as a real Field/Current/New HTML
+    # table, unconditionally (no "View changes" expander gating it) - see
+    # that function's own docstring on why it's always shown inline.
+    def test_save_confirmation_shows_the_diff_as_a_table(self):
+        self._write_two_rows()
+        at = self._open_and_select("row-B")
+        self._click_edit(at)
+
+        size_input = next(n for n in at.number_input if n.label == "Size Sqft")
+        size_input.set_value(4500.0).run()
+        save_btn = next(b for b in at.button if b.label == "Save")
+        save_btn.click().run()
+        self.assertFalse(at.exception)
+
+        markdown_text = "".join(m.value or "" for m in at.markdown)
+        self.assertIn('<table class="diff-table">', markdown_text)
+        self.assertIn("<td>Size</td>", markdown_text)
+        self.assertIn("<td>2,000 sq ft</td>", markdown_text)
+        self.assertIn("<td>4,500 sq ft</td>", markdown_text)
+
     # 3/18. Cancel changes nothing - no write, form closes.
     def test_cancel_writes_nothing(self):
         self._write_two_rows()
