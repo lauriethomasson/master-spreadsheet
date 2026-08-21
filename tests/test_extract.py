@@ -646,5 +646,128 @@ class ImagesFromPngPagesMimeTypeSniffingTests(unittest.TestCase):
         self.assertEqual(parts[1].inline_data.data, self._PNG_BYTES)
 
 
+class ImagesFromPngPagesLinkCandidatesTests(unittest.TestCase):
+    """images_from_png_pages' own page_links param - interleaves a text
+    Part describing a page's own real link candidates immediately after
+    that page's own image, for the paste-a-link Canva/Pitch flow (see
+    canva_renderer/app.py's own _page_link_candidates)."""
+
+    _PNG_BYTES = b"\x89PNG\r\n\x1a\n rest of a real PNG"
+
+    def test_default_page_links_none_behaves_exactly_like_before_this_existed(self):
+        parts = extract.images_from_png_pages([self._PNG_BYTES, self._PNG_BYTES])
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(hasattr(p, "inline_data") for p in parts))
+
+    def test_a_page_with_links_gets_a_text_part_right_after_its_image(self):
+        page_links = [[{"href": "https://colliers.com/kingsland-house", "text": "LINK TO BROCHURE"}]]
+        parts = extract.images_from_png_pages([self._PNG_BYTES], page_links=page_links)
+
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(hasattr(parts[0], "inline_data"))  # the image, first
+        self.assertIsInstance(parts[1], str)  # the link text, immediately after
+        self.assertIn("'LINK TO BROCHURE' -> https://colliers.com/kingsland-house", parts[1])
+
+    def test_a_page_with_no_links_gets_no_text_part_at_all(self):
+        page_links = [[]]
+        parts = extract.images_from_png_pages([self._PNG_BYTES], page_links=page_links)
+        self.assertEqual(len(parts), 1)  # just the image - no empty/noise text Part
+
+    def test_multiple_pages_each_get_their_own_links_right_after_their_own_image(self):
+        page_links = [
+            [{"href": "https://example.com/a.pdf", "text": "Brochure"}],
+            [],
+            [{"href": "https://example.com/c.pdf", "text": "Building C"}],
+        ]
+        parts = extract.images_from_png_pages(
+            [self._PNG_BYTES, self._PNG_BYTES, self._PNG_BYTES], page_links=page_links,
+        )
+
+        # image, text, image, (no text for the middle page), image, text
+        self.assertEqual(len(parts), 5)
+        self.assertTrue(hasattr(parts[0], "inline_data"))
+        self.assertIn("Brochure", parts[1])
+        self.assertTrue(hasattr(parts[2], "inline_data"))
+        self.assertTrue(hasattr(parts[3], "inline_data"))
+        self.assertIn("Building C", parts[4])
+
+    def test_multiple_links_on_one_page_are_all_included(self):
+        page_links = [[
+            {"href": "https://example.com/brochure.pdf", "text": "LINK TO BROCHURE"},
+            {"href": "mailto:sales@example.com", "text": "BOOK A VIEWING"},
+        ]]
+        parts = extract.images_from_png_pages([self._PNG_BYTES], page_links=page_links)
+
+        self.assertIn("LINK TO BROCHURE", parts[1])
+        self.assertIn("BOOK A VIEWING", parts[1])
+
+
+class ExtractFromPngPagesTests(unittest.TestCase):
+    """extract_from_png_pages - the paste-a-link (Canva/Pitch) counterpart
+    to extract(), operating on already-rendered page images rather than a
+    real PDF file on disk. Gemini itself is mocked wholesale (call_gemini),
+    same principle as every other test in this module - no real rendering
+    or network call involved."""
+
+    _PNG_BYTES = b"\x89PNG\r\n\x1a\n rest of a real PNG"
+
+    def test_builds_rows_from_gemini_output_same_as_extract(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [{"building": "Kingsland House", "floor_unit": "3rd", "brochure_link": None}],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw) as mock_call_gemini:
+            rows = extract.extract_from_png_pages(
+                [self._PNG_BYTES], original_filename="colliers.pdf", brochure_url="https://storage/colliers.pdf",
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "Kingsland House")
+        self.assertEqual(rows[0].source_file, "colliers.pdf")
+        # No genuine per-unit link and no page_links given - falls back to
+        # the shared document link, exactly like extract()'s own rule 3.
+        self.assertEqual(rows[0].brochure_link, "https://storage/colliers.pdf")
+        mock_call_gemini.assert_called_once()
+
+    def test_page_links_are_threaded_through_to_the_gemini_call(self):
+        raw = {"provider": None, "contacts": None, "units": []}
+        page_links = [[{"href": "https://example.com/a.pdf", "text": "27-29 Gloucester Place"}]]
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw) as mock_call_gemini:
+            extract.extract_from_png_pages(
+                [self._PNG_BYTES], original_filename="deck.pdf", page_links=page_links,
+            )
+
+        called_parts = mock_call_gemini.call_args.args[2]
+        joined = " ".join(p for p in called_parts if isinstance(p, str))
+        self.assertIn("27-29 Gloucester Place", joined)
+        self.assertIn("https://example.com/a.pdf", joined)
+
+    def test_a_genuine_per_unit_link_from_gemini_is_kept_not_overridden(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [{
+                "building": "27-29 Gloucester Place", "floor_unit": "2nd",
+                "brochure_link": "https://blob.example.com/gloucester.pdf",
+            }],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [self._PNG_BYTES], original_filename="deck.pdf", brochure_url="https://storage/deck.pdf",
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://blob.example.com/gloucester.pdf")
+
+    def test_no_original_filename_or_brochure_url_falls_back_to_the_filename_itself(self):
+        raw = {"provider": None, "contacts": None, "units": [{"building": "X", "brochure_link": None}]}
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="pasted.pdf")
+
+        self.assertEqual(rows[0].brochure_link, "pasted.pdf")
+
+
 if __name__ == "__main__":
     unittest.main()

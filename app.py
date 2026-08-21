@@ -561,16 +561,33 @@ PASTED_LINK_UNREADABLE_MESSAGE = (
 class _PastedLinkFile:
     """
     Minimal file-like stand-in for a pasted link's own fetched PDF bytes -
-    exposes exactly .name/.getvalue(), the only two attributes the Extract
-    loop below ever reads off an uploaded_file, so a successfully-fetched
-    link can sit in the exact same uploaded_files list as a real st.
-    file_uploader UploadedFile and flow through hashing/staging/brochure
-    enrichment completely unchanged.
+    exposes exactly .name/.getvalue(), the only two attributes hashing/
+    staging/brochure enrichment ever read off an uploaded_file, so a
+    successfully-fetched link can sit in the exact same uploaded_files
+    list as a real st.file_uploader UploadedFile and flow through all of
+    that completely unchanged.
+
+    png_pages/page_links (both None for a direct-PDF or resolved-landing-
+    page link - see _fetch_pasted_link) are the ONE piece the Extract
+    loop below does treat specially: when present, they're the ORIGINAL
+    Canva/Pitch render pages and each page's own real link candidates
+    (see brochure_enrichment.fetch_rendered_page_with_links) - extracted
+    via extract.extract_from_png_pages directly (never by re-rasterizing
+    .getvalue()'s own assembled PDF bytes back into images - png_pages
+    already ARE real screenshots, so that round trip would just be a
+    slower, lossier no-op for identical content) so Gemini can attribute
+    a per-property brochure_link from each page's own real anchors,
+    rather than every unit falling back to one shared document link.
+    .getvalue()'s own assembled-PDF bytes are still what gets persisted
+    as this pasted link's own "whole document" fallback copy either way -
+    only which BYTES Gemini actually sees differs.
     """
 
-    def __init__(self, name: str, data: bytes):
+    def __init__(self, name: str, data: bytes, png_pages: list = None, page_links: list = None):
         self.name = name
         self._data = data
+        self.png_pages = png_pages
+        self.page_links = page_links
 
     def getvalue(self) -> bytes:
         return self._data
@@ -619,28 +636,77 @@ def _pdf_bytes_from_png_pages(png_pages: list) -> bytes:
 def _fetch_pasted_link(url: str):
     """
     Real PDF bytes for a pasted link, wrapped as a _PastedLinkFile, or None
-    on any failure. Reuses brochure_enrichment._fetch_pdf_bytes wholesale -
-    it already implements exactly the precedence this needs (a direct
-    document link fetched as-is; a Canva/Pitch "view" link read via the
-    existing render service, when configured; anything else resolved one
-    hop via resolve_brochure_link's landing-page scan) for any brochure_
-    link fetch already, so this never duplicates that logic.
+    on any failure - the exact precedence a brochure_link fetch already
+    uses: a direct document link fetched as-is; a Canva/Pitch "view" link
+    read via the existing render service, when configured; anything else
+    resolved one hop via resolve_brochure_link's landing-page scan.
 
-    The ONE case _fetch_pdf_bytes itself returns something other than
-    real PDF bytes: a Canva/Pitch link renders to list[bytes] (PNG pages,
-    never a PDF) - assembled into one here via _pdf_bytes_from_png_pages
-    so every caller of this function gets the same PDF-bytes contract
-    regardless of which of the three strategies actually produced it.
+    The Canva/Pitch case is checked HERE, first, rather than delegated to
+    brochure_enrichment._fetch_pdf_bytes (which also has its own,
+    untouched canva/pitch branches - see FetchPdfBytesCanvaRoutingTests/
+    FetchPdfBytesPitchDispatchTests) specifically so this can ALSO get
+    each page's own real link candidates (see brochure_enrichment.
+    fetch_rendered_page_with_links) for per-property attribution during
+    extraction - _fetch_pdf_bytes's own canva/pitch branches only ever
+    return the bare page images, discarding link data, since that's the
+    correct, unchanged contract for its OTHER caller (the per-unit
+    brochure enrichment path, never touched by this). Both checks use
+    the exact same condition (is_canva_view_link(url) or is_pitch_view_
+    link(url)) AND _canva_renderer_configured()) _fetch_pdf_bytes's own
+    branches require, so nothing about the overall precedence for any
+    OTHER url shape changes - a canva/pitch url with the renderer NOT
+    configured still falls through to the generic path below exactly as
+    before, correctly failing the same clean way a generic unreadable
+    link would (see this feature's own original scoping note on the
+    Pitch renderer not needing to exist yet for this to degrade safely).
     """
+    if (
+        brochure_enrichment.is_canva_view_link(url) or brochure_enrichment.is_pitch_view_link(url)
+    ) and brochure_enrichment._canva_renderer_configured():
+        pages, page_links = brochure_enrichment.fetch_rendered_page_with_links(url)
+        if pages is None:
+            return None
+        try:
+            data = _pdf_bytes_from_png_pages(pages)
+        except Exception:
+            return None
+        return _PastedLinkFile(_filename_from_url(url), data, png_pages=pages, page_links=page_links)
+
     data = brochure_enrichment._fetch_pdf_bytes(url)
     if data is None:
         return None
-    if isinstance(data, list):
-        try:
-            data = _pdf_bytes_from_png_pages(data)
-        except Exception:
-            return None
     return _PastedLinkFile(_filename_from_url(url), data)
+
+
+def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) -> None:
+    """
+    Mutates each row's own brochure_link in place - only ever called for
+    a pasted Canva/Pitch link's own rows (see the Extract loop's own
+    png_pages branch). A per-unit link Gemini attributed from a page's
+    real link candidates (see extract.extract_from_png_pages/images_
+    from_png_pages's own page_links param) is trusted by LABEL alone up
+    to this point, never by having actually been fetched - this is where
+    that happens, reusing brochure_enrichment._fetch_pdf_bytes wholesale
+    (the exact same real-document check, and direct-vs-landing-page-scan
+    precedence, any other brochure_link fetch already uses) rather than
+    a second, differently-tuned validation. A link that fails - a real
+    page but blocked to a plain fetch, a dead link, anything that
+    doesn't resolve to real document bytes - loses to the shared
+    document-level fallback link instead of staging a dead one.
+
+    A row whose brochure_link already equals shared_fallback_link never
+    had a genuine per-unit pick at all (see finalize_brochure_link's own
+    rule 3 - the fallback IS the value already) - nothing to validate,
+    and nothing to fall back FROM either. A row flagged brochure_link_
+    is_floorplan (a floorplan link substituted in because no genuine
+    brochure link existed at all) is left alone too - a separate, pre-
+    existing mechanism this feature doesn't touch.
+    """
+    for row in rows:
+        if not row.brochure_link or row.brochure_link == shared_fallback_link or row.brochure_link_is_floorplan:
+            continue
+        if brochure_enrichment._fetch_pdf_bytes(row.brochure_link) is None:
+            row.brochure_link = shared_fallback_link
 
 
 with page_setup.setup_page("upload"):
@@ -1105,9 +1171,40 @@ with page_setup.setup_page("upload"):
                                 # the bare filename - see
                                 # finalize_brochure_link's rule 3.
                                 brochure_url = save_original_pdf(uploaded_file.getvalue(), uploaded_file.name)
-                                rows = extract.extract(
-                                    tmp_path, original_filename=uploaded_file.name, brochure_url=brochure_url
-                                )
+                                png_pages = getattr(uploaded_file, "png_pages", None)
+                                if png_pages is not None:
+                                    # A pasted Canva/Pitch link (see
+                                    # app.py's own _fetch_pasted_link/
+                                    # _PastedLinkFile) - extracted straight
+                                    # from the ORIGINAL render pages, never
+                                    # by re-rasterizing the temp file's own
+                                    # assembled-PDF bytes back into images
+                                    # (that would just be a slower, lossier
+                                    # no-op round trip for identical
+                                    # content - see extract_from_png_
+                                    # pages's own docstring). page_links
+                                    # (each page's own real <a href>
+                                    # candidates) lets Gemini attribute a
+                                    # genuine per-property brochure_link
+                                    # instead of every unit falling back to
+                                    # this one shared brochure_url.
+                                    rows = extract.extract_from_png_pages(
+                                        png_pages, original_filename=uploaded_file.name, brochure_url=brochure_url,
+                                        page_links=uploaded_file.page_links,
+                                    )
+                                    # Gemini's own per-unit pick is trusted
+                                    # by LABEL alone up to this point, never
+                                    # by having actually been fetched - a
+                                    # link genuinely labeled as the
+                                    # brochure that turns out to be a
+                                    # blocked/unreadable page must lose to
+                                    # the working shared link instead of
+                                    # silently staging a dead one.
+                                    _validate_pasted_link_brochure_links(rows, brochure_url)
+                                else:
+                                    rows = extract.extract(
+                                        tmp_path, original_filename=uploaded_file.name, brochure_url=brochure_url,
+                                    )
                             elif suffix == ".eml":
                                 rows = extract_email.extract(tmp_path, original_filename=uploaded_file.name)
                             else:

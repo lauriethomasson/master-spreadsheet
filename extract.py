@@ -405,6 +405,17 @@ Also extract for each unit:
   HARD RULE, no exceptions: if a link sits near words like "unsubscribe", "opt out", "opt-out", "manage
   preferences", "manage your subscription", or "email preferences", it must NEVER be used as a brochure_link,
   even as a last resort when nothing else is found. Leave brochure_link null for that unit instead.
+  Some pages are immediately followed by a line in this exact shape: "(Real links found on the page shown
+  just above: 'visible text' -> URL; ...)" — these are the page's own genuine, real links, already confirmed
+  to exist (never invented). When one is present, use it (following every rule above — still never a
+  booking/viewing/contact/floor-plan/unsubscribe link, still never reused across a different unit) rather
+  than relying on the visual layout alone: match a candidate to a specific unit by its own visible text —
+  e.g. the candidate's text IS that unit's own building name (a table row where the building name itself is
+  the link), or the candidate's text is an unambiguous document label ("Link to Brochure", "View Brochure",
+  "Download") sitting on a page that describes only that one unit. Never use a URL that ISN'T listed in one
+  of these lines when they're present for that page — copy it verbatim, character for character, never
+  paraphrased or guessed. A page with no such line has no real link candidates at all for this feature —
+  fall back to every rule above exactly as if this paragraph didn't exist.
 - floorplan_link: a URL specifically labeled/described as a floor plan for THIS unit (e.g. "Floor Plan",
   "Floorplan", "View floorplan", "Download Floorplans"), if one is given — the exact link brochure_link
   above must NEVER use. Leave null if no such link is given for this unit. Same generic-homepage/
@@ -507,7 +518,16 @@ def render_pages(pdf_source) -> list[types.Part]:
 _JPEG_MAGIC = b"\xff\xd8\xff"
 
 
-def images_from_png_pages(png_pages: list) -> list[types.Part]:
+def _page_links_text(links: list) -> str:
+    """One text line listing a single page's own real link candidates
+    (see canva_renderer/app.py's _page_link_candidates), in the exact
+    "'visible text' -> URL" shape PROMPT's own brochure_link instructions
+    describe - semicolon-joined when a page has more than one. Never
+    called for an empty list (see images_from_png_pages's own guard)."""
+    return "; ".join(f"{l['text']!r} -> {l['href']}" for l in links)
+
+
+def images_from_png_pages(png_pages: list, page_links: list = None) -> list:
     """
     `png_pages` (a list of already-rendered page image bytes, one per page
     - see canva_renderer/app.py's multi-page capture) wrapped as types.Part
@@ -517,22 +537,22 @@ def images_from_png_pages(png_pages: list) -> list[types.Part]:
 
     Despite this function's own name (kept for backward compatibility with
     every existing call site - see brochure_enrichment._extract_brochure_
-    units, the only caller), the bytes aren't always actually PNG: canva_
-    renderer/app.py adaptively re-encodes a large/photo-dense capture as
-    JPEG instead, to stay under Cloud Run's own hard 32MB response-size
-    ceiling (confirmed directly - a real 29-page brochure's PNG+base64
-    payload measured at 34.24MB, over that limit; JPEG at quality=85
-    measured at 7.00MB for the identical real capture). The mime_type used
-    for EVERY page here is sniffed once from the FIRST page's own magic
-    bytes (JPEG's fixed \\xff\\xd8\\xff header vs. anything else treated as
-    PNG) - a whole render's pages are always ALL the same format (the
-    renderer picks one format for the entire response, never mixed per
-    page), so checking just the first is sufficient and avoids a per-page
-    branch. Deliberately NOT a new field in the renderer's own JSON
-    response that this app would have to know about - sniffing the actual
-    bytes works correctly regardless of which of the two services gets
-    deployed first, with zero cross-service wire-contract coordination
-    required either way.
+    units, the only caller that omits page_links), the bytes aren't always
+    actually PNG: canva_renderer/app.py adaptively re-encodes a large/
+    photo-dense capture as JPEG instead, to stay under Cloud Run's own
+    hard 32MB response-size ceiling (confirmed directly - a real 29-page
+    brochure's PNG+base64 payload measured at 34.24MB, over that limit;
+    JPEG at quality=85 measured at 7.00MB for the identical real capture).
+    The mime_type used for EVERY page here is sniffed once from the FIRST
+    page's own magic bytes (JPEG's fixed \\xff\\xd8\\xff header vs.
+    anything else treated as PNG) - a whole render's pages are always ALL
+    the same format (the renderer picks one format for the entire
+    response, never mixed per page), so checking just the first is
+    sufficient and avoids a per-page branch. Deliberately NOT a new field
+    in the renderer's own JSON response that this app would have to know
+    about - sniffing the actual bytes works correctly regardless of which
+    of the two services gets deployed first, with zero cross-service
+    wire-contract coordination required either way.
 
     Deliberately NOT routed through render_pages/fitz.open at all: these
     bytes are already rendered raster pages (a real browser's own
@@ -542,9 +562,31 @@ def images_from_png_pages(png_pages: list) -> list[types.Part]:
     enrichment._extract_brochure_units) still passes the result straight
     into render_and_extract, exactly like render_pages' own output - there
     is no separate extraction path for this source.
+
+    page_links (default None - every existing call site keeps working
+    completely unchanged) is the SAME length as png_pages (see brochure_
+    enrichment.fetch_rendered_page_with_links) - when given, each page's
+    own real <a href> candidates (see canva_renderer/app.py's own
+    _page_link_candidates) are interleaved as a plain text Part
+    immediately AFTER that page's own image, in PROMPT's own documented
+    "'visible text' -> URL" shape - the same "surrounding text already
+    tells you which link belongs to which unit" idea extract_email.py's
+    own plain-text email body already lets Gemini use for attributing a
+    link to a unit, just sourced from a rendered page's real DOM links
+    instead of an email's inline text. A page with no real links at all
+    ([] in page_links) gets no text Part - never an empty/noise line.
     """
     mime_type = "image/jpeg" if png_pages and png_pages[0][:3] == _JPEG_MAGIC else "image/png"
-    return [types.Part.from_bytes(data=page, mime_type=mime_type) for page in png_pages]
+    if page_links is None:
+        return [types.Part.from_bytes(data=page, mime_type=mime_type) for page in png_pages]
+
+    parts = []
+    for i, page in enumerate(png_pages):
+        parts.append(types.Part.from_bytes(data=page, mime_type=mime_type))
+        links = page_links[i] if i < len(page_links) else []
+        if links:
+            parts.append(f"(Real links found on the page shown just above: {_page_links_text(links)})")
+    return parts
 
 
 def render_and_extract(images: list, client=None, prompt: str = None) -> dict:
@@ -633,6 +675,60 @@ def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = N
     # this doesn't apply to is completely unaffected either way.
     _attach_per_row_pdf_links(pdf_path, raw.get("units", []))
 
+    return _rows_from_raw(raw, filename, pdf_fallback_link)
+
+
+def extract_from_png_pages(
+    png_pages: list, original_filename: str, brochure_url: str = None, page_links: list = None,
+) -> list[ListingRow]:
+    """
+    Like extract(), but for a set of already-rendered page images (a
+    Canva/Pitch paste-a-link render - see app.py's own _fetch_pasted_link/
+    brochure_enrichment.fetch_rendered_page_with_links) rather than a
+    real PDF file on disk. Never rasterizes anything itself (png_pages
+    are already real screenshots), and never calls _attach_per_row_pdf_
+    links - that mechanism reads a real PDF's own embedded link
+    ANNOTATIONS (see fitz.Page.get_links), which a screenshot-derived
+    document has none of; page_links (see images_from_png_pages) is the
+    equivalent signal for THIS source, read directly from the live DOM
+    at render time instead, and is handed to Gemini itself rather than
+    joined by page position after the fact.
+
+    brochure_url here is the pasted link's own persisted-copy URL (see
+    app.py's own save_original_pdf call for its assembled synthetic
+    PDF) - the same "whole document" fallback rule 3 of finalize_
+    brochure_link already applies for an ordinary PDF upload with no
+    per-unit link of its own.
+
+    Returns rows exactly like extract() does - a caller wanting to
+    validate/replace a per-unit brochure_link this produced (see the
+    Review page's own paste-a-link validation, comparing each row's
+    brochure_link against the same brochure_url passed in here) does so
+    afterward, on the returned rows; this function itself never fetches
+    anything over the network.
+    """
+    client = get_client()
+    images = images_from_png_pages(png_pages, page_links=page_links)
+    raw = render_and_extract(images, client=client)
+    return _rows_from_raw(raw, original_filename, brochure_url or original_filename)
+
+
+def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> list[ListingRow]:
+    """
+    The raw Gemini JSON's own "units" (plus document-level provider/
+    contacts) turned into ListingRows - shared by extract() (a real PDF
+    file) and extract_from_png_pages() (an already-rendered page-image
+    source, e.g. a pasted Canva/Pitch link) so there is only ONE such
+    conversion, never two independently-drifting implementations. Each
+    caller is responsible for whatever page-specific per-unit link
+    attachment applies to ITS OWN source BEFORE calling this (see
+    extract()'s own _attach_per_row_pdf_links call, and extract_from_
+    png_pages's own docstring on why that specific mechanism doesn't
+    apply to a rendered-image source at all) - by the time raw["units"]
+    reaches here, each unit's own "brochure_link" is already whatever
+    that source-specific step (or Gemini's own vision-only guess) left
+    it as.
+    """
     brochure = {
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),

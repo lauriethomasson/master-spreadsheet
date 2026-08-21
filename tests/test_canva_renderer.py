@@ -209,6 +209,7 @@ def _make_async_page(
     go_to_page_text="1 / 1",
     go_to_page_raises=True,
     click_advances_page=True,
+    page_links=None,
 ):
     """
     A MagicMock shaped like an async Playwright Page - every method
@@ -261,6 +262,19 @@ def _make_async_page(
     MAX_CANVA_PAGES" check (0 simulates the button having been removed
     from the DOM entirely, e.g. a design whose last page coincides with
     the cap).
+
+    `page_links` mocks _page_link_candidates' own page.evaluate(
+    _PAGE_LINK_CANDIDATES_JS) call - a list of per-page link-candidate
+    lists, cycled the same way `screenshots` is (so a test exercising
+    several pages can supply exactly as many entries, or fewer and let it
+    repeat). Defaults to an empty list of links for every page, matching
+    every pre-existing test's own implicit assumption that link data is
+    irrelevant to it. page.evaluate is itself shared with the completely
+    UNRELATED _page_content_fingerprint call the advance-verification
+    logic below also makes (see `advance_state`) - both go through this
+    SAME mocked method, so _evaluate below dispatches on the script text
+    itself to answer with the right one, never a single fixed value for
+    every call regardless of which script was actually passed.
     """
     page = MagicMock()
     page.url = final_url
@@ -305,8 +319,11 @@ def _make_async_page(
     # times without an intervening successful click correctly reports
     # "unchanged", exactly like a real Canva viewer's own DOM would.
     advance_state = {"page": 1}
+    link_candidates_iter = itertools.cycle(page_links if page_links is not None else [[]])
 
     async def _evaluate(script):
+        if script == canva_renderer._PAGE_LINK_CANDIDATES_JS:
+            return next(link_candidates_iter)
         return f"content-page-{advance_state['page']}"
 
     page.evaluate = AsyncMock(side_effect=_evaluate)
@@ -374,15 +391,17 @@ def _make_async_pitch_page(
     next_button_raises=False,
     next_button_count=1,
     click_advances_page=True,
+    page_links=None,
 ):
     """
     Pitch's own counterpart to _make_async_page (see that fixture's own
-    docstring for the full shape this mirrors) - the one real difference
-    is next_disabled_sequence's own values: a plain bool (True = the
-    `disabled` attribute is present, False = absent/None) rather than
-    Canva's own literal "true"/"false" ARIA string values, matching
-    render_pitch_page_async's own `get_attribute("disabled", ...) is not
-    None` check (never Canva's own `== "true"` string comparison).
+    docstring for the full shape this mirrors, including `page_links`) -
+    the one real difference is next_disabled_sequence's own values: a
+    plain bool (True = the `disabled` attribute is present, False =
+    absent/None) rather than Canva's own literal "true"/"false" ARIA
+    string values, matching render_pitch_page_async's own `get_attribute(
+    "disabled", ...) is not None` check (never Canva's own `== "true"`
+    string comparison).
     """
     page = MagicMock()
     page.url = final_url
@@ -408,8 +427,11 @@ def _make_async_pitch_page(
     page.screenshot = AsyncMock(side_effect=_screenshot)
 
     advance_state = {"page": 1}
+    link_candidates_iter = itertools.cycle(page_links if page_links is not None else [[]])
 
     async def _evaluate(script):
+        if script == canva_renderer._PAGE_LINK_CANDIDATES_JS:
+            return next(link_candidates_iter)
         return f"content-page-{advance_state['page']}"
 
     page.evaluate = AsyncMock(side_effect=_evaluate)
@@ -486,7 +508,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page = _make_async_page(screenshots=(b"\x89PNG real bytes",))
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG real bytes"])
         self.assertIsNone(detected_total)
@@ -532,7 +554,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page = _make_async_page(screenshots=(b"\x89PNG only page",), next_button_raises=True)
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG only page"])
         context.close.assert_awaited_once()
@@ -546,7 +568,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         )
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])
         self.assertEqual(detected_total, 3)
@@ -563,7 +585,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         )
         patcher, context = self._patch_browser(page)
         with patch.object(canva_renderer, "MAX_CANVA_PAGES", 5), patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(len(pages), 5)
         context.close.assert_awaited_once()
@@ -584,7 +606,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         buf = io.StringIO()
         patcher, context = self._patch_browser(page)
         with patch.object(canva_renderer, "MAX_CANVA_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(len(pages), 3)
         stderr_output = buf.getvalue()
@@ -611,7 +633,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         buf = io.StringIO()
         patcher, context = self._patch_browser(page)
         with patch.object(canva_renderer, "MAX_CANVA_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(len(pages), 3)
         stderr_output = buf.getvalue()
@@ -634,7 +656,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         buf = io.StringIO()
         patcher, context = self._patch_browser(page)
         with patch.object(canva_renderer, "MAX_CANVA_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(len(pages), 3)
         stderr_output = buf.getvalue()
@@ -662,7 +684,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page.get_by_role("button", name="Next page").click = AsyncMock(side_effect=_flaky_click)
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
         context.close.assert_awaited_once()
@@ -690,7 +712,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page.get_by_role("button", name="Next page").click = AsyncMock(side_effect=_flaky_click)
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])
         self.assertEqual(call_count["n"], 3)  # one failed attempt + one successful retry
@@ -708,7 +730,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         next_button.click = AsyncMock(side_effect=Exception("Timeout 15000ms exceeded"))
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1"])
         self.assertEqual(next_button.click.await_count, canva_renderer.MAX_NEXT_CLICK_ATTEMPTS)
@@ -736,7 +758,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page.get_by_role("button", name="Next page").click = AsyncMock(side_effect=_debounced_then_real_click)
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
         self.assertEqual(call_count["n"], 2)  # one no-op "success" + one real advance
@@ -756,7 +778,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         buf = io.StringIO()
         patcher, context = self._patch_browser(page)
         with patcher, contextlib.redirect_stderr(buf):
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1"])  # never advanced past the cover
         self.assertEqual(next_button.click.await_count, canva_renderer.MAX_NEXT_CLICK_ATTEMPTS)
@@ -779,7 +801,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         )
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, detected_total = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
         self.assertEqual(detected_total, 2)
@@ -835,7 +857,7 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         )
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2"])
         context.close.assert_awaited_once()
@@ -902,6 +924,77 @@ class RenderCanvaPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         starter.start.assert_awaited_once()  # never launched a second browser
 
 
+class PageLinkCandidatesTests(unittest.TestCase):
+    """Unit tests for _page_link_candidates in isolation - no browser/
+    render loop involved, just the DOM-eval wrapper's own contract."""
+
+    def test_returns_whatever_the_dom_eval_yields(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=[{"href": "https://example.com/a.pdf", "text": "Link"}])
+
+        result = _run(canva_renderer._page_link_candidates(page))
+
+        self.assertEqual(result, [{"href": "https://example.com/a.pdf", "text": "Link"}])
+        page.evaluate.assert_awaited_once_with(canva_renderer._PAGE_LINK_CANDIDATES_JS)
+
+    def test_a_failed_dom_eval_returns_an_empty_list_not_a_raise(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock(side_effect=Exception("evaluate failed"))
+
+        result = _run(canva_renderer._page_link_candidates(page))
+
+        self.assertEqual(result, [])
+
+
+class RenderCanvaPageAsyncLinkCaptureTests(_ResetGlobalBrowserStateTestCase):
+    """render_canva_page_async's own new third return value - link data
+    captured alongside each screenshot, never in place of it."""
+
+    def _patch_browser(self, page):
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        return patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser))
+
+    def test_single_page_link_data_is_returned_alongside_the_screenshot(self):
+        page_one_links = [{"href": "https://colliers.com/kingsland-house", "text": "LINK TO BROCHURE"}]
+        page = _make_async_page(screenshots=(b"\x89PNG p1",), page_links=[page_one_links])
+        with self._patch_browser(page):
+            pages, page_links, _ = _run(
+                canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG p1"])
+        self.assertEqual(page_links, [page_one_links])
+
+    def test_multi_page_link_data_stays_aligned_with_its_own_page(self):
+        links_p1 = [{"href": "https://example.com/shared.pdf", "text": "Brochure"}]
+        links_p2 = [{"href": "https://blob.example.com/gloucester.pdf", "text": "27-29 Gloucester Place"}]
+        links_p3 = []  # a page with genuinely no links at all
+        page = _make_async_page(
+            screenshots=(b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"),
+            next_disabled_sequence=("false", "false", "true"),
+            page_links=[links_p1, links_p2, links_p3],
+        )
+        with self._patch_browser(page):
+            pages, page_links, _ = _run(
+                canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view")
+            )
+
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(page_links, [links_p1, links_p2, links_p3])
+
+    def test_default_page_links_is_an_empty_list_per_page_when_unspecified(self):
+        # Every pre-existing test in this file relies on this default -
+        # confirms it explicitly rather than only implicitly via those.
+        page = _make_async_page(screenshots=(b"\x89PNG p1", b"\x89PNG p2"), next_disabled_sequence=("false", "true"))
+        with self._patch_browser(page):
+            pages, page_links, _ = _run(
+                canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view")
+            )
+
+        self.assertEqual(page_links, [[], []])
+
+
 class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
     """Unit-level tests against render_pitch_page_async directly - mirrors
     RenderCanvaPageAsyncTests' own coverage for the shared loop shape, plus
@@ -925,7 +1018,7 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page = _make_async_pitch_page(screenshots=(b"\x89PNG real bytes",))
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, detected_total = _run(
+            pages, _, detected_total = _run(
                 canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
             )
 
@@ -949,7 +1042,7 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page = _make_async_pitch_page(screenshots=(b"\x89PNG only page",), next_button_raises=True)
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(
+            pages, _, _ = _run(
                 canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
             )
 
@@ -963,7 +1056,7 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         )
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(
+            pages, _, _ = _run(
                 canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
             )
 
@@ -982,7 +1075,7 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page = _make_async_pitch_page(screenshots=(b"\x89PNG p1",), next_disabled_sequence=(True,))
         patcher, context = self._patch_browser(page)
         with patcher:
-            pages, _ = _run(
+            pages, _, _ = _run(
                 canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
             )
 
@@ -994,7 +1087,7 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         page = _make_async_pitch_page(screenshots=screenshots, next_disabled_sequence=[False] * 10)
         patcher, context = self._patch_browser(page)
         with patch.object(canva_renderer, "MAX_PITCH_PAGES", 5), patcher:
-            pages, _ = _run(
+            pages, _, _ = _run(
                 canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
             )
 
@@ -1020,26 +1113,38 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
                 _run(canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
         self.assertIn("navigation returned HTTP", str(ctx.exception))
 
+    def test_link_data_is_captured_alongside_the_screenshot(self):
+        page_links = [{"href": "https://example.com/deck.pdf", "text": "View deck"}]
+        page = _make_async_pitch_page(screenshots=(b"\x89PNG p1",), page_links=[page_links])
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            pages, links, _ = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG p1"])
+        self.assertEqual(links, [page_links])
+
 
 class RenderPageDispatchTests(unittest.TestCase):
     """render_page - the one call site Handler.do_POST uses, dispatching
     to whichever platform's own renderer a URL shape recognizes."""
 
     def test_canva_url_dispatches_to_render_canva_page(self):
-        with patch.object(canva_renderer, "render_canva_page", return_value=([b"x"], 1)) as mock_canva, \
+        with patch.object(canva_renderer, "render_canva_page", return_value=([b"x"], [], 1)) as mock_canva, \
              patch.object(canva_renderer, "render_pitch_page") as mock_pitch:
             result = canva_renderer.render_page("https://www.canva.com/design/x/y/view")
 
-        self.assertEqual(result, ([b"x"], 1))
+        self.assertEqual(result, ([b"x"], [], 1))
         mock_canva.assert_called_once_with("https://www.canva.com/design/x/y/view")
         mock_pitch.assert_not_called()
 
     def test_pitch_url_dispatches_to_render_pitch_page(self):
         with patch.object(canva_renderer, "render_canva_page") as mock_canva, \
-             patch.object(canva_renderer, "render_pitch_page", return_value=([b"x"], 1)) as mock_pitch:
+             patch.object(canva_renderer, "render_pitch_page", return_value=([b"x"], [], 1)) as mock_pitch:
             result = canva_renderer.render_page("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
 
-        self.assertEqual(result, ([b"x"], 1))
+        self.assertEqual(result, ([b"x"], [], 1))
         mock_pitch.assert_called_once_with("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
         mock_canva.assert_not_called()
 
@@ -1072,7 +1177,7 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
     def test_single_render_succeeds_through_the_real_thread_bridge(self):
         page = _make_async_page(screenshots=(b"\x89PNG single",))
         with self._patch_browser(page):
-            pages, _ = canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
+            pages, _, _ = canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view")
         self.assertEqual(pages, [b"\x89PNG single"])
 
     def test_sequential_renders_all_succeed(self):
@@ -1081,7 +1186,7 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
             results = [
                 canva_renderer.render_canva_page("https://www.canva.com/design/x/y/view") for _ in range(5)
             ]
-        self.assertEqual([pages for pages, _ in results], [[b"\x89PNG seq"]] * 5)
+        self.assertEqual([pages for pages, _, _ in results], [[b"\x89PNG seq"]] * 5)
 
     def test_concurrent_renders_from_multiple_threads_never_hit_a_cross_thread_playwright_error(self):
         # The exact real production shape: several /render requests
@@ -1104,7 +1209,7 @@ class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
                 ]
                 results = [f.result(timeout=10) for f in futures]
 
-        self.assertEqual([pages for pages, _ in results], [[b"\x89PNG concurrent"]] * 8)
+        self.assertEqual([pages for pages, _, _ in results], [[b"\x89PNG concurrent"]] * 8)
 
     def test_context_is_cleaned_up_even_under_concurrent_load(self):
         page = _make_async_page()
@@ -1205,17 +1310,33 @@ class RenderHandlerTests(unittest.TestCase):
 
     def test_valid_request_returns_bounded_json_page_list(self):
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], 1)):
+        with patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], [], 1)):
             handler.do_POST()
         handler.send_response.assert_called_with(200)
         payload = json.loads(handler.wfile.getvalue())
         self.assertEqual(payload["pages"], [base64.b64encode(b"\x89PNG bytes").decode("ascii")])
         self.assertEqual(payload["page_count_detected"], 1)
 
+    def test_response_includes_links_alongside_pages(self):
+        # New, additive response field - each page's own real <a href>
+        # candidates (see _page_link_candidates), never base64-encoded
+        # (plain JSON-serializable dicts already).
+        handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
+        pages = [b"\x89PNG p1", b"\x89PNG p2"]
+        links = [
+            [{"href": "https://colliers.com/kingsland-house", "text": "LINK TO BROCHURE"}],
+            [{"href": "https://blob.example.com/gloucester.pdf", "text": "27-29 Gloucester Place"}],
+        ]
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, links, 2)):
+            handler.do_POST()
+        handler.send_response.assert_called_with(200)
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(payload["links"], links)
+
     def test_valid_request_with_multiple_pages_preserves_order(self):
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
         pages = [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"]
-        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 3)):
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, [], 3)):
             handler.do_POST()
         handler.send_response.assert_called_with(200)
         payload = json.loads(handler.wfile.getvalue())
@@ -1232,7 +1353,7 @@ class RenderHandlerTests(unittest.TestCase):
         # lifetime is this handler's to assume.
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
         pages = [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"]
-        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 3)):
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, [], 3)):
             handler.do_POST()
 
         self.assertEqual(pages, [b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3"])  # untouched
@@ -1255,7 +1376,7 @@ class RenderHandlerTests(unittest.TestCase):
         # stays "png" and _reencode_as_jpeg is never even called - full
         # lossless quality, completely unchanged from before this feature.
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], 1)), \
+        with patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], [], 1)), \
                 patch.object(canva_renderer, "_reencode_as_jpeg") as mock_reencode:
             handler.do_POST()
         payload = json.loads(handler.wfile.getvalue())
@@ -1275,7 +1396,7 @@ class RenderHandlerTests(unittest.TestCase):
         pages = [b"\x89PNG p1", b"\x89PNG p2"]
         jpeg_bytes = [b"\xff\xd8\xff jpeg1", b"\xff\xd8\xff jpeg2"]
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 2)), \
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, [], 2)), \
                 patch.object(canva_renderer, "RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES", 1), \
                 patch.object(canva_renderer, "_reencode_as_jpeg", side_effect=jpeg_bytes) as mock_reencode:
             handler.do_POST()
@@ -1289,7 +1410,7 @@ class RenderHandlerTests(unittest.TestCase):
     def test_re_encoding_never_mutates_the_original_pages_list(self):
         pages = [b"\x89PNG p1", b"\x89PNG p2"]
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
-        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, 2)), \
+        with patch.object(canva_renderer, "render_canva_page", return_value=(pages, [], 2)), \
                 patch.object(canva_renderer, "RESPONSE_SIZE_SAFETY_THRESHOLD_BYTES", 1), \
                 patch.object(canva_renderer, "_reencode_as_jpeg", side_effect=lambda p: b"jpeg-" + p):
             handler.do_POST()
@@ -1326,7 +1447,7 @@ class RenderHandlerTests(unittest.TestCase):
         handler = self._make_handler(json.dumps({"url": "https://www.canva.com/design/x/y/view"}).encode())
         handler.headers["Authorization"] = "Bearer topsecret"
         with patch.object(canva_renderer, "SHARED_SECRET", "topsecret"), \
-                patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], 1)):
+                patch.object(canva_renderer, "render_canva_page", return_value=([b"\x89PNG bytes"], [], 1)):
             handler.do_POST()
         handler.send_response.assert_called_with(200)
 
@@ -1463,7 +1584,7 @@ class SemaphoreQueueingTests(unittest.TestCase):
                 call_order.append("started")
             if is_first:
                 release_first.wait(timeout=5)
-            return ([b"\x89PNG bytes"], 1)
+            return ([b"\x89PNG bytes"], [], 1)
 
         handler_a = self._make_handler()
         handler_b = self._make_handler()
@@ -1515,7 +1636,7 @@ class SemaphoreQueueingTests(unittest.TestCase):
             call_log.append(url)
             if len(call_log) == 1:
                 raise canva_renderer.RenderError("navigation timed out")
-            return ([b"\x89PNG bytes"], 1)
+            return ([b"\x89PNG bytes"], [], 1)
 
         handler_a = self._make_handler()
         handler_b = self._make_handler()
@@ -1544,7 +1665,7 @@ class SemaphoreQueueingTests(unittest.TestCase):
 
         def a_holds_the_slot(url):
             release_first.wait(timeout=5)
-            return ([b"\x89PNG a"], 1)
+            return ([b"\x89PNG a"], [], 1)
 
         with patch.object(canva_renderer, "_render_semaphore", threading.Semaphore(1)), \
                 patch.object(canva_renderer, "SEMAPHORE_WAIT_TIMEOUT_SECONDS", 5), \
@@ -1594,7 +1715,7 @@ class BrowserCrashRecoveryTests(_ResetGlobalBrowserStateTestCase):
         starter.start = AsyncMock(return_value=MagicMock(chromium=MagicMock(launch=AsyncMock(return_value=fresh_browser))))
 
         with patch.object(canva_renderer, "async_playwright", MagicMock(return_value=starter)):
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG recovered"])
         starter.start.assert_awaited_once()  # relaunched exactly once
@@ -1609,7 +1730,7 @@ class BrowserCrashRecoveryTests(_ResetGlobalBrowserStateTestCase):
         canva_renderer._playwright_ctx = MagicMock()
 
         with patch.object(canva_renderer, "async_playwright") as mock_playwright:
-            pages, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
+            pages, _, _ = _run(canva_renderer.render_canva_page_async("https://www.canva.com/design/x/y/view"))
 
         self.assertEqual(pages, [b"\x89PNG healthy"])
         mock_playwright.assert_not_called()  # never even touched async_playwright() - no relaunch needed

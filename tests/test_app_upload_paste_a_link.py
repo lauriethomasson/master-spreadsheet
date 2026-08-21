@@ -26,6 +26,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_app_upload_paste_a_link -v
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -37,6 +38,7 @@ from streamlit.testing.v1 import AppTest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app
+from schema import ListingRow
 from storage.file_store import list_pending_staging_files
 
 BASE = Path(__file__).resolve().parent.parent
@@ -90,22 +92,118 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         self.assertEqual(result.getvalue(), b"%PDF-1.4 fake pdf bytes")
 
     def test_png_pages_are_assembled_into_a_real_multi_page_pdf(self):
+        # A Canva/Pitch link is now intercepted BEFORE _fetch_pdf_bytes
+        # (see app._fetch_pasted_link's own docstring) specifically so
+        # each page's own real link candidates can be captured alongside
+        # the pages themselves - mocking brochure_enrichment.fetch_
+        # rendered_page_with_links, not _fetch_pdf_bytes, for this shape.
         png_pages = [_make_png((1, 0, 0)), _make_png((0, 1, 0)), _make_png((0, 0, 1))]
-        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=png_pages):
+        page_links = [[], [], []]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment.fetch_rendered_page_with_links",
+                    return_value=(png_pages, page_links),
+                ) as mock_fetch:
             result = app._fetch_pasted_link("https://canva.link/cvkmdcet1gpz149")
 
+        mock_fetch.assert_called_once_with("https://canva.link/cvkmdcet1gpz149")
         self.assertIsInstance(result, app._PastedLinkFile)
+        self.assertEqual(result.png_pages, png_pages)
+        self.assertEqual(result.page_links, page_links)
         doc = fitz.open("pdf", result.getvalue())
         try:
             self.assertEqual(doc.page_count, 3)
         finally:
             doc.close()
 
+    def test_canva_url_without_the_renderer_configured_falls_through_to_the_generic_path(self):
+        # No CANVA_RENDERER_URL set - _canva_renderer_configured() is
+        # False, so this must fall through to the plain _fetch_pdf_bytes
+        # path exactly like before this feature existed (which itself
+        # already knows not to attempt an unconfigured canva/pitch render
+        # - see that function's own canva/pitch branches).
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=None) as mock_fetch, \
+                patch("brochure_enrichment.fetch_rendered_page_with_links") as mock_with_links:
+            result = app._fetch_pasted_link("https://canva.link/cvkmdcet1gpz149")
+
+        self.assertIsNone(result)
+        mock_fetch.assert_called_once_with("https://canva.link/cvkmdcet1gpz149")
+        mock_with_links.assert_not_called()
+
     def test_total_fetch_failure_returns_none(self):
         with patch("brochure_enrichment._fetch_pdf_bytes", return_value=None):
             result = app._fetch_pasted_link("https://drive.google.com/file/d/doesnotexist/view")
 
         self.assertIsNone(result)
+
+
+class ValidatePastedLinkBrochureLinksTests(unittest.TestCase):
+    """Direct, non-AppTest unit tests of app._validate_pasted_link_
+    brochure_links - the per-property link validation/fallback step for
+    a pasted Canva/Pitch link's own rows (see the Extract loop's own
+    png_pages branch)."""
+
+    SHARED_URL = "https://storage.example.com/pasted-deck.pdf"
+
+    def _row(self, brochure_link, brochure_link_is_floorplan=None):
+        return ListingRow(
+            building="Test Building", provider="Colliers",
+            brochure_link=brochure_link, brochure_link_is_floorplan=brochure_link_is_floorplan,
+        )
+
+    def test_a_link_that_fetches_as_a_real_document_is_kept(self):
+        row = self._row("https://blob.example.com/gloucester.pdf")
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real") as mock_fetch:
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_fetch.assert_called_once_with("https://blob.example.com/gloucester.pdf")
+        self.assertEqual(row.brochure_link, "https://blob.example.com/gloucester.pdf")
+
+    def test_a_link_that_fails_to_fetch_falls_back_to_the_shared_link(self):
+        row = self._row("https://www.colliers.com/en-gb/properties/kingsland-house")
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=None):
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        self.assertEqual(row.brochure_link, self.SHARED_URL)
+
+    def test_a_link_already_equal_to_the_shared_fallback_is_never_fetched(self):
+        row = self._row(self.SHARED_URL)
+        with patch("brochure_enrichment._fetch_pdf_bytes") as mock_fetch:
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_fetch.assert_not_called()
+        self.assertEqual(row.brochure_link, self.SHARED_URL)
+
+    def test_a_blank_brochure_link_is_never_fetched(self):
+        row = self._row(None)
+        with patch("brochure_enrichment._fetch_pdf_bytes") as mock_fetch:
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_fetch.assert_not_called()
+        self.assertIsNone(row.brochure_link)
+
+    def test_a_floorplan_substituted_link_is_left_alone_even_if_it_would_fail(self):
+        # brochure_link_is_floorplan is a separate, pre-existing mechanism
+        # this feature doesn't touch - never validated/replaced here.
+        row = self._row("https://app.box.com/s/some-floorplan", brochure_link_is_floorplan=True)
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=None) as mock_fetch:
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_fetch.assert_not_called()
+        self.assertEqual(row.brochure_link, "https://app.box.com/s/some-floorplan")
+
+    def test_mixed_batch_only_the_failing_row_falls_back(self):
+        good_row = self._row("https://blob.example.com/good.pdf")
+        bad_row = self._row("https://www.colliers.com/en-gb/properties/blocked")
+
+        def fake_fetch(url):
+            return b"%PDF-1.4" if url == "https://blob.example.com/good.pdf" else None
+
+        with patch("brochure_enrichment._fetch_pdf_bytes", side_effect=fake_fetch):
+            app._validate_pasted_link_brochure_links([good_row, bad_row], self.SHARED_URL)
+
+        self.assertEqual(good_row.brochure_link, "https://blob.example.com/good.pdf")
+        self.assertEqual(bad_row.brochure_link, self.SHARED_URL)
 
 
 class InvalidLinkTests(unittest.TestCase):
@@ -169,9 +267,12 @@ class SuccessfulDirectPdfLinkTests(unittest.TestCase):
 
 
 class SuccessfulCanvaStyleLinkTests(unittest.TestCase):
-    """The Canva/Pitch render path - brochure_enrichment._fetch_pdf_bytes
-    returns list[bytes] (PNG pages), never a PDF directly - exercises the
-    real _pdf_bytes_from_png_pages assembly, not just a stubbed shortcut."""
+    """The Canva/Pitch render path - a Canva/Pitch link is intercepted
+    before _fetch_pdf_bytes (see app._fetch_pasted_link's own docstring)
+    so each page's own real link candidates can be captured alongside
+    the pages themselves, and extracted via extract.extract_from_png_
+    pages directly (never by re-rasterizing the assembled PDF bytes back
+    into images - see that function's own docstring)."""
 
     def setUp(self):
         _clear_pending()
@@ -179,11 +280,17 @@ class SuccessfulCanvaStyleLinkTests(unittest.TestCase):
     def tearDown(self):
         _clear_pending()
 
-    def test_png_pages_are_assembled_into_one_multi_page_pdf(self):
+    def test_png_pages_are_assembled_and_extracted_via_extract_from_png_pages(self):
         url = "https://canva.link/cvkmdcet1gpz149"
         png_pages = [_make_png((1, 0, 0)), _make_png((0, 1, 0)), _make_png((0, 0, 1))]
-        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=png_pages), \
-             patch("extract.extract", return_value=[]) as mock_pdf_extract:
+        page_links = [[], [], []]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment.fetch_rendered_page_with_links",
+                    return_value=(png_pages, page_links),
+                ), \
+                patch("extract.extract_from_png_pages", return_value=[]) as mock_extract, \
+                patch("extract.extract") as mock_plain_extract:
             at = _run_upload_page()
             _add_link(at, url)
             self.assertFalse(at.exception)
@@ -195,8 +302,11 @@ class SuccessfulCanvaStyleLinkTests(unittest.TestCase):
             extract_buttons[0].click().run()
             self.assertFalse(at.exception)
 
-        mock_pdf_extract.assert_called_once()
-        self.assertEqual(mock_pdf_extract.call_args.kwargs["original_filename"], app._filename_from_url(url))
+        mock_extract.assert_called_once()
+        self.assertEqual(mock_extract.call_args.args[0], png_pages)
+        self.assertEqual(mock_extract.call_args.kwargs["original_filename"], app._filename_from_url(url))
+        self.assertEqual(mock_extract.call_args.kwargs["page_links"], page_links)
+        mock_plain_extract.assert_not_called()  # never the re-rasterizing PDF-file path for this source
         self.assertEqual(len(list_pending_staging_files()), 1)
 
 
@@ -329,6 +439,86 @@ class MixedBatchTests(unittest.TestCase):
         mock_pdf_extract.assert_called_once()
         self.assertEqual(mock_pdf_extract.call_args.kwargs["original_filename"], "good.pdf")
         self.assertEqual(len(list_pending_staging_files()), 1)
+
+
+class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
+    """
+    Full pipeline, only Gemini and the validation fetch mocked (real
+    extract.extract_from_png_pages, real images_from_png_pages, real
+    app._validate_pasted_link_brochure_links) - the real Colliers deck
+    shape: one page describing a single property (Kingsland House) whose
+    only real link is a Colliers.com webpage that turns out blocked, and
+    another page whose building name IS the link, pointing directly at a
+    real PDF.
+    """
+
+    def setUp(self):
+        _clear_pending()
+
+    def tearDown(self):
+        _clear_pending()
+
+    def test_kingsland_house_falls_back_gloucester_place_keeps_its_own_link(self):
+        url = "https://canva.link/cvkmdcet1gpz149"
+        png_pages = [_make_png((1, 0, 0)), _make_png((0, 1, 0))]
+        page_links = [
+            [{"href": "https://www.colliers.com/en-gb/properties/kingsland-house", "text": "LINK TO BROCHURE"}],
+            [{"href": "https://blob.example.com/gloucester.pdf", "text": "27-29 Gloucester Place"}],
+        ]
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {
+                    "building": "Kingsland House", "floor_unit": "Ground", "page_index": 0,
+                    "brochure_link": "https://www.colliers.com/en-gb/properties/kingsland-house",
+                },
+                {
+                    "building": "27-29 Gloucester Place", "floor_unit": "2nd", "page_index": 1,
+                    "brochure_link": "https://blob.example.com/gloucester.pdf",
+                },
+            ],
+        }
+
+        def fake_validate_fetch(fetch_url):
+            # Kingsland's own Colliers.com page is blocked to a plain
+            # fetch (real, confirmed HTTP 403); Gloucester's own Azure
+            # blob URL is a real, directly-fetchable PDF (also real,
+            # confirmed) - see the PR's own recon findings.
+            return b"%PDF-1.4 real" if fetch_url == "https://blob.example.com/gloucester.pdf" else None
+
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment.fetch_rendered_page_with_links",
+                    return_value=(png_pages, page_links),
+                ), \
+                patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw), \
+                patch("brochure_enrichment._fetch_pdf_bytes", side_effect=fake_validate_fetch):
+            at = _run_upload_page()
+            _add_link(at, url)
+            self.assertFalse(at.exception)
+
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        from storage.file_store import load_staging_as_dataframe
+
+        staged = list_pending_staging_files()
+        self.assertEqual(len(staged), 1)
+        df = load_staging_as_dataframe(staged[0])
+        by_building = {row["building"]: row["brochure_link"] for _, row in df.iterrows()}
+
+        # Kingsland House's only real candidate is blocked - must NOT end
+        # up with the dead Colliers.com link; falls back to the shared
+        # document-level link instead.
+        self.assertNotEqual(
+            by_building["Kingsland House"], "https://www.colliers.com/en-gb/properties/kingsland-house",
+        )
+        # 27-29 Gloucester Place's own real PDF link survives validation -
+        # its own genuine per-property link, not the shared fallback.
+        self.assertEqual(by_building["27-29 Gloucester Place"], "https://blob.example.com/gloucester.pdf")
+        self.assertNotEqual(by_building["27-29 Gloucester Place"], by_building["Kingsland House"])
 
 
 if __name__ == "__main__":

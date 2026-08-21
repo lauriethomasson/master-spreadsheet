@@ -767,14 +767,23 @@ class PitchRendererConfiguredEligibilityTests(EnrichmentTestCase):
             self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_PITCH_URL))
 
 
-def _canva_pages_response(pages, page_count_detected=None, status_code=200):
+def _canva_pages_response(pages, page_count_detected=None, status_code=200, links=None):
     """A MagicMock httpx.Response shaped like the renderer's own new JSON
     multi-page format (see canva_renderer/app.py's Handler.do_POST) -
-    {"pages": [base64 PNG, ...], "page_count_detected": N|None}."""
+    {"pages": [base64 PNG, ...], "page_count_detected": N|None}.
+
+    `links` (default None, meaning "omit the key entirely") mocks an
+    older renderer deploy that predates that field, alongside the
+    genuine current shape - a list of per-page link-candidate lists, one
+    per entry in `pages`, only ever added to the payload when explicitly
+    given so every pre-existing call site of this helper (testing before
+    this field existed) is completely unaffected."""
     payload = {
         "pages": [base64.b64encode(p).decode("ascii") for p in pages],
         "page_count_detected": page_count_detected,
     }
+    if links is not None:
+        payload["links"] = links
     return MagicMock(
         status_code=status_code, headers={"content-type": "application/json"}, json=MagicMock(return_value=payload),
     )
@@ -1112,6 +1121,96 @@ class FetchPitchRenderedPageTests(EnrichmentTestCase):
 
         self.assertIsNone(result)
         self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+
+
+class FetchRenderedPageWithLinksTests(EnrichmentTestCase):
+    """fetch_rendered_page_with_links - the new, additive entry point for
+    the paste-a-link flow (see app.py's own _fetch_pasted_link). Never
+    called by the existing per-unit enrichment path - that coverage
+    (FetchCanvaRenderedPageTests/FetchPitchRenderedPageTests above)
+    already confirms _fetch_canva_rendered_page/_fetch_pitch_rendered_
+    page keep their own plain list[bytes]-or-None contract unaffected by
+    this function's addition."""
+
+    def test_canva_url_returns_pages_and_links_together(self):
+        pages = [b"\x89PNG p1", b"\x89PNG p2"]
+        links = [
+            [{"href": "https://colliers.com/kingsland-house", "text": "LINK TO BROCHURE"}],
+            [{"href": "https://blob.example.com/gloucester.pdf", "text": "27-29 Gloucester Place"}],
+        ]
+        response = _canva_pages_response(pages, page_count_detected=2, links=links)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_CANVA_URL)
+
+        self.assertEqual(result_pages, pages)
+        self.assertEqual(result_links, links)
+
+    def test_pitch_url_returns_pages_and_links_together(self):
+        pages = [b"\x89PNG deck"]
+        links = [[{"href": "https://example.com/deck.pdf", "text": "View the deck"}]]
+        response = _canva_pages_response(pages, page_count_detected=1, links=links)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_PITCH_URL)
+
+        self.assertEqual(result_pages, pages)
+        self.assertEqual(result_links, links)
+
+    def test_an_older_renderer_response_with_no_links_field_at_all_yields_empty_lists(self):
+        # Backward compatibility with a renderer deploy that predates this
+        # field entirely - never a KeyError, [] per page instead.
+        pages = [b"\x89PNG p1", b"\x89PNG p2"]
+        response = _canva_pages_response(pages, page_count_detected=2)  # links=None (omitted)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_CANVA_URL)
+
+        self.assertEqual(result_pages, pages)
+        self.assertEqual(result_links, [[], []])
+
+    def test_links_are_truncated_in_lockstep_with_a_capped_pages_list(self):
+        pages = [f"\x89PNG p{i}".encode() for i in range(1, 8)]
+        links = [[{"href": f"https://example.com/{i}.pdf", "text": str(i)}] for i in range(1, 8)]
+        response = _canva_pages_response(pages, page_count_detected=7, links=links)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch.object(brochure_enrichment, "_CANVA_MAX_PAGES_ACCEPTED", 3):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_CANVA_URL)
+
+        self.assertEqual(len(result_pages), 3)
+        self.assertEqual(result_links, links[:3])
+
+    def test_render_failure_returns_none_none_not_a_partial_tuple(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", side_effect=Exception("connection refused")):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_CANVA_URL)
+
+        self.assertIsNone(result_pages)
+        self.assertIsNone(result_links)
+
+    def test_a_url_matching_neither_platform_returns_none_none_without_raising(self):
+        result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(
+            "https://example.com/not-canva-or-pitch"
+        )
+        self.assertIsNone(result_pages)
+        self.assertIsNone(result_links)
+
+    def test_existing_canva_wrapper_still_returns_plain_list_unaffected(self):
+        # The exact same underlying call, but through the OLD/existing
+        # entry point - confirms it's still untouched by this addition.
+        pages = [b"\x89PNG p1"]
+        links = [[{"href": "https://example.com/a.pdf", "text": "A"}]]
+        response = _canva_pages_response(pages, page_count_detected=1, links=links)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_canva_rendered_page(_CANVA_URL)
+
+        self.assertEqual(result, pages)  # plain list[bytes], never a tuple
 
 
 class FetchPdfBytesPitchDispatchTests(EnrichmentTestCase):
