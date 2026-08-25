@@ -41,6 +41,25 @@ import app
 from schema import ListingRow
 from storage.file_store import list_pending_staging_files
 
+# The bare `import app` above executes app.py's top-level page code once,
+# with no active Streamlit runtime (see this file's own module docstring
+# for why app.py must be imported this way at all - reaching app._filename_
+# from_url etc.). That was harmless before the paste-a-link input was
+# wrapped in st.form - confirmed directly against a minimal repro, with no
+# active runtime Streamlit's own st.form() mutates the process-wide main
+# DeltaGenerator singleton's _form_data IN PLACE (rather than creating a
+# genuinely separate child block, which is only possible with a real
+# runtime), permanently tainting that one singleton for the rest of this
+# process. Left uncleared, EVERY subsequent AppTest run of app.py in this
+# process - not just this file's own - would see a spurious "Forms cannot
+# be nested in other forms." the first time it reaches this same st.form,
+# even though nothing is actually nested. Clearing it here, once, right
+# after the bare import that causes it, is the narrowest fix available -
+# it touches no application logic, only this one bare-import side effect.
+from streamlit.delta_generator_singletons import get_dg_singleton_instance
+
+get_dg_singleton_instance().main_dg._form_data = None
+
 BASE = Path(__file__).resolve().parent.parent
 
 

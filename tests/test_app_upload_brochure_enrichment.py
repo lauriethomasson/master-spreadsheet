@@ -37,6 +37,22 @@ from storage.file_store import (
     load_staging_as_dataframe,
 )
 
+# The bare `import app` above executes app.py's top-level page code once
+# with no active Streamlit runtime. With no runtime, st.form (the paste-a-
+# link input's own form - see app.py's own comment there) mutates the
+# process-wide main DeltaGenerator singleton's _form_data IN PLACE instead
+# of creating a genuinely separate child block - confirmed directly against
+# a minimal repro. Left uncleared, this taints every subsequent AppTest run
+# of app.py in this process (this file's own AND any other test module's)
+# with a spurious "Forms cannot be nested in other forms." the first time
+# it reaches that same st.form, even though nothing is actually nested. See
+# tests/test_app_upload_paste_a_link.py's own copy of this same fix for the
+# full explanation - duplicated here (no shared conftest.py exists yet)
+# since this file independently imports app and drives AppTest against it.
+from streamlit.delta_generator_singletons import get_dg_singleton_instance
+
+get_dg_singleton_instance().main_dg._form_data = None
+
 BASE = Path(__file__).resolve().parent.parent
 
 

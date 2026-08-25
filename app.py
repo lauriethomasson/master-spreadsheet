@@ -795,15 +795,24 @@ with page_setup.setup_page("upload"):
     st.session_state.setdefault("excluded_upload_file_ids", set())
     st.session_state.setdefault("paste_link_input_epoch", 0)
 
-    link_input_col, add_link_col = st.columns([5, 1])
-    with link_input_col:
-        pasted_link_text = st.text_input(
-            "Or paste a link to a brochure (a PDF, or a Canva/Pitch view link)",
-            key=f"paste_link_input_{st.session_state['paste_link_input_epoch']}",
-        )
-    with add_link_col:
-        st.write("")  # vertical alignment with the text_input's own label row
-        add_link_clicked = st.button("Add link")
+    # st.form is what makes pressing Enter in the text_input below add the
+    # link, not just clicking the button - a bare st.text_input never
+    # submits on Enter at all, only a form (via st.form_submit_button)
+    # does. clear_on_submit is deliberately left at its default (False):
+    # clearing the input is already handled below by bumping the epoch key
+    # ONLY on a successful add, so a failed validation (see the "Paste a
+    # link first"/"doesn't look like a valid link" warnings) still leaves
+    # what the reviewer typed visible to fix, exactly as before this existed.
+    with st.form(key="paste_link_form", clear_on_submit=False):
+        link_input_col, add_link_col = st.columns([5, 1])
+        with link_input_col:
+            pasted_link_text = st.text_input(
+                "Or paste a link to a brochure (a PDF, or a Canva/Pitch view link)",
+                key=f"paste_link_input_{st.session_state['paste_link_input_epoch']}",
+            )
+        with add_link_col:
+            st.write("")  # vertical alignment with the text_input's own label row
+            add_link_clicked = st.form_submit_button("Add link")
 
     if add_link_clicked:
         candidate = pasted_link_text.strip()
