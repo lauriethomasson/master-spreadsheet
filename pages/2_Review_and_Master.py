@@ -2278,6 +2278,16 @@ def _render_pending_review(pending: list):
             )
             if not remaining.diffs:
                 continue  # every one of this row's own diffs was a geocode field - nothing left to decide
+            if not remaining.risky_fields:
+                # Nothing left needs a deliberate look - only safe fields
+                # (the same shape auto_matched already handles above) -
+                # these belong in the "Automatic updates" summary, never
+                # their own empty "no decisions needed" card sitting under
+                # "Needs your decision" for no reason.
+                entry = {f: new_val for f, (old_val, new_val) in remaining.diffs.items()}
+                entry["source_file"] = m.new_row.source_file
+                auto_updates[m.master_index] = entry
+                continue
             _render_matched_row(remaining, f"risky_{i}_{m.property_id}", "⚠️ ", True, decision_updates)
 
         # near_miss (against an existing master property) and

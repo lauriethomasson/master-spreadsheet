@@ -210,17 +210,14 @@ class NoRiskyFieldsLeftAfterConsolidationTests(IsolatedCwdTestCase):
     Real Hatchers Yard shape this regression-tests: once a row's ONLY
     risky field (its shared geocode address) is claimed by the
     consolidated card, this row's OWN leftover diffs (brochure_link,
-    size_sqft) are both ordinary safe fields - risky_fields is empty, but
-    this is the default_checked=True fallback loop (see _render_matched_
-    row's own docstring on why that's a DIFFERENT rule from decision_
-    solo_collision's default_checked=False case - see tests/test_app_
-    review_collision_ui.py's own SoloCollisionDecisionCountUnaffectedTests
-    for that unchanged behavior). The leftover card must say "no decisions
-    needed", never a wrong "N decisions needed" for fields that actually
-    render as a single automatic bundle with zero checkboxes.
+    size_sqft) are both ordinary safe fields - risky_fields is empty.
+    Nothing here needs a deliberate look, so this must NOT render its own
+    empty "no decisions needed" card under "⚠️ Needs your decision" at
+    all - these safe fields belong in the "✅ Automatic updates" summary,
+    the exact same bucket auto_matched rows already use.
     """
 
-    def test_leftover_safe_only_fields_show_no_decisions_needed_not_a_wrong_count(self):
+    def test_leftover_safe_only_fields_skip_the_decision_section_and_land_in_automatic_updates(self):
         master_writer.write_master([
             ListingRow(
                 building="Hatchers Yard", provider="Colliers", floor_unit="1st Floor",
@@ -259,18 +256,29 @@ class NoRiskyFieldsLeftAfterConsolidationTests(IsolatedCwdTestCase):
         self.assertEqual(len(consolidated), 1)
         self.assertIn("2 properties", consolidated[0])
 
-        # Both floors still get their own leftover card (their safe fields
-        # were never part of the consolidated card), but neither claims a
-        # decision that doesn't exist.
+        # Neither floor gets its own leftover card at all - there was
+        # never a real decision left once the address moved into the
+        # consolidated card above (see the removed "no decisions needed"
+        # shape this replaces).
         leftover = [l for l in expander_labels if "Hatchers Yard" in l and "Floor" in l]
-        self.assertEqual(len(leftover), 2)
-        for label in leftover:
-            self.assertIn("no decisions needed", label)
-            self.assertIn("2 other changes will apply automatically", label)
-            self.assertNotIn("0 decisions needed", label)
+        self.assertEqual(leftover, [])
+        self.assertNotIn("no decisions needed", " ".join(expander_labels))
 
-        caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("2 other changes (Size, Brochure Link) will apply automatically.", caption_text)
+        # Both floors' safe fields (brochure_link, size_sqft) show up in
+        # the Automatic updates section instead.
+        self.assertIn("✅ Automatic updates", [s.value for s in at.subheader])
+        info_text = "".join(i.value for i in at.info)
+        self.assertIn("2 existing properties will be updated automatically.", info_text)
+
+        markdown_text = "".join(m.value or "" for m in at.markdown)
+        self.assertEqual(
+            markdown_text.count('<td colspan="3">Hatchers Yard — Colliers — 1st Floor</td>'), 1,
+        )
+        self.assertEqual(
+            markdown_text.count('<td colspan="3">Hatchers Yard — Colliers — 2nd Floor</td>'), 1,
+        )
+        self.assertIn("<td>Brochure Link</td>", markdown_text)
+        self.assertIn("<td>Size</td>", markdown_text)
 
 
 if __name__ == "__main__":
