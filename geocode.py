@@ -53,6 +53,19 @@ different postcode area entirely, still comfortably inside the bbox. The
 parsing is purely the UK postcode's own outward/inward code grammar, never a
 hardcoded list of specific areas, buildings, or providers - the same check
 applies identically to any other UK postcode district a future file states.
+
+The postcode-district cross-check above needs a source hint to check
+AGAINST - when there is none at all (a Tier 2 row with no address_1/
+postcode/building-trailing-token evidence whatsoever), an accepted
+candidate is flagged row.geocode_unverified rather than trusted like any
+other result, since a building-name-only match has no independent
+evidence it resolved to the RIGHT same-named building at all. Confirmed
+real failures this exists for: "Henly House" (not indexed under that
+spelling by Places) and "Ivybridge House" (resolves to a stale/mislabeled
+POI) - genuine Google Places data problems no query rephrasing or name-
+similarity check can fix, since the returned candidate is itself wrong.
+See schema.ListingRow.geocode_unverified's own docstring for how this is
+surfaced to a reviewer.
 """
 
 import json
@@ -774,6 +787,17 @@ def geocode_row(row: ListingRow) -> ListingRow:
         if result["status"] == "OK" and within_london_bbox(result["lat"], result["lng"]):
             row.lat = result["lat"]
             row.lng = result["lng"]
+
+            # No source address_1/postcode/building-trailing-token hint at
+            # all (see _source_location_hint) means this candidate was
+            # accepted purely on a building-name-only Places match, with
+            # nothing to cross-check it against - flag it so the Review
+            # page can give it its own stronger caution (see schema.
+            # ListingRow.geocode_unverified's own docstring) rather than
+            # treating it with the same confidence as a hint-corroborated
+            # result.
+            if not source_hint:
+                row.geocode_unverified = True
 
             if not row.address_1 or not row.postcode:
                 address_1, postcode = _address_line1_and_postcode(

@@ -82,6 +82,22 @@ class ListingRow(BaseModel):
     # utils.with_brochure_link_display_labels to swap brochure_link's own
     # display label to "Open floor plan" instead of "Open brochure".
     brochure_link_is_floorplan: Optional[bool] = None
+    # Tri-state, never Gemini-set (like lat/lng above) - set True by
+    # geocode.py's own geocode_row when its Tier 2 (Places) fallback had to
+    # accept a candidate with ZERO source address_1/postcode/building-
+    # trailing-token hint to cross-check it against at all (see that
+    # module's _source_location_hint) - there is no independent evidence
+    # the result is even the right building, as opposed to a same-named
+    # but genuinely different real place (confirmed real cases: "Henly
+    # House" not indexed under that spelling, "Ivybridge House" resolving
+    # to a stale/mislabeled POI). Never set True for Tier 1, nor for a
+    # Tier 2 run that DID have a hint to check against - those already have
+    # real corroborating evidence. None is deliberately NOT the same as
+    # False, same reasoning as brochure_link_broken above - a fresh row
+    # that resolved with real corroborating evidence this run must never
+    # accidentally clear a master row's own already-True unverified flag
+    # via master_merge.diff_fields' own blank-skip rule.
+    geocode_unverified: Optional[bool] = None
     special_features: Optional[str] = None
     state_of_space: Optional[str] = None
     contacts: Optional[str] = None  # all contacts combined, one per line/semicolon, each as "Name, email, phone"

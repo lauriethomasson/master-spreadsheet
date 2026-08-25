@@ -534,6 +534,76 @@ class CompoundBuildingGeocodingTests(unittest.TestCase):
         self.assertEqual(row.postcode, "W1T 2RG")
 
 
+class GeocodeUnverifiedFlagTests(unittest.TestCase):
+    """
+    Regression coverage for row.geocode_unverified (see schema.ListingRow's
+    own docstring) - confirmed real cases: "Henly House" (not indexed under
+    that exact spelling by Places) and "Ivybridge House" (Places resolves it
+    to a stale/mislabeled POI), neither fixable by better query phrasing or
+    a name-similarity check, since the returned candidate itself is wrong.
+    What geocode_row CAN do is stop treating a zero-hint Tier 2 acceptance
+    with the same confidence as any other result - see geocode_row's own
+    Tier 2 block.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_henly_house_zero_hint_tier2_acceptance_is_flagged_unverified(self):
+        # No address_1/postcode, and "Henly House" has no trailing postcode-
+        # district token either - _source_location_hint has nothing at all
+        # to offer, so this is exactly the zero-hint Tier 2 shape.
+        row = ListingRow(building="Henly House", provider="MetSpace")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.52, "lng": -0.09, "address_components": []},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertTrue(row.geocode_unverified)
+
+    def test_ivybridge_house_zero_hint_tier2_acceptance_is_flagged_unverified(self):
+        row = ListingRow(building="Ivybridge House", provider="Workplace Plus")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5, "lng": -0.12, "address_components": []},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertTrue(row.geocode_unverified)
+
+    def test_tier_1_geocoding_api_success_is_never_flagged_unverified(self):
+        row = ListingRow(building="16 Mortimer Street", address_1="16 Mortimer Street", postcode="W1T 3JL")
+
+        with patch("geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5188, "lng": -0.1381}), \
+             patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.geocode_unverified)
+
+    def test_tier_2_with_a_source_postcode_hint_is_never_flagged_unverified(self):
+        # A trailing postcode-district token on `building` IS a source hint
+        # (see _source_location_hint) - the Places candidate here agrees
+        # with it (both district ("WC", "1")), so this is corroborated, not
+        # a zero-hint acceptance, even though it went through Tier 2.
+        row = ListingRow(building="New Derwent House WC1", provider="beem")
+        components = [
+            {"longText": "1", "types": ["street_number"]},
+            {"longText": "New Derwent House", "types": ["route"]},
+            {"longText": "WC1B 3ES", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.52, "lng": -0.12, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.geocode_unverified)
+
+
 class GeocodeRowsGroupingTests(unittest.TestCase):
     """
     geocode_rows (the batch entry point, distinct from geocode_row) groups

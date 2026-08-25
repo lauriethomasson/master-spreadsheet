@@ -34,14 +34,25 @@ def _empty_master_df() -> pd.DataFrame:
     return pd.DataFrame(columns=list(ListingRow.model_fields.keys()))
 
 
-def _risky_field_reason(field: str) -> str:
+def _risky_field_reason(field: str, unverified: bool = False) -> str:
     """
     Short, plain-English reason ONE specific risky field needs a manual
     decision - derived directly from WHICH of master_merge's own risk
     categories that field belongs to (see MatchedRow.risky_fields' own
     computation in build_merge_plan), never invented independently of
     that existing logic and never exposing an internal name/function.
+
+    unverified (see master_merge.GEOCODE_UNVERIFIED_FIELDS' own docstring
+    and geocode.py's Tier 2 zero-hint fallback) is checked FIRST, ahead of
+    every other category: an address/coordinate produced with nothing at
+    all to cross-check it against needs its own stronger caution, not the
+    normal "existing value would be replaced" wording - that phrasing
+    implies the OLD value is the one to trust and the new one is merely
+    different, which is backwards here, since it's the NEW value that
+    actually needs the reviewer's own manual confirmation.
     """
+    if unverified and field in master_merge.GEOCODE_UNVERIFIED_FIELDS:
+        return "This address couldn't be independently verified — please confirm it yourself before applying"
     if field in master_merge.HOUSE_NUMBER_FIELDS:
         return "Existing address would be replaced"
     if field in master_merge.GEOCODE_RISK_FIELDS:
@@ -87,7 +98,10 @@ def _word_diff_highlight(old_val: str, new_val: str) -> tuple:
     return " ".join(before_parts), " ".join(after_parts)
 
 
-def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset()) -> dict:
+def _render_field_rows(
+    diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
+    unverified: bool = False,
+) -> dict:
     """
     Renders one compact row per field that genuinely needs a reviewer's
     own attention: field name (+ a short reason when risky - see
@@ -117,6 +131,13 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
     starts unchecked regardless of default_checked, and gets its own
     reason caption - the point is a reviewer has to notice and opt in, not
     just uncheck something that would otherwise apply silently.
+
+    unverified is passed straight through to _risky_field_reason (see its
+    own docstring) so a risky field caused by an unverified geocode (see
+    master_merge.GEOCODE_UNVERIFIED_FIELDS) gets that stronger caption
+    instead of whichever generic reason its field name would otherwise
+    map to - callers with nothing unverified about this row simply never
+    pass it, leaving every existing caption exactly as it was.
 
     Returns only the fields whose checkbox is checked (or bundled as
     safe), using whatever value is currently entered - letting a reviewer
@@ -160,7 +181,7 @@ def _render_field_rows(diffs: dict, key_prefix: str, default_checked: bool, risk
         with label_col:
             st.markdown(f"**{display_utils.friendly_field_label(f)}**")
             if is_risky:
-                st.caption(f"⚠️ {_risky_field_reason(f)}")
+                st.caption(f"⚠️ {_risky_field_reason(f, unverified)}")
         with before_col:
             if is_text_diff:
                 st.caption(before_highlight)
@@ -486,7 +507,8 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
     label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {decisions_needed} {noun} needed"
     with st.expander(label, key=f"{key_prefix}_expander"):
         approved_fields = _render_field_rows(
-            m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields
+            m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields,
+            unverified=bool(m.new_row.geocode_unverified),
         )
     if approved_fields:
         entry = updates.setdefault(m.master_index, {})
@@ -580,7 +602,10 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
                 st.divider()
         if agree_diffs:
             approved.update(
-                _render_field_rows(agree_diffs, f"{key_prefix}_agree", default_checked=True, risky_fields=risky_fields)
+                _render_field_rows(
+                    agree_diffs, f"{key_prefix}_agree", default_checked=True, risky_fields=risky_fields,
+                    unverified=any(bool(mm.new_row.geocode_unverified) for mm in group),
+                )
             )
 
     if approved:
@@ -1888,12 +1913,16 @@ def _render_near_miss_link_diff(u, row_dict: dict, target_index: int, plan, key_
     diffs = master_merge.diff_fields(old_rec, row_dict)
     st.caption(f"Linked to an existing property — {len(diffs)} field(s) would change.")
     if diffs:
+        unverified = bool(row_dict.get("geocode_unverified"))
         risky_fields = frozenset(
             f for f in diffs
             if f in master_merge.RISKY_TEXT_FIELDS and master_merge.is_detail_loss(*diffs[f])
+        ) | frozenset(
+            f for f in diffs if f in master_merge.GEOCODE_UNVERIFIED_FIELDS and unverified
         )
         approved_fields = _render_field_rows(
-            diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields
+            diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields,
+            unverified=unverified,
         )
         if approved_fields:
             entry = decision_updates.setdefault(target_index, {})

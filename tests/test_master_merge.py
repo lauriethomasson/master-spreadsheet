@@ -4088,6 +4088,82 @@ class GeocodeLocationRiskTests(unittest.TestCase):
         self.assertEqual(matched.risky_fields, frozenset())
 
 
+class GeocodeUnverifiedRiskyFieldsTests(unittest.TestCase):
+    """
+    row.geocode_unverified (see schema.ListingRow's own docstring and
+    geocode.py's Tier 2 zero-hint fallback - the real Henly House/Ivybridge
+    House cases this exists for) unconditionally forces address_1/postcode/
+    lat/lng into risky_fields whenever they show up as a genuine diff -
+    unlike HOUSE_NUMBER_FIELDS (address_1 only, structural changes only)
+    and GEOCODE_RISK_FIELDS (lat/lng only, distance+corroboration judged),
+    this has no leniency at all. geocode_unverified itself is diagnostic
+    metadata, never its own diff row (see the brochure_link_broken-style
+    move into MatchedRow.silent_updates).
+    """
+
+    def _plan(self, master_extra=None, new_extra=None):
+        master_df = _master_df([{
+            "building": "40 Basinghall Street", "provider": "GPE", "floor_unit": "3rd Floor",
+            **(master_extra or {}),
+        }])
+        new_row = ListingRow(
+            building="40 Basinghall Street", provider="GPE", floor_unit="3rd Floor",
+            **(new_extra or {}),
+        )
+        return master_merge.build_merge_plan([new_row], master_df)
+
+    def test_unverified_address_and_postcode_diff_is_flagged_risky(self):
+        plan = self._plan(
+            master_extra={"address_1": "1 Old Road", "postcode": "EC2V 1AA"},
+            new_extra={
+                "address_1": "40 Basinghall Street", "postcode": "EC2V 5DE", "geocode_unverified": True,
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("address_1", matched.risky_fields)
+        self.assertIn("postcode", matched.risky_fields)
+
+    def test_unverified_lat_lng_diff_is_flagged_risky_with_no_distance_leniency(self):
+        # Both lat AND lng genuinely change here (a diff on an unchanged
+        # field never exists at all - see diff_fields) - a ~60m move that
+        # would normally clear SAME_LOCATION_METERS/be judged for safety
+        # (see GeocodeLocationRiskTests) is instead forced risky outright,
+        # since unverified applies with no distance leniency at all.
+        plan = self._plan(
+            master_extra={"lat": 51.5142, "lng": -0.1494},
+            new_extra={"lat": _lat_offset(51.5142, 60), "lng": -0.1400, "geocode_unverified": True},
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("lat", matched.risky_fields)
+        self.assertIn("lng", matched.risky_fields)
+
+    def test_geocode_unverified_itself_never_appears_as_its_own_diff_row(self):
+        plan = self._plan(
+            master_extra={"address_1": "1 Old Road", "postcode": "EC2V 1AA"},
+            new_extra={
+                "address_1": "40 Basinghall Street", "postcode": "EC2V 5DE", "geocode_unverified": True,
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertNotIn("geocode_unverified", matched.diffs)
+        self.assertNotIn("geocode_unverified", matched.risky_fields)
+        self.assertEqual(matched.silent_updates.get("geocode_unverified"), True)
+
+    def test_not_unverified_keeps_the_pre_existing_non_risky_address_behavior(self):
+        # Regression: address_1/postcode with no geocode_unverified flag at
+        # all must be completely unaffected by this feature (see
+        # GeocodeLocationRiskTests.test_explicit_valid_new_address_can_
+        # still_update_freely for the same guarantee on a plain, non-
+        # geocoded upload).
+        plan = self._plan(
+            master_extra={"address_1": "40 Basinghall Street", "postcode": "EC2V 5DD"},
+            new_extra={"address_1": "40 Basinghall Street", "postcode": "EC2V 5DE"},
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("postcode", matched.diffs)
+        self.assertEqual(matched.risky_fields, frozenset())
+
+
 class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
     """
     _floor_unit_key - the redundant-building-name-prefix fix. Confidently

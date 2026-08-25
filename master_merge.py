@@ -119,6 +119,21 @@ HOUSE_NUMBER_FIELDS = ("address_1", "building")
 # evidence), rather than every change being flagged unconditionally.
 GEOCODE_RISK_FIELDS = ("lat", "lng")
 
+# address_1/postcode/lat/lng specifically as they stood immediately after
+# geocode.py's own Tier 2 fallback ran with ZERO source address_1/postcode/
+# building-trailing-token hint to cross-check its result against at all
+# (see that module's geocode_row/_source_location_hint) - row.geocode_
+# unverified is the tri-state tag that run sets (see schema.ListingRow's
+# own docstring). Unlike GEOCODE_RISK_FIELDS (lat/lng only, judged by
+# distance + corroborating evidence - see _location_change_is_safe), and
+# unlike HOUSE_NUMBER_FIELDS (address_1, only for a structural leading-
+# number change), this has no leniency at all: a result with nothing
+# whatsoever to check it against is unverified regardless of how far it
+# moved or what shape the change is, so any of these fields showing up as
+# a genuine diff on such a row always needs a human's own confirmation -
+# see build_merge_plan's own risky_fields computation below.
+GEOCODE_UNVERIFIED_FIELDS = ("address_1", "postcode", "lat", "lng")
+
 _EARTH_RADIUS_METERS = 6371000.0
 
 
@@ -1867,7 +1882,9 @@ def matched_collision_field_choice(values: list, field_name: str = None) -> tupl
 # is-this-a-conflict decision - a genuine lat/lng or brochure_link_is_
 # floorplan disagreement is still real evidence worth flagging the group
 # for review over, it's only ever hidden from what gets SHOWN.
-DUPLICATE_CARD_HIDDEN_FIELDS = ("brochure_link_broken", "brochure_link_is_floorplan", "lat", "lng")
+DUPLICATE_CARD_HIDDEN_FIELDS = (
+    "brochure_link_broken", "brochure_link_is_floorplan", "lat", "lng", "geocode_unverified",
+)
 
 
 def genuinely_differing_fields(dicts: list) -> list:
@@ -2383,6 +2400,16 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             if "brochure_link_broken" in diffs:
                 silent["brochure_link_broken"] = diffs.pop("brochure_link_broken")[1]
 
+            # geocode_unverified is the same kind of diagnostic pipeline
+            # metadata as brochure_link_broken above - never a property
+            # fact of its own for a reviewer to approve, just a signal this
+            # module reads below (GEOCODE_UNVERIFIED_FIELDS) to decide
+            # whether THIS row's own address_1/postcode/lat/lng diffs need
+            # a stronger caution, then folds silently into the write like
+            # any other diagnostic flag.
+            if "geocode_unverified" in diffs:
+                silent["geocode_unverified"] = diffs.pop("geocode_unverified")[1]
+
             # Auto-merge a DETAIL_LOSS_MERGE_FIELDS update BEFORE risky_fields
             # is computed below, whenever it's safe to (see merge_compatible_
             # text's own docstring): is_detail_loss says old_val has a
@@ -2456,6 +2483,18 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 f for f in diffs
                 if f in GEOCODE_RISK_FIELDS and not _is_blank(old_rec.get(f))
                 and not _location_change_is_safe(old_rec, new_dict)
+            ) | frozenset(
+                # This run's own geocode result had ZERO source evidence to
+                # check itself against at all (see GEOCODE_UNVERIFIED_
+                # FIELDS' own docstring) - flagged unconditionally, with
+                # none of the leniency HOUSE_NUMBER_FIELDS/GEOCODE_RISK_
+                # FIELDS apply above (a structural-only address check, a
+                # distance+corroboration check for lat/lng): there is
+                # nothing at all backing this result, so any genuine diff
+                # on it always needs a human's own confirmation, regardless
+                # of how small/plausible the change looks.
+                f for f in diffs
+                if f in GEOCODE_UNVERIFIED_FIELDS and new_dict.get("geocode_unverified")
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])
