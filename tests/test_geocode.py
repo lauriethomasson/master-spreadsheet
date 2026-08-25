@@ -766,6 +766,33 @@ class GeocodeRowsGroupingTests(unittest.TestCase):
         self.assertEqual(row_a.address_1, "Row A's own stated address")
         self.assertEqual(row_a.postcode, "AA1 1AA")
 
+    def test_geocode_unverified_flag_is_copied_to_every_group_member(self):
+        # Confirmed real-world symptom this regression-tests: Hatchers Yard
+        # (3 rows) and Ivybridge House (6 rows) each only flagged the ONE
+        # representative row actually sent through geocode_row, leaving
+        # every other member silently sharing the identical unverified
+        # address with no flag/caution shown at all - because the group
+        # copy-down loop copied lat/lng/address_1/postcode but not
+        # geocode_unverified alongside them.
+        hatchers_yard = [
+            ListingRow(building="Hatchers Yard", provider="Beam", floor_unit="1st Floor"),
+            ListingRow(building="Hatchers Yard", provider="Beam", floor_unit="2nd Floor"),
+            ListingRow(building="Hatchers Yard", provider="Beam", floor_unit="3rd Floor"),
+        ]
+        ivybridge_house = [
+            ListingRow(building="Ivybridge House", provider="Workplace Plus", floor_unit=f"Suite {i}")
+            for i in range(1, 7)
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5, "lng": -0.12, "address_components": []},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_rows(hatchers_yard + ivybridge_house)
+
+        for row in hatchers_yard + ivybridge_house:
+            self.assertTrue(row.geocode_unverified, f"{row.building} {row.floor_unit} was not flagged unverified")
+
     def test_blank_building_rows_are_never_grouped_with_anything(self):
         row_a = ListingRow(building="", provider="UNION")
         row_b = ListingRow(building="", provider="UNION")

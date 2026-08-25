@@ -937,6 +937,15 @@ def geocode_rows(rows: list) -> list:
     an arbitrary first-in-batch pick - submarket is deliberately excluded
     from that preference and never touched by this copy-down at all, since
     it's the one field this whole grouping exists to keep row-specific.
+
+    geocode_unverified (see schema.ListingRow's own docstring) travels
+    alongside lat/lng/address_1/postcode in this same copy-down, never with
+    submarket - it describes the CONFIDENCE of that one shared physical-
+    location result, not a row-specific fact, so every member inheriting
+    the representative's address/coordinates must inherit its unverified
+    status too, or the Review page's stronger caution (see pages/2_Review_
+    and_Master.py's _risky_field_reason) would only ever show up on
+    whichever single row happened to be the representative.
     """
     groups = {}
     ungrouped = []
@@ -988,6 +997,15 @@ def geocode_rows(rows: list) -> list:
                 row.address_1 = representative.address_1
             if not row.postcode and representative.postcode:
                 row.postcode = representative.postcode
+            # geocode_unverified describes the CONFIDENCE of the shared
+            # lat/lng/address_1/postcode result above, not a fact of its
+            # own - it must travel with those fields to every member that
+            # inherits them, or a group's other rows would silently share
+            # an unverified address with no caution shown at all (confirmed
+            # real gap: Hatchers Yard/Ivybridge House groups only flagged
+            # the one representative actually sent through geocode_row).
+            if not row.geocode_unverified and representative.geocode_unverified:
+                row.geocode_unverified = representative.geocode_unverified
             # submarket is NEVER copied here - see this function's own
             # docstring on why that field alone stays row-specific.
             if row.lat is not None and row.lng is not None:
