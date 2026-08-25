@@ -4366,9 +4366,10 @@ class GeocodeConsolidationGroupsTests(unittest.TestCase):
 
 class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
     """
-    _floor_unit_key - the redundant-building-name-prefix fix, plus the
-    standalone-word-"floor" strip alongside it. Confidently matches once
-    the redundant prefix/word is normalized away, but never weakens
+    _floor_unit_key - the redundant-building-name-prefix fix, the
+    standalone-word-"floor" strip, and the bare-floor-number normalization
+    (all three) alongside it. Confidently matches once the redundant
+    prefix/word/ordinal-suffix is normalized away, but never weakens
     genuine floor/unit distinctions (6th vs 7th, North vs South, different
     buildings) - see BuildMergePlanFuzzyBuildingTests/MatchUnitStyle tests
     elsewhere in this file for the pre-existing safeguards this must not
@@ -4490,6 +4491,97 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
         # \bfloor\b matches only the exact, separate word "floor" - never
         # a substring inside a longer word.
         self.assertEqual(master_merge._floor_unit_key(None, "Floorspace A"), "floorspace a")
+
+    def test_ordinal_suffix_is_normalized_mainframe_style(self):
+        # Real confirmed cases: Mainframe's "8th floor" (master) vs "8"
+        # (upload), and likewise "7th floor"/"7", "4th floor"/"4" - still
+        # requiring manual confirmation even after the standalone-"floor"-
+        # word fix alone.
+        self.assertEqual(
+            master_merge._floor_unit_key("Mainframe", "8th floor"), master_merge._floor_unit_key("Mainframe", "8"),
+        )
+        self.assertEqual(
+            master_merge._floor_unit_key("Mainframe", "7th floor"), master_merge._floor_unit_key("Mainframe", "7"),
+        )
+        self.assertEqual(
+            master_merge._floor_unit_key("Mainframe", "4th floor"), master_merge._floor_unit_key("Mainframe", "4"),
+        )
+
+    def test_mainframe_rows_no_longer_need_a_near_miss_decision(self):
+        master_df = _master_df([
+            {"building": "Mainframe", "provider": "Colliers", "floor_unit": "8th floor"},
+            {"building": "Mainframe", "provider": "Colliers", "floor_unit": "7th floor"},
+            {"building": "Mainframe", "provider": "Colliers", "floor_unit": "4th floor"},
+        ])
+        new_rows = [
+            ListingRow(building="Mainframe", provider="Colliers", floor_unit="8"),
+            ListingRow(building="Mainframe", provider="Colliers", floor_unit="7"),
+            ListingRow(building="Mainframe", provider="Colliers", floor_unit="4"),
+        ]
+
+        plan = master_merge.build_merge_plan(new_rows, master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 3)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_ambiguous_multi_number_floor_unit_is_unaffected(self):
+        # "2nd & 4th Floors" has two distinct numbers - genuinely
+        # ambiguous which one (if either) is "the" floor, so this must
+        # never reduce to a bare number, same conservative philosophy as
+        # _floor_number's own "more than one number -> None" rule.
+        key = master_merge._floor_unit_key(None, "2nd & 4th Floors")
+        self.assertNotIn(key, ("2", "4"))
+
+    def test_kent_house_and_elm_yard_regressions_still_pass(self):
+        # The two earlier real cases (word "floor" alone, no ordinal
+        # number involved on one side) must be completely unaffected by
+        # this additional normalization.
+        self.assertEqual(
+            master_merge._floor_unit_key("Kent House", "1st floor (South)"),
+            master_merge._floor_unit_key("Kent House", "1st (South)"),
+        )
+        self.assertEqual(
+            master_merge._floor_unit_key("Elm Yard", "5th floor"), master_merge._floor_unit_key("Elm Yard", "5th"),
+        )
+
+    def test_elsley_house_case_still_correctly_falls_through_unchanged(self):
+        # Regression guard, not a fix - confirms the ordinal-suffix
+        # normalization does NOT accidentally rescue the Elsley House
+        # case either: "Elsley House 1st Floor (North)" reduces (via the
+        # building-prefix + "floor"-word strips) to "1st north" - a
+        # number PLUS a real extra word, "north" - which the required
+        # FULL-STRING match against _FLOOR_NUMBER_TOKEN_RE correctly
+        # refuses to reduce further, unlike _floor_number's own tolerant
+        # token-scan (which WOULD discard "north" and wrongly return 1).
+        master_df = _master_df([
+            {"building": "Elsley House", "provider": "UNION", "floor_unit": "1st floor(N) Elsley House"},
+        ])
+        new_row = ListingRow(building="Elsley House", provider="UNION", floor_unit="Elsley House 1st Floor (North)")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+    def test_a_genuine_floor_number_conflict_still_keeps_rows_separate(self):
+        # A real, different floor number must still be kept separate by
+        # the exact-match key - this normalization only reconciles
+        # DIFFERENT FORMATTING of the SAME number, never different
+        # numbers.
+        self.assertNotEqual(
+            master_merge._floor_unit_key("Mainframe", "7"), master_merge._floor_unit_key("Mainframe", "8th Floor"),
+        )
+
+    def test_floor_conflicts_near_miss_exclusion_is_unaffected_by_this_change(self):
+        # _floor_conflicts (used by _suggest_similar for near-miss
+        # suggestion exclusion) calls _floor_number directly - a
+        # genuinely different call site from _floor_unit_key's own new
+        # full-string match, and this change never touches _floor_number/
+        # _FLOOR_NUMBER_TOKEN_RE itself. "7" vs "8th Floor" must still be
+        # EXCLUDED from suggestions, never silently treated as a match.
+        self.assertTrue(
+            master_merge._floor_conflicts({"floor_unit": "7"}, {"floor_unit": "8th Floor"}),
+        )
 
 
 class AmbiguousIdentityStillManualTests(unittest.TestCase):

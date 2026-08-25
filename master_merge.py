@@ -1247,6 +1247,27 @@ def _floor_unit_key(building, floor_unit) -> str:
     handles) plus an "(N)" vs "(North)" abbreviation difference, a
     different and more complex normalization problem this fix does not
     attempt to solve.
+
+    Finally, if what's left after both strips above is NOTHING BUT a
+    single floor number - optionally with an ordinal suffix ("8th" or
+    "8"), recognized via the same _FLOOR_NUMBER_TOKEN_RE number-SHAPE
+    pattern _floor_number (below) uses - normalizes to that bare number.
+    Confirmed real cases: Mainframe's "8th floor" (master) vs "8"
+    (upload), and likewise "7th floor"/"7", "4th floor"/"4".
+
+    Deliberately a FULL-STRING match against the entire remaining text
+    (_FLOOR_NUMBER_TOKEN_RE.fullmatch), never _floor_number's own token-
+    by-token scan, which tolerates and ignores OTHER surrounding words by
+    design for its own, looser near-miss-conflict purpose (see that
+    function's own docstring - "Mainframe — Colliers — 8" deliberately
+    still resolves to 8 there, junk words and all). Reusing that same
+    tolerant behavior HERE would be unsafe: it would reduce "1st South"
+    and "1st North" down to the same bare "1", silently discarding the
+    one word that actually distinguishes them. Requiring the ENTIRE
+    remaining text to be nothing but the number means "2nd & 4th Floors"
+    (two numbers), "LG" (no number), and Elsley House's own "1st north"
+    shape above (a number PLUS a real extra word, "north") all correctly
+    keep falling through unchanged, exactly as they do today.
     """
     floor_key = normalize_key(floor_unit)
     building_key = normalize_key(building)
@@ -1255,7 +1276,9 @@ def _floor_unit_key(building, floor_unit) -> str:
         if rest == "" or rest[0] == " ":
             floor_key = rest.strip()
     floor_key = re.sub(r"\bfloor\b", "", floor_key)
-    return re.sub(r"\s+", " ", floor_key).strip()
+    floor_key = re.sub(r"\s+", " ", floor_key).strip()
+    number_match = _FLOOR_NUMBER_TOKEN_RE.fullmatch(floor_key)
+    return str(int(number_match.group(1))) if number_match else floor_key
 
 
 def _fallback_key(row: dict) -> tuple:
