@@ -259,6 +259,43 @@ class BrokenBrochureLinkDisplayTests(unittest.TestCase):
         column_letter = ws.cell(row=1, column=col_idx).column_letter
         self.assertTrue(ws.column_dimensions[column_letter].hidden)
 
+    def test_geocode_unverified_column_is_hidden_not_shown_as_a_raw_flag(self):
+        # geocode_unverified is diagnostic pipeline metadata (see its own
+        # schema.py docstring, "same reasoning as brochure_link_broken
+        # above") - it was never actually added to HIDDEN_COLUMNS when
+        # introduced, so it showed up as a real, visible column. Same
+        # hidden-not-dropped treatment as brochure_link_broken: still
+        # written with its real value, just not shown by default.
+        row = ListingRow(building="A", address_1="1 Example Street", geocode_unverified=True)
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("geocode_unverified")) + 1
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        self.assertTrue(ws.column_dimensions[column_letter].hidden)
+        self.assertEqual(ws.cell(row=2, column=col_idx).value, True)
+
+    def test_development_name_column_is_hidden_but_still_present_with_its_real_data(self):
+        # development_name is behind-the-scenes geocoding metadata (feeds
+        # geocode.py's own Tier 2 disambiguation query - see that field's
+        # own schema.py docstring), not something Mark/Laurie need to see
+        # as its own column. Same hidden-not-dropped treatment as every
+        # other HIDDEN_COLUMNS entry: still written with its real value.
+        row = ListingRow(building="The Canal Building", development_name="Regent's Wharf")
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("development_name")) + 1
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        self.assertTrue(ws.column_dimensions[column_letter].hidden)
+        self.assertEqual(ws.cell(row=2, column=col_idx).value, "Regent's Wharf")
+
     def test_floorplan_link_column_is_hidden_but_still_present_with_its_real_data(self):
         # Purely a visibility change (see HIDDEN_COLUMNS' own comment) -
         # the column is hidden in Excel, never dropped: still there with

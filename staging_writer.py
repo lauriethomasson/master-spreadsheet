@@ -82,9 +82,18 @@ DATA_ROW_HEIGHT = 60
 # enrichment.py) are all completely untouched, still written into this
 # file exactly as before and still hyperlinked (see HYPERLINK_COLUMNS/
 # LINK_DISPLAY_TEXT below, both unaffected by this) - it just no longer
-# shows as its own visible column.
+# shows as its own visible column. geocode_unverified is the same
+# diagnostic-pipeline-metadata idea again (see that field's own schema.py
+# docstring, "same reasoning as brochure_link_broken above") - a raw
+# True/blank column would expose internal geocoding confidence bookkeeping
+# rather than the Review page's own "couldn't be independently verified"
+# caution that's meant to communicate it instead. development_name is
+# behind-the-scenes geocoding metadata too (see that field's own schema.py
+# docstring) - it feeds geocode.py's own Tier 2 disambiguation query, but
+# isn't itself a property fact Mark/Laurie need to see as its own column.
 HIDDEN_COLUMNS = [
     "source_file", "property_id", "brochure_link_broken", "brochure_link_is_floorplan", "floorplan_link",
+    "geocode_unverified", "development_name",
 ]
 
 

@@ -1993,13 +1993,16 @@ def geocode_consolidation_groups(rows: list) -> dict:
 # listing comparison card (see pages/2_Review_and_Master.py's own
 # _render_intra_batch_duplicate_group, via listing_summary_lines).
 # property_id/source_file are already excluded from DIFF_FIELDS itself;
-# these four are the same idea for a value genuinely_differing_fields/
+# these fields are the same idea for a value genuinely_differing_fields/
 # _group_has_genuine_conflict still legitimately checks for the ACTUAL
 # is-this-a-conflict decision - a genuine lat/lng or brochure_link_is_
 # floorplan disagreement is still real evidence worth flagging the group
 # for review over, it's only ever hidden from what gets SHOWN.
+# development_name is behind-the-scenes geocoding metadata (see schema.
+# ListingRow's own docstring), same idea as geocode_unverified alongside
+# it here.
 DUPLICATE_CARD_HIDDEN_FIELDS = (
-    "brochure_link_broken", "brochure_link_is_floorplan", "lat", "lng", "geocode_unverified",
+    "brochure_link_broken", "brochure_link_is_floorplan", "lat", "lng", "geocode_unverified", "development_name",
 )
 
 
