@@ -4200,6 +4200,49 @@ class GeocodeUnverifiedRiskyFieldsTests(unittest.TestCase):
         self.assertEqual(matched.risky_fields, frozenset())
 
 
+class GeocodeUnverifiedSelfCorrectionTests(unittest.TestCase):
+    """
+    geocode_row now writes an explicit False (never merely None) on a
+    Tier 1 success or a hint-corroborated Tier 2 success (see that
+    module's own docstring and schema.ListingRow.geocode_unverified's own
+    docstring on why False and None are deliberately different values) -
+    round-tripped here through the REAL diff/merge path (build_merge_plan
+    -> apply_merge), not just geocode_row in isolation, confirming a
+    stale True left in master by an earlier zero-hint upload is actually
+    cleared once a later upload resolves the same building with real
+    evidence.
+    """
+
+    def test_a_fresh_tier1_verified_row_clears_a_stale_true_in_master(self):
+        master_df = _master_df([{
+            "building": "Henly House", "provider": "Colliers", "floor_unit": "1st Floor",
+            "geocode_unverified": True, "lat": 51.5, "lng": -0.1,
+        }])
+        new_row = ListingRow(
+            building="Henly House", provider="Colliers", floor_unit="1st Floor",
+            address_1="Bolsover St", postcode="NW1 3AU", lat=51.5236906, lng=-0.1436278,
+            geocode_unverified=False,
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = plan.matched_changed[0]
+
+        # geocode_unverified is diagnostic metadata, never its own diff
+        # row (same brochure_link_broken-style routing) - it lands in
+        # silent_updates, applied regardless of whether the row's other
+        # fields needed a decision.
+        self.assertNotIn("geocode_unverified", matched.diffs)
+        self.assertIs(matched.silent_updates.get("geocode_unverified"), False)
+
+        updates = {matched.master_index: dict(matched.silent_updates)}
+        updates[matched.master_index].update(
+            {f: new_val for f, (old_val, new_val) in matched.diffs.items()}
+        )
+        merged = master_merge.apply_merge(plan.master_records, updates, [], frozenset())
+
+        self.assertIs(merged[0].geocode_unverified, False)
+
+
 class GeocodeConsolidationGroupsTests(unittest.TestCase):
     """
     geocode_consolidation_groups - the pure grouping logic behind pages/2_

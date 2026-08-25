@@ -98,13 +98,20 @@ class ListingRow(BaseModel):
     # the result is even the right building, as opposed to a same-named
     # but genuinely different real place (confirmed real cases: "Henly
     # House" not indexed under that spelling, "Ivybridge House" resolving
-    # to a stale/mislabeled POI). Never set True for Tier 1, nor for a
-    # Tier 2 run that DID have a hint to check against - those already have
-    # real corroborating evidence. None is deliberately NOT the same as
-    # False, same reasoning as brochure_link_broken above - a fresh row
-    # that resolved with real corroborating evidence this run must never
-    # accidentally clear a master row's own already-True unverified flag
-    # via master_merge.diff_fields' own blank-skip rule.
+    # to a stale/mislabeled POI).
+    #
+    # Set explicitly False (never left at None) by Tier 1, and by a Tier 2
+    # run that DID have a hint to check against - both are real,
+    # independently corroborated evidence, so both positively CLEAR a
+    # stale True a prior upload's own zero-hint fallback may have left on
+    # this same row, rather than leaving it stuck forever. This is exactly
+    # why False and None are deliberately different values here, same
+    # reasoning as brochure_link_broken above: None means "this run didn't
+    # even touch the question" (row already had lat/lng and returned
+    # early, e.g.) and must never disturb master's existing flag either
+    # way via master_merge.diff_fields' own blank-skip rule, while False
+    # means "this run has real evidence the location IS verified" and
+    # must be written through like any other genuine value.
     geocode_unverified: Optional[bool] = None
     # The overall campus/development's own brand name, distinct from any
     # individual building's own name within it (e.g. "Regent's Wharf"

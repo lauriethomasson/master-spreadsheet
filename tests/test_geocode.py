@@ -40,6 +40,12 @@ class SkipAlreadyGeocodedRowsTests(unittest.TestCase):
         mock_reverse.assert_not_called()
         self.assertEqual(result.lat, 51.5)
         self.assertEqual(result.lng, -0.1)
+        # This run never actually checked anything - it must leave
+        # geocode_unverified completely untouched (still None, never
+        # explicit False), so a real prior True from another row/upload
+        # sharing this same building is never silently cleared by a run
+        # that did no verification work at all.
+        self.assertIsNone(result.geocode_unverified)
 
     def test_row_missing_lat_still_goes_through_the_normal_path(self):
         row = ListingRow(building="City Tower", provider="Breezblok", lat=None, lng=-0.1)
@@ -699,7 +705,11 @@ class GeocodeUnverifiedFlagTests(unittest.TestCase):
              patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
             geocode.geocode_row(row)
 
-        self.assertIsNone(row.geocode_unverified)
+        # Explicit False, not merely "not True" - a Tier 1 success is real
+        # evidence, so it must positively clear a stale True a prior
+        # upload's own zero-hint fallback may have left on this row (see
+        # schema.ListingRow.geocode_unverified's own docstring).
+        self.assertIs(row.geocode_unverified, False)
 
     def test_tier_2_with_a_source_postcode_hint_is_never_flagged_unverified(self):
         # A trailing postcode-district token on `building` IS a source hint
@@ -719,7 +729,9 @@ class GeocodeUnverifiedFlagTests(unittest.TestCase):
         ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
             geocode.geocode_row(row)
 
-        self.assertIsNone(row.geocode_unverified)
+        # Same explicit-False reasoning as Tier 1 above - a hint-
+        # corroborated Tier 2 match is real evidence too.
+        self.assertIs(row.geocode_unverified, False)
 
 
 class GeocodeRowsGroupingTests(unittest.TestCase):

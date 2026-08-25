@@ -65,7 +65,13 @@ spelling by Places) and "Ivybridge House" (resolves to a stale/mislabeled
 POI) - genuine Google Places data problems no query rephrasing or name-
 similarity check can fix, since the returned candidate is itself wrong.
 See schema.ListingRow.geocode_unverified's own docstring for how this is
-surfaced to a reviewer.
+surfaced to a reviewer. Tier 1 and a hint-corroborated Tier 2 match both
+set this explicitly False (never leave it at None) - real evidence, so
+either one also self-corrects a stale True a prior upload's own zero-hint
+fallback left on this same row, rather than that warning sitting there
+forever with no way to clear (confirmed real gap this closes - see
+schema.ListingRow.geocode_unverified's own docstring on why False and
+None are deliberately different values here).
 
 row.development_name (see schema.ListingRow's own docstring) is tried as
 an extra Tier 2 query disambiguator, ahead of submarket - a real London
@@ -739,6 +745,17 @@ def geocode_row(row: ListingRow) -> ListingRow:
         if result["status"] == "OK":
             row.lat = result["lat"]
             row.lng = result["lng"]
+            # Always an independently corroborated lookup, never a guess -
+            # explicitly clears a stale True a prior upload's own Tier 2
+            # zero-hint fallback may have left on this row (see schema.
+            # ListingRow.geocode_unverified's own docstring). An explicit
+            # False, not None, is what actually matters here: master_
+            # merge.diff_fields' blank-skip rule treats None as "no data
+            # this time, don't touch master's existing value" (correct -
+            # that's what stops a row that wasn't rechecked from erasing a
+            # real warning), but False is a real, positive value that DOES
+            # overwrite a stale True.
+            row.geocode_unverified = False
             _backfill_submarket_from_coords(row, row.lat, row.lng)
             return row
         # fall through to Places if Geocoding fails despite having an address
@@ -829,6 +846,14 @@ def geocode_row(row: ListingRow) -> ListingRow:
             # result.
             if not source_hint:
                 row.geocode_unverified = True
+            else:
+                # A genuinely hint-corroborated Tier 2 match is real
+                # evidence, same as Tier 1 - explicit False (never just
+                # left at None) so it too can clear a stale True a prior
+                # upload's own zero-hint fallback left on this row (see
+                # geocode_row's own Tier 1 success branch for the same
+                # explicit-False reasoning).
+                row.geocode_unverified = False
 
             if not row.address_1 or not row.postcode:
                 address_1, postcode = _address_line1_and_postcode(
