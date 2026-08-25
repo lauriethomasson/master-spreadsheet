@@ -534,6 +534,124 @@ class CompoundBuildingGeocodingTests(unittest.TestCase):
         self.assertEqual(row.postcode, "W1T 2RG")
 
 
+class DevelopmentNameDisambiguationTests(unittest.TestCase):
+    """
+    Regression coverage for row.development_name (see schema.ListingRow's
+    own docstring) - the real confirmed case: "Canal Building" (Colliers),
+    part of the real "Regent's Wharf" campus on All Saints Street, King's
+    Cross (alongside "Thorley Works", "The Mill", "The Packing House"),
+    states no street number anywhere in its own brochure. A plain "Canal
+    Building, King's Cross, London, UK" query (building name + coarse
+    submarket alone) is not unique enough - it can land on a genuinely
+    different "Canal Reach" street also in King's Cross. development_name
+    ("Regent's Wharf") is a more specific disambiguator, tried BEFORE the
+    submarket-based variants (see geocode_row's own Tier 2 block).
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_development_name_variant_is_tried_before_the_submarket_variant(self):
+        row = ListingRow(
+            building="Canal Building", provider="Colliers", submarket="King's Cross",
+            development_name="Regent's Wharf",
+        )
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5363, "lng": -0.1201, "address_components": []},
+        ) as mock_places, patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        mock_places.assert_called_once_with("Canal Building, Regent's Wharf, London, UK")
+
+    def test_development_name_disambiguates_a_real_same_area_collision(self):
+        # The plain submarket-only query would resolve to the WRONG real
+        # place (a decoy "Canal Reach" street, also in King's Cross, also
+        # comfortably in-bbox) - the development_name variant, tried
+        # first, must resolve to the actual Regent's Wharf building
+        # instead, without ever falling through to the decoy.
+        row = ListingRow(
+            building="Canal Building", provider="Colliers", submarket="King's Cross",
+            development_name="Regent's Wharf",
+        )
+
+        def fake_places(query):
+            if query == "Canal Building, Regent's Wharf, London, UK":
+                return {"status": "OK", "lat": 51.5363, "lng": -0.1201, "address_components": []}
+            if query == "Canal Building, King's Cross, London, UK":
+                # The real, wrong "Canal Reach" collision this feature exists for.
+                return {"status": "OK", "lat": 51.5395, "lng": -0.1180, "address_components": []}
+            raise AssertionError(f"unexpected query: {query!r}")
+
+        with patch("geocode.call_places_text_search", side_effect=fake_places), \
+             patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5363)
+        self.assertEqual(row.lng, -0.1201)
+
+    def test_development_name_query_failing_falls_back_to_the_submarket_variant(self):
+        row = ListingRow(
+            building="Canal Building", provider="Colliers", submarket="King's Cross",
+            development_name="Regent's Wharf",
+        )
+        queried = []
+
+        def fake_places(query):
+            queried.append(query)
+            if query == "Canal Building, Regent's Wharf, London, UK":
+                return {"status": "ZERO_RESULTS"}
+            return {"status": "OK", "lat": 51.5363, "lng": -0.1201, "address_components": []}
+
+        with patch("geocode.call_places_text_search", side_effect=fake_places), \
+             patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        # The submarket fallback itself still tries its own no-space
+        # variant first (see _submarket_query_variants' own docstring) -
+        # unchanged by this feature, just tried AFTER development_name.
+        self.assertEqual(
+            queried,
+            ["Canal Building, Regent's Wharf, London, UK", "Canal Building, King'sCross, London, UK"],
+        )
+        self.assertEqual(row.lat, 51.5363)
+
+    def test_no_development_name_behaves_exactly_as_before(self):
+        # Regression: a row with no development_name at all must query
+        # exactly the same submarket-based text as before this feature -
+        # never a "None" artifact from the new location_texts list.
+        row = ListingRow(building="Canal Building", provider="Colliers", submarket="King's Cross")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5363, "lng": -0.1201, "address_components": []},
+        ) as mock_places, patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        # The no-space submarket variant is tried first (see
+        # _submarket_query_variants' own docstring) - unchanged by this
+        # feature for a row with no development_name at all.
+        mock_places.assert_called_once_with("Canal Building, King'sCross, London, UK")
+
+    def test_development_name_never_marks_the_result_as_unverified(self):
+        # A development-name-assisted match is a better GUESS, not
+        # independent evidence - it must be flagged for manual
+        # confirmation exactly like any other zero-hint Tier 2 result,
+        # never treated as verified just because it used development_name.
+        row = ListingRow(
+            building="Canal Building", provider="Colliers", development_name="Regent's Wharf",
+        )
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5363, "lng": -0.1201, "address_components": []},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertTrue(row.geocode_unverified)
+
+
 class GeocodeUnverifiedFlagTests(unittest.TestCase):
     """
     Regression coverage for row.geocode_unverified (see schema.ListingRow's

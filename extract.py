@@ -337,6 +337,14 @@ how many properties or units it covers):
   unrelated properties, or a feature is only ever described for one specific building rather than the
   whole site, leave this null rather than guessing it's shared — that belongs in building_features
   instead (see below, after the units). Leave null if the document states nothing at this level.
+- development_name: the name of the overall campus/development this brochure describes, ONLY when it is
+  a genuinely DISTINCT name from any individual building's own name within it — e.g. a brochure branded
+  "Regent's Wharf" that contains separately-named buildings "Thorley Works", "The Canal Building", "The
+  Mill", and "The Packing House" would have development_name "Regent's Wharf" (never one of the building
+  names themselves). If the brochure describes just a single building with no separate campus/development
+  branding — i.e. the building's own name IS the only name given, with nothing bigger it belongs to — leave
+  this null rather than repeating the building name here or inventing a development name that isn't
+  actually stated.
 
 Then, identify EVERY SEPARATE AVAILABLE UNIT/SPACE described in the brochure. A brochure may describe
 just one unit, many units within one building (e.g. a schedule of areas listing multiple floors), or
@@ -452,6 +460,7 @@ Return your answer as a single JSON object with this exact structure:
   "provider": "..." or null,
   "contacts": "..." or null,
   "property_features": "..." or null,
+  "development_name": "..." or null,
   "building_features": [
     {"building": "...", "features": "..."}
   ],
@@ -767,6 +776,7 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),
         "contacts": raw.get("contacts"),
+        "development_name": raw.get("development_name"),
     }
 
     rows = []

@@ -66,6 +66,21 @@ POI) - genuine Google Places data problems no query rephrasing or name-
 similarity check can fix, since the returned candidate is itself wrong.
 See schema.ListingRow.geocode_unverified's own docstring for how this is
 surfaced to a reviewer.
+
+row.development_name (see schema.ListingRow's own docstring) is tried as
+an extra Tier 2 query disambiguator, ahead of submarket - a real London
+office campus often brands an overall development name distinct from
+each building's own (often generic) name inside it, and building name +
+coarse submarket alone can still collide with an unrelated real place.
+Confirmed real failure this exists for: "Canal Building" (Colliers, part
+of the real "Regent's Wharf" campus on All Saints Street, King's Cross -
+alongside "Thorley Works", "The Mill", "The Packing House" - with no
+street number stated anywhere in its own brochure) resolved via "Canal
+Building, King's Cross, London, UK" to a genuinely different "Canal
+Reach" street also in King's Cross. Never wired into _source_location_
+hint or geocode_unverified - a development-name-assisted match is a
+better GUESS, not independent evidence, so it's still flagged for manual
+confirmation exactly like any other zero-hint Tier 2 result.
 """
 
 import json
@@ -758,22 +773,38 @@ def geocode_row(row: ListingRow) -> ListingRow:
         # tried before giving up - never "candidate 1 conflicts -> blank"
         # while a safer variant remains untried.
         #
-        # Each candidate is itself tried against every _submarket_query_
-        # variants() variant (a no-space submarket variant first, then the
-        # submarket exactly as extracted/normalized - see that function's
-        # own docstring for why THAT specific order is the only one that
-        # changes anything) before moving on to the next candidate - same
-        # "keep trying safer/differently-phrased queries before giving up"
-        # principle, one level deeper. Same OK-and-in-bbox acceptance check
-        # either way; a submarket variant is never given any different
-        # treatment than the base query once it's built.
+        # Each candidate is itself tried against a list of location-text
+        # variants, most specific first, before moving on to the next
+        # candidate - same "keep trying safer/differently-phrased queries
+        # before giving up" principle, one level deeper. row.development_
+        # name (the overall campus/development's own brand name, e.g.
+        # "Regent's Wharf" for "The Canal Building" - see schema.
+        # ListingRow's own docstring), when present, is tried FIRST: it's a
+        # more specific, more reliable disambiguator than submarket alone -
+        # confirmed real failure this exists for: "Canal Building" (no
+        # street number stated anywhere in its own brochure) resolved via
+        # a plain "Canal Building, King's Cross, London, UK" query to a
+        # genuinely different "Canal Reach" street also in King's Cross,
+        # since building name + coarse area alone isn't unique enough.
+        # _submarket_query_variants() (a no-space submarket variant first,
+        # then the submarket exactly as extracted/normalized - see that
+        # function's own docstring for why THAT specific order is the only
+        # one that changes anything) is always tried too, as a fallback
+        # for a development-name query that itself doesn't resolve, or for
+        # any row with no development_name at all - never skipped, only
+        # ever tried after the more specific variant first. Same OK-and-
+        # in-bbox acceptance check throughout; neither variant is ever
+        # given any different treatment than the base query once built.
         result = {"status": "ZERO_RESULTS"}
         for candidate in query_variants:
             matched = False
-            for submarket_text in _submarket_query_variants(row.submarket):
+            location_texts = ([row.development_name] if row.development_name else []) + (
+                _submarket_query_variants(row.submarket)
+            )
+            for location_text in location_texts:
                 query_parts = [candidate]
-                if submarket_text:
-                    query_parts.append(submarket_text)
+                if location_text:
+                    query_parts.append(location_text)
                 query_parts.append("London, UK")
                 query = ", ".join(query_parts)
 

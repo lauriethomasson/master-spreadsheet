@@ -730,6 +730,36 @@ class ExtractFromPngPagesTests(unittest.TestCase):
         self.assertEqual(rows[0].brochure_link, "https://storage/colliers.pdf")
         mock_call_gemini.assert_called_once()
 
+    def test_development_name_from_gemini_output_flows_through_to_every_row(self):
+        # Real Regent's Wharf shape: one brochure-level development_name,
+        # shared across every unit regardless of which of the campus'
+        # several separately-named buildings it's in (see extract.py's own
+        # PROMPT and schema.ListingRow.development_name's own docstring).
+        raw = {
+            "provider": "Colliers", "contacts": None, "development_name": "Regent's Wharf",
+            "units": [
+                {"building": "The Canal Building", "floor_unit": "1st", "brochure_link": None},
+                {"building": "Thorley Works", "floor_unit": "2nd", "brochure_link": None},
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="regents-wharf.pdf")
+
+        self.assertEqual(rows[0].development_name, "Regent's Wharf")
+        self.assertEqual(rows[1].development_name, "Regent's Wharf")
+
+    def test_no_development_name_in_gemini_output_leaves_it_null(self):
+        # Regression: a raw payload with no "development_name" key at all
+        # (every existing test/real single-building brochure) must leave
+        # the field null, never raise.
+        raw = {"provider": None, "contacts": None, "units": [{"building": "X", "brochure_link": None}]}
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="pasted.pdf")
+
+        self.assertIsNone(rows[0].development_name)
+
     def test_page_links_are_threaded_through_to_the_gemini_call(self):
         raw = {"provider": None, "contacts": None, "units": []}
         page_links = [[{"href": "https://example.com/a.pdf", "text": "27-29 Gloucester Place"}]]

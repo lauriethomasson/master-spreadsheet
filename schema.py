@@ -14,6 +14,14 @@ class ExtractedFields(BaseModel):
     address_1: Optional[str] = None  # not every source (e.g. email listings) states a street address
     postcode: Optional[str] = None   # same — never fabricate, leave null if not stated
     submarket: Optional[str] = None
+    # The overall campus/development's own brand name, distinct from any
+    # individual building's own name within it (e.g. "Regent's Wharf"
+    # containing "The Canal Building", "Thorley Works", ...) - only when
+    # the source document genuinely states one; null for a brochure
+    # describing just one single building with no separate campus
+    # branding, never invented. See geocode.py's own use of this as an
+    # extra Tier 2 disambiguator.
+    development_name: Optional[str] = None
     building: str
     floor_unit: Optional[str] = None
     size_sqft: Optional[float] = None        # single unit's size — normal case, unchanged
@@ -98,6 +106,14 @@ class ListingRow(BaseModel):
     # accidentally clear a master row's own already-True unverified flag
     # via master_merge.diff_fields' own blank-skip rule.
     geocode_unverified: Optional[bool] = None
+    # The overall campus/development's own brand name, distinct from any
+    # individual building's own name within it (e.g. "Regent's Wharf"
+    # containing "The Canal Building", "Thorley Works", ...) - only when
+    # the source document genuinely states one; null for a brochure
+    # describing just one single building with no separate campus
+    # branding, never invented. See geocode.py's own use of this as an
+    # extra Tier 2 disambiguator.
+    development_name: Optional[str] = None
     special_features: Optional[str] = None
     state_of_space: Optional[str] = None
     contacts: Optional[str] = None  # all contacts combined, one per line/semicolon, each as "Name, email, phone"
