@@ -4246,18 +4246,37 @@ class GeocodeConsolidationGroupsTests(unittest.TestCase):
 
         self.assertEqual(master_merge.geocode_consolidation_groups(rows), {})
 
-    def test_different_old_value_is_not_consolidated_even_with_the_same_new_value(self):
-        # Two rows offering the SAME new address but a genuinely different
-        # OLD (master) value are not the same before/after decision - see
-        # this function's own docstring on why the full diff, not just the
-        # new value, is the grouping key.
+    def test_different_old_value_still_consolidates_when_new_value_matches(self):
+        # Real Henly House case: two floors' master records held genuinely
+        # different (or blank) prior text, but geocode_rows' own grouping
+        # already resolved and copied the SAME new address to both - this
+        # is the same shared geocode fact either way, regardless of what
+        # each row's own OLD value happened to be beforehand (see this
+        # function's own docstring for why old-value matching was wrong).
         row_a = self._matched_row(
-            0, "Mainframe", "Colliers", "7th", {"address_1": ("Old Address A", "40 Basinghall Street")},
+            0, "Henly House", "Colliers", "4th", {"address_1": (None, "30 Barkston Gardens")},
             {"address_1"},
         )
         row_b = self._matched_row(
-            1, "Mainframe", "Colliers", "8th", {"address_1": ("Old Address B", "40 Basinghall Street")},
+            1, "Henly House", "Colliers", "1st", {"address_1": ("Old Henly House Text", "30 Barkston Gardens")},
             {"address_1"},
+        )
+
+        groups = master_merge.geocode_consolidation_groups([row_a, row_b])
+
+        self.assertEqual(len(groups), 1)
+        (members,) = groups.values()
+        self.assertEqual({m.master_index for m in members}, {0, 1})
+
+    def test_genuinely_different_new_values_do_not_consolidate(self):
+        # Same building+provider, but the two rows propose genuinely
+        # different new addresses - never the same shared geocode fact,
+        # so never consolidated together.
+        row_a = self._matched_row(
+            0, "Mainframe", "Colliers", "7th", {"address_1": (None, "40 Basinghall Street")}, {"address_1"},
+        )
+        row_b = self._matched_row(
+            1, "Mainframe", "Colliers", "8th", {"address_1": (None, "1 Some Other Street")}, {"address_1"},
         )
 
         self.assertEqual(master_merge.geocode_consolidation_groups([row_a, row_b]), {})

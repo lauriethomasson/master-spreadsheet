@@ -1942,16 +1942,21 @@ def geocode_consolidation_groups(rows: list) -> dict:
     """
     Groups `rows` (MatchedRow objects already known to have a non-empty
     risky_fields - see pages/2_Review_and_Master.py's own decision_risky)
-    by (building, provider) identity plus an IDENTICAL diff on GEOCODE_
-    UNVERIFIED_FIELDS (address_1/postcode/lat/lng) - geocode.py's own
-    geocode_rows grouping already guarantees these specific fields are
+    by (building, provider) identity plus an identical NEW value on every
+    GEOCODE_UNVERIFIED_FIELDS (address_1/postcode/lat/lng) member present
+    in the row's own diffs - geocode.py's own geocode_rows grouping
+    already guarantees the NEW value for these specific fields is
     resolved ONCE per building+provider and copied verbatim (including
     geocode_unverified - see that module's own group copy-down) to every
-    row sharing that identity, so several floors/units of the same
-    building all showing the exact same geocoded-address change is one
-    physical fact repeated N times, not N independent facts. Returns only
-    keys with 2+ members - a lone row with nothing else sharing its own
-    geocode-risky fields is left for its own individual card, unchanged.
+    row sharing that identity, so two rows agreeing on which of these
+    fields changed and what they changed TO are describing the exact
+    same underlying geocode fact, regardless of what each row's own OLD
+    (master) value happened to be beforehand - a floor whose master
+    record already had some stale text on file and a floor that was
+    still blank are still the SAME shared geocode result once resolved,
+    not two different ones. Returns only keys with 2+ members - a lone
+    row with nothing else sharing its own geocode fields is left for its
+    own individual card, unchanged.
 
     Deliberately restricted to GEOCODE_UNVERIFIED_FIELDS alone, never
     generalized to "any field that happens to match across rows" - e.g. a
@@ -1959,21 +1964,25 @@ def geocode_consolidation_groups(rows: list) -> dict:
     no such guarantee of being the SAME underlying fact, only geocode.py's
     own grouped-and-copied fields do.
 
-    The grouping key includes the full (old, new) diff tuple for each
-    shared field, not just the new value - two rows whose OLD (master)
-    values genuinely differ are not offering the reviewer the same before/
-    after decision, even if their new value is identical, so they are
-    deliberately NOT consolidated together.
+    The field LIST itself (which of the 4 fields actually changed for
+    this row, sorted for determinism) is still part of the key, not just
+    the values - two rows must agree on WHICH fields changed, not merely
+    happen to share a value on the fields they both have; this is
+    membership in the row's own diffs, never m.risky_fields' fuller set
+    (a field can be risky for an unrelated reason - e.g. lat/lng via
+    GEOCODE_RISK_FIELDS' own distance check, or address_1 via a
+    structural house-number change - without saying anything about
+    whether every OTHER member shares that same reason or value).
     """
     groups = {}
     for m in rows:
-        geo_fields = tuple(f for f in GEOCODE_UNVERIFIED_FIELDS if f in m.risky_fields)
+        geo_fields = tuple(sorted(f for f in GEOCODE_UNVERIFIED_FIELDS if f in m.diffs))
         if not geo_fields:
             continue
         key = (
             normalize_key(m.new_row.building),
             normalize_key(m.new_row.provider),
-            tuple((f, m.diffs[f]) for f in geo_fields),
+            tuple((f, m.diffs[f][1]) for f in geo_fields),
         )
         groups.setdefault(key, []).append(m)
     return {key: members for key, members in groups.items() if len(members) >= 2}
