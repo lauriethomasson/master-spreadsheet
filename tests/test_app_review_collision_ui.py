@@ -142,5 +142,61 @@ class CollisionGroupRendersAsOneDecisionTests(unittest.TestCase):
         self.assertEqual(len(choice_radios), 1)
 
 
+class SoloCollisionDecisionCountUnaffectedTests(unittest.TestCase):
+    """
+    _render_matched_row's decisions_needed formula must still count every
+    changed field for decision_solo_collision's own default_checked=False
+    call site (a collision group that shrank to one non-let-status member -
+    see that loop's own comment) - unaffected by the geocode-consolidation
+    fallback loop's own default_checked=True case, which needs risky_fields
+    alone even when it's empty (see tests/test_app_review_geocode_
+    consolidation.py's own coverage of THAT case).
+    """
+
+    def setUp(self):
+        self._original_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._original_cwd)
+        self._tmp.cleanup()
+
+    def test_solo_collision_with_no_risky_field_still_counts_every_diff(self):
+        # Two sheets of one upload both match the same existing master row -
+        # one states "Under Offer" (pulled out into its own let-status
+        # decision), leaving exactly one non-let-status member behind. That
+        # member's own two changed fields (brochure_link, size_sqft) are
+        # both ordinary safe fields - risky_fields is empty - but this is
+        # the default_checked=False shape, where an empty risky_fields
+        # still means "every diff needs a deliberate look", unchanged.
+        master_writer.write_master([
+            ListingRow(
+                building="Solo Collision House", provider="UNION", floor_unit="5th Floor",
+                brochure_link="https://example.com/old-brochure.pdf", size_sqft=1000.0,
+            ),
+        ])
+        let_status_row = ListingRow(
+            building="Solo Collision House", provider="UNION", floor_unit="5th Floor",
+            special_features="Under Offer", source_file="solo.xlsx — Portfolio",
+        )
+        other_row = ListingRow(
+            building="Solo Collision House", provider="UNION", floor_unit="5th Floor",
+            brochure_link="https://example.com/new-brochure.pdf", size_sqft=1200.0, source_file="solo.xlsx — Detail",
+        )
+        save_staging_file([let_status_row, other_row], "solo.xlsx", content_hash="test-hash-solo-collision")
+
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self.assertFalse(at.exception)
+
+        solo_expanders = [
+            e for e in at.expander if "Solo Collision House" in (e.label or "") and "decision" in (e.label or "")
+        ]
+        self.assertEqual(len(solo_expanders), 1)
+        self.assertIn("2 decisions needed", solo_expanders[0].label)
+        self.assertNotIn("no decisions needed", solo_expanders[0].label)
+
+
 if __name__ == "__main__":
     unittest.main()

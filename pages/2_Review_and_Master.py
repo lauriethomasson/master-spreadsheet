@@ -519,18 +519,41 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
     of that loop so the rare group-of-one edge case can reuse it instead of
     duplicating the expander/checkbox rendering.
 
-    The expander's own label counts DECISIONS, not changed fields: when
-    m.risky_fields is non-empty, that's exactly how many fields
-    _render_field_rows renders individually (everything else is bundled
-    into its own "N other safe changes" line - see that function's own
-    docstring); when there's no risky field at all (default_checked=False,
-    a same-batch collision forcing a deliberate look at every field), every
-    changed field still needs its own decision, matching _render_field_
-    rows' behavior for that case exactly.
+    The expander's own label counts DECISIONS, not changed fields - but
+    which rule decides that count depends on default_checked, not merely
+    on whether risky_fields happens to be empty:
+
+    - default_checked=False (decision_solo_collision's own same-batch-
+      collision case): an empty risky_fields genuinely means every
+      changed field still needs its own deliberate look, matching
+      _render_field_rows' own behavior for that case exactly - every diff
+      is counted.
+    - default_checked=True (an ordinary risky matched row, or the
+      geocode-consolidation fallback loop's own "remaining" row once its
+      shared geocode fields have already been claimed by a consolidated
+      card - see that loop's own docstring): risky_fields alone is the
+      count, even when it's empty. A row whose only risky field was just
+      consolidated away can be left with nothing but safe fields, which
+      _render_field_rows bundles into its own "N other changes will apply
+      automatically" line with zero checkboxes - counting len(m.diffs)
+      there would claim decisions that don't actually exist anywhere in
+      the rendered card (confirmed real case: Hatchers Yard's brochure_
+      link/special_features safe changes, left behind once its address
+      field moved into a consolidated card, wrongly labeled "2 decisions
+      needed"). decisions_needed == 0 gets its own label wording instead
+      of the nonsensical "0 decisions needed", naming the very count
+      _render_field_rows' own bundled-safe-changes caption already shows.
     """
-    decisions_needed = len(m.risky_fields) if m.risky_fields else len(m.diffs)
-    noun = "decision" if decisions_needed == 1 else "decisions"
-    label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {decisions_needed} {noun} needed"
+    decisions_needed = len(m.risky_fields) if (m.risky_fields or default_checked) else len(m.diffs)
+    if decisions_needed == 0:
+        n = len(m.diffs)
+        label = (
+            f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — no decisions needed — "
+            f"{n} other change{'s' if n != 1 else ''} will apply automatically"
+        )
+    else:
+        noun = "decision" if decisions_needed == 1 else "decisions"
+        label = f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — {decisions_needed} {noun} needed"
     with st.expander(label, key=f"{key_prefix}_expander"):
         approved_fields = _render_field_rows(
             m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields,

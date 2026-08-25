@@ -205,5 +205,73 @@ class OtherFieldsRenderPerRowUnaffectedTests(IsolatedCwdTestCase):
         )
 
 
+class NoRiskyFieldsLeftAfterConsolidationTests(IsolatedCwdTestCase):
+    """
+    Real Hatchers Yard shape this regression-tests: once a row's ONLY
+    risky field (its shared geocode address) is claimed by the
+    consolidated card, this row's OWN leftover diffs (brochure_link,
+    size_sqft) are both ordinary safe fields - risky_fields is empty, but
+    this is the default_checked=True fallback loop (see _render_matched_
+    row's own docstring on why that's a DIFFERENT rule from decision_
+    solo_collision's default_checked=False case - see tests/test_app_
+    review_collision_ui.py's own SoloCollisionDecisionCountUnaffectedTests
+    for that unchanged behavior). The leftover card must say "no decisions
+    needed", never a wrong "N decisions needed" for fields that actually
+    render as a single automatic bundle with zero checkboxes.
+    """
+
+    def test_leftover_safe_only_fields_show_no_decisions_needed_not_a_wrong_count(self):
+        master_writer.write_master([
+            ListingRow(
+                building="Hatchers Yard", provider="Colliers", floor_unit="1st Floor",
+                brochure_link="https://example.com/old-brochure.pdf", size_sqft=1000.0,
+                property_id=str(uuid.uuid4()),
+            ),
+            ListingRow(
+                building="Hatchers Yard", provider="Colliers", floor_unit="2nd Floor",
+                brochure_link="https://example.com/old-brochure.pdf", size_sqft=1000.0,
+                property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [
+                ListingRow(
+                    building="Hatchers Yard", provider="Colliers", floor_unit="1st Floor",
+                    address_1="30 Barkston Gardens", postcode="SW5 0EW", lat=51.49, lng=-0.19,
+                    geocode_unverified=True,
+                    brochure_link="https://example.com/new-brochure.pdf", size_sqft=1100.0,
+                ),
+                ListingRow(
+                    building="Hatchers Yard", provider="Colliers", floor_unit="2nd Floor",
+                    address_1="30 Barkston Gardens", postcode="SW5 0EW", lat=51.49, lng=-0.19,
+                    geocode_unverified=True,
+                    brochure_link="https://example.com/new-brochure.pdf", size_sqft=1200.0,
+                ),
+            ],
+            "hatchers_yard.xlsx", content_hash="hatchers-yard-no-decisions-hash",
+        )
+
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        expander_labels = [e.label or "" for e in at.expander]
+        consolidated = [l for l in expander_labels if "shared by" in l]
+        self.assertEqual(len(consolidated), 1)
+        self.assertIn("2 properties", consolidated[0])
+
+        # Both floors still get their own leftover card (their safe fields
+        # were never part of the consolidated card), but neither claims a
+        # decision that doesn't exist.
+        leftover = [l for l in expander_labels if "Hatchers Yard" in l and "Floor" in l]
+        self.assertEqual(len(leftover), 2)
+        for label in leftover:
+            self.assertIn("no decisions needed", label)
+            self.assertIn("2 other changes will apply automatically", label)
+            self.assertNotIn("0 decisions needed", label)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("2 other changes (Size, Brochure Link) will apply automatically.", caption_text)
+
+
 if __name__ == "__main__":
     unittest.main()
