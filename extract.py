@@ -779,6 +779,30 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
         "development_name": raw.get("development_name"),
     }
 
+    # finalize_brochure_link's own rule 3 (nothing genuine found for THIS
+    # unit -> default to the whole uploaded document) is correct for a
+    # real single-building/single-campus brochure, where the document
+    # genuinely IS that property's brochure - but confirmed real failure:
+    # a "canva view" upload that was actually a combined portfolio tracker
+    # spanning genuinely unrelated areas (Soho, Fitzrovia, Marylebone,
+    # King's Cross, Euston, SE1, Bermondsey, Midtown) gave every unit with
+    # no link of its own the SAME fallback link - the whole tracker, not
+    # anything about that specific property. Distinct non-null submarket
+    # values across this document's own units is the signal: 2+ means the
+    # document spans genuinely unrelated areas, so the whole-document
+    # fallback is unreliable and every unit gets None instead for rule 3
+    # (rules 1/2/4 - a unit's own genuine or generic link - are completely
+    # unaffected either way). 0 or 1 distinct value (a real Henly House-
+    # style single-building brochure, or a real Regent's Wharf-style
+    # single-campus one - see schema.ListingRow.development_name's own
+    # docstring - where every building genuinely shares one submarket)
+    # keeps today's exact behavior. Known, accepted limitation: two
+    # genuinely different buildings sharing one broad submarket label
+    # (rather than a real shared campus) still incorrectly share a
+    # fallback link under this rule - not solved here.
+    distinct_submarkets = {u.get("submarket") for u in raw.get("units", []) if u.get("submarket")}
+    effective_pdf_fallback_link = pdf_fallback_link if len(distinct_submarkets) <= 1 else None
+
     rows = []
     page_indices = []
     last_building = None
@@ -799,7 +823,7 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
             page_index = None
 
         unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=True, pdf_fallback_link=pdf_fallback_link
+            unit.get("brochure_link"), is_pdf=True, pdf_fallback_link=effective_pdf_fallback_link
         )
         unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 

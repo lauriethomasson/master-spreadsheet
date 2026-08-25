@@ -259,6 +259,110 @@ class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
         self.assertIsNone(row.brochure_link_is_floorplan)
 
 
+class MultiSubmarketFallbackSuppressionTests(unittest.TestCase):
+    """
+    finalize_brochure_link's own rule 3 (nothing genuine for THIS unit ->
+    default to the whole uploaded document) is correct for a real single-
+    building/single-campus brochure - but confirmed real failure: a
+    "canva view" upload that was actually a combined portfolio tracker
+    spanning genuinely unrelated areas (Soho, Fitzrovia, Marylebone,
+    King's Cross, Euston, SE1, Bermondsey, Midtown) gave every unit with
+    no link of its own the SAME shared fallback link - the whole tracker,
+    not anything about that specific property. _rows_from_raw now
+    suppresses rule 3 (passes None instead of the real pdf_fallback_link)
+    for any document whose own units' submarket values span 2+ distinct
+    values - covering both extract() (real PDF upload) and extract_from_
+    png_pages() (pasted Canva/Pitch link, the real failing case's own
+    path), since both share this same function.
+    """
+
+    def test_single_submarket_document_keeps_the_shared_fallback_link(self):
+        # Regression: a real Henly House-shaped brochure (one building,
+        # one submarket across every unit) must keep today's exact
+        # behavior - the whole PDF genuinely IS this property's brochure.
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"building": "Henly House", "floor_unit": "1st Floor", "submarket": "Fitzrovia", "brochure_link": None},
+                {"building": "Henly House", "floor_unit": "2nd Floor", "submarket": "Fitzrovia", "brochure_link": None},
+            ],
+        }
+        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
+            rows = extract.extract(
+                Path("henly.pdf"), original_filename="henly.pdf", brochure_url="https://storage/henly.pdf",
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://storage/henly.pdf")
+        self.assertEqual(rows[1].brochure_link, "https://storage/henly.pdf")
+
+    def test_regents_wharf_shaped_campus_sharing_one_submarket_is_unaffected(self):
+        # A real multi-building campus brochure (Regent's Wharf) still
+        # counts as ONE submarket - development_name, not submarket
+        # diversity, is what distinguishes a real shared campus from a
+        # tracker (see schema.ListingRow.development_name's own docstring).
+        raw = {
+            "provider": "Colliers", "contacts": None, "development_name": "Regent's Wharf",
+            "units": [
+                {"building": "The Canal Building", "submarket": "King's Cross", "brochure_link": None},
+                {"building": "The Mill", "submarket": "King's Cross", "brochure_link": None},
+                {"building": "The Packing House", "submarket": "King's Cross", "brochure_link": None},
+            ],
+        }
+        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
+            rows = extract.extract(
+                Path("regents-wharf.pdf"), original_filename="regents-wharf.pdf",
+                brochure_url="https://storage/regents-wharf.pdf",
+            )
+
+        for row in rows:
+            self.assertEqual(row.brochure_link, "https://storage/regents-wharf.pdf")
+
+    def test_multi_submarket_tracker_gets_no_fallback_link_via_the_pasted_link_path(self):
+        # The real failing shape, through the real failing path - a
+        # combined portfolio tracker pasted as a Canva/Pitch link
+        # (extract_from_png_pages, never extract() directly) with units
+        # spanning genuinely unrelated areas across London.
+        raw = {
+            "provider": None, "contacts": None,
+            "units": [
+                {"building": "35 Gresse Street", "submarket": "Soho", "brochure_link": None},
+                {"building": "Whites Grounds", "submarket": "Bermondsey", "brochure_link": None},
+                {"building": "Hatchers Yard", "submarket": "Midtown", "brochure_link": None},
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf",
+                brochure_url="https://storage/tracker.pdf",
+            )
+
+        for row in rows:
+            self.assertIsNone(row.brochure_link)
+
+    def test_a_units_own_genuine_link_is_unaffected_by_submarket_diversity(self):
+        # Only rule 3 (the whole-document fallback) is ever touched by
+        # this feature - a unit with its own genuine, listing-specific
+        # link (rule 1) is completely unaffected either way.
+        raw = {
+            "provider": None, "contacts": None,
+            "units": [
+                {"building": "35 Gresse Street", "submarket": "Soho",
+                 "brochure_link": "https://example.com/gresse-street.pdf"},
+                {"building": "Whites Grounds", "submarket": "Bermondsey", "brochure_link": None},
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf",
+                brochure_url="https://storage/tracker.pdf",
+            )
+
+        self.assertEqual(rows[0].brochure_link, "https://example.com/gresse-street.pdf")
+        self.assertIsNone(rows[1].brochure_link)
+
+
 def _make_multi_link_column_pdf(rows: list) -> Path:
     """
     rows: list of (floor_unit, size_sqft, brochure_url, floor_plan_url,
