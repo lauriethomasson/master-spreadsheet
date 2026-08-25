@@ -1938,6 +1938,47 @@ def matched_collision_field_choice(values: list, field_name: str = None) -> tupl
     return True, None
 
 
+def geocode_consolidation_groups(rows: list) -> dict:
+    """
+    Groups `rows` (MatchedRow objects already known to have a non-empty
+    risky_fields - see pages/2_Review_and_Master.py's own decision_risky)
+    by (building, provider) identity plus an IDENTICAL diff on GEOCODE_
+    UNVERIFIED_FIELDS (address_1/postcode/lat/lng) - geocode.py's own
+    geocode_rows grouping already guarantees these specific fields are
+    resolved ONCE per building+provider and copied verbatim (including
+    geocode_unverified - see that module's own group copy-down) to every
+    row sharing that identity, so several floors/units of the same
+    building all showing the exact same geocoded-address change is one
+    physical fact repeated N times, not N independent facts. Returns only
+    keys with 2+ members - a lone row with nothing else sharing its own
+    geocode-risky fields is left for its own individual card, unchanged.
+
+    Deliberately restricted to GEOCODE_UNVERIFIED_FIELDS alone, never
+    generalized to "any field that happens to match across rows" - e.g. a
+    special_features value matching by coincidence across two rows carries
+    no such guarantee of being the SAME underlying fact, only geocode.py's
+    own grouped-and-copied fields do.
+
+    The grouping key includes the full (old, new) diff tuple for each
+    shared field, not just the new value - two rows whose OLD (master)
+    values genuinely differ are not offering the reviewer the same before/
+    after decision, even if their new value is identical, so they are
+    deliberately NOT consolidated together.
+    """
+    groups = {}
+    for m in rows:
+        geo_fields = tuple(f for f in GEOCODE_UNVERIFIED_FIELDS if f in m.risky_fields)
+        if not geo_fields:
+            continue
+        key = (
+            normalize_key(m.new_row.building),
+            normalize_key(m.new_row.provider),
+            tuple((f, m.diffs[f]) for f in geo_fields),
+        )
+        groups.setdefault(key, []).append(m)
+    return {key: members for key, members in groups.items() if len(members) >= 2}
+
+
 # DIFF_FIELDS fields that are internal pipeline bookkeeping, never
 # something a reviewer should be asked to eyeball on the duplicate-
 # listing comparison card (see pages/2_Review_and_Master.py's own

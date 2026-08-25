@@ -1,3 +1,4 @@
+import dataclasses
 import difflib
 import hashlib
 import html
@@ -539,6 +540,50 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
         entry = updates.setdefault(m.master_index, {})
         entry.update(approved_fields)
         entry["source_file"] = m.new_row.source_file
+
+
+def _render_geocode_consolidated_decision(members: list, key_prefix: str, updates: dict) -> None:
+    """
+    One consolidated decision card for a group of matched rows that share
+    the exact same building+provider AND an identical geocode-driven diff
+    (see master_merge.geocode_consolidation_groups) - e.g. Ivybridge
+    House's 6 floors, each independently re-geocoded to the exact same
+    unverified address, previously showed 6 byte-identical "couldn't be
+    independently verified" cards for what is really one physical fact.
+
+    Reuses _render_field_rows for the actual field-level before/after/
+    checkbox rendering - same editable input, word-diff highlighting, and
+    risky-reason caption every other card already uses - called ONCE
+    against the group's own shared diff (every member's diff is identical
+    by construction, see geocode_consolidation_groups, so members[0]'s own
+    diff/geocode_unverified stands in for the whole group) rather than
+    once per member. Whichever field(s) end up checked are applied to
+    EVERY member's own master_index with that member's own source_file -
+    unchecked leaves every member's address_1/postcode/lat/lng untouched,
+    exactly as if each had been individually declined.
+    """
+    representative = members[0]
+    geo_fields = frozenset(f for f in master_merge.GEOCODE_UNVERIFIED_FIELDS if f in representative.diffs)
+    shared_diffs = {f: representative.diffs[f] for f in geo_fields}
+
+    label = (
+        f"⚠️ {representative.new_row.building} ({representative.new_row.provider}) — "
+        f"same address update shared by {len(members)} properties"
+    )
+    with st.expander(label, key=f"{key_prefix}_expander"):
+        st.caption(
+            f"This geocoded location change is identical across all {len(members)} rows sharing this "
+            "building and provider - decide once, applied to all of them together."
+        )
+        approved_fields = _render_field_rows(
+            shared_diffs, key_prefix, default_checked=False, risky_fields=geo_fields,
+            unverified=bool(representative.new_row.geocode_unverified),
+        )
+    if approved_fields:
+        for m in members:
+            entry = updates.setdefault(m.master_index, {})
+            entry.update(approved_fields)
+            entry["source_file"] = m.new_row.source_file
 
 
 def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_accept: bool) -> None:
@@ -2179,8 +2224,38 @@ def _render_pending_review(pending: list):
         for i, m in enumerate(decision_solo_collision):
             _render_matched_row(m, f"solo_collision_{i}_{m.property_id}", "⚠️ ", False, decision_updates)
 
+        # Several floors/units of the same building sharing one geocode-
+        # driven address/location diff (see master_merge.geocode_
+        # consolidation_groups) get ONE consolidated card here instead of
+        # one per row - computed from decision_risky itself (never a
+        # separate pass over plan.matched_changed), since only a row
+        # already needing a decision is eligible to begin with.
+        geocode_groups = master_merge.geocode_consolidation_groups(decision_risky)
+        consolidated_ids = {id(m) for members in geocode_groups.values() for m in members}
+
+        for i, members in enumerate(geocode_groups.values()):
+            _render_geocode_consolidated_decision(members, f"geo_consolidated_{i}", decision_updates)
+
         for i, m in enumerate(decision_risky):
-            _render_matched_row(m, f"risky_{i}_{m.property_id}", "⚠️ ", True, decision_updates)
+            if id(m) not in consolidated_ids:
+                _render_matched_row(m, f"risky_{i}_{m.property_id}", "⚠️ ", True, decision_updates)
+                continue
+            # This row's geocode-driven fields are already covered by its
+            # own consolidated card above - render its OWN remaining
+            # fields (if any) individually, exactly as before, just
+            # without re-showing the fields the consolidated card already
+            # decided. dataclasses.replace leaves the original MatchedRow
+            # (already used elsewhere - _apply_silent, risky_changed_ids,
+            # etc.) completely untouched; this is a display-only copy.
+            geo_fields = frozenset(f for f in master_merge.GEOCODE_UNVERIFIED_FIELDS if f in m.risky_fields)
+            remaining = dataclasses.replace(
+                m,
+                diffs={f: v for f, v in m.diffs.items() if f not in geo_fields},
+                risky_fields=m.risky_fields - geo_fields,
+            )
+            if not remaining.diffs:
+                continue  # every one of this row's own diffs was a geocode field - nothing left to decide
+            _render_matched_row(remaining, f"risky_{i}_{m.property_id}", "⚠️ ", True, decision_updates)
 
         # near_miss (against an existing master property) and
         # unmatched_collisions (against another row in this same upload)

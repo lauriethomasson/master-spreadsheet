@@ -4200,6 +4200,108 @@ class GeocodeUnverifiedRiskyFieldsTests(unittest.TestCase):
         self.assertEqual(matched.risky_fields, frozenset())
 
 
+class GeocodeConsolidationGroupsTests(unittest.TestCase):
+    """
+    geocode_consolidation_groups - the pure grouping logic behind pages/2_
+    Review_and_Master.py's consolidated geocode decision card (real case:
+    Ivybridge House's 6 floors each independently showing the exact same
+    unverified-address change, previously as 6 byte-identical cards).
+    """
+
+    def _matched_row(self, master_index, building, provider, floor_unit, diffs, risky_fields):
+        new_row = ListingRow(
+            building=building, provider=provider, floor_unit=floor_unit,
+            **{f: new_val for f, (old_val, new_val) in diffs.items()},
+        )
+        return master_merge.MatchedRow(
+            master_index, f"prop-{master_index}", new_row, dict(diffs), "fallback",
+            risky_fields=frozenset(risky_fields),
+        )
+
+    def test_identical_geocode_diff_across_six_floors_groups_together(self):
+        # The real Ivybridge House shape: 6 floors, same building+provider,
+        # every one independently re-geocoded to the exact same unverified
+        # address/postcode/lat/lng.
+        shared_diffs = {
+            "address_1": (None, "1 Ivybridge Terrace"),
+            "postcode": (None, "TW1 1AA"),
+            "lat": (None, 51.45),
+            "lng": (None, -0.32),
+        }
+        rows = [
+            self._matched_row(i, "Ivybridge House", "Workplace Plus", f"Floor {i}", shared_diffs, shared_diffs.keys())
+            for i in range(6)
+        ]
+
+        groups = master_merge.geocode_consolidation_groups(rows)
+
+        self.assertEqual(len(groups), 1)
+        (members,) = groups.values()
+        self.assertEqual(len(members), 6)
+        self.assertEqual({m.master_index for m in members}, set(range(6)))
+
+    def test_a_lone_row_with_nothing_to_share_forms_no_group(self):
+        diffs = {"address_1": (None, "40 Basinghall Street")}
+        rows = [self._matched_row(0, "City Tower", "GPE", "2nd", diffs, diffs.keys())]
+
+        self.assertEqual(master_merge.geocode_consolidation_groups(rows), {})
+
+    def test_different_old_value_is_not_consolidated_even_with_the_same_new_value(self):
+        # Two rows offering the SAME new address but a genuinely different
+        # OLD (master) value are not the same before/after decision - see
+        # this function's own docstring on why the full diff, not just the
+        # new value, is the grouping key.
+        row_a = self._matched_row(
+            0, "Mainframe", "Colliers", "7th", {"address_1": ("Old Address A", "40 Basinghall Street")},
+            {"address_1"},
+        )
+        row_b = self._matched_row(
+            1, "Mainframe", "Colliers", "8th", {"address_1": ("Old Address B", "40 Basinghall Street")},
+            {"address_1"},
+        )
+
+        self.assertEqual(master_merge.geocode_consolidation_groups([row_a, row_b]), {})
+
+    def test_different_building_or_provider_never_groups_together(self):
+        diffs = {"address_1": (None, "40 Basinghall Street")}
+        row_a = self._matched_row(0, "City Tower", "GPE", "2nd", diffs, diffs.keys())
+        row_b = self._matched_row(1, "City Tower", "Some Other Agent", "3rd", diffs, diffs.keys())
+        row_c = self._matched_row(2, "A Different Building", "GPE", "4th", diffs, diffs.keys())
+
+        self.assertEqual(master_merge.geocode_consolidation_groups([row_a, row_b, row_c]), {})
+
+    def test_never_groups_on_a_non_geocode_field_matching_by_coincidence(self):
+        # special_features happening to match across two rows carries none
+        # of geocode.py's own grouped-and-shared-result guarantee - never
+        # treated as consolidatable, even if byte-identical.
+        diffs = {"special_features": ("Old", "Fully fitted")}
+        row_a = self._matched_row(0, "Nexus Place", "UNION", "1st", diffs, {"special_features"})
+        row_b = self._matched_row(1, "Nexus Place", "UNION", "2nd", diffs, {"special_features"})
+
+        self.assertEqual(master_merge.geocode_consolidation_groups([row_a, row_b]), {})
+
+    def test_a_row_with_a_geocode_field_plus_another_risky_field_still_groups_on_the_geocode_part(self):
+        # Real shape this must handle: one floor's own Special Features
+        # ALSO changed independently - only the shared geocode fields (the
+        # part that's genuinely the same fact across the group) determine
+        # the grouping key, an extra per-row-only risky field must not
+        # block that.
+        row_a = self._matched_row(
+            0, "Henly House", "MetSpace", "1st",
+            {"address_1": (None, "1 Henly Row"), "special_features": ("Old", "Fully fitted")},
+            {"address_1", "special_features"},
+        )
+        row_b = self._matched_row(
+            1, "Henly House", "MetSpace", "2nd", {"address_1": (None, "1 Henly Row")}, {"address_1"},
+        )
+
+        groups = master_merge.geocode_consolidation_groups([row_a, row_b])
+
+        self.assertEqual(len(groups), 1)
+        (members,) = groups.values()
+        self.assertEqual({m.master_index for m in members}, {0, 1})
+
+
 class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
     """
     _floor_unit_key - the redundant-building-name-prefix fix. Confidently
