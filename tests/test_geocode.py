@@ -558,7 +558,7 @@ class GeocodeUnverifiedFlagTests(unittest.TestCase):
         with patch(
             "geocode.call_places_text_search",
             return_value={"status": "OK", "lat": 51.52, "lng": -0.09, "address_components": []},
-        ):
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
             geocode.geocode_row(row)
 
         self.assertTrue(row.geocode_unverified)
@@ -569,7 +569,7 @@ class GeocodeUnverifiedFlagTests(unittest.TestCase):
         with patch(
             "geocode.call_places_text_search",
             return_value={"status": "OK", "lat": 51.5, "lng": -0.12, "address_components": []},
-        ):
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
             geocode.geocode_row(row)
 
         self.assertTrue(row.geocode_unverified)
@@ -598,7 +598,7 @@ class GeocodeUnverifiedFlagTests(unittest.TestCase):
         with patch(
             "geocode.call_places_text_search",
             return_value={"status": "OK", "lat": 51.52, "lng": -0.12, "address_components": components},
-        ):
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
             geocode.geocode_row(row)
 
         self.assertIsNone(row.geocode_unverified)
