@@ -1677,6 +1677,60 @@ def _address_conflicts(new_dict: dict, candidate: dict) -> bool:
     return new_hint["district"] != candidate_hint["district"]
 
 
+_FLOOR_NUMBER_TOKEN_RE = re.compile(r"(\d+)(?:st|nd|rd|th)?", re.IGNORECASE)
+
+
+def _floor_number(floor_unit):
+    """
+    The single floor number `floor_unit` unambiguously identifies, or None
+    when there isn't exactly one to find - never a guess between several
+    candidates. Splits on whitespace/comma/hyphen/en-dash/em-dash (covers
+    both "8th Floor" - the number leading a word - and "Mainframe —
+    Colliers — 8" - the number trailing a dash-separated provider/agent
+    chain) and looks for a token that IS a bare number, optionally with an
+    ordinal suffix ("8th" -> 8, "3rd" -> 3, "8" -> 8) - never a number
+    merely embedded inside a longer token (a suite/unit code like "204A"
+    is never mistaken for floor 204). Returns None when zero such tokens
+    exist (nothing to compare) OR more than one genuinely different number
+    does (e.g. "Suite 204, 3rd Floor" - which of 204/3 is "the" floor
+    number is genuinely ambiguous, so this stays conservative rather than
+    guessing) - a repeated token for the SAME number is fine either way.
+    """
+    if not floor_unit:
+        return None
+    tokens = re.split(r"[\s,–—-]+", str(floor_unit).strip())
+    numbers = set()
+    for token in tokens:
+        match = _FLOOR_NUMBER_TOKEN_RE.fullmatch(token)
+        if match:
+            numbers.add(int(match.group(1)))
+    if len(numbers) == 1:
+        return next(iter(numbers))
+    return None
+
+
+def _floor_conflicts(new_dict: dict, candidate: dict) -> bool:
+    """
+    True only when BOTH new_dict and candidate have a floor_unit with a
+    single, clearly extractable floor number (see _floor_number) and those
+    numbers genuinely differ - the same permissive-default shape as
+    _address_conflicts: never true when either side has nothing (or
+    something ambiguous) to compare, so this only ever EXCLUDES a
+    candidate that already passed every other check, never adds a new
+    requirement for one that can't be compared at all. "8th Floor" vs a
+    differently-FORMATTED same number ("Mainframe — Colliers — 8") is
+    never a conflict - 8 == 8 regardless of how each source wrote it; only
+    a genuinely different number (e.g. floor 7 vs floor 8) excludes.
+    """
+    new_floor = _floor_number(new_dict.get("floor_unit"))
+    if new_floor is None:
+        return False
+    candidate_floor = _floor_number(candidate.get("floor_unit"))
+    if candidate_floor is None:
+        return False
+    return new_floor != candidate_floor
+
+
 def _suggest_similar(new_dict: dict, master_records: list) -> list:
     """Cheap, stdlib-only fuzzy hint for the "no match" review section - not
     part of matching itself, just reduces manual searching when a near-miss
@@ -1727,7 +1781,18 @@ def _suggest_similar(new_dict: dict, master_records: list) -> list:
     identical and both share the same provider. Only ever excludes a
     candidate that already passed every check above - never a new
     requirement for one whose address can't be compared at all (see
-    _address_conflicts' own permissive "nothing to compare" default)."""
+    _address_conflicts' own permissive "nothing to compare" default).
+
+    Also excludes any candidate whose own floor_unit states a clearly
+    different floor NUMBER from new_dict's (see _floor_conflicts) - the
+    same shape of guard as _address_conflicts, one level down: two
+    genuinely different floors of the same-NAMED building are not a near-
+    miss for the SAME listing, regardless of how closely the building
+    names themselves fuzzy-match. Never excludes merely differently-
+    FORMATTED same number ("Mainframe — Colliers — 8" vs "8th Floor" is
+    still 8 == 8, so it's still suggested, exactly as before this
+    existed) and never excludes when either side's floor_unit has nothing
+    clearly extractable to compare at all."""
     target_building = new_dict.get("building")
     if not _building_has_no_digits(target_building):
         return []
@@ -1740,6 +1805,7 @@ def _suggest_similar(new_dict: dict, master_records: list) -> list:
         if normalize_key(r.get("provider")) == target_provider
         and _building_has_no_digits(r.get("building"))
         and not _address_conflicts(new_dict, r)
+        and not _floor_conflicts(new_dict, r)
     ]
     keys = [normalize_key(r.get("building")) for r in candidates]
     close = set(difflib.get_close_matches(target, keys, n=3, cutoff=BUILDING_FUZZY_MATCH_THRESHOLD))

@@ -169,6 +169,38 @@ class SuggestSimilarTests(unittest.TestCase):
         new_dict = {"building": "City Towr", "provider": "GPE"}
         self.assertEqual(len(master_merge._suggest_similar(new_dict, master_records)), 1)
 
+    def test_same_name_same_provider_but_conflicting_floor_number_is_never_suggested(self):
+        # Real confirmed case: master's "Mainframe"/Colliers listing is on
+        # the 8th floor - a genuinely different, differently-sized unit on
+        # floor 7 must never be suggested as the same near-miss just
+        # because the building name and provider are identical.
+        master_records = [{
+            "building": "Mainframe", "provider": "Colliers", "floor_unit": "8th floor", "size_sqft": 5000,
+        }]
+        new_dict = {
+            "building": "Mainframe", "provider": "Colliers", "floor_unit": "Mainframe — Colliers — 7",
+            "size_sqft": 3000,
+        }
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), [])
+
+    def test_same_floor_number_different_formatting_still_suggested(self):
+        # The same real floor number, just formatted differently by two
+        # different sources ("8th Floor" vs "Mainframe — Colliers — 8") -
+        # 8 == 8 regardless of formatting, so this must still surface as a
+        # near-miss for manual confirmation, exactly as before this guard
+        # existed - never auto-merged, just not blocked from being shown.
+        master_records = [{"building": "Mainframe", "provider": "Colliers", "floor_unit": "8th floor"}]
+        new_dict = {"building": "Mainframe", "provider": "Colliers", "floor_unit": "Mainframe — Colliers — 8"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), master_records)
+
+    def test_floor_conflict_guard_never_blocks_when_either_side_has_nothing_to_compare(self):
+        # Same "permissive nothing-to-compare default" _address_conflicts
+        # already documents - a blank/unparseable floor_unit on either
+        # side must never block an otherwise-genuine near-miss.
+        master_records = [{"building": "Mainframe", "provider": "Colliers"}]
+        new_dict = {"building": "Mainframe", "provider": "Colliers", "floor_unit": "8th floor"}
+        self.assertEqual(master_merge._suggest_similar(new_dict, master_records), master_records)
+
 
 class ValuesEqualTests(unittest.TestCase):
     """
@@ -1854,9 +1886,13 @@ class BuildMergePlanNearMatchSuggestionProviderScopeTests(unittest.TestCase):
 
     def test_same_provider_genuine_near_match_still_suggested_for_review(self):
         # Provider scoping must never remove a genuinely useful SAME-
-        # provider hint - only cross-provider ones.
+        # provider hint - only cross-provider ones. Same floor number on
+        # both sides (9) deliberately, so this stays purely about provider
+        # scoping and isn't incidentally caught by the unrelated floor-
+        # number conflict guard (see SuggestSimilarTests' own coverage of
+        # that guard).
         master_df = _master_df([{"building": "Thirty Lighterman", "provider": "MetSpace", "floor_unit": "9th"}])
-        new_row = ListingRow(building="Thirty Lightman", provider="MetSpace", floor_unit="2nd Floor")
+        new_row = ListingRow(building="Thirty Lightman", provider="MetSpace", floor_unit="9th Floor")
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
