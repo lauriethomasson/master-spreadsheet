@@ -1228,14 +1228,34 @@ def _floor_unit_key(building, floor_unit) -> str:
     unchanged, exactly as before this existed - still exact-match-only,
     same "conservative, human catches it" philosophy as normalize_key
     itself.
+
+    Also strips the standalone word "floor" itself (word-boundary matched
+    via \\bfloor\\b, then whitespace collapsed again), after the building-
+    prefix strip above - confirmed real cases from one real upload: Kent
+    House ("1st floor (South)" vs "1st (South)") and two Elm Yard rows
+    ("5th floor" vs "5th", "4th floor" vs "4th"), all flagged as near-misses
+    purely because the word "floor" was present in one source's own
+    phrasing and absent in the other's, with nothing else different. Same
+    plain, deterministic word removal as the prefix strip above, never a
+    fuzzy/similarity match: \\bfloor\\b only matches the exact, separate
+    word, so "floor" fused into a longer token with no word boundary (e.g.
+    "floor(N)", once normalize_key's own punctuation-stripping has already
+    fused it into "floorn") is deliberately left untouched. A real
+    confirmed near-miss this leaves unmatched ON PURPOSE: Elsley House's
+    "1st floor(N) Elsley House" vs "Elsley House 1st Floor (North)" - a
+    redundant building-name SUFFIX (not the prefix this function already
+    handles) plus an "(N)" vs "(North)" abbreviation difference, a
+    different and more complex normalization problem this fix does not
+    attempt to solve.
     """
     floor_key = normalize_key(floor_unit)
     building_key = normalize_key(building)
     if building_key and floor_key.startswith(building_key):
         rest = floor_key[len(building_key):]
         if rest == "" or rest[0] == " ":
-            return rest.strip()
-    return floor_key
+            floor_key = rest.strip()
+    floor_key = re.sub(r"\bfloor\b", "", floor_key)
+    return re.sub(r"\s+", " ", floor_key).strip()
 
 
 def _fallback_key(row: dict) -> tuple:

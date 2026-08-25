@@ -4366,12 +4366,13 @@ class GeocodeConsolidationGroupsTests(unittest.TestCase):
 
 class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
     """
-    _floor_unit_key - the redundant-building-name-prefix fix. Confidently
-    matches once the redundant prefix is normalized away, but never
-    weakens genuine floor/unit distinctions (6th vs 7th, North vs South,
-    different buildings) - see BuildMergePlanFuzzyBuildingTests/MatchUnit-
-    style tests elsewhere in this file for the pre-existing safeguards
-    this must not loosen.
+    _floor_unit_key - the redundant-building-name-prefix fix, plus the
+    standalone-word-"floor" strip alongside it. Confidently matches once
+    the redundant prefix/word is normalized away, but never weakens
+    genuine floor/unit distinctions (6th vs 7th, North vs South, different
+    buildings) - see BuildMergePlanFuzzyBuildingTests/MatchUnitStyle tests
+    elsewhere in this file for the pre-existing safeguards this must not
+    loosen.
     """
 
     def test_redundant_building_name_prefix_still_matches(self):
@@ -4421,6 +4422,74 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
 
         self.assertEqual(len(plan.matched_changed), 0)
         self.assertEqual(len(plan.unmatched), 1)
+
+    def test_standalone_word_floor_is_stripped_kent_house_style(self):
+        # Real confirmed case: Kent House's "1st floor (South)" vs "1st
+        # (South)" - flagged as a near-miss purely because the word
+        # "floor" was present in one source's own phrasing and absent in
+        # the other's, nothing else different.
+        self.assertEqual(
+            master_merge._floor_unit_key("Kent House", "1st floor (South)"),
+            master_merge._floor_unit_key("Kent House", "1st (South)"),
+        )
+
+    def test_standalone_word_floor_is_stripped_elm_yard_style(self):
+        # Real confirmed case: two Elm Yard rows, "5th floor"/"5th" and
+        # "4th floor"/"4th".
+        self.assertEqual(
+            master_merge._floor_unit_key("Elm Yard", "5th floor"), master_merge._floor_unit_key("Elm Yard", "5th"),
+        )
+        self.assertEqual(
+            master_merge._floor_unit_key("Elm Yard", "4th floor"), master_merge._floor_unit_key("Elm Yard", "4th"),
+        )
+
+    def test_kent_house_no_longer_needs_a_near_miss_decision(self):
+        master_df = _master_df([{"building": "Kent House", "provider": "UNION", "floor_unit": "1st floor (South)"}])
+        new_row = ListingRow(building="Kent House", provider="UNION", floor_unit="1st (South)")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_elm_yard_rows_no_longer_need_a_near_miss_decision(self):
+        master_df = _master_df([
+            {"building": "Elm Yard", "provider": "UNION", "floor_unit": "5th floor"},
+            {"building": "Elm Yard", "provider": "UNION", "floor_unit": "4th floor"},
+        ])
+        new_rows = [
+            ListingRow(building="Elm Yard", provider="UNION", floor_unit="5th"),
+            ListingRow(building="Elm Yard", provider="UNION", floor_unit="4th"),
+        ]
+
+        plan = master_merge.build_merge_plan(new_rows, master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 2)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_elsley_house_suffix_and_abbreviation_case_is_unchanged_by_this_fix(self):
+        # Regression guard, not a fix - the fourth real near-miss from the
+        # same upload: a redundant building-name SUFFIX (not the prefix
+        # this function already handles) plus an "(N)" vs "(North)"
+        # abbreviation difference, where normalize_key's own punctuation
+        # stripping has already fused "floor(N)" into "floorn" - no word
+        # boundary left for \bfloor\b to match at all. A different, more
+        # complex normalization problem this fix does not attempt to
+        # solve - must keep falling through to a manual near-miss card.
+        master_df = _master_df([
+            {"building": "Elsley House", "provider": "UNION", "floor_unit": "1st floor(N) Elsley House"},
+        ])
+        new_row = ListingRow(building="Elsley House", provider="UNION", floor_unit="Elsley House 1st Floor (North)")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+    def test_floor_as_part_of_a_longer_word_is_never_stripped(self):
+        # \bfloor\b matches only the exact, separate word "floor" - never
+        # a substring inside a longer word.
+        self.assertEqual(master_merge._floor_unit_key(None, "Floorspace A"), "floorspace a")
 
 
 class AmbiguousIdentityStillManualTests(unittest.TestCase):
