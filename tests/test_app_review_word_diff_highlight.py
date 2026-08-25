@@ -26,6 +26,7 @@ sys.modules["review_and_master_page"] = review_and_master_page
 _spec.loader.exec_module(review_and_master_page)
 
 _word_diff_highlight = review_and_master_page._word_diff_highlight
+_has_shared_words = review_and_master_page._has_shared_words
 
 
 class WordDiffHighlightTests(unittest.TestCase):
@@ -65,6 +66,31 @@ class WordDiffHighlightTests(unittest.TestCase):
         self.assertEqual(after, value)
         self.assertNotIn(":red[", before)
         self.assertNotIn(":green[", after)
+
+
+class HasSharedWordsTests(unittest.TestCase):
+    """
+    _has_shared_words is what _render_field_rows checks before rendering
+    _word_diff_highlight's own captions at all - see that function's own
+    docstring on why a complete replacement (zero word overlap) must skip
+    them entirely rather than showing the whole new value wrapped in green,
+    which would just duplicate the editable input right above it.
+    """
+
+    def test_a_partial_edit_with_real_overlap_is_shared(self):
+        # Same shape as WordDiffHighlightTests' own replaced-words case -
+        # "MR" survives across both values, a genuine partial edit.
+        self.assertTrue(_has_shared_words("MR + PB; Available: November", "+ MR; Available: September"))
+
+    def test_a_complete_replacement_with_zero_overlap_is_not_shared(self):
+        # Real confirmed case: an address field replaced wholesale, not
+        # edited - "Great Portland Street" and "30 Barkston Gardens" share
+        # not one single word.
+        self.assertFalse(_has_shared_words("Great Portland Street", "30 Barkston Gardens"))
+
+    def test_identical_values_are_shared(self):
+        value = "Fully fitted; 24 desks; 1 boardroom"
+        self.assertTrue(_has_shared_words(value, value))
 
 
 if __name__ == "__main__":

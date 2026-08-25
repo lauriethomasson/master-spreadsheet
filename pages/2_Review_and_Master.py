@@ -98,6 +98,23 @@ def _word_diff_highlight(old_val: str, new_val: str) -> tuple:
     return " ".join(before_parts), " ".join(after_parts)
 
 
+def _has_shared_words(old_val: str, new_val: str) -> bool:
+    """
+    True when old_val and new_val share at least one real overlapping word
+    (a genuine partial edit, e.g. Special Features gaining/losing one
+    phrase) - i.e. _word_diff_highlight's own SequenceMatcher produces at
+    least one "equal" opcode. False for a complete replacement with zero
+    word overlap (e.g. an address changing from "Great Portland Street" to
+    "30 Barkston Gardens") - there, _word_diff_highlight's own "after"
+    would just wrap the ENTIRE new value in green, duplicating the text
+    already shown in the editable input right above it with no new
+    information. Used by _render_field_rows to skip the highlight captions
+    entirely for that shape, never by changing _word_diff_highlight itself.
+    """
+    matcher = difflib.SequenceMatcher(None, old_val.split(), new_val.split(), autojunk=False)
+    return any(tag == "equal" for tag, _, _, _, _ in matcher.get_opcodes())
+
+
 def _render_field_rows(
     diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
     unverified: bool = False,
@@ -147,12 +164,19 @@ def _render_field_rows(
     once, above the loop - same convention as _render_near_miss_
     comparison_table's own "IN MASTER"/"THIS UPLOAD" header) - only when
     there's at least one row to head. For a field where both old_val and
-    new_val are genuinely non-blank strings (covers special_features and
-    other free-text fields - see _word_diff_highlight), the before
-    caption highlights the removed words in place, and a small extra
-    caption right below the editable "after" input highlights the added
-    words - the live input widget itself is never touched, since a plain
-    st.text_area/st.text_input can't render rich-text highlighting.
+    new_val are genuinely non-blank strings AND share at least one real
+    word (covers special_features and other free-text fields - see
+    _word_diff_highlight/_has_shared_words), the before caption highlights
+    the removed words in place, and a small extra caption right below the
+    editable "after" input highlights the added words - the live input
+    widget itself is never touched, since a plain st.text_area/
+    st.text_input can't render rich-text highlighting. A complete
+    replacement with zero word overlap (e.g. an address changing from
+    "Great Portland Street" to "30 Barkston Gardens" - see _has_shared_
+    words) skips both highlight captions entirely: the before caption
+    falls back to the plain old value, and nothing extra renders below the
+    "after" input, since highlighting the WHOLE new value in green there
+    would only duplicate what the input already shows.
     """
     approved = {}
     bundle_safe_fields = default_checked
@@ -172,6 +196,7 @@ def _render_field_rows(
         kind = master_merge.field_kind(f)
         is_text_diff = (
             isinstance(old_val, str) and old_val.strip() and isinstance(new_val, str) and new_val.strip()
+            and _has_shared_words(old_val, new_val)
         )
         before_highlight = after_highlight = None
         if is_text_diff:
