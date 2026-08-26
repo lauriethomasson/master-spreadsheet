@@ -1205,52 +1205,90 @@ def is_richness_regression(old_val, new_val) -> bool:
     return new_words / old_words < RICHNESS_RATIO_THRESHOLD
 
 
+_FLOOR_WORD_RE = re.compile(r"\bfloor\b", re.IGNORECASE)
+
+# Common compass-direction abbreviations, mapped to their canonical
+# expanded form - see _floor_unit_key's own docstring. Same small, explicit,
+# whole-token-only philosophy as _STREET_SUFFIX_EXPANSIONS (used only for
+# building-street matching, never here) - deliberately scoped to
+# _floor_unit_key alone, never applied by normalize_key/_building_match_key
+# themselves.
+_COMPASS_ABBREVIATIONS = {
+    "n": "north", "s": "south", "e": "east", "w": "west",
+    "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
+}
+
+# Generic descriptor words that routinely sit directly next to a building's
+# own name as part of how a source phrases it ("Hallmark House", "Nexus
+# Building") - see _floor_unit_key's own building-prefix/suffix strip.
+# Deliberately a short, explicit, hand-picked pair rather than a general
+# scheme - the same conservative philosophy as _STREET_SUFFIX_EXPANSIONS/
+# _COMPASS_ABBREVIATIONS above.
+_BUILDING_DESCRIPTOR_WORDS = ("house", "building")
+
+
 def _floor_unit_key(building, floor_unit) -> str:
     """
-    normalize_key(floor_unit), with a redundant leading occurrence of the
-    row's OWN building name stripped first - confirmed real shape: the same
-    real unit's floor_unit extracted as "Hallmark 6th Floor" in one upload
-    and plain "6th Floor" in another (building "Hallmark" in both) - an
-    exact normalize_key comparison never reconciles these two strings even
-    though a human reads them as unambiguously the same floor, since
-    building+provider already agree and only floor_unit carries the
-    redundant building-name prefix one source happened to repeat.
+    normalize_key(floor_unit), with a redundant occurrence of the row's OWN
+    building name stripped from either end first - confirmed real shape:
+    the same real unit's floor_unit extracted as "Hallmark 6th Floor" in
+    one upload and plain "6th Floor" in another (building "Hallmark" in
+    both) - an exact normalize_key comparison never reconciles these two
+    strings even though a human reads them as unambiguously the same
+    floor, since building+provider already agree and only floor_unit
+    carries the redundant building-name text one source happened to repeat.
 
-    Deliberately a plain prefix strip, never a fuzzy/similarity match: only
-    fires when floor_unit's own normalized text literally BEGINS with
-    building's own normalized text followed by a word boundary - "Hallmark
-    6th Floor" strips to "6th floor" (building "Hallmark"), but "Hallmark
-    House 6th Floor" does NOT strip against building "Hallmark" (the next
-    character after the shared prefix is "h", not a boundary) - a genuinely
-    different, longer building name is never partially matched against a
-    shorter one this way. A floor_unit that just short of literally repeats
-    the building name (any other real-world phrasing) falls through
-    unchanged, exactly as before this existed - still exact-match-only,
-    same "conservative, human catches it" philosophy as normalize_key
-    itself.
+    Deliberately a plain prefix/suffix strip, never a fuzzy/similarity
+    match: only fires when floor_unit's own normalized text literally
+    BEGINS or ENDS with building's own normalized text at a word boundary -
+    "Hallmark 6th Floor" strips to "6th floor" (building "Hallmark"), but
+    "Hallmark Annex 6th Floor" does NOT strip against building "Hallmark"
+    (the word right after the shared prefix is "annex", not one of the
+    tolerated descriptor words below, and not a boundary onto the rest of
+    the text either) - a genuinely different, longer building name/phrase
+    is never partially matched against a shorter one this way.
+
+    Tolerates exactly ONE trailing/leading occurrence of a generic building
+    descriptor word (_BUILDING_DESCRIPTOR_WORDS - "house"/"building")
+    immediately adjacent to the building name, on whichever side it
+    strips from: "Hallmark House 6th Floor" strips to "6th floor" against
+    building "Hallmark" (prefix side: building name, then descriptor, then
+    a word boundary onto the rest), and "6th Floor Hallmark House" strips
+    the same way from the end (suffix side: the rest of the text, then
+    building name, then descriptor, right at the end) - confirmed real
+    case, see below. Any OTHER word in that position (not "house"/
+    "building") is left alone, exactly as before this tolerance existed -
+    see test_a_different_building_that_happens_to_start_the_same_is_not_
+    stripped's own "Annex" case.
 
     Also strips the standalone word "floor" itself (word-boundary matched
-    via \\bfloor\\b, then whitespace collapsed again), after the building-
-    prefix strip above - confirmed real cases from one real upload: Kent
-    House ("1st floor (South)" vs "1st (South)") and two Elm Yard rows
-    ("5th floor" vs "5th", "4th floor" vs "4th"), all flagged as near-misses
-    purely because the word "floor" was present in one source's own
-    phrasing and absent in the other's, with nothing else different. Same
-    plain, deterministic word removal as the prefix strip above, never a
-    fuzzy/similarity match: \\bfloor\\b only matches the exact, separate
-    word, so "floor" fused into a longer token with no word boundary (e.g.
-    "floor(N)", once normalize_key's own punctuation-stripping has already
-    fused it into "floorn") is deliberately left untouched. A real
-    confirmed near-miss this leaves unmatched ON PURPOSE: Elsley House's
-    "1st floor(N) Elsley House" vs "Elsley House 1st Floor (North)" - a
-    redundant building-name SUFFIX (not the prefix this function already
-    handles) plus an "(N)" vs "(North)" abbreviation difference, a
-    different and more complex normalization problem this fix does not
-    attempt to solve.
+    via \\bfloor\\b, case-insensitively, on the RAW floor_unit text -
+    BEFORE normalize_key ever runs, then re-normalized) - confirmed real
+    cases from one real upload: Kent House ("1st floor (South)" vs "1st
+    (South)") and two Elm Yard rows ("5th floor" vs "5th", "4th floor" vs
+    "4th"), all flagged as near-misses purely because the word "floor" was
+    present in one source's own phrasing and absent in the other's, with
+    nothing else different. Doing this strip on the RAW text, rather than
+    normalize_key(floor_unit) as originally implemented, matters for a
+    trickier real case: Elsley House's "1st floor(N) Elsley House" - by the
+    time normalize_key has already stripped "(" ")", "floor(N)" has fused
+    into "floorn" with no word boundary left for \\bfloor\\b to ever match
+    (the character immediately after "floor" is now "n", a word character,
+    not a boundary). The raw string still has a real "(" there, a genuine
+    boundary character, so stripping "floor" first - while it's still
+    visible - catches this. \\bfloor\\b still only ever matches the exact,
+    separate word either way, so "Floorspace" is never touched.
 
-    Finally, if what's left after both strips above is NOTHING BUT a
-    single floor number - optionally with an ordinal suffix ("8th" or
-    "8"), recognized via the same _FLOOR_NUMBER_TOKEN_RE number-SHAPE
+    After normalize_key, any token (whitespace-split) that's an EXACT,
+    whole match for a _COMPASS_ABBREVIATIONS key is expanded to its
+    canonical form - same "N" vs "North" idea Elsley House's own address
+    needed ("(N)" -> "n" once normalize_key strips the parentheses around
+    it), never applied inside a longer token (a unit code like "N12" is
+    left alone). Scoped to this function alone.
+
+    Finally, if what's left after every strip/expansion above is NOTHING
+    BUT a single floor number - optionally with an ordinal suffix ("8th"
+    or "8"), recognized via the same _FLOOR_NUMBER_TOKEN_RE number-SHAPE
     pattern _floor_number (below) uses - normalizes to that bare number.
     Confirmed real cases: Mainframe's "8th floor" (master) vs "8"
     (upload), and likewise "7th floor"/"7", "4th floor"/"4".
@@ -1265,18 +1303,44 @@ def _floor_unit_key(building, floor_unit) -> str:
     and "1st North" down to the same bare "1", silently discarding the
     one word that actually distinguishes them. Requiring the ENTIRE
     remaining text to be nothing but the number means "2nd & 4th Floors"
-    (two numbers), "LG" (no number), and Elsley House's own "1st north"
-    shape above (a number PLUS a real extra word, "north") all correctly
-    keep falling through unchanged, exactly as they do today.
+    (two numbers) and "LG" (no number) both correctly keep falling through
+    unchanged, exactly as they do today - and Elsley House's own "1st
+    north" (a number PLUS a real extra word) stays "1st north", never
+    collapsed to bare "1", the same way "1st South"/"1st North" already do.
     """
-    floor_key = normalize_key(floor_unit)
+    raw = "" if floor_unit is None or (isinstance(floor_unit, float) and pd.isna(floor_unit)) else str(floor_unit)
+    floor_key = normalize_key(_FLOOR_WORD_RE.sub("", raw))
     building_key = normalize_key(building)
+
     if building_key and floor_key.startswith(building_key):
         rest = floor_key[len(building_key):]
         if rest == "" or rest[0] == " ":
             floor_key = rest.strip()
-    floor_key = re.sub(r"\bfloor\b", "", floor_key)
-    floor_key = re.sub(r"\s+", " ", floor_key).strip()
+            for descriptor in _BUILDING_DESCRIPTOR_WORDS:
+                if floor_key == descriptor or floor_key.startswith(descriptor + " "):
+                    floor_key = floor_key[len(descriptor):].strip()
+                    break
+    elif building_key:
+        # Unlike the prefix side above, entry into this branch can't be
+        # gated on a plain floor_key.endswith(building_key) check - the
+        # real Elsley House shape this exists for ends in "...elsley
+        # house", which does NOT end with bare "elsley" at all (it ends
+        # with "house"). So the combo ("<building> house"/"<building>
+        # building") suffix is tried FIRST, and only falls back to a bare
+        # building_key suffix match if no descriptor is present.
+        stripped = None
+        for descriptor in _BUILDING_DESCRIPTOR_WORDS:
+            combo = f"{building_key} {descriptor}"
+            if floor_key == combo or floor_key.endswith(" " + combo):
+                stripped = floor_key[: -len(combo)].strip()
+                break
+        if stripped is None and (floor_key == building_key or floor_key.endswith(" " + building_key)):
+            stripped = floor_key[: -len(building_key)].strip()
+        if stripped is not None:
+            floor_key = stripped
+
+    floor_key = " ".join(_COMPASS_ABBREVIATIONS.get(word, word) for word in floor_key.split())
+
     number_match = _FLOOR_NUMBER_TOKEN_RE.fullmatch(floor_key)
     return str(int(number_match.group(1))) if number_match else floor_key
 

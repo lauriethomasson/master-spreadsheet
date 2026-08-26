@@ -4426,13 +4426,16 @@ class GeocodeConsolidationGroupsTests(unittest.TestCase):
 class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
     """
     _floor_unit_key - the redundant-building-name-prefix fix, the
-    standalone-word-"floor" strip, and the bare-floor-number normalization
-    (all three) alongside it. Confidently matches once the redundant
-    prefix/word/ordinal-suffix is normalized away, but never weakens
-    genuine floor/unit distinctions (6th vs 7th, North vs South, different
-    buildings) - see BuildMergePlanFuzzyBuildingTests/MatchUnitStyle tests
-    elsewhere in this file for the pre-existing safeguards this must not
-    loosen.
+    standalone-word-"floor" strip (now done on the raw text, before
+    normalize_key), the bare-floor-number normalization, the compass-
+    abbreviation expansion, and the building-name prefix-OR-suffix strip
+    (tolerant of one adjacent "house"/"building" descriptor word) - all
+    together. Confidently matches once the redundant prefix/suffix/word/
+    ordinal-suffix/compass-abbreviation is normalized away, but never
+    weakens genuine floor/unit distinctions (6th vs 7th, North vs South,
+    different buildings) - see BuildMergePlanFuzzyBuildingTests/
+    MatchUnitStyle tests elsewhere in this file for the pre-existing
+    safeguards this must not loosen.
     """
 
     def test_redundant_building_name_prefix_still_matches(self):
@@ -4472,16 +4475,34 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
         self.assertEqual(len(plan.unmatched), 1)
 
     def test_a_different_building_that_happens_to_start_the_same_is_not_stripped(self):
-        # "Hallmark House" must never be treated as building "Hallmark"
-        # plus a floor label - the character right after the shared prefix
-        # isn't a word boundary, so no stripping happens at all here.
-        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark House 2nd Floor"}])
+        # "Hallmark Annex" must never be treated as building "Hallmark"
+        # plus a floor label - "annex" isn't one of the tolerated
+        # descriptor words (_BUILDING_DESCRIPTOR_WORDS - "house"/
+        # "building" only), so no stripping happens at all here. See
+        # test_a_following_house_word_is_also_tolerated_hallmark_style
+        # below for the one specific extra word that IS now tolerated.
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark Annex 2nd Floor"}])
         new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="2nd Floor")
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
         self.assertEqual(len(plan.matched_changed), 0)
         self.assertEqual(len(plan.unmatched), 1)
+
+    def test_a_following_house_word_is_also_tolerated_hallmark_style(self):
+        # Extends the redundant-prefix strip above: "Hallmark House" is a
+        # common enough way to phrase a building's own name that a single
+        # trailing "house"/"building" word right after the building-name
+        # prefix is now tolerated too (_BUILDING_DESCRIPTOR_WORDS) - unlike
+        # "Annex" above, which is some OTHER, genuinely distinguishing word
+        # and stays untouched.
+        master_df = _master_df([{"building": "Hallmark", "provider": "UNION", "floor_unit": "Hallmark House 2nd Floor"}])
+        new_row = ListingRow(building="Hallmark", provider="UNION", floor_unit="2nd Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
 
     def test_standalone_word_floor_is_stripped_kent_house_style(self):
         # Real confirmed case: Kent House's "1st floor (South)" vs "1st
@@ -4527,15 +4548,18 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
         self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 2)
         self.assertEqual(len(plan.unmatched), 0)
 
-    def test_elsley_house_suffix_and_abbreviation_case_is_unchanged_by_this_fix(self):
-        # Regression guard, not a fix - the fourth real near-miss from the
-        # same upload: a redundant building-name SUFFIX (not the prefix
-        # this function already handles) plus an "(N)" vs "(North)"
-        # abbreviation difference, where normalize_key's own punctuation
-        # stripping has already fused "floor(N)" into "floorn" - no word
-        # boundary left for \bfloor\b to match at all. A different, more
-        # complex normalization problem this fix does not attempt to
-        # solve - must keep falling through to a manual near-miss card.
+    def test_elsley_house_suffix_and_abbreviation_case_now_matches(self):
+        # The fourth real near-miss from the same upload: a redundant
+        # building-name SUFFIX ("...Elsley House", not the prefix shape
+        # this function already handled) plus an "(N)" vs "(North)"
+        # abbreviation difference. Needs all three pieces together: the
+        # raw-text floor-word strip (so "floor(N)" loses "floor" while "("
+        # is still a real boundary, rather than fusing into "floorn"
+        # first), the compass-abbreviation expansion ("n" -> "north"), and
+        # the new suffix-side building+descriptor strip (building-name
+        # THEN "house", right at the end - see _floor_unit_key's own
+        # docstring on why this can't be a plain endswith(building_key)
+        # check).
         master_df = _master_df([
             {"building": "Elsley House", "provider": "UNION", "floor_unit": "1st floor(N) Elsley House"},
         ])
@@ -4543,8 +4567,54 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_elsley_house_pair_reduces_to_the_same_key(self):
+        # The exact pair from the real upload, at the _floor_unit_key
+        # level - both must reduce to "1st north".
+        self.assertEqual(
+            master_merge._floor_unit_key("Elsley", "1st floor(N) Elsley House"),
+            master_merge._floor_unit_key("Elsley", "Elsley House 1st Floor (North)"),
+        )
+        self.assertEqual(master_merge._floor_unit_key("Elsley", "1st floor(N) Elsley House"), "1st north")
+
+    def test_elsley_house_different_compass_directions_stay_distinct(self):
+        # True-negative guard: two genuinely different directions on the
+        # same "House"-suffixed building name must never be merged, even
+        # though both now go through the same suffix-strip/compass-
+        # expansion path.
+        self.assertNotEqual(
+            master_merge._floor_unit_key("Elsley", "Elsley House 1st Floor (North)"),
+            master_merge._floor_unit_key("Elsley", "Elsley House 1st Floor (South)"),
+        )
+
+        master_df = _master_df([
+            {"building": "Elsley", "provider": "UNION", "floor_unit": "Elsley House 1st Floor (North)"},
+        ])
+        new_row = ListingRow(building="Elsley", provider="UNION", floor_unit="Elsley House 1st Floor (South)")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
         self.assertEqual(len(plan.matched_changed), 0)
         self.assertEqual(len(plan.unmatched), 1)
+
+    def test_compass_abbreviation_alone_no_building_name_involved(self):
+        # The compass-expansion piece on its own, with no building-name
+        # prefix/suffix stripping in play at all (building=None).
+        self.assertEqual(
+            master_merge._floor_unit_key(None, "1st Floor N"), master_merge._floor_unit_key(None, "1st Floor North"),
+        )
+        self.assertEqual(master_merge._floor_unit_key(None, "1st Floor N"), "1st north")
+        self.assertEqual(master_merge._floor_unit_key(None, "1st Floor NE"), "1st northeast")
+
+    def test_building_name_suffix_strip_alone_no_compass_involved(self):
+        # The new suffix-side building+descriptor strip on its own, with
+        # no compass abbreviation anywhere in the text.
+        self.assertEqual(
+            master_merge._floor_unit_key("Nexus", "5th Floor Nexus House"),
+            master_merge._floor_unit_key("Nexus", "5th"),
+        )
 
     def test_floor_as_part_of_a_longer_word_is_never_stripped(self):
         # \bfloor\b matches only the exact, separate word "floor" - never
@@ -4603,15 +4673,22 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
             master_merge._floor_unit_key("Elm Yard", "5th floor"), master_merge._floor_unit_key("Elm Yard", "5th"),
         )
 
-    def test_elsley_house_case_still_correctly_falls_through_unchanged(self):
-        # Regression guard, not a fix - confirms the ordinal-suffix
-        # normalization does NOT accidentally rescue the Elsley House
-        # case either: "Elsley House 1st Floor (North)" reduces (via the
-        # building-prefix + "floor"-word strips) to "1st north" - a
+    def test_elsley_house_case_reduces_to_1st_north_not_bare_1(self):
+        # Regression guard: confirms the ordinal-suffix normalization does
+        # NOT accidentally over-collapse the Elsley House case: "Elsley
+        # House 1st Floor (North)" reduces (via the building-prefix +
+        # "floor"-word strips + compass expansion) to "1st north" - a
         # number PLUS a real extra word, "north" - which the required
         # FULL-STRING match against _FLOOR_NUMBER_TOKEN_RE correctly
         # refuses to reduce further, unlike _floor_number's own tolerant
         # token-scan (which WOULD discard "north" and wrongly return 1).
+        # Now that all three floor_unit_key pieces are in place, this row
+        # DOES match master (see test_elsley_house_suffix_and_abbreviation_
+        # case_now_matches above) - what this guards is that it matches
+        # because both sides reduce to "1st north", never because either
+        # side got wrongly collapsed to a bare "1".
+        self.assertEqual(master_merge._floor_unit_key("Elsley House", "Elsley House 1st Floor (North)"), "1st north")
+
         master_df = _master_df([
             {"building": "Elsley House", "provider": "UNION", "floor_unit": "1st floor(N) Elsley House"},
         ])
@@ -4619,8 +4696,8 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
-        self.assertEqual(len(plan.matched_changed), 0)
-        self.assertEqual(len(plan.unmatched), 1)
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
 
     def test_a_genuine_floor_number_conflict_still_keeps_rows_separate(self):
         # A real, different floor number must still be kept separate by
