@@ -1283,7 +1283,7 @@ def _floor_unit_key(building, floor_unit) -> str:
 
 def _fallback_key(row: dict) -> tuple:
     return (
-        normalize_key(row.get("building")),
+        _building_match_key(row.get("building")),
         normalize_key(row.get("provider")),
         _floor_unit_key(row.get("building"), row.get("floor_unit")),
     )
@@ -1403,6 +1403,37 @@ _STREET_SUFFIX_EXPANSIONS = {
     "cres": "crescent", "gdns": "gardens", "ter": "terrace",
 }
 
+
+def _expand_street_suffix(normalized_text: str) -> str:
+    """Expands a common UK street-suffix abbreviation (see
+    _STREET_SUFFIX_EXPANSIONS) in the LAST word only of already-normalize_
+    key'd text - e.g. "89 charterhouse st" -> "89 charterhouse street".
+    Never touches any word but the last, so "st james's" (a name, not a
+    trailing street suffix) is left completely alone. Shared by
+    _address_street_key and _building_match_key so the two never drift
+    apart on what "expand the suffix" means."""
+    words = normalized_text.split()
+    if not words:
+        return normalized_text
+    words[-1] = _STREET_SUFFIX_EXPANSIONS.get(words[-1], words[-1])
+    return " ".join(words)
+
+
+def _building_match_key(building) -> str:
+    """normalize_key(building) with a trailing street-suffix abbreviation
+    expanded (see _expand_street_suffix) - lets building-identity matching
+    (_fallback_key, and by extension _primary_key/_dedup_key) recognize
+    "Nineteen Wells Street" and "Nineteen Wells St" as the same building.
+
+    Deliberately does NOT strip a leading house number the way
+    _address_street_key does for its own intra-batch grouping use: this
+    key drives actual matching against master (and dedup among pending
+    rows), not just a near-miss grouping a human still reviews, so
+    collapsing two different numbered buildings on the same street onto
+    the same key here would be unsafe."""
+    return _expand_street_suffix(normalize_key(building))
+
+
 # _leading_house_number is imported from house_number.py (see that module's
 # own docstring) - shared verbatim with extract_spreadsheet_gemini.py's
 # address_1 verification pass, rather than reimplemented here, so the two
@@ -1443,19 +1474,26 @@ def _address_street_key(building) -> str:
     building-name line).
 
     ONLY used for intra-batch duplicate grouping, never for matching
-    against master - _primary_key/_fallback_key/normalize_key and the
-    fuzzy-matching tier (_fuzzy_building_match/_building_has_no_digits/
-    BUILDING_FUZZY_MATCH_THRESHOLD) are completely untouched by this
-    function and never call it. That tier's numbered-address exclusion
-    exists specifically because a SIMILARITY-score-based fuzzy match
-    (difflib ratio) scores a genuinely different real property higher than
-    an actual typo often enough to be dangerous on short numbered strings -
-    a real, measured risk documented on BUILDING_FUZZY_MATCH_THRESHOLD
-    itself. This function is a different, more conservative kind of check:
-    a deterministic rule (strip a leading number, expand one suffix
-    abbreviation), paired with _leading_house_number's own guard against
-    merging two rows whose numbers genuinely disagree - not a score that
-    could rank a different property above a real match.
+    against master - _primary_key/_fallback_key never call THIS function.
+    They do share this function's suffix-expansion half via
+    _building_match_key/_expand_street_suffix, but deliberately without
+    the leading-house-number strip below: stripping the number here is
+    safe only for this function's own looser near-miss grouping (a human
+    still reviews the result), never for _fallback_key's actual matching
+    against master, where collapsing two different numbered buildings on
+    the same street onto one key would be unsafe. The fuzzy-matching tier
+    (_fuzzy_building_match/_building_has_no_digits/
+    BUILDING_FUZZY_MATCH_THRESHOLD) is untouched by any of this. That
+    tier's numbered-address exclusion exists specifically because a
+    SIMILARITY-score-based fuzzy match (difflib ratio) scores a genuinely
+    different real property higher than an actual typo often enough to be
+    dangerous on short numbered strings - a real, measured risk documented
+    on BUILDING_FUZZY_MATCH_THRESHOLD itself. This function is a
+    different, more conservative kind of check: a deterministic rule
+    (strip a leading number, expand one suffix abbreviation), paired with
+    _leading_house_number's own guard against merging two rows whose
+    numbers genuinely disagree - not a score that could rank a different
+    property above a real match.
 
     Returns "" for a blank building (or one that's number-only after
     stripping) - callers must treat that as "no address-aware key
@@ -1472,11 +1510,7 @@ def _address_street_key(building) -> str:
     if match:
         text = text[match.end():]
     text = normalize_key(text)
-    words = text.split()
-    if not words:
-        return ""
-    words[-1] = _STREET_SUFFIX_EXPANSIONS.get(words[-1], words[-1])
-    return " ".join(words)
+    return _expand_street_suffix(text)
 
 
 def merge_field_choice(values: list, field_name: str = None) -> tuple:

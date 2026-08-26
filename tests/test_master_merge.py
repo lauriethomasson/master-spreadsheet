@@ -1400,6 +1400,65 @@ class AddressStreetKeyTests(unittest.TestCase):
         self.assertEqual(master_merge._address_street_key("89"), "")
 
 
+class BuildingMatchKeyTests(unittest.TestCase):
+    def test_abbreviated_and_full_street_suffix_share_a_key(self):
+        self.assertEqual(
+            master_merge._building_match_key("Nineteen Wells Street"),
+            master_merge._building_match_key("Nineteen Wells St"),
+        )
+
+    def test_genuinely_different_building_name_is_not_merged(self):
+        self.assertNotEqual(
+            master_merge._building_match_key("Nineteen Wells Street"),
+            master_merge._building_match_key("Twenty Wells Street"),
+        )
+
+    def test_leading_st_that_is_not_a_street_suffix_is_untouched(self):
+        # "St" here is part of the name ("Saint James's"), not a trailing
+        # street-suffix abbreviation - only the LAST word is ever expanded
+        # (see _expand_street_suffix), so this must survive unchanged and
+        # in particular must never collapse onto an unrelated "...Street"
+        # building.
+        self.assertEqual(master_merge._building_match_key("St James's Square"), "st jamess square")
+        self.assertNotEqual(
+            master_merge._building_match_key("St James's Square"),
+            master_merge._building_match_key("Saint James's Square"),
+        )
+
+    def test_leading_house_number_is_not_stripped_unlike_address_street_key(self):
+        # Deliberately unsafe to strip here (unlike _address_street_key's
+        # own intra-batch grouping use): two different numbered buildings
+        # on the same street must never share a matching key.
+        self.assertNotEqual(
+            master_merge._building_match_key("27 Cannon Street"),
+            master_merge._building_match_key("108 Cannon Street"),
+        )
+
+
+class BuildMergePlanStreetSuffixMatchingTests(unittest.TestCase):
+    def test_abbreviated_street_suffix_no_longer_needs_a_near_miss_decision(self):
+        master_df = _master_df([
+            {"building": "Nineteen Wells Street", "provider": "UNION", "floor_unit": "2nd Floor"},
+        ])
+        new_row = ListingRow(building="Nineteen Wells St", provider="UNION", floor_unit="2nd Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_genuinely_different_building_still_goes_unmatched(self):
+        master_df = _master_df([
+            {"building": "Nineteen Wells Street", "provider": "UNION", "floor_unit": "2nd Floor"},
+        ])
+        new_row = ListingRow(building="Twenty Wells Street", provider="UNION", floor_unit="2nd Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+
 class LeadingHouseNumberTests(unittest.TestCase):
     def test_extracts_a_plain_number(self):
         self.assertEqual(master_merge._leading_house_number("89 Charterhouse St"), "89")
