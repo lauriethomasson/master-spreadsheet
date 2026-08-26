@@ -3239,6 +3239,59 @@ def enrich_rows_grouped(
     return current, log, stats
 
 
+def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriched_rows: list) -> None:
+    """
+    Re-geocodes any row whose address_1/postcode was genuinely BLANK
+    before this enrichment pass and is now filled in (see BUILDING_LEVEL_
+    FIELDS/_apply_units_to_row's own backfill, above) - a Tier 2 zero-hint
+    guess (see schema.ListingRow.geocode_unverified's own docstring) made
+    back when geocode_row had no address at all to check itself against
+    can now run through Tier 1 against this freshly-backfilled address
+    instead. On success, geocode_row's own existing Tier 1 branch already
+    sets geocode_unverified=False itself (the earlier self-correction fix -
+    nothing new needed here); on failure, it falls through to geocode_
+    row's own existing Tier 2 logic exactly as today - never a special
+    case, just an ordinary call.
+
+    row.lat/row.lng are cleared FIRST when geocode_unverified was True -
+    otherwise geocode_row's own early-return guard ("already has real
+    coordinates") would block Tier 1 from ever running against the new
+    address at all, leaving the untrustworthy Tier 2 guess in place
+    despite a real address now being on file.
+
+    Paired by INDEX (zip), never property_id and never object identity:
+    - property_id is still blank for every row at this pending/staging
+      stage (see schema.ListingRow.property_id's own docstring -
+      "assigned once a row lands in the master... never set by
+      extraction"), so matching on it would collapse every row to the
+      same key.
+    - a changed row comes back as a NEW ListingRow (model_copy), never
+      the same object, so identity comparison would silently skip every
+      row this enrichment pass actually touched.
+    enrich_rows_grouped/_enrich_rows_from_floorplans both build their own
+    returned list as `current = list(rows)` and only ever replace entries
+    IN PLACE by index (never reorder, add, or drop a row) - see either
+    function's own docstring - so paired position is the one reliable
+    identity available here.
+
+    A row whose address_1/postcode was already present before this pass
+    is completely untouched - no wasted re-geocode call. This adds no new
+    network/Gemini cost beyond an occasional Geocoding API call: the
+    brochure itself is already fetched exactly once per URL by enrich_
+    rows_grouped for its own, separate enrichment purposes, regardless of
+    whether this function ever runs at all.
+    """
+    for original, enriched in zip(original_rows, enriched_rows):
+        address_1_backfilled = _is_blank(original.address_1) and not _is_blank(enriched.address_1)
+        postcode_backfilled = _is_blank(original.postcode) and not _is_blank(enriched.postcode)
+        if not (address_1_backfilled or postcode_backfilled):
+            continue
+        if enriched.geocode_unverified:
+            enriched.lat = None
+            enriched.lng = None
+        geocode.geocode_row(enriched)
+
+
 def run_brochure_enrichment(
     rows: list, staging_path: str, already_processed: dict, floorplan_already_processed: dict = None,
 ) -> list:
@@ -3359,6 +3412,15 @@ def run_brochure_enrichment(
         floorplan_url_checkpoint_callback=on_floorplan_url_checkpoint,
     )
     progress_slot.empty()
+
+    # A row that just had address_1/postcode backfilled from its own
+    # brochure (see BUILDING_LEVEL_FIELDS above) may have been geocoded
+    # earlier - before staging, with no address to check itself against -
+    # via geocode.py's own Tier 2 zero-hint fallback. Re-geocode it now
+    # that a real address is on file (see _regeocode_rows_with_newly_
+    # backfilled_addresses's own docstring) - mutates enriched_rows'
+    # own entries in place, so the persistence below already reflects it.
+    _regeocode_rows_with_newly_backfilled_addresses(rows, enriched_rows)
 
     cumulative_processed_urls = {**already_processed, **stats["processed_urls"]}
     cumulative_floorplan_processed_urls = {**floorplan_already_processed, **stats["floorplan_processed_urls"]}

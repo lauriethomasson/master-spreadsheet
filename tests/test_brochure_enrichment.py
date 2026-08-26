@@ -5079,5 +5079,111 @@ class RealNashHouseBrochureFieldFallbackTests(EnrichmentTestCase):
         self.assertIn("special_features", fields)
 
 
+class RegeocodeRowsWithNewlyBackfilledAddressesTests(unittest.TestCase):
+    """
+    _regeocode_rows_with_newly_backfilled_addresses - run_brochure_
+    enrichment's own post-enrichment step: a row whose address_1/postcode
+    was blank at geocode time (so geocode.py's own Tier 2 zero-hint
+    fallback had nothing to check itself against - see schema.ListingRow.
+    geocode_unverified's own docstring) may have just had a real address
+    backfilled from its own brochure (see BUILDING_LEVEL_FIELDS/
+    _apply_units_to_row above) - this re-geocodes it against that fresh
+    address, letting a stale, unverified guess self-correct. Paired by
+    index (see that function's own docstring on why, not property_id or
+    object identity), so every test here passes single-element lists in
+    the same order.
+    """
+
+    def _row(self, **kwargs):
+        defaults = {"building": "Henly House", "provider": "Colliers"}
+        defaults.update(kwargs)
+        return ListingRow(**defaults)
+
+    def test_backfilled_address_clears_a_stale_unverified_guess(self):
+        original = self._row()
+        enriched = self._row(
+            address_1="Bolsover St", postcode="NW1 3AU", lat=51.5, lng=-0.09, geocode_unverified=True,
+        )
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5237, "lng": -0.1436},
+        ) as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_called_once_with("Bolsover St, NW1 3AU, UK")
+        self.assertEqual(enriched.lat, 51.5237)
+        self.assertEqual(enriched.lng, -0.1436)
+        self.assertIs(enriched.geocode_unverified, False)
+
+    def test_backfilled_address_with_no_prior_geocode_result_gets_geocoded_for_the_first_time(self):
+        original = self._row()
+        enriched = self._row(address_1="Bolsover St", postcode="NW1 3AU")
+
+        with patch("geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5237, "lng": -0.1436}):
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        self.assertEqual(enriched.lat, 51.5237)
+        self.assertEqual(enriched.lng, -0.1436)
+        self.assertIs(enriched.geocode_unverified, False)
+
+    def test_a_row_whose_address_was_already_present_is_left_completely_untouched(self):
+        original = self._row(address_1="Bolsover St", postcode="NW1 3AU", lat=51.5, lng=-0.09)
+        enriched = self._row(address_1="Bolsover St", postcode="NW1 3AU", lat=51.5, lng=-0.09)
+
+        with patch("geocode.call_geocoding_api") as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_not_called()
+        self.assertEqual(enriched.lat, 51.5)
+        self.assertEqual(enriched.lng, -0.09)
+
+    def test_tier_1_failure_on_the_backfilled_address_falls_through_to_existing_tier_2_behavior(self):
+        original = self._row()
+        enriched = self._row(
+            address_1="Bolsover St", postcode="NW1 3AU", lat=51.5, lng=-0.09, geocode_unverified=True,
+        )
+
+        with patch("geocode.call_geocoding_api", return_value={"status": "ZERO_RESULTS"}), \
+             patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}):
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        # geocode_row's own Tier 1 branch failed, then its own Tier 2
+        # (building-name-only, no source hint since address_1/postcode
+        # were only just backfilled and haven't produced a hint here) also
+        # found nothing - exactly today's existing "no match" outcome, not
+        # a new special case. The stale guess was already cleared before
+        # this attempt (see this function's own docstring on why) and is
+        # never silently restored just because the retry didn't pan out;
+        # geocode_unverified itself is left exactly as this function set
+        # it going in (True), still correctly describing this row's own
+        # now-blank lat/lng as unverified, never flipped to False by a
+        # call that resolved nothing.
+        self.assertIsNone(enriched.lat)
+        self.assertIsNone(enriched.lng)
+        self.assertIs(enriched.geocode_unverified, True)
+
+    def test_address_1_alone_backfilled_is_still_enough_to_trigger_a_regeocode(self):
+        original = self._row(postcode="NW1 3AU")
+        enriched = self._row(address_1="Bolsover St", postcode="NW1 3AU")
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5237, "lng": -0.1436},
+        ) as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_called_once()
+
+    def test_postcode_alone_backfilled_is_still_enough_to_trigger_a_regeocode(self):
+        original = self._row(address_1="Bolsover St")
+        enriched = self._row(address_1="Bolsover St", postcode="NW1 3AU")
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5237, "lng": -0.1436},
+        ) as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
