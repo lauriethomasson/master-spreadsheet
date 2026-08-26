@@ -687,6 +687,74 @@ class DropboxAndGoogleDriveShareUrlTests(unittest.TestCase):
         self.assertIsNone(brochure_enrichment._google_drive_file_id("https://drive.google.com/drive/folders/abc123"))
 
 
+class GoogleDriveConfirmParamsTests(unittest.TestCase):
+    """_google_drive_confirm_params - the confirmation token(s) needed to
+    get past Google Drive's "can't scan this file for viruses"
+    interstitial for a large file, in the two real shapes Google has
+    shipped (see that function's own docstring)."""
+
+    def test_plain_link_shape(self):
+        html = b'<html><a href="/uc?export=download&confirm=t7xK&id=ABC123">Download anyway</a></html>'
+        self.assertEqual(brochure_enrichment._google_drive_confirm_params(html), {"confirm": "t7xK"})
+
+    def test_hidden_form_shape_without_uuid(self):
+        html = (
+            b'<form id="download-form" action="https://drive.usercontent.google.com/download" method="get">'
+            b'<input type="hidden" name="id" value="ABC123">'
+            b'<input type="hidden" name="export" value="download">'
+            b'<input type="hidden" name="confirm" value="t">'
+            b"</form>"
+        )
+        self.assertEqual(brochure_enrichment._google_drive_confirm_params(html), {"confirm": "t"})
+
+    def test_hidden_form_shape_with_uuid(self):
+        html = (
+            b'<form id="download-form" action="https://drive.usercontent.google.com/download" method="get">'
+            b'<input type="hidden" name="id" value="ABC123">'
+            b'<input type="hidden" name="confirm" value="t">'
+            b'<input type="hidden" name="uuid" value="12345678-90ab-cdef-1234-567890abcdef">'
+            b"</form>"
+        )
+        self.assertEqual(
+            brochure_enrichment._google_drive_confirm_params(html),
+            {"confirm": "t", "uuid": "12345678-90ab-cdef-1234-567890abcdef"},
+        )
+
+    def test_hidden_form_preferred_over_a_coincidental_link_match(self):
+        # Both shapes present on the same page - the hidden form (the
+        # newer, more complete shape) must win, never the plain link.
+        html = (
+            b'<input type="hidden" name="confirm" value="real-token">'
+            b'<input type="hidden" name="uuid" value="real-uuid">'
+            b'<a href="/some-other-link?confirm=stale-token">unrelated</a>'
+        )
+        self.assertEqual(
+            brochure_enrichment._google_drive_confirm_params(html),
+            {"confirm": "real-token", "uuid": "real-uuid"},
+        )
+
+    def test_no_token_found_returns_empty_dict(self):
+        html = b"<html>Google Drive can't scan this file for viruses...</html>"
+        self.assertEqual(brochure_enrichment._google_drive_confirm_params(html), {})
+
+    def test_non_utf8_content_returns_empty_dict_without_raising(self):
+        self.assertEqual(brochure_enrichment._google_drive_confirm_params(b"\xff\xfe\x00\x01binary junk"), {})
+
+    def test_blank_content_returns_empty_dict(self):
+        self.assertEqual(brochure_enrichment._google_drive_confirm_params(b""), {})
+
+    def test_a_visible_non_hidden_input_named_confirm_is_not_used(self):
+        # Only type="hidden" inputs count for the form shape - a visible
+        # input happening to share the name "confirm" (unconfirmed to ever
+        # occur, but costs nothing to guard against) falls through to the
+        # plain-link check instead, same as if no hidden input existed.
+        html = (
+            b'<input type="text" name="confirm" value="not-a-real-token">'
+            b'<a href="/uc?export=download&confirm=t7xK&id=ABC123">Download anyway</a>'
+        )
+        self.assertEqual(brochure_enrichment._google_drive_confirm_params(html), {"confirm": "t7xK"})
+
+
 class FetchPdfBytesDropboxAndGoogleDriveTests(EnrichmentTestCase):
     def test_dropbox_share_link_is_fetched_via_its_direct_download_url(self):
         with patch("brochure_enrichment.httpx.get", return_value=_response()) as mock_get, \
@@ -719,16 +787,22 @@ class FetchPdfBytesDropboxAndGoogleDriveTests(EnrichmentTestCase):
         # A file that triggers Drive's "can't scan this file for viruses"
         # confirmation page returns HTML, not the PDF - this must be
         # treated exactly like any other unreadable source (None), never
-        # mis-extracted from the interstitial's own HTML content.
+        # mis-extracted from the interstitial's own HTML content. This
+        # particular interstitial has no parseable confirmation token at
+        # all (see GoogleDriveConfirmParamsTests/FetchPdfBytesGoogleDrive
+        # ConfirmRetryTests below for the token-found retry-success path),
+        # so httpx.get here is called exactly once - no retry is even
+        # attempted when there's no token to retry with.
         interstitial = _response(
             content=b"<html>Google Drive can't scan this file for viruses...</html>", content_type="text/html",
         )
-        with patch("brochure_enrichment.httpx.get", return_value=interstitial):
+        with patch("brochure_enrichment.httpx.get", return_value=interstitial) as mock_get:
             result = brochure_enrichment._fetch_pdf_bytes(
                 "https://drive.google.com/file/d/1AbCdEfGh_IJK-lmno/view?usp=sharing"
             )
 
         self.assertIsNone(result)
+        mock_get.assert_called_once()
 
     def test_dropbox_fetch_failure_returns_none_and_is_recorded(self):
         with patch("brochure_enrichment.httpx.get", side_effect=httpx.ConnectError("dns failure")):
@@ -768,6 +842,117 @@ class FetchPdfBytesDropboxAndGoogleDriveTests(EnrichmentTestCase):
             brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
         )
         self.assertFalse(brochure_enrichment._is_eligible_brochure_url(canva_url))
+
+
+class FetchPdfBytesGoogleDriveConfirmRetryTests(EnrichmentTestCase):
+    """_fetch_pdf_bytes's one-time Google Drive confirm-token retry - the
+    real confirmed case this exists for: a MetSpace listing's brochure
+    link resolved to a large Google Drive file ("67 Clerkenwell Rd - 4th
+    Floor - Brochure.pdf") that was unreadable through the old single-
+    attempt fetch, leaving geocoding nothing but a bare street name to
+    guess an address from."""
+
+    def _drive_url(self):
+        return "https://drive.google.com/file/d/1AbCdEfGh_IJK-lmno/view?usp=sharing"
+
+    def test_plain_link_shape_interstitial_succeeds_via_retry(self):
+        interstitial = _response(
+            content=b'<a href="/uc?export=download&confirm=t7xK&id=1AbCdEfGh_IJK-lmno">Download anyway</a>',
+            content_type="text/html",
+        )
+        real_pdf = _response(content=b"%PDF-1.4 real brochure bytes", content_type="application/pdf")
+        with patch("brochure_enrichment.httpx.get", side_effect=[interstitial, real_pdf]) as mock_get:
+            result = brochure_enrichment._fetch_pdf_bytes(self._drive_url())
+
+        self.assertEqual(result, b"%PDF-1.4 real brochure bytes")
+        self.assertEqual(mock_get.call_count, 2)
+        retry_call_url = mock_get.call_args_list[1].args[0]
+        self.assertEqual(
+            retry_call_url, "https://drive.google.com/uc?export=download&id=1AbCdEfGh_IJK-lmno&confirm=t7xK",
+        )
+
+    def test_hidden_form_shape_interstitial_succeeds_via_retry(self):
+        interstitial = _response(
+            content=(
+                b'<input type="hidden" name="confirm" value="t">'
+                b'<input type="hidden" name="uuid" value="u-1234">'
+            ),
+            content_type="text/html",
+        )
+        real_pdf = _response(content=b"%PDF-1.4 real brochure bytes", content_type="application/pdf")
+        with patch("brochure_enrichment.httpx.get", side_effect=[interstitial, real_pdf]) as mock_get:
+            result = brochure_enrichment._fetch_pdf_bytes(self._drive_url())
+
+        self.assertEqual(result, b"%PDF-1.4 real brochure bytes")
+        retry_call_url = mock_get.call_args_list[1].args[0]
+        self.assertIn("confirm=t", retry_call_url)
+        self.assertIn("uuid=u-1234", retry_call_url)
+
+    def test_retry_itself_still_unreadable_fails_safe(self):
+        # The retry found a token and tried it, but the second response
+        # ALSO isn't a readable document - falls through to the normal
+        # failure path, never a second retry attempt.
+        interstitial = _response(
+            content=b'<a href="/uc?export=download&confirm=t7xK&id=X">Download anyway</a>', content_type="text/html",
+        )
+        still_html = _response(content=b"<html>still not a pdf</html>", content_type="text/html")
+        with patch("brochure_enrichment.httpx.get", side_effect=[interstitial, still_html]) as mock_get:
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_pdf_bytes(self._drive_url())
+
+        self.assertIsNone(result)
+        self.assertEqual(mock_get.call_count, 2)  # exactly one retry, never a third attempt
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+
+    def test_retry_request_itself_raising_fails_safe(self):
+        interstitial = _response(
+            content=b'<a href="/uc?export=download&confirm=t7xK&id=X">Download anyway</a>', content_type="text/html",
+        )
+        with patch(
+            "brochure_enrichment.httpx.get", side_effect=[interstitial, httpx.ConnectError("dns failure")],
+        ) as mock_get:
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_pdf_bytes(self._drive_url())
+
+        self.assertIsNone(result)
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_FETCH_FAILED)
+        self.assertIn("confirm-token retry failed", sink["detail"])
+
+    def test_no_token_found_never_retries(self):
+        # No confirmation token anywhere on the page - nothing to retry
+        # with, so this must fail safe on the FIRST attempt alone.
+        interstitial = _response(
+            content=b"<html>Google Drive can't scan this file for viruses...</html>", content_type="text/html",
+        )
+        with patch("brochure_enrichment.httpx.get", return_value=interstitial) as mock_get:
+            result = brochure_enrichment._fetch_pdf_bytes(self._drive_url())
+
+        self.assertIsNone(result)
+        mock_get.assert_called_once()
+
+    def test_non_drive_url_returning_html_with_a_confirm_looking_string_is_never_retried(self):
+        # Scoped strictly to a genuine Google Drive URL (drive_file_id
+        # truthy) - a completely unrelated host that happens to return
+        # HTML containing something shaped like "confirm=..." must never
+        # trigger this retry path at all.
+        coincidental_html = _response(
+            content=b'<a href="/download?confirm=abc123">Some other confirm link</a>', content_type="text/html",
+        )
+        with patch("brochure_enrichment.httpx.get", return_value=coincidental_html) as mock_get, \
+                patch("brochure_enrichment.resolve_brochure_link", return_value="https://example.com/brochure"):
+            result = brochure_enrichment._fetch_pdf_bytes("https://example.com/brochure.pdf")
+
+        self.assertIsNone(result)
+        mock_get.assert_called_once()
+
+    def test_successful_first_fetch_never_attempts_a_retry(self):
+        real_pdf = _response(content=b"%PDF-1.4 real bytes", content_type="application/pdf")
+        with patch("brochure_enrichment.httpx.get", return_value=real_pdf) as mock_get:
+            result = brochure_enrichment._fetch_pdf_bytes(self._drive_url())
+
+        self.assertEqual(result, b"%PDF-1.4 real bytes")
+        mock_get.assert_called_once()
 
 
 _CANVA_URL = "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"

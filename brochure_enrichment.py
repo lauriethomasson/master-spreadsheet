@@ -1154,15 +1154,16 @@ def _dropbox_direct_download_url(url: str) -> str:
 # PUBLICLY shared file's direct bytes - not Drive's authenticated REST API
 # (no OAuth/app credentials) and not a reverse-engineered internal
 # endpoint (this exact URL shape has been documented and relied upon
-# externally for over a decade). Deliberately does NOT attempt Drive's
-# separate "Google can't scan this file for viruses" HTML interstitial/
-# confirmation-token flow that appears for large files - extracting a
-# token out of that HTML would be exactly the kind of brittle,
-# undocumented scraping this task explicitly avoids. A file that triggers
-# that interstitial instead of a direct download simply fails
-# _looks_like_fetchable_document below (an HTML page, not a PDF) and is
-# skipped exactly like any other unreadable source - never mis-extracted,
-# just not one this pipeline can reach.
+# externally for over a decade). For a large file this endpoint alone
+# returns Drive's own "can't scan this file for viruses" HTML confirmation
+# page instead of the file itself - see _google_drive_confirm_params below
+# for the one-time confirmation-token retry this now attempts rather than
+# failing outright (real confirmed case: a MetSpace listing's brochure
+# link resolved to a Google Drive file - "67 Clerkenwell Rd - 4th Floor -
+# Brochure.pdf" - unreadable through a single fetch attempt, leaving
+# geocoding nothing but a bare "Clerkenwell Road" street name to guess an
+# address from, which produced a wrong, unrelated address on the same
+# street).
 _GOOGLE_DRIVE_FILE_ID_RE = re.compile(r"^https?://drive\.google\.com/file/d/([\w-]+)", re.IGNORECASE)
 
 
@@ -1172,6 +1173,68 @@ def _google_drive_file_id(url: str):
     mirroring _box_share_token's own convention."""
     match = _GOOGLE_DRIVE_FILE_ID_RE.match(url)
     return match.group(1) if match else None
+
+
+# The confirmation token(s) needed to get past Google Drive's "can't scan
+# this file for viruses" interstitial for a large file - Google has
+# shipped two real shapes for this over time, both handled here:
+#   (a) a plain link on the interstitial page whose href contains a bare
+#       "confirm=TOKEN" query parameter (the older, simpler shape);
+#   (b) a hidden download <form> - <input type="hidden" name="confirm"
+#       value="...">, sometimes paired with a second <input type="hidden"
+#       name="uuid" value="...">, since some interstitials require both,
+#       not just confirm alone (the newer, more complete shape).
+# Attribute order within an <input> tag is not assumed fixed (real Google
+# markup has been observed both ways) - each candidate <input> tag is
+# matched as a whole first, then name="..."/value="..." are read from
+# WITHIN that match, independent of which comes first.
+_GOOGLE_DRIVE_HIDDEN_INPUT_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_GOOGLE_DRIVE_INPUT_TYPE_RE = re.compile(r'type\s*=\s*"([^"]*)"', re.IGNORECASE)
+_GOOGLE_DRIVE_INPUT_NAME_RE = re.compile(r'name\s*=\s*"([^"]*)"', re.IGNORECASE)
+_GOOGLE_DRIVE_INPUT_VALUE_RE = re.compile(r'value\s*=\s*"([^"]*)"', re.IGNORECASE)
+_GOOGLE_DRIVE_LINK_CONFIRM_RE = re.compile(r"confirm=([\w-]+)")
+
+
+def _google_drive_confirm_params(content: bytes) -> dict:
+    """
+    {"confirm": token} or {"confirm": token, "uuid": token} extracted from
+    `content` (a Google Drive virus-scan interstitial page's own HTML), or
+    {} when no confirmation token can be found at all - including for
+    binary/non-UTF8 content, which is never a real interstitial page and
+    must never raise trying to decode it as one.
+
+    The hidden-form shape (b, see the module-level regexes' own comment)
+    is preferred whenever both shapes are present on the same page - it's
+    the newer, more complete one, and the plain-link shape (a) alone can't
+    express a required "uuid" value the newer flow sometimes needs. Only
+    falls back to the plain-link shape when no hidden "confirm" input was
+    found at all.
+    """
+    try:
+        html = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return {}
+
+    hidden_values = {}
+    for tag in _GOOGLE_DRIVE_HIDDEN_INPUT_RE.findall(html):
+        type_match = _GOOGLE_DRIVE_INPUT_TYPE_RE.search(tag)
+        name_match = _GOOGLE_DRIVE_INPUT_NAME_RE.search(tag)
+        value_match = _GOOGLE_DRIVE_INPUT_VALUE_RE.search(tag)
+        if not (type_match and name_match and value_match):
+            continue
+        if type_match.group(1).lower() != "hidden":
+            continue
+        if name_match.group(1) in ("confirm", "uuid"):
+            hidden_values[name_match.group(1)] = value_match.group(1)
+
+    if "confirm" in hidden_values:
+        return hidden_values
+
+    link_match = _GOOGLE_DRIVE_LINK_CONFIRM_RE.search(html)
+    if link_match:
+        return {"confirm": link_match.group(1)}
+
+    return {}
 
 
 # A Google Drive FOLDER share link ("drive.google.com/drive/folders/{id}",
@@ -1843,6 +1906,18 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     extension is fetched as-is, otherwise resolve_brochure_link's one-hop
     landing-page scan is tried first.
 
+    A Google Drive fetch that comes back as Drive's own "can't scan this
+    file for viruses" HTML interstitial (routine for a large file, and
+    most real brochure PDFs are large - see _google_drive_confirm_params'
+    own docstring) gets ONE retry with that page's own confirmation
+    token(s) appended to the download URL, never more than one - a
+    genuinely unreadable source (a private/deleted file, a real network
+    failure, an interstitial whose token this can't parse) still fails
+    safe exactly as before, just no longer including the common "the file
+    was simply too large" case. Scoped strictly to a Google Drive URL
+    (drive_file_id truthy) - a non-Drive source that happens to return
+    HTML is never retried this way.
+
     A Canva "view" link (see is_canva_view_link), a Pitch.com "view" link
     (see is_pitch_view_link), OR a GPE flipbook link (see is_gpe_flipbook_
     link - GPE's own branded domain for this exact same Pitch mechanism)
@@ -1905,6 +1980,38 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     if not _looks_like_fetchable_document(
         response.headers.get("content-type"), response.content, accept_image_formats=accept_image_formats,
     ):
+        if drive_file_id:
+            confirm_params = _google_drive_confirm_params(response.content)
+            if confirm_params:
+                retry_target = f"{target}&{urlencode(confirm_params)}"
+                try:
+                    retry_response = httpx.get(
+                        retry_target, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT},
+                        follow_redirects=True,
+                    )
+                    retry_response.raise_for_status()
+                except Exception as e:
+                    print(
+                        f"[brochure_enrichment] Google Drive confirm-token retry failed for {url!r} ({e!r}) — "
+                        "skipping enrichment.",
+                        file=sys.stderr,
+                    )
+                    _record_status(STATUS_FETCH_FAILED, f"Google Drive confirm-token retry failed: {e!r}")
+                    return None
+
+                if _looks_like_fetchable_document(
+                    retry_response.headers.get("content-type"), retry_response.content,
+                    accept_image_formats=accept_image_formats,
+                ):
+                    return retry_response.content
+
+                # The retry itself still didn't produce a readable document
+                # (e.g. an interstitial shape this couldn't fully parse) -
+                # falls through to the same failure reporting below, just
+                # describing the RETRY's own response rather than the
+                # original interstitial - never a second retry attempt.
+                response = retry_response
+
         print(
             f"[brochure_enrichment] {url!r} did not resolve to a "
             f"{'PDF/image' if accept_image_formats else 'PDF'} — skipping enrichment.",
