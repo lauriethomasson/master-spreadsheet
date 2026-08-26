@@ -1060,7 +1060,14 @@ def geocode_rows(rows: list) -> list:
             # an unverified address with no caution shown at all (confirmed
             # real gap: Hatchers Yard/Ivybridge House groups only flagged
             # the one representative actually sent through geocode_row).
-            if not row.geocode_unverified and representative.geocode_unverified:
+            # Checked with `is None`, never truthiness - representative.
+            # geocode_unverified can genuinely be False (a real, positive
+            # "this IS verified" value - see schema.ListingRow's own
+            # docstring on why False and None are deliberately different),
+            # which a bare truthiness check would wrongly treat as
+            # "nothing to propagate" and silently drop, leaving other
+            # group members' own still-None value unresolved.
+            if row.geocode_unverified is None and representative.geocode_unverified is not None:
                 row.geocode_unverified = representative.geocode_unverified
             # submarket is NEVER copied here - see this function's own
             # docstring on why that field alone stays row-specific.

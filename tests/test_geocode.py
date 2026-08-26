@@ -923,6 +923,25 @@ class GeocodeRowsGroupingTests(unittest.TestCase):
         for row in hatchers_yard + ivybridge_house:
             self.assertTrue(row.geocode_unverified, f"{row.building} {row.floor_unit} was not flagged unverified")
 
+    def test_explicit_false_geocode_unverified_is_also_copied_to_every_group_member(self):
+        # A different, later-introduced regression than the one above:
+        # once Tier 1/a hint-corroborated Tier 2 match started writing an
+        # explicit False (see schema.ListingRow.geocode_unverified's own
+        # docstring), the group copy-down's own truthiness check (`if not
+        # row.geocode_unverified and representative.geocode_unverified`)
+        # treated that False as "nothing to propagate" (False is falsy
+        # too) and silently left every OTHER member's own value at None -
+        # confirmed directly with a plain Tier 1 success shared by a
+        # 2-row group.
+        row_a = ListingRow(building="Test Building", provider="UNION", address_1="1 Test St", postcode="EC1A 1AA")
+        row_b = ListingRow(building="Test Building", provider="UNION", address_1="1 Test St", postcode="EC1A 1AA")
+
+        with patch("geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5, "lng": -0.1}):
+            geocode.geocode_rows([row_a, row_b])
+
+        self.assertIs(row_a.geocode_unverified, False)
+        self.assertIs(row_b.geocode_unverified, False)
+
     def test_blank_building_rows_are_never_grouped_with_anything(self):
         row_a = ListingRow(building="", provider="UNION")
         row_b = ListingRow(building="", provider="UNION")
