@@ -742,6 +742,39 @@ def _strip_trailing_street_suffix_word(key: str) -> str:
     return key
 
 
+def _is_placeholder_address(address_1, building) -> bool:
+    """
+    True when `address_1` is either genuinely blank OR just a duplicate of
+    `building` in disguise - confirmed real shape: a listing whose source
+    document never states a separate numbered street address at all gets
+    address_1 filled in as a plain copy of building ("Nineteen Wells St"
+    for both), rather than left blank, since extraction has nothing better
+    to put there. That still isn't a real address - it carries zero
+    information address_1 wouldn't already carry via building - so it must
+    be treated the same as blank for address_1's own enrichment-
+    eligibility/backfill/re-geocode-trigger purposes (see needs_enrichment,
+    _apply_units_to_row's BUILDING_LEVEL_FIELDS step, and
+    _regeocode_rows_with_newly_backfilled_addresses, all below) - but ONLY
+    for address_1 specifically; this is never generalized to any other
+    field.
+
+    Reuses _strip_trailing_street_suffix_word (this module's own existing
+    building-identity comparison, already used to match a row's building
+    against a brochure's own building/unit candidates elsewhere in this
+    file) rather than a plain exact-string check, so "Nineteen Wells St"
+    (address_1) vs "Nineteen Wells Street" (building) still counts as a
+    duplicate - a street-suffix abbreviation difference alone must never
+    make a placeholder look like a genuine, independent address.
+    """
+    if _is_blank(address_1):
+        return True
+    if _is_blank(building):
+        return False
+    address_key = _strip_trailing_street_suffix_word(normalize_key(address_1))
+    building_key = _strip_trailing_street_suffix_word(normalize_key(building))
+    return address_key == building_key
+
+
 def _distinct_building_group(indices: list, candidate_buildings: list) -> list:
     """
     `indices` unchanged if every one of them shares the SAME candidate
@@ -904,8 +937,21 @@ def needs_enrichment(row: ListingRow) -> bool:
     - checked BEFORE any network/Gemini activity is even considered (see
     enrich_row), so a row with nothing missing never costs a fetch or a
     Gemini call at all.
+
+    address_1 is checked via _is_placeholder_address rather than a plain
+    blank check - a row whose only "problem" is an address_1 that's really
+    just a copy of its own building (see that function's own docstring)
+    still has nothing genuinely useful there, and must remain eligible for
+    enrichment on that basis alone, exactly as if address_1 were blank.
     """
-    return any(_is_blank(getattr(row, field)) for field in ENRICHABLE_FIELDS)
+    for field in ENRICHABLE_FIELDS:
+        if field == "address_1":
+            if _is_placeholder_address(row.address_1, row.building):
+                return True
+            continue
+        if _is_blank(getattr(row, field)):
+            return True
+    return False
 
 
 def eligible_rows_and_brochures(rows: list):
@@ -2343,7 +2389,16 @@ def _apply_units_to_row(row: ListingRow, units):
             updates["special_features"] = combined
 
         for field in BUILDING_LEVEL_FIELDS:
-            if not _is_blank(getattr(row, field)):
+            if field == "address_1":
+                # A placeholder address_1 (blank, or just a copy of the
+                # row's own building - see _is_placeholder_address) is
+                # eligible to be overwritten by a genuine brochure-derived
+                # address here, same as a blank one always was - postcode/
+                # submarket below keep their own plain blank-only check,
+                # completely unchanged.
+                if not _is_placeholder_address(row.address_1, row.building):
+                    continue
+            elif not _is_blank(getattr(row, field)):
                 continue
             value = _match_building_value(row, units, field)
             if value is not None:
@@ -3241,17 +3296,19 @@ def enrich_rows_grouped(
 
 def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriched_rows: list) -> None:
     """
-    Re-geocodes any row whose address_1/postcode was genuinely BLANK
-    before this enrichment pass and is now filled in (see BUILDING_LEVEL_
-    FIELDS/_apply_units_to_row's own backfill, above) - a Tier 2 zero-hint
-    guess (see schema.ListingRow.geocode_unverified's own docstring) made
-    back when geocode_row had no address at all to check itself against
-    can now run through Tier 1 against this freshly-backfilled address
-    instead. On success, geocode_row's own existing Tier 1 branch already
-    sets geocode_unverified=False itself (the earlier self-correction fix -
-    nothing new needed here); on failure, it falls through to geocode_
-    row's own existing Tier 2 logic exactly as today - never a special
-    case, just an ordinary call.
+    Re-geocodes any row whose address_1/postcode was genuinely BLANK, OR
+    whose address_1 was only a placeholder (see _is_placeholder_address -
+    blank, or just a copy of the row's own building), before this
+    enrichment pass and is now filled in with something real (see
+    BUILDING_LEVEL_FIELDS/_apply_units_to_row's own backfill, above) - a
+    Tier 2 zero-hint guess (see schema.ListingRow.geocode_unverified's own
+    docstring) made back when geocode_row had no real address at all to
+    check itself against can now run through Tier 1 against this freshly-
+    backfilled address instead. On success, geocode_row's own existing
+    Tier 1 branch already sets geocode_unverified=False itself (the
+    earlier self-correction fix - nothing new needed here); on failure, it
+    falls through to geocode_row's own existing Tier 2 logic exactly as
+    today - never a special case, just an ordinary call.
 
     row.lat/row.lng are cleared FIRST when geocode_unverified was True -
     otherwise geocode_row's own early-return guard ("already has real
@@ -3274,15 +3331,18 @@ def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriche
     function's own docstring - so paired position is the one reliable
     identity available here.
 
-    A row whose address_1/postcode was already present before this pass
-    is completely untouched - no wasted re-geocode call. This adds no new
-    network/Gemini cost beyond an occasional Geocoding API call: the
-    brochure itself is already fetched exactly once per URL by enrich_
-    rows_grouped for its own, separate enrichment purposes, regardless of
-    whether this function ever runs at all.
+    A row whose address_1 was already genuine (not blank, not a placeholder)
+    and whose postcode was already present before this pass is completely
+    untouched - no wasted re-geocode call. This adds no new network/Gemini
+    cost beyond an occasional Geocoding API call: the brochure itself is
+    already fetched exactly once per URL by enrich_rows_grouped for its own,
+    separate enrichment purposes, regardless of whether this function ever
+    runs at all.
     """
     for original, enriched in zip(original_rows, enriched_rows):
-        address_1_backfilled = _is_blank(original.address_1) and not _is_blank(enriched.address_1)
+        address_1_backfilled = _is_placeholder_address(
+            original.address_1, original.building
+        ) and not _is_placeholder_address(enriched.address_1, enriched.building)
         postcode_backfilled = _is_blank(original.postcode) and not _is_blank(enriched.postcode)
         if not (address_1_backfilled or postcode_backfilled):
             continue

@@ -83,6 +83,37 @@ class TrimMemoryTests(unittest.TestCase):
             brochure_enrichment._trim_memory()  # must not raise
 
 
+class IsPlaceholderAddressTests(unittest.TestCase):
+    """_is_placeholder_address - True when address_1 is blank OR just a
+    duplicate of building in disguise (the confirmed real "Nineteen Wells
+    St" shape: a source with no separate numbered address states, gets
+    address_1 filled in as a plain copy of building rather than left
+    blank)."""
+
+    def test_blank_address_is_a_placeholder(self):
+        self.assertTrue(brochure_enrichment._is_placeholder_address(None, "Nineteen Wells St"))
+        self.assertTrue(brochure_enrichment._is_placeholder_address("", "Nineteen Wells St"))
+
+    def test_exact_duplicate_of_building_is_a_placeholder(self):
+        self.assertTrue(brochure_enrichment._is_placeholder_address("Nineteen Wells St", "Nineteen Wells St"))
+
+    def test_street_suffix_abbreviation_difference_is_still_a_placeholder(self):
+        # "St" (address_1) vs "Street" (building) - a street-suffix
+        # abbreviation difference alone must never make a placeholder look
+        # like a genuine, independent address.
+        self.assertTrue(brochure_enrichment._is_placeholder_address("Nineteen Wells St", "Nineteen Wells Street"))
+        self.assertTrue(brochure_enrichment._is_placeholder_address("Nineteen Wells Street", "Nineteen Wells St"))
+
+    def test_genuinely_different_address_is_not_a_placeholder(self):
+        self.assertFalse(brochure_enrichment._is_placeholder_address("22 Newman Street", "Kent House"))
+
+    def test_blank_building_with_non_blank_address_is_not_a_placeholder(self):
+        # Nothing to compare address_1 against - a real, stated address_1
+        # is never treated as a placeholder just because building happens
+        # to be blank too.
+        self.assertFalse(brochure_enrichment._is_placeholder_address("22 Newman Street", None))
+
+
 class NeedsEnrichmentTests(EnrichmentTestCase):
     def test_blank_special_features_needs_enrichment(self):
         row = ListingRow(building="A", special_features=None, state_of_space="Cat A")
@@ -105,6 +136,25 @@ class NeedsEnrichmentTests(EnrichmentTestCase):
             building="A", postcode="EC1A 1AA", submarket="City", floor_unit="1st", size_sqft=1000,
             desks_max=20, rent_pcm=5000, rent_psf=60, special_features="Nice", state_of_space="Cat A",
             contacts="Jane, jane@x.com", address_1=None,
+        )
+        self.assertTrue(brochure_enrichment.needs_enrichment(row))
+
+    def test_placeholder_address_1_alone_needs_enrichment(self):
+        # The confirmed real "Nineteen Wells St" shape: every OTHER
+        # ENRICHABLE_FIELDS is genuinely filled - address_1 being just a
+        # copy of building is the ONLY reason this row is eligible at all.
+        row = ListingRow(
+            building="Nineteen Wells St", address_1="Nineteen Wells St", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Nice", state_of_space="Cat A", contacts="Jane, jane@x.com",
+        )
+        self.assertTrue(brochure_enrichment.needs_enrichment(row))
+
+    def test_placeholder_address_1_with_street_suffix_abbreviation_needs_enrichment(self):
+        row = ListingRow(
+            building="Nineteen Wells Street", address_1="Nineteen Wells St", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Nice", state_of_space="Cat A", contacts="Jane, jane@x.com",
         )
         self.assertTrue(brochure_enrichment.needs_enrichment(row))
 
@@ -2843,6 +2893,65 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
         self.assertIn("address_1", fields)
         self.assertIn("postcode", fields)
 
+    def test_placeholder_address_duplicate_of_building_is_overwritten(self):
+        # The confirmed real "Nineteen Wells St" shape: address_1 is a
+        # plain copy of building, not a real address - a genuine brochure-
+        # derived address_1 must still be allowed to overwrite it, exactly
+        # as it would a literally blank one.
+        row = ListingRow(building="Nineteen Wells St", address_1="Nineteen Wells St", postcode=None)
+        units = _brochure_units([
+            {"building": "Nineteen Wells St", "address_1": "19 Wells Street", "postcode": "W1T 3PA"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.address_1, "19 Wells Street")
+        self.assertEqual(new_row.postcode, "W1T 3PA")
+        self.assertIn("address_1", fields)
+
+    def test_placeholder_address_with_street_suffix_abbreviation_is_overwritten(self):
+        # address_1 "Nineteen Wells St" vs building "Nineteen Wells Street"
+        # - a street-suffix abbreviation difference alone must still count
+        # as a placeholder, not a genuine, independent address.
+        row = ListingRow(building="Nineteen Wells Street", address_1="Nineteen Wells St")
+        units = _brochure_units([
+            {"building": "Nineteen Wells Street", "address_1": "19 Wells Street"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.address_1, "19 Wells Street")
+        self.assertIn("address_1", fields)
+
+    def test_genuine_non_placeholder_address_is_completely_unaffected(self):
+        # A row whose address_1 is already genuine (not blank, not a
+        # duplicate of building) must be left exactly as it is today -
+        # never overwritten, even by a confidently-matched brochure value.
+        row = ListingRow(building="Nineteen Wells St", address_1="1 Some Other Road")
+        units = _brochure_units([
+            {"building": "Nineteen Wells St", "address_1": "19 Wells Street"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(fields, [])
+        self.assertIs(new_row, row)
+        self.assertEqual(new_row.address_1, "1 Some Other Road")
+
+    def test_placeholder_address_with_no_real_brochure_address_falls_through_cleanly(self):
+        # The brochure itself doesn't state a real address either - must
+        # fall through to today's existing "nothing to enrich" behavior,
+        # no error, address_1 left exactly as the placeholder it was.
+        row = ListingRow(building="Nineteen Wells St", address_1="Nineteen Wells St")
+        units = _brochure_units([
+            {"building": "Nineteen Wells St", "floor_unit": "1st"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("address_1", fields)
+        self.assertEqual(new_row.address_1, "Nineteen Wells St")
+
     def test_ambiguous_building_leaves_address_blank(self):
         # Two genuinely different buildings share a brand/prefix once the
         # address suffix is stripped - _building_identity_matches' own
@@ -5183,6 +5292,130 @@ class RegeocodeRowsWithNewlyBackfilledAddressesTests(unittest.TestCase):
             brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
 
         mock_geocoding.assert_called_once()
+
+    def test_placeholder_to_real_address_transition_triggers_a_regeocode(self):
+        # The confirmed real "Nineteen Wells St" shape: address_1 wasn't
+        # blank, just a copy of building - the OLD address_1_backfilled
+        # check (blank -> non-blank) would never have fired here at all.
+        original = self._row(
+            building="Nineteen Wells St", address_1="Nineteen Wells St", postcode="W1T 3PA",
+            lat=51.0, lng=-0.1, geocode_unverified=True,
+        )
+        enriched = self._row(
+            building="Nineteen Wells St", address_1="19 Wells Street", postcode="W1T 3PA",
+            lat=51.0, lng=-0.1, geocode_unverified=True,
+        )
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5177, "lng": -0.1416},
+        ) as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_called_once_with("19 Wells Street, W1T 3PA, UK")
+        self.assertEqual(enriched.lat, 51.5177)
+        self.assertEqual(enriched.lng, -0.1416)
+        self.assertIs(enriched.geocode_unverified, False)
+
+    def test_placeholder_to_real_with_street_suffix_abbreviation_still_triggers(self):
+        # A backfilled address that only differs from the placeholder by a
+        # street-suffix abbreviation ("St" -> "Street") must still count
+        # as a genuine transition, not be mistaken for "already real".
+        original = self._row(building="Nineteen Wells Street", address_1="Nineteen Wells St", postcode="W1T 3PA")
+        enriched = self._row(building="Nineteen Wells Street", address_1="19 Wells Street", postcode="W1T 3PA")
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5177, "lng": -0.1416},
+        ) as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_called_once()
+
+    def test_still_placeholder_after_enrichment_never_triggers(self):
+        # The brochure had no real address either - address_1 is still a
+        # placeholder on both sides, so no re-geocode call is warranted.
+        original = self._row(building="Nineteen Wells St", address_1="Nineteen Wells St")
+        enriched = self._row(building="Nineteen Wells St", address_1="Nineteen Wells St")
+
+        with patch("geocode.call_geocoding_api") as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        mock_geocoding.assert_not_called()
+
+
+class NineteenWellsStPlaceholderAddressEndToEndTests(EnrichmentTestCase):
+    """
+    The exact confirmed real case, end-to-end: a row whose address_1 is
+    just a copy of its own building ("Nineteen Wells St" for both) - (1)
+    becomes enrichment-eligible purely because of that placeholder address
+    (see NeedsEnrichmentTests.test_placeholder_address_1_alone_needs_
+    enrichment), (2) a matching brochure unit's real address_1 backfills
+    it (enrich_rows_grouped -> _apply_units_to_row's BUILDING_LEVEL_FIELDS
+    step), and (3) the existing re-geocode trigger then picks up that
+    placeholder-to-real transition and clears a stale geocode_unverified
+    guess on success - three separately-testable pieces, chained together
+    here exactly as run_brochure_enrichment itself chains them (enrich_
+    rows_grouped, then _regeocode_rows_with_newly_backfilled_addresses).
+    """
+
+    def _row(self, **kwargs):
+        defaults = {
+            "building": "Nineteen Wells St", "provider": "GPE", "floor_unit": "1st",
+            "address_1": "Nineteen Wells St", "postcode": "W1T 3PA",
+            "brochure_link": "https://example.com/brochure.pdf",
+            "lat": 51.0, "lng": -0.1, "geocode_unverified": True,
+            # Every OTHER ENRICHABLE_FIELDS already filled, so the
+            # placeholder address_1 is the only reason this row is
+            # eligible at all - proves point (1) above, not just (2)/(3).
+            "submarket": "Fitzrovia", "size_sqft": 1000, "desks_max": 20, "rent_pcm": 5000, "rent_psf": 60,
+            "special_features": "Nice", "state_of_space": "Cat A", "contacts": "Jane, jane@x.com",
+        }
+        defaults.update(kwargs)
+        return ListingRow(**defaults)
+
+    def test_placeholder_address_backfilled_then_regeocoded_and_unverified_cleared(self):
+        row = self._row()
+        self.assertTrue(brochure_enrichment.needs_enrichment(row))  # (1)
+
+        units = [{"building": "Nineteen Wells St", "floor_unit": "1st", "address_1": "19 Wells Street"}]
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched_rows, _, _ = brochure_enrichment.enrich_rows_grouped([row])
+
+        enriched = enriched_rows[0]
+        self.assertEqual(enriched.address_1, "19 Wells Street")  # (2)
+        # geocode_unverified/lat/lng are untouched by enrichment itself -
+        # still the stale Tier 2 guess, exactly as _regeocode_rows_with_
+        # newly_backfilled_addresses' own docstring expects going in.
+        self.assertIs(enriched.geocode_unverified, True)
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5177, "lng": -0.1416},
+        ) as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([row], enriched_rows)
+
+        mock_geocoding.assert_called_once_with("19 Wells Street, W1T 3PA, UK")  # (3)
+        self.assertEqual(enriched.lat, 51.5177)
+        self.assertEqual(enriched.lng, -0.1416)
+        self.assertIs(enriched.geocode_unverified, False)
+
+    def test_brochure_with_no_real_address_falls_through_with_no_error(self):
+        # The brochure itself doesn't state a real address either - the
+        # row stays eligible (nothing wrong with checking), but nothing
+        # changes and no re-geocode is triggered; no exception anywhere in
+        # the chain.
+        row = self._row()
+
+        units = [{"building": "Nineteen Wells St", "floor_unit": "1st"}]
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched_rows, _, _ = brochure_enrichment.enrich_rows_grouped([row])
+
+        enriched = enriched_rows[0]
+        self.assertEqual(enriched.address_1, "Nineteen Wells St")
+
+        with patch("geocode.call_geocoding_api") as mock_geocoding:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([row], enriched_rows)
+
+        mock_geocoding.assert_not_called()
+        self.assertIs(enriched.geocode_unverified, True)  # left exactly as it was
 
 
 if __name__ == "__main__":
