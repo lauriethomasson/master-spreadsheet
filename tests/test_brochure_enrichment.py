@@ -817,6 +817,47 @@ class PitchRendererConfiguredEligibilityTests(EnrichmentTestCase):
             self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_PITCH_URL))
 
 
+_GPE_FLIPBOOK_URL = "https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd"
+
+
+class GpeFlipbookRendererConfiguredEligibilityTests(EnrichmentTestCase):
+    """Mirrors CanvaRendererConfiguredEligibilityTests/PitchRendererConfigured
+    EligibilityTests exactly, for GPE's own branded fm.gpe.co.uk flipbook
+    link - same CANVA_RENDERER_URL env var gates all three, since fm.gpe.
+    co.uk is confirmed to be the same deployed Pitch mechanism (see is_gpe_
+    flipbook_link's own docstring)."""
+
+    def test_gpe_flipbook_stays_ineligible_without_the_env_var(self):
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(_GPE_FLIPBOOK_URL),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+        self.assertFalse(brochure_enrichment._is_eligible_brochure_url(_GPE_FLIPBOOK_URL))
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url(_GPE_FLIPBOOK_URL))
+
+    def test_gpe_flipbook_becomes_eligible_when_renderer_is_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}):
+            self.assertIsNone(brochure_enrichment.classify_link_eligibility(_GPE_FLIPBOOK_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_brochure_url(_GPE_FLIPBOOK_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_GPE_FLIPBOOK_URL))
+
+
+class RenderPlatformLabelTests(unittest.TestCase):
+    """_render_platform_label - the single shared three-way check every
+    platform_label call site now uses, replacing what used to be three
+    separately hand-rolled "Pitch" if is_pitch_view_link(url) else
+    "Canva" ternaries."""
+
+    def test_canva_url(self):
+        self.assertEqual(brochure_enrichment._render_platform_label(_CANVA_URL), "Canva")
+
+    def test_pitch_url(self):
+        self.assertEqual(brochure_enrichment._render_platform_label(_PITCH_URL), "Pitch")
+
+    def test_gpe_flipbook_url(self):
+        self.assertEqual(brochure_enrichment._render_platform_label(_GPE_FLIPBOOK_URL), "GPE Flipbook")
+
+
 def _canva_pages_response(pages, page_count_detected=None, status_code=200, links=None):
     """A MagicMock httpx.Response shaped like the renderer's own new JSON
     multi-page format (see canva_renderer/app.py's Handler.do_POST) -
@@ -1173,6 +1214,76 @@ class FetchPitchRenderedPageTests(EnrichmentTestCase):
         self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
 
 
+class FetchGpeFlipbookRenderedPageTests(EnrichmentTestCase):
+    """_fetch_gpe_flipbook_rendered_page - a thin wrapper over the exact
+    same _fetch_rendered_page implementation _fetch_canva_rendered_page/
+    _fetch_pitch_rendered_page call, and it shares Pitch's OWN max_pages_
+    accepted cap rather than a separate one (see _PITCH_MAX_PAGES_
+    ACCEPTED's own docstring on why - fm.gpe.co.uk is confirmed to be the
+    identical underlying Pitch mechanism). Only re-checks the pieces that
+    could plausibly differ (platform_label in log text, its use of Pitch's
+    cap) - every retry/error-handling rule is already covered by
+    FetchCanvaRenderedPageTests/FetchPitchRenderedPageTests, same code
+    path."""
+
+    def test_successful_render_returns_png_bytes(self):
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_gpe_flipbook_rendered_page(_GPE_FLIPBOOK_URL)
+
+        self.assertEqual(result, [b"\x89PNG real bytes"])
+        mock_post.assert_called_once()
+        self.assertEqual(mock_post.call_args.kwargs["json"], {"url": _GPE_FLIPBOOK_URL})
+
+    def test_shares_pitchs_own_max_pages_accepted_cap_not_canvas(self):
+        pages = [f"\x89PNG p{i}".encode() for i in range(1, 30)]
+        response = _canva_pages_response(pages, page_count_detected=29)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch.object(brochure_enrichment, "_PITCH_MAX_PAGES_ACCEPTED", 5), \
+                patch.object(brochure_enrichment, "_CANVA_MAX_PAGES_ACCEPTED", 999):
+            result = brochure_enrichment._fetch_gpe_flipbook_rendered_page(_GPE_FLIPBOOK_URL)
+
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result, pages[:5])
+
+    def test_successful_render_logs_gpe_flipbook_not_canva_or_pitch(self):
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment._fetch_gpe_flipbook_rendered_page(_GPE_FLIPBOOK_URL)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("GPE Flipbook render succeeded", logged)
+        self.assertNotIn("Canva render succeeded", logged)
+        self.assertNotIn("Pitch render succeeded", logged)
+
+    def test_renderer_reports_email_gate_failure_returns_none_with_reason(self):
+        # The email-gate case (see canva_renderer/app.py's own render_
+        # pitch_page_async docstring) surfaces here exactly like any other
+        # clean RenderError - no special-casing needed on this side.
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={
+                "error": "render_failed",
+                "reason": "presentation requires an email to open (access-gated, not publicly viewable)",
+            }),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_gpe_flipbook_rendered_page(_GPE_FLIPBOOK_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIn("requires an email to open", sink["detail"])
+
+
 class FetchRenderedPageWithLinksTests(EnrichmentTestCase):
     """fetch_rendered_page_with_links - the new, additive entry point for
     the paste-a-link flow (see app.py's own _fetch_pasted_link). Never
@@ -1249,6 +1360,17 @@ class FetchRenderedPageWithLinksTests(EnrichmentTestCase):
         self.assertIsNone(result_pages)
         self.assertIsNone(result_links)
 
+    def test_gpe_flipbook_url_returns_pages_and_links_together(self):
+        pages = [b"\x89PNG deck"]
+        links = [[{"href": "https://example.com/deck.pdf", "text": "View the deck"}]]
+        response = _canva_pages_response(pages, page_count_detected=1, links=links)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_GPE_FLIPBOOK_URL)
+
+        self.assertEqual(result_pages, pages)
+        self.assertEqual(result_links, links)
+
     def test_existing_canva_wrapper_still_returns_plain_list_unaffected(self):
         # The exact same underlying call, but through the OLD/existing
         # entry point - confirms it's still untouched by this addition.
@@ -1289,6 +1411,64 @@ class FetchPdfBytesPitchDispatchTests(EnrichmentTestCase):
             brochure_enrichment._fetch_pdf_bytes(_PITCH_URL)
 
         mock_fetch.assert_not_called()
+
+
+class FetchPdfBytesGpeFlipbookDispatchTests(EnrichmentTestCase):
+    """_fetch_pdf_bytes's own GPE flipbook dispatch branch - mirrors
+    FetchPdfBytesPitchDispatchTests exactly, at the one new call site this
+    feature adds."""
+
+    def test_gpe_flipbook_url_is_routed_to_the_gpe_flipbook_fetch_when_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment._fetch_gpe_flipbook_rendered_page", return_value=[b"\x89PNG"],
+                ) as mock_fetch, \
+                patch("brochure_enrichment._fetch_canva_rendered_page") as mock_canva_fetch, \
+                patch("brochure_enrichment._fetch_pitch_rendered_page") as mock_pitch_fetch:
+            result = brochure_enrichment._fetch_pdf_bytes(_GPE_FLIPBOOK_URL)
+
+        self.assertEqual(result, [b"\x89PNG"])
+        mock_fetch.assert_called_once_with(_GPE_FLIPBOOK_URL)
+        mock_canva_fetch.assert_not_called()
+        mock_pitch_fetch.assert_not_called()
+
+    def test_gpe_flipbook_url_falls_through_to_generic_fetch_when_unconfigured(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("brochure_enrichment._fetch_gpe_flipbook_rendered_page") as mock_fetch, \
+                patch("brochure_enrichment.resolve_brochure_link", return_value=_GPE_FLIPBOOK_URL), \
+                patch("brochure_enrichment.httpx.get", side_effect=httpx.ConnectError("dns failure")):
+            brochure_enrichment._fetch_pdf_bytes(_GPE_FLIPBOOK_URL)
+
+        mock_fetch.assert_not_called()
+
+    def test_a_gpe_rows_plain_pdf_link_never_triggers_the_gpe_flipbook_fetch(self):
+        # Detection is purely URL-shape-based, never inferred from
+        # row.provider - a GPE upload with an ordinary direct .pdf link
+        # must go through the completely unaffected, ordinary direct-
+        # fetch path, never anywhere near the flipbook renderer.
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_gpe_flipbook_rendered_page") as mock_gpe_fetch, \
+                patch("brochure_enrichment._fetch_canva_rendered_page") as mock_canva_fetch, \
+                patch("brochure_enrichment._fetch_pitch_rendered_page") as mock_pitch_fetch, \
+                patch("brochure_enrichment.httpx.get", return_value=_response()):
+            brochure_enrichment._fetch_pdf_bytes("https://example.com/GPE-brochure.pdf")
+
+        mock_gpe_fetch.assert_not_called()
+        mock_canva_fetch.assert_not_called()
+        mock_pitch_fetch.assert_not_called()
+
+    def test_a_gpe_rows_plain_pitch_link_is_routed_to_pitch_never_gpe_flipbook(self):
+        # A GPE row genuinely using a plain pitch.com/v/... link (not the
+        # fm.gpe.co.uk custom domain) must go through the ordinary Pitch
+        # path unaffected - the two are distinguished purely by host.
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_pitch_rendered_page", return_value=[b"\x89PNG"]) as mock_pitch_fetch, \
+                patch("brochure_enrichment._fetch_gpe_flipbook_rendered_page") as mock_gpe_fetch:
+            result = brochure_enrichment._fetch_pdf_bytes(_PITCH_URL)
+
+        self.assertEqual(result, [b"\x89PNG"])
+        mock_pitch_fetch.assert_called_once_with(_PITCH_URL)
+        mock_gpe_fetch.assert_not_called()
 
 
 class TransientRendererRetryTests(EnrichmentTestCase):

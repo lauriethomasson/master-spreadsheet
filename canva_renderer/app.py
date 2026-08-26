@@ -2,15 +2,21 @@
 canva_renderer/app.py
 
 Small, isolated HTTP service whose only job is: given a public Canva
-"view" URL OR a public Pitch.com "view" URL, render it in a real headless
-Chromium (a plain HTTP fetch of either URL shape returns only an empty/
-"Unsupported client" shell instead of the actual content - confirmed
-directly, see the main app's brochure_link_resolver.is_canva_view_link/
-is_pitch_view_link docstrings) and return one PNG screenshot per page.
+"view" URL, a public Pitch.com "view" URL, OR GPE's own branded custom
+domain for Pitch's "Managed Links" feature (fm.gpe.co.uk - see
+_GPE_FLIPBOOK_VIEW_URL_RE's own docstring for why this is Pitch itself,
+not a separate platform), render it in a real headless Chromium (a plain
+HTTP fetch of any of these URL shapes returns only an empty/"Unsupported
+client" shell instead of the actual content - confirmed directly, see the
+main app's brochure_link_resolver.is_canva_view_link/is_pitch_view_link/
+is_gpe_flipbook_link docstrings) and return one PNG screenshot per page.
 Pitch support was added second, reusing this exact same architecture
 (browser lifecycle, SSRF allow-list, pagination-capture loop shape) - see
 render_pitch_page_async's own docstring for the two genuine, confirmed
-differences from Canva's own render_canva_page_async.
+differences from Canva's own render_canva_page_async. A recognized GPE
+flipbook URL is routed straight into that same render_pitch_page_async -
+confirmed to be the identical underlying Pitch player, not a third
+platform needing its own render function.
 
 Deliberately NEVER runs inside the main spreadsheet app's own container/
 process - a stuck/misbehaving page or a Chromium OOM here must never be
@@ -112,13 +118,47 @@ _CANVA_SHORT_LINK_RE = re.compile(r"^https?://canva\.link/[^/\s?#]+(?:[/?#].*)?$
 # not a shared import.
 _PITCH_VIEW_URL_RE = re.compile(r"^https?://(?:[\w-]+\.)*pitch\.com/v/[^/\s?#]+(?:[/?#].*)?$", re.IGNORECASE)
 
+# Mirrors brochure_link_resolver.is_gpe_flipbook_link's own narrow shape in
+# the main app - GPE's own branded custom domain for Pitch's "Managed
+# Links" feature (e.g. "https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-
+# 6hqnfd", confirmed real in this project's own GPE.eml sample fixture,
+# which also carries a second real shape with a trailing UUID segment:
+# ".../v/gpe-availability-schedule-zu7yk2/b812cdcc-...").
+#
+# CONFIRMED, not assumed, to be Pitch itself rather than a separate
+# platform - via a throwaway Playwright recon script against the real
+# example URL above: every script/font/stylesheet/API request the page
+# makes loads from pitch.com/*.services.pitch.com (nothing GPE-specific in
+# the client at all), the backend call that fetches the deck is literally
+# POST backend.services.pitch.com/fetch-document-snapshot-by-managed-link,
+# and the on-page viewer chrome, the "Next"/"Previous" accessible button
+# names, their plain HTML `disabled` attribute (not aria-disabled), and
+# the "1 / 20"-shaped page-count text are all pixel- and DOM-identical to
+# a plain pitch.com/v/... render - verified directly by clicking through a
+# real 20-page deck end to end. This is Pitch's own "Managed Links"
+# custom-domain feature (GPE's DNS pointed at Pitch's own infrastructure),
+# not a white-labeled or independently-built viewer - so a recognized URL
+# of this shape is routed straight into render_pitch_page (see render_page
+# below), never a separate duplicated render function: duplicating ~170
+# lines of identical pagination logic for what is provably the same
+# product would only create a second copy to keep in sync for no reason.
+_GPE_FLIPBOOK_VIEW_URL_RE = re.compile(
+    r"^https?://(?:[\w-]+\.)*fm\.gpe\.co\.uk/v/[^/\s?#]+(?:/[^/\s?#]+)?(?:[/?#].*)?$", re.IGNORECASE
+)
+
 # The ONLY hostnames this service's browser is ever allowed to talk to -
 # see the module's own SSRF docstring above. Exact-or-subdomain match
 # only, same principle as the main app's own is_generic_link
 # KNOWN_NON_BROCHURE_DOMAINS check - "canva.com.evil.com" does NOT match
 # ".canva.com". pitch.com added alongside canva.com/canva.link - same
 # service, same allow-list mechanism, one more recognized platform.
-_ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link", "pitch.com")
+# fm.gpe.co.uk added for the SAME reason as pitch.com itself - a
+# recognized GPE flipbook URL is routed into render_pitch_page (see
+# _GPE_FLIPBOOK_VIEW_URL_RE's own docstring), whose own initial navigation
+# targets fm.gpe.co.uk, not pitch.com; every OTHER resource that page then
+# loads (scripts, fonts, the backend API) is already a pitch.com
+# subdomain, already covered by the existing "pitch.com" entry.
+_ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link", "pitch.com", "fm.gpe.co.uk")
 
 # Real production evidence this covers: `Page.goto: Timeout 15000ms
 # exceeded` on a genuine public Canva "view" link that DOES eventually
@@ -300,6 +340,16 @@ SEMAPHORE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("SEMAPHORE_WAIT_TIMEOUT_SECO
 # Collapses internal whitespace/newlines first since Canva renders this as
 # several separate text nodes ("1", "/", "7"), not one plain string.
 _PAGE_COUNT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+# Confirmed real, verbatim substring of the body text a Pitch "Managed
+# Links" document shows when its owner has enabled the optional email-
+# capture gate, INSTEAD of the actual deck - see render_pitch_page_async's
+# own docstring for the full real case this closes (a real GPE managed-
+# link fixture rendered exactly this). Lowercased match against a
+# lowercased page read - Pitch's own exact capitalization/wording is not a
+# documented contract, so this is deliberately just the one distinctive,
+# unambiguous phrase rather than the surrounding sentence verbatim.
+_EMAIL_GATE_MARKER = "requires you to enter an email"
 # Optional defense-in-depth on top of Cloud Run's own IAM-based invoker
 # check (see README.md) - never the primary access control, since a
 # static secret has to be stored/rotated somewhere, but cheap insurance
@@ -335,6 +385,10 @@ def _is_recognized_canva_url(url: str) -> bool:
 
 def _is_recognized_pitch_url(url: str) -> bool:
     return bool(_PITCH_VIEW_URL_RE.match(url.strip()))
+
+
+def _is_recognized_gpe_flipbook_url(url: str) -> bool:
+    return bool(_GPE_FLIPBOOK_VIEW_URL_RE.match(url.strip()))
 
 
 def _run_loop_forever():
@@ -546,6 +600,26 @@ async def _page_content_fingerprint(page) -> str:
         return await page.evaluate("() => document.body.innerText.slice(0, 500)")
     except Exception:
         return ""
+
+
+async def _page_shows_email_gate(page) -> bool:
+    """
+    True when `page` is currently showing a Pitch "Managed Links"
+    email-capture gate instead of the actual document - see _EMAIL_GATE_
+    MARKER's own docstring for the real case this detects. A plain body-
+    text substring check, same "cheap, DOM-structure-agnostic accessible-
+    text read" philosophy as _page_content_fingerprint - never a CSS
+    selector/DOM structure guess. False (never raises) on any read
+    failure - fails open into the ordinary render path exactly like
+    _page_content_fingerprint's own "" fallback does, so a page that
+    genuinely IS the real document is never blocked by this check merely
+    misbehaving.
+    """
+    try:
+        text = await page.evaluate("() => document.body.innerText.slice(0, 500)")
+    except Exception:
+        return False
+    return _EMAIL_GATE_MARKER in text.lower()
 
 
 async def _page_advance_signature(page) -> tuple:
@@ -993,11 +1067,35 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
     distinct constant (see its own docstring for why, even though it
     currently shares the same default value).
 
+    Also the entry point for a recognized GPE flipbook URL (see render_
+    page/_GPE_FLIPBOOK_VIEW_URL_RE's own docstring) - confirmed to be this
+    exact same Pitch player on GPE's own branded domain, so this function
+    is never GPE-specialized in any way; `url` itself (a fm.gpe.co.uk
+    address) is simply what gets navigated to.
+
+    Also detects a Pitch "Managed Links" email-gated document (see the
+    email-gate check below, right after the initial navigation settles) -
+    a genuinely different failure shape from the dead/expired-link check
+    above: the navigation itself succeeds with a real HTTP 200 (unlike
+    Canva's own "roadblock" 404 page), but the page shows an email-capture
+    prompt instead of the actual deck. Confirmed real: a second real GPE
+    managed-link (from the same GPE.eml fixture the URL-shape regex above
+    was confirmed against) rendered exactly this gate rather than any
+    brochure content. Before this check existed, that page would have been
+    silently captured as a normal one-page "successful" render - the gate
+    screen itself handed to Gemini as if it were real brochure content,
+    since the gate page has no "Next"/"Previous" controls at all, so
+    pagination simply (and silently) stopped after page 1 exactly like a
+    genuine single-page deck would. Checked here, in the SHARED Pitch
+    function, rather than only for the GPE case specifically - a plain
+    pitch.com/v/... link can have this exact same gate enabled by its own
+    owner; nothing about it is GPE-specific.
+
     Returns/raises exactly like render_canva_page_async - see that
     function's own docstring for the full contract.
     """
-    if not _is_recognized_pitch_url(url):
-        raise RenderError("not a recognized public Pitch URL")
+    if not (_is_recognized_pitch_url(url) or _is_recognized_gpe_flipbook_url(url)):
+        raise RenderError("not a recognized public Pitch or GPE flipbook URL")
     if not _host_allowed(url):
         raise RenderError("host not allowed")
 
@@ -1038,6 +1136,14 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
             raise RenderError("navigation left the allowed Pitch host")
 
         await page.wait_for_timeout(SETTLE_MS)
+
+        # Checked BEFORE the cookie-dismiss/screenshot below - a gated
+        # document never has any real deck content to screenshot at all
+        # (see this function's own docstring for the real GPE managed-link
+        # case this closes), so there is nothing worth attempting past
+        # this point once detected.
+        if await _page_shows_email_gate(page):
+            raise RenderError("presentation requires an email to open (access-gated, not publicly viewable)")
 
         # Best-effort only, same as Canva's own - not confirmed present on
         # either real recon URL, but costs nothing to also attempt here if
@@ -1177,18 +1283,24 @@ def render_pitch_page(url: str) -> tuple[list[bytes], list, int]:
 def render_page(url: str) -> tuple[list[bytes], list, int]:
     """
     Dispatches to whichever platform's own renderer a `url` shape
-    recognizes (see _is_recognized_canva_url/_is_recognized_pitch_url) -
-    the one call site Handler.do_POST actually needs, so it never has to
-    know which platform-specific render function to call itself. Raises
-    RenderError (never any other exception) when `url` matches neither
-    shape - the same "clean, expected failure" contract every other
-    rejection path in this module already uses.
+    recognizes (see _is_recognized_canva_url/_is_recognized_pitch_url/
+    _is_recognized_gpe_flipbook_url) - the one call site Handler.do_POST
+    actually needs, so it never has to know which platform-specific render
+    function to call itself. Raises RenderError (never any other
+    exception) when `url` matches none of these shapes - the same "clean,
+    expected failure" contract every other rejection path in this module
+    already uses.
+
+    A recognized GPE flipbook URL routes into render_pitch_page directly -
+    see _GPE_FLIPBOOK_VIEW_URL_RE's own docstring for why this is
+    confirmed to be the same underlying Pitch player on GPE's own branded
+    domain, never a separate render function.
     """
     if _is_recognized_canva_url(url):
         return render_canva_page(url)
-    if _is_recognized_pitch_url(url):
+    if _is_recognized_pitch_url(url) or _is_recognized_gpe_flipbook_url(url):
         return render_pitch_page(url)
-    raise RenderError("not a recognized public Canva or Pitch URL")
+    raise RenderError("not a recognized public Canva, Pitch, or GPE flipbook URL")
 
 
 def _reencode_as_jpeg(page_bytes: bytes) -> bytes:

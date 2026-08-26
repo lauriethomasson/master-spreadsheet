@@ -83,6 +83,35 @@ class IsRecognizedPitchUrlTests(unittest.TestCase):
         self.assertFalse(canva_renderer._is_recognized_pitch_url("https://pitch.com/"))
 
 
+class IsRecognizedGpeFlipbookUrlTests(unittest.TestCase):
+    """GPE's own branded "fm.gpe.co.uk" custom domain for Pitch's Managed
+    Links feature - confirmed real via a throwaway Playwright recon script
+    against a real GPE managed-link URL (see render_pitch_page_async's own
+    docstring): every asset/API call the page makes loads from pitch.com/
+    *.services.pitch.com, so this is Pitch itself, not a separate
+    platform - routed into render_pitch_page directly (see render_page)."""
+
+    def test_real_flipbook_link_is_recognized(self):
+        self.assertTrue(
+            canva_renderer._is_recognized_gpe_flipbook_url("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd")
+        )
+
+    def test_trailing_uuid_segment_variant_is_recognized(self):
+        # Real second shape confirmed in tests/sample_docs/GPE.eml.
+        self.assertTrue(canva_renderer._is_recognized_gpe_flipbook_url(
+            "https://fm.gpe.co.uk/v/gpe-availability-schedule-zu7yk2/b812cdcc-7bbb-429b-8af5-d000b8032853"
+        ))
+
+    def test_non_gpe_url_is_rejected(self):
+        self.assertFalse(canva_renderer._is_recognized_gpe_flipbook_url("https://example.com/brochure.pdf"))
+
+    def test_plain_pitch_com_url_is_not_recognized_as_gpe(self):
+        self.assertFalse(canva_renderer._is_recognized_gpe_flipbook_url("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+    def test_gpe_flipbook_homepage_is_rejected(self):
+        self.assertFalse(canva_renderer._is_recognized_gpe_flipbook_url("https://fm.gpe.co.uk/"))
+
+
 class HostAllowedSsrfTests(unittest.TestCase):
     """
     The renderer's core SSRF defense - a strict allow-list, not a
@@ -102,6 +131,19 @@ class HostAllowedSsrfTests(unittest.TestCase):
 
     def test_pitch_lookalike_domain_is_rejected(self):
         self.assertFalse(canva_renderer._host_allowed("https://pitch.com.evil.com/v/abc"))
+
+    def test_fm_gpe_co_uk_is_allowed(self):
+        self.assertTrue(canva_renderer._host_allowed("https://fm.gpe.co.uk/v/abc"))
+
+    def test_fm_gpe_co_uk_lookalike_domain_is_rejected(self):
+        self.assertFalse(canva_renderer._host_allowed("https://fm.gpe.co.uk.evil.com/v/abc"))
+
+    def test_plain_gpe_co_uk_without_the_fm_subdomain_is_rejected(self):
+        # The allow-list entry is exactly "fm.gpe.co.uk", never the bare
+        # "gpe.co.uk" - GPE's own ordinary corporate site is a completely
+        # different, unrelated host this service has no reason to ever
+        # navigate to.
+        self.assertFalse(canva_renderer._host_allowed("https://gpe.co.uk/portfolio/city-tower"))
 
     def test_lookalike_domain_is_rejected(self):
         # "canva.com.evil.com" must NOT match ".canva.com".
@@ -392,6 +434,7 @@ def _make_async_pitch_page(
     next_button_count=1,
     click_advances_page=True,
     page_links=None,
+    email_gate=False,
 ):
     """
     Pitch's own counterpart to _make_async_page (see that fixture's own
@@ -402,6 +445,14 @@ def _make_async_pitch_page(
     string values, matching render_pitch_page_async's own `get_attribute(
     "disabled", ...) is not None` check (never Canva's own `== "true"`
     string comparison).
+
+    `email_gate=True` makes the body-innerText read (the SAME page.
+    evaluate call both _page_shows_email_gate and _page_content_
+    fingerprint use - see render_pitch_page_async's own docstring on the
+    real GPE managed-link case this covers) return real gate wording
+    instead of the default "content-page-N" fingerprint text, so a test
+    can exercise the gate-detection branch without needing its own
+    separate mock plumbing.
     """
     page = MagicMock()
     page.url = final_url
@@ -432,6 +483,8 @@ def _make_async_pitch_page(
     async def _evaluate(script):
         if script == canva_renderer._PAGE_LINK_CANDIDATES_JS:
             return next(link_candidates_iter)
+        if email_gate:
+            return "This presentation requires you to enter an email to open"
         return f"content-page-{advance_state['page']}"
 
     page.evaluate = AsyncMock(side_effect=_evaluate)
@@ -1125,6 +1178,62 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         self.assertEqual(pages, [b"\x89PNG p1"])
         self.assertEqual(links, [page_links])
 
+    def test_gpe_flipbook_url_is_accepted_by_the_same_pitch_render_function(self):
+        # fm.gpe.co.uk is confirmed to be Pitch's own player on GPE's own
+        # branded domain (see this function's own docstring) - a
+        # recognized GPE URL must be accepted here directly, never
+        # rejected as "not a recognized public Pitch URL".
+        page = _make_async_pitch_page(
+            final_url="https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd",
+            screenshots=(b"\x89PNG real bytes",),
+        )
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _, _ = _run(
+                canva_renderer.render_pitch_page_async("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG real bytes"])
+        context.close.assert_awaited_once()
+
+    def test_email_gated_document_raises_render_error_instead_of_a_false_success(self):
+        # Real confirmed case (see this function's own docstring): a
+        # Pitch Managed Link with its owner's email-capture gate enabled
+        # returns real HTTP 200 and has no "Next"/"Previous" controls at
+        # all - before this check existed, that would have been silently
+        # captured as a normal one-page "successful" render (the gate
+        # screen itself handed to Gemini as if it were brochure content).
+        page = _make_async_pitch_page(email_gate=True, next_button_raises=True)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError) as ctx:
+                _run(canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+        self.assertIn("email", str(ctx.exception).lower())
+        page.screenshot.assert_not_called()
+        context.close.assert_awaited_once()
+
+    def test_email_gate_check_also_applies_to_a_gpe_flipbook_url(self):
+        # Checked in the SHARED function, not a GPE special case - applies
+        # identically regardless of which URL shape got here.
+        page = _make_async_pitch_page(email_gate=True, next_button_raises=True)
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError):
+                _run(canva_renderer.render_pitch_page_async("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd"))
+
+    def test_a_normal_non_gated_render_is_unaffected_by_the_gate_check(self):
+        # The gate check must never produce a false positive on an
+        # ordinary deck's own real content.
+        page = _make_async_pitch_page(email_gate=False, screenshots=(b"\x89PNG real bytes",))
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            pages, _, _ = _run(
+                canva_renderer.render_pitch_page_async("https://pitch.com/v/1-finsbury-brochure-4jnj9d")
+            )
+
+        self.assertEqual(pages, [b"\x89PNG real bytes"])
+
 
 class RenderPageDispatchTests(unittest.TestCase):
     """render_page - the one call site Handler.do_POST uses, dispatching
@@ -1156,6 +1265,18 @@ class RenderPageDispatchTests(unittest.TestCase):
 
         mock_canva.assert_not_called()
         mock_pitch.assert_not_called()
+
+    def test_gpe_flipbook_url_dispatches_to_the_same_render_pitch_page(self):
+        # Confirmed to be the identical underlying Pitch player (see
+        # _GPE_FLIPBOOK_VIEW_URL_RE's own docstring) - routed into the
+        # SAME render_pitch_page, never a separate render function.
+        with patch.object(canva_renderer, "render_canva_page") as mock_canva, \
+             patch.object(canva_renderer, "render_pitch_page", return_value=([b"x"], [], 1)) as mock_pitch:
+            result = canva_renderer.render_page("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd")
+
+        self.assertEqual(result, ([b"x"], [], 1))
+        mock_pitch.assert_called_once_with("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd")
+        mock_canva.assert_not_called()
 
 
 class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):

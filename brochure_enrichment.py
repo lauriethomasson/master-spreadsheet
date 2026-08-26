@@ -130,7 +130,7 @@ import streamlit as st
 import extract
 from brochure_link_resolver import (
     REQUEST_TIMEOUT, USER_AGENT, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link,
-    is_pitch_view_link, looks_like_url, resolve_brochure_link,
+    is_gpe_flipbook_link, is_pitch_view_link, looks_like_url, resolve_brochure_link,
 )
 import geocode
 from house_number import leading_house_number
@@ -239,6 +239,30 @@ def _canva_renderer_configured() -> bool:
     return bool(os.environ.get(CANVA_RENDERER_URL_ENV_VAR))
 
 
+def _render_platform_label(url: str) -> str:
+    """Which of the three URL shapes canva_renderer/ supports `url`
+    matches, as the exact string used throughout this module's own log
+    lines/diagnostics ("Canva"/"Pitch"/"GPE Flipbook") - factored out so
+    every caller that needs this label (there are several - grep this
+    module for its own call sites) shares ONE three-way check, rather than
+    each hand-rolling its own "Pitch" if is_pitch_view_link(url) else
+    "Canva"-style ternary that would need updating individually every time
+    a new platform is added. GPE checked before Pitch: is_gpe_flipbook_
+    link's own regex is disjoint from is_pitch_view_link's (different
+    host), so the order between them doesn't actually matter for
+    correctness, but checking the newer, narrower shape first reads
+    slightly more naturally than the reverse. Callers are expected to only
+    ever call this once one of the three has already been confirmed True
+    (e.g. via classify_link_eligibility) - returns "Canva" as a fallback
+    for a URL matching none of the three, never raises, but that fallback
+    is not expected to be reached in practice."""
+    if is_gpe_flipbook_link(url):
+        return "GPE Flipbook"
+    if is_pitch_view_link(url):
+        return "Pitch"
+    return "Canva"
+
+
 def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
     """
     None if `url` is eligible for a real fetch attempt (the existing
@@ -275,7 +299,7 @@ def classify_link_eligibility(url, reject_floorplan_shaped: bool = True):
         return STATUS_UNSUPPORTED_LINK_TYPE
     if is_generic_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
-    if (is_canva_view_link(url) or is_pitch_view_link(url)) and not _canva_renderer_configured():
+    if (is_canva_view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url)) and not _canva_renderer_configured():
         return STATUS_UNSUPPORTED_LINK_TYPE
     if _is_google_drive_folder_link(url):
         return STATUS_UNSUPPORTED_LINK_TYPE
@@ -1004,7 +1028,7 @@ def _is_eligible_brochure_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
-    if (is_canva_view_link(url) or is_pitch_view_link(url)) and not _canva_renderer_configured():
+    if (is_canva_view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url)) and not _canva_renderer_configured():
         return False
     if _is_google_drive_folder_link(url):
         return False
@@ -1389,6 +1413,15 @@ _CANVA_MAX_PAGES_ACCEPTED = 30
 # canva_renderer/app.py's own MAX_PITCH_PAGES, same reason as the Canva
 # pair (see tests.test_canva_renderer.MaxPagesCapsStayInSyncTests for the
 # analogous pairing test this constant needs too).
+#
+# Also the cap used for a GPE flipbook link (see _fetch_gpe_flipbook_
+# rendered_page below) - deliberately NOT a separate _GPE_MAX_PAGES_
+# ACCEPTED constant: fm.gpe.co.uk is confirmed to be this exact same Pitch
+# player on GPE's own branded domain (see is_gpe_flipbook_link's own
+# docstring), routed into canva_renderer's existing render_pitch_page on
+# that side too (never a separate render function/page cap there either -
+# see that service's own render_page docstring), so there is no second,
+# independently-tracked cap to keep in lockstep with in the first place.
 _PITCH_MAX_PAGES_ACCEPTED = 30
 
 # Same idea as the renderer's own _MAX_REASON_LENGTH (canva_renderer/app.py)
@@ -1719,6 +1752,24 @@ def _fetch_pitch_rendered_page(url: str):
     return pages
 
 
+def _fetch_gpe_flipbook_rendered_page(url: str):
+    """GPE flipbook's own thin wrapper over _fetch_rendered_page - see
+    that function's own docstring for the full contract. fm.gpe.co.uk is
+    confirmed to be Pitch's own "Managed Links" feature on GPE's own
+    branded domain (see is_gpe_flipbook_link's own docstring) - the SAME
+    renderer-side function (canva_renderer/app.py's own render_pitch_
+    page_async) handles it, and it shares Pitch's own max_pages_accepted
+    cap rather than a separate one (see _PITCH_MAX_PAGES_ACCEPTED's own
+    docstring on why). platform_label is still its own distinct "GPE
+    Flipbook" string, purely so this app's own logs/diagnostics can tell
+    which URL shape actually triggered a given render, independent of the
+    fact that the underlying mechanism is identical to Pitch's."""
+    pages, _page_links = _fetch_rendered_page(
+        url, platform_label="GPE Flipbook", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED,
+    )
+    return pages
+
+
 def fetch_rendered_page_with_links(url: str) -> tuple:
     """
     Public entry point for the paste-a-link flow (see app.py's own
@@ -1733,12 +1784,13 @@ def fetch_rendered_page_with_links(url: str) -> tuple:
     new capability for a different caller, never a change to those.
 
     Dispatches on the URL's own shape (see is_canva_view_link/is_pitch_
-    view_link) exactly like _fetch_pdf_bytes' own canva/pitch branches do
-    - callers should still check is_canva_view_link(url) or is_pitch_
-    view_link(url) themselves before calling this (see _fetch_pasted_
-    link), same as every other caller of either platform-specific
-    fetch already does; a URL matching neither shape returns (None, None)
-    here rather than raising, so this stays safe to call defensively.
+    view_link/is_gpe_flipbook_link) exactly like _fetch_pdf_bytes' own
+    canva/pitch/GPE branches do - callers should still check is_canva_
+    view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url)
+    themselves before calling this (see _fetch_pasted_link), same as every
+    other caller of either platform-specific fetch already does; a URL
+    matching none of these shapes returns (None, None) here rather than
+    raising, so this stays safe to call defensively.
 
     Returns (pages, page_links) - pages is list[bytes] exactly like the
     plain wrappers (or None on any failure, same failure contract as
@@ -1750,6 +1802,8 @@ def fetch_rendered_page_with_links(url: str) -> tuple:
         return _fetch_rendered_page(url, platform_label="Canva", max_pages_accepted=_CANVA_MAX_PAGES_ACCEPTED)
     if is_pitch_view_link(url):
         return _fetch_rendered_page(url, platform_label="Pitch", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED)
+    if is_gpe_flipbook_link(url):
+        return _fetch_rendered_page(url, platform_label="GPE Flipbook", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED)
     return None, None
 
 
@@ -1789,15 +1843,17 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     extension is fetched as-is, otherwise resolve_brochure_link's one-hop
     landing-page scan is tried first.
 
-    A Canva "view" link (see is_canva_view_link) OR a Pitch.com "view"
-    link (see is_pitch_view_link) is read via the separate rendering
-    service instead (see _fetch_canva_rendered_page/_fetch_pitch_
-    rendered_page - the same deployed service handles both), but ONLY
+    A Canva "view" link (see is_canva_view_link), a Pitch.com "view" link
+    (see is_pitch_view_link), OR a GPE flipbook link (see is_gpe_flipbook_
+    link - GPE's own branded domain for this exact same Pitch mechanism)
+    is read via the separate rendering service instead (see _fetch_canva_
+    rendered_page/_fetch_pitch_rendered_page/_fetch_gpe_flipbook_
+    rendered_page - the same deployed service handles all three), but ONLY
     when CANVA_RENDERER_URL is actually configured (see _canva_renderer_
     configured) - classify_link_eligibility/_is_eligible_brochure_url/
-    _is_eligible_floorplan_url already reject either URL before it gets
-    here at all in that case, so this check is normally redundant, but
-    this function's own direct callers (e.g. a diagnostic script, or a
+    _is_eligible_floorplan_url already reject any of the three before it
+    gets here at all in that case, so this check is normally redundant,
+    but this function's own direct callers (e.g. a diagnostic script, or a
     test exercising this layer directly) don't necessarily go through
     that eligibility gate first - falling through to the exact same
     generic fetch path as any other URL when unconfigured, rather than
@@ -1805,13 +1861,13 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
     keeps this function's own behavior correct independent of whether a
     caller already checked eligibility.
 
-    The Canva/Pitch branches are the ONE case this function returns
+    The Canva/Pitch/GPE branches are the ONE case this function returns
     list[bytes] (one PNG per page, see _fetch_canva_rendered_page/_fetch_
-    pitch_rendered_page) rather than a single bytes object - every other
-    branch/URL shape is unaffected. Both callers (_extract_brochure_
-    units/_extract_floorplan_units) branch on this via _images_from_
-    fetched_document, so neither needs its own isinstance check
-    duplicated.
+    pitch_rendered_page/_fetch_gpe_flipbook_rendered_page) rather than a
+    single bytes object - every other branch/URL shape is unaffected.
+    Both callers (_extract_brochure_units/_extract_floorplan_units) branch
+    on this via _images_from_fetched_document, so neither needs its own
+    isinstance check duplicated.
     """
     if _box_share_token(url):
         return _fetch_box_shared_pdf(
@@ -1823,6 +1879,9 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
 
     if is_pitch_view_link(url) and _canva_renderer_configured():
         return _fetch_pitch_rendered_page(url)
+
+    if is_gpe_flipbook_link(url) and _canva_renderer_configured():
+        return _fetch_gpe_flipbook_rendered_page(url)
 
     direct_extensions = (".pdf", ".png", ".jpg", ".jpeg") if accept_image_formats else (".pdf",)
     try:
@@ -1996,7 +2055,7 @@ def _extract_brochure_units(url: str):
     ]
     has_data = bool(units) or bool(units.property_features) or bool(units.contacts) or bool(units.building_features)
     _record_status(STATUS_EXTRACTED_SUCCESSFULLY if has_data else STATUS_EXTRACTED_NO_USEFUL_DATA)
-    if is_canva_view_link(url) or is_pitch_view_link(url):
+    if is_canva_view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url):
         # Canva/Pitch-specific diagnostic only (never printed for the PDF/
         # Box/Dropbox/GDrive paths, which already have years of production
         # history without this) - shows exactly what Gemini's raw JSON
@@ -2005,7 +2064,7 @@ def _extract_brochure_units(url: str):
         # useful" and "matching/apply rejected what Gemini found" are never
         # ambiguous with each other in the logs. Field NAMES only, never
         # the actual extracted text (which could be long/PII-bearing).
-        platform_label = "Pitch" if is_pitch_view_link(url) else "Canva"
+        platform_label = _render_platform_label(url)
         print(
             f"[brochure_enrichment] {platform_label} extraction for {url!r}: {len(units)} unit(s), "
             f"property_features={'present' if units.property_features else 'absent'}, "
@@ -2505,7 +2564,7 @@ def _is_eligible_floorplan_url(url) -> bool:
         return False
     if is_generic_link(url):
         return False
-    if (is_canva_view_link(url) or is_pitch_view_link(url)) and not _canva_renderer_configured():
+    if (is_canva_view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url)) and not _canva_renderer_configured():
         return False
     if _is_google_drive_folder_link(url):
         return False
@@ -3197,7 +3256,7 @@ def enrich_rows_grouped(
                     new_row = new_row.model_copy(update={"brochure_link_broken": link_broken_update})
                 current[i] = new_row
                 if fields:
-                    if is_canva_view_link(url) or is_pitch_view_link(url):
+                    if is_canva_view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url):
                         # Distinct, greppable confirmation that a Canva/
                         # Pitch-sourced render made it all the way through
                         # the existing extraction pipeline AND actually
@@ -3207,7 +3266,7 @@ def enrich_rows_grouped(
                         # render succeeded" log confirms only the rendering
                         # half of (see this module's own "prove end-to-end"
                         # verification).
-                        platform_label = "Pitch" if is_pitch_view_link(url) else "Canva"
+                        platform_label = _render_platform_label(url)
                         print(
                             f"[brochure_enrichment] {platform_label} enrichment applied {fields} to "
                             f"{new_row.building!r} ({new_row.floor_unit!r}).",
@@ -3238,7 +3297,7 @@ def enrich_rows_grouped(
                             "building": new_row.building, "floor_unit": new_row.floor_unit,
                             "status": STATUS_EXTRACTED_BUT_AMBIGUOUS,
                         })
-                    if is_canva_view_link(url) or is_pitch_view_link(url):
+                    if is_canva_view_link(url) or is_pitch_view_link(url) or is_gpe_flipbook_link(url):
                         # Canva/Pitch-specific diagnostic only - the document
                         # read fine (see the extraction log above) but this
                         # ROW still has blank fields afterward; names the
@@ -3248,7 +3307,7 @@ def enrich_rows_grouped(
                         # the rent guard rejected it" are never conflated.
                         still_blank = [f for f in ENRICHABLE_FIELDS if _is_blank(getattr(new_row, f))]
                         reason = "ambiguous/rent-conflicting match" if ambiguous else "no confident match for this row"
-                        platform_label = "Pitch" if is_pitch_view_link(url) else "Canva"
+                        platform_label = _render_platform_label(url)
                         print(
                             f"[brochure_enrichment] {platform_label} extraction read fine for {new_row.building!r} "
                             f"({new_row.floor_unit!r}) but left {still_blank} blank — {reason}.",

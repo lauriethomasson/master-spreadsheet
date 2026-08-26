@@ -20,8 +20,8 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brochure_link_resolver import (
-    finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, is_pitch_view_link,
-    looks_like_url,
+    finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, is_gpe_flipbook_link,
+    is_pitch_view_link, looks_like_url,
 )
 from storage import blob_store, file_store
 
@@ -321,6 +321,40 @@ class IsPitchViewLinkTests(unittest.TestCase):
     def test_blank_is_not_a_view_link(self):
         self.assertFalse(is_pitch_view_link(None))
         self.assertFalse(is_pitch_view_link(""))
+
+
+class IsGpeFlipbookLinkTests(unittest.TestCase):
+    """GPE's own branded "fm.gpe.co.uk" custom domain for Pitch's Managed
+    Links feature - confirmed real shapes in tests/sample_docs/GPE.eml."""
+
+    def test_real_gpe_flipbook_link_is_recognised(self):
+        self.assertTrue(is_gpe_flipbook_link("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd"))
+
+    def test_the_trailing_uuid_segment_variant_is_also_recognised(self):
+        # Real second shape from the same GPE.eml fixture - a Dynamics
+        # marketing-tracked link carries an extra recipient-specific UUID
+        # path segment after the slug.
+        self.assertTrue(is_gpe_flipbook_link(
+            "https://fm.gpe.co.uk/v/gpe-availability-schedule-zu7yk2/b812cdcc-7bbb-429b-8af5-d000b8032853"
+        ))
+
+    def test_a_bare_fm_gpe_co_uk_homepage_is_not_a_flipbook_link(self):
+        self.assertFalse(is_gpe_flipbook_link("https://fm.gpe.co.uk/"))
+
+    def test_a_plain_gpe_co_uk_link_is_not_a_flipbook_link(self):
+        # "gpe.co.uk/portfolio/..." - GPE's own ordinary corporate site,
+        # a completely different host from the "fm." flipbook subdomain.
+        self.assertFalse(is_gpe_flipbook_link("https://gpe.co.uk/portfolio/city-tower"))
+
+    def test_a_plain_pitch_com_link_is_not_a_gpe_flipbook_link(self):
+        # Same underlying player, but this detector is matched purely on
+        # the URL's own host - a genuine pitch.com/v/... link stays
+        # is_pitch_view_link's own job, never double-counted here too.
+        self.assertFalse(is_gpe_flipbook_link("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+    def test_blank_is_not_a_flipbook_link(self):
+        self.assertFalse(is_gpe_flipbook_link(None))
+        self.assertFalse(is_gpe_flipbook_link(""))
 
 
 class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):

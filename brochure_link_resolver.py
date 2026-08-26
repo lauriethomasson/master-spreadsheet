@@ -162,8 +162,12 @@ def is_canva_view_link(url: str) -> bool:
 # problem as Canva's own "view" link (see _CANVA_VIEW_URL_RE's own
 # docstring): a plain HTTP GET returns only an empty client-side-rendered
 # shell (Pitch's own SPA, confirmed directly via a throwaway Playwright
-# recon script - no login/email gate, real content renders correctly in
-# a real browser), never the actual content. canva_renderer/ (see that
+# recon script), never the actual content - real content DOES render
+# correctly in a real browser, UNLESS the document's own owner has turned
+# on Pitch's optional email-capture gate (confirmed real via a second GPE
+# managed-link example - see is_gpe_flipbook_link's own docstring; the
+# renderer service detects and cleanly fails this case, see canva_
+# renderer/app.py's own _page_shows_email_gate). canva_renderer/ (see that
 # service's own README/module docstring) now handles Pitch too, reusing
 # the exact same architecture it already had for Canva.
 _PITCH_VIEW_URL_RE = re.compile(r"^https?://(?:[\w-]+\.)*pitch\.com/v/[^/\s?#]+(?:[/?#].*)?$", re.IGNORECASE)
@@ -178,6 +182,53 @@ def is_pitch_view_link(url: str) -> bool:
     if not url:
         return False
     return bool(_PITCH_VIEW_URL_RE.match(url.strip()))
+
+
+# GPE's own branded custom domain for Pitch's "Managed Links" feature -
+# e.g. "https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd", real and
+# confirmed in this project's own GPE.eml sample fixture, which also
+# carries a second real shape with a trailing UUID path segment (".../v/
+# gpe-availability-schedule-zu7yk2/b812cdcc-..."), matched by the optional
+# second path segment below.
+#
+# CONFIRMED, via a throwaway Playwright recon script against the real
+# example URL above, to be Pitch itself, not a separate platform GPE built
+# or white-labeled: every script/font/stylesheet/API request the page
+# makes loads from pitch.com/*.services.pitch.com, the backend call that
+# fetches the deck is literally POST backend.services.pitch.com/fetch-
+# document-snapshot-by-managed-link, and the on-page viewer chrome, the
+# "Next"/"Previous" controls, and the page-count indicator are all
+# identical to a plain pitch.com/v/... render (verified by clicking
+# through a real 20-page deck end to end). This is Pitch's own "Managed
+# Links" custom-domain feature - GPE's DNS points fm.gpe.co.uk at Pitch's
+# own infrastructure. canva_renderer/ routes a recognized URL of this
+# shape straight into its existing Pitch render path (see that service's
+# own render_page/_GPE_FLIPBOOK_VIEW_URL_RE), never a separate render
+# implementation, since duplicating identical pagination logic for a
+# provably identical product would only create a second copy to drift out
+# of sync with the original.
+#
+# A GPE row's own PDF or Pitch.com brochure link is NOT affected by this
+# in any way - this is matched purely against the URL's own text (exactly
+# like is_canva_view_link/is_pitch_view_link), never inferred from
+# row.provider or any other field, so a GPE upload with a plain PDF link
+# continues through the ordinary direct-fetch path completely unchanged.
+_GPE_FLIPBOOK_VIEW_URL_RE = re.compile(
+    r"^https?://(?:[\w-]+\.)*fm\.gpe\.co\.uk/v/[^/\s?#]+(?:/[^/\s?#]+)?(?:[/?#].*)?$", re.IGNORECASE
+)
+
+
+def is_gpe_flipbook_link(url: str) -> bool:
+    """True for GPE's own branded "fm.gpe.co.uk" custom domain for Pitch's
+    "Managed Links" feature - see _GPE_FLIPBOOK_VIEW_URL_RE's own
+    docstring for why this is unsupported by default (exactly like
+    is_canva_view_link/is_pitch_view_link) and how canva_renderer/ opts a
+    deployment into real support by routing it into its existing Pitch
+    render path. Never a fetch - matched against the URL's own text only,
+    same as is_canva_view_link/is_pitch_view_link."""
+    if not url:
+        return False
+    return bool(_GPE_FLIPBOOK_VIEW_URL_RE.match(url.strip()))
 
 
 def looks_like_url(value) -> bool:
