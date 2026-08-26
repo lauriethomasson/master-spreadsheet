@@ -2670,6 +2670,28 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             if "geocode_unverified" in diffs:
                 silent["geocode_unverified"] = diffs.pop("geocode_unverified")[1]
 
+            # address_conflict (see schema.ListingRow's own docstring) is
+            # the same kind of diagnostic pipeline metadata as brochure_
+            # link_broken/geocode_unverified above - never shown as its
+            # own raw diff line (a "None -> 'Brochure states ...'" row
+            # would be meaningless to a reviewer on its own), folded
+            # silently into the write instead. address_1 is then injected
+            # into diffs (if not already there) so the row still gets a
+            # genuine risky-field decision card below - the confirmed real
+            # Ivybridge House shape this exists for has address_1 UNCHANGED
+            # between old and new (the row's own value was already wrong
+            # before AND after this run; only the brochure's own SEPARATE
+            # text disagrees with it), so diff_fields alone would never
+            # have surfaced address_1 as a field to review at all. Reuses
+            # the exact same editable "New" value + Apply checkbox
+            # mechanism every other risky field already has - a reviewer
+            # who agrees with the brochure just edits the New value to
+            # match it and applies, never a new, bespoke decision-card
+            # shape invented just for this one field.
+            if "address_conflict" in diffs:
+                silent["address_conflict"] = diffs.pop("address_conflict")[1]
+                diffs.setdefault("address_1", (old_rec.get("address_1"), new_dict.get("address_1")))
+
             # Auto-merge a DETAIL_LOSS_MERGE_FIELDS update BEFORE risky_fields
             # is computed below, whenever it's safe to (see merge_compatible_
             # text's own docstring): is_detail_loss says old_val has a
@@ -2755,6 +2777,19 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 # of how small/plausible the change looks.
                 f for f in diffs
                 if f in GEOCODE_UNVERIFIED_FIELDS and new_dict.get("geocode_unverified")
+            ) | frozenset(
+                # address_conflict (see schema.ListingRow's own docstring
+                # and the address_1-injection comment above) - flagged
+                # unconditionally whenever present, same "positive
+                # evidence of a real problem, always needs a human's own
+                # look" philosophy as the GEOCODE_UNVERIFIED_FIELDS clause
+                # just above, never the more lenient HOUSE_NUMBER_FIELDS
+                # treatment (a structural change is tolerated there when
+                # the number itself still agrees - this is a DIFFERENT,
+                # already-confirmed-genuine disagreement, not a plain
+                # structural check).
+                f for f in diffs
+                if f == "address_1" and new_dict.get("address_conflict")
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])

@@ -2344,6 +2344,88 @@ def _source_postcode_conflict(row: ListingRow, candidate_postcode: str) -> bool:
     return geocode._postcode_hint_conflicts(source_hint, candidate_postcode)
 
 
+# Range-connector words that can legitimately sit between two house
+# numbers in a real UK address ("1 to 5 Adam Street") - filtered out
+# alongside pure-digit tokens (below) before the street-name word-overlap
+# check in _address_conflict_note, so a range's own extra number/connector
+# words are never mistaken for a genuine street-name difference. Small and
+# explicit, same conservative philosophy as this file's other hand-picked
+# word lists (_TRAILING_STREET_SUFFIX_WORDS, _ORDINAL_WORD_TO_NUMBER).
+_ADDRESS_RANGE_CONNECTOR_WORDS = frozenset({"to", "and"})
+
+
+def _street_name_words(address: str) -> frozenset:
+    """The normalized word set of `address` with every pure-digit token
+    (a house number, or the second half of a word-form range like "1 to
+    5") and range-connector word (_ADDRESS_RANGE_CONNECTOR_WORDS) removed
+    - leaving just the street-name text itself, independent of exactly how
+    a leading house number/range happens to be phrased. Used only for the
+    word-overlap half of _address_conflict_note's own comparison; the
+    house-number half is handled separately, via house_number.leading_
+    house_number, never by this function."""
+    words = normalize_key(address).split()
+    return frozenset(w for w in words if w not in _ADDRESS_RANGE_CONNECTOR_WORDS and not w.isdigit())
+
+
+def _address_conflict_note(file_address, brochure_address):
+    """
+    A human-readable note (see schema.ListingRow.address_conflict's own
+    docstring) describing a genuine disagreement between `file_address` (a
+    row's own ALREADY-STATED address_1 - right or wrong, never re-checked
+    once non-blank by BUILDING_LEVEL_FIELDS' own blank-only backfill rule)
+    and `brochure_address` (the SAME building's own address_1 as that
+    row's own brochure independently states it) - or None when there's no
+    genuine conflict, or nothing real to compare at all.
+
+    Two independent checks, either one alone is enough to flag a conflict:
+    - a disagreeing LEADING HOUSE NUMBER (via house_number.leading_house_
+      number - the same authoritative parser master_merge.house_number_
+      changed already uses for this exact kind of comparison, never a
+      second, independently-drifting implementation) - e.g. "27 Cannon
+      Street" vs "108 Cannon Street".
+    - street-name text that doesn't substantially overlap (a WORD-SET
+      comparison via _street_name_words, once each side's own house
+      number/range has been filtered out) - the confirmed real Ivybridge
+      House case this exists for: address_1 "1 John Adam Street" vs its
+      own brochure's "1 to 5 Adam Street" - the leading house numbers
+      agree ("1" both sides), but "john" is a real word on the file's own
+      side with nothing corresponding on the brochure's side.
+
+    Deliberately conservative, same "a human catches a case this misses"
+    philosophy as this file's other matching tiers - returns None (no
+    flag) whenever:
+    - either address is blank - nothing to compare;
+    - the brochure's own text has no house-number-shaped token in it AT
+      ALL (leading_house_number returns None) - a bare building/street
+      name with nothing number-shaped to check against is not evidence of
+      a conflict, just a brochure that didn't state a number;
+    - both checks above find no disagreement - a genuine match, including
+      one that only differs by formatting (case, punctuation, a range vs.
+      its own first number) already tolerated by normalize_key/leading_
+      house_number themselves.
+
+    Never called when file_address is blank/a placeholder (see _is_
+    placeholder_address) - that shape is already handled by BUILDING_
+    LEVEL_FIELDS' own ordinary backfill, which is a completely different,
+    unrelated case from this cross-check.
+    """
+    if _is_blank(file_address) or _is_blank(brochure_address):
+        return None
+
+    brochure_number = leading_house_number(brochure_address)
+    if brochure_number is None:
+        return None
+
+    file_number = leading_house_number(file_address)
+    if file_number is not None and file_number != brochure_number:
+        return f"Brochure states '{brochure_address}', file has '{file_address}'"
+
+    if _street_name_words(file_address) != _street_name_words(brochure_address):
+        return f"Brochure states '{brochure_address}', file has '{file_address}'"
+
+    return None
+
+
 def _match_building_value(row: ListingRow, units, field: str):
     """
     The single, unambiguous value for `field` (one of BUILDING_LEVEL_FIELDS
@@ -2497,6 +2579,18 @@ def _apply_units_to_row(row: ListingRow, units):
        matched, since none of these is safe to assume applies beyond the
        one unit it was actually stated for.
 
+    address_1 gets a FOURTH, independent check alongside step 2 above,
+    regardless of whether row.address_1 is already genuine (non-blank,
+    non-placeholder): if the brochure's own building-level address text
+    disagrees with what the row already has on file, address_conflict
+    (see schema.ListingRow's own docstring) is set to a note describing
+    both values - address_1 itself is NEVER overwritten by this (see
+    _address_conflict_note's own docstring for exactly what counts as a
+    genuine disagreement, and the real confirmed Ivybridge House case this
+    exists for). A blank/placeholder address_1 is unaffected by this check
+    entirely - that shape is what step 2's own ordinary backfill already
+    handles.
+
     Every value taken from `units`/`unit` is coerced to ListingRow's own
     declared type for that field before being trusted (see _coerced_unit_
     value for numeric fields, plain isinstance(str) for text ones) - fields
@@ -2556,15 +2650,32 @@ def _apply_units_to_row(row: ListingRow, units):
 
         for field in BUILDING_LEVEL_FIELDS:
             if field == "address_1":
-                # A placeholder address_1 (blank, or just a copy of the
-                # row's own building - see _is_placeholder_address) is
-                # eligible to be overwritten by a genuine brochure-derived
-                # address here, same as a blank one always was - postcode/
-                # submarket below keep their own plain blank-only check,
-                # completely unchanged.
-                if not _is_placeholder_address(row.address_1, row.building):
+                if _is_placeholder_address(row.address_1, row.building):
+                    # A placeholder address_1 (blank, or just a copy of
+                    # the row's own building - see _is_placeholder_
+                    # address) is eligible to be overwritten by a genuine
+                    # brochure-derived address here, same as a blank one
+                    # always was.
+                    value = _match_building_value(row, units, field)
+                    if value is not None:
+                        updates[field] = value
                     continue
-            elif not _is_blank(getattr(row, field)):
+                # A GENUINE, already-stated address_1 is never overwritten
+                # here (that's what the placeholder branch above is for) -
+                # but it's still worth cross-checking against what this
+                # row's own brochure independently states, since being
+                # non-blank has never itself been evidence the value is
+                # actually correct (see _address_conflict_note's own
+                # docstring for the real confirmed Ivybridge House case
+                # this catches - a wrong address that was simply never re-
+                # checked once address_1 stopped being blank).
+                brochure_value = _match_building_value(row, units, field)
+                if brochure_value is not None:
+                    conflict = _address_conflict_note(row.address_1, brochure_value)
+                    if conflict:
+                        updates["address_conflict"] = conflict
+                continue
+            if not _is_blank(getattr(row, field)):
                 continue
             value = _match_building_value(row, units, field)
             if value is not None:

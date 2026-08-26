@@ -91,9 +91,13 @@ DATA_ROW_HEIGHT = 60
 # behind-the-scenes geocoding metadata too (see that field's own schema.py
 # docstring) - it feeds geocode.py's own Tier 2 disambiguation query, but
 # isn't itself a property fact Mark/Laurie need to see as its own column.
+# address_conflict is the same idea once more (see that field's own
+# schema.py docstring) - a raw text column would show the SAME conflict
+# note the Review page's own risky-field caption already surfaces, in a
+# spot no one is looking at it during review.
 HIDDEN_COLUMNS = [
     "source_file", "property_id", "brochure_link_broken", "brochure_link_is_floorplan", "floorplan_link",
-    "geocode_unverified", "development_name",
+    "geocode_unverified", "development_name", "address_conflict",
 ]
 
 

@@ -35,7 +35,7 @@ def _empty_master_df() -> pd.DataFrame:
     return pd.DataFrame(columns=list(ListingRow.model_fields.keys()))
 
 
-def _risky_field_reason(field: str, unverified: bool = False) -> str:
+def _risky_field_reason(field: str, unverified: bool = False, address_conflict: str = None) -> str:
     """
     Short, plain-English reason ONE specific risky field needs a manual
     decision - derived directly from WHICH of master_merge's own risk
@@ -43,8 +43,14 @@ def _risky_field_reason(field: str, unverified: bool = False) -> str:
     computation in build_merge_plan), never invented independently of
     that existing logic and never exposing an internal name/function.
 
-    unverified (see master_merge.GEOCODE_UNVERIFIED_FIELDS' own docstring
-    and geocode.py's Tier 2 zero-hint fallback) is checked FIRST, ahead of
+    address_conflict (see schema.ListingRow's own docstring and build_
+    merge_plan's own address_1-injection comment) is checked FIRST of
+    all, ahead of even `unverified` - it's the most specific, most
+    actionable reason there is: the row's own brochure has ALREADY told
+    us what it thinks address_1 should say, and that exact text is worth
+    showing verbatim rather than a generic category caption. unverified
+    (see master_merge.GEOCODE_UNVERIFIED_FIELDS' own docstring and
+    geocode.py's Tier 2 zero-hint fallback) is checked next, ahead of
     every other category: an address/coordinate produced with nothing at
     all to cross-check it against needs its own stronger caution, not the
     normal "existing value would be replaced" wording - that phrasing
@@ -52,6 +58,8 @@ def _risky_field_reason(field: str, unverified: bool = False) -> str:
     different, which is backwards here, since it's the NEW value that
     actually needs the reviewer's own manual confirmation.
     """
+    if address_conflict and field == "address_1":
+        return address_conflict
     if unverified and field in master_merge.GEOCODE_UNVERIFIED_FIELDS:
         return "This address couldn't be independently verified — please confirm it yourself before applying"
     if field in master_merge.HOUSE_NUMBER_FIELDS:
@@ -118,7 +126,7 @@ def _has_shared_words(old_val: str, new_val: str) -> bool:
 
 def _render_field_rows(
     diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
-    unverified: bool = False,
+    unverified: bool = False, address_conflict: str = None,
 ) -> dict:
     """
     Renders one compact row per field that genuinely needs a reviewer's
@@ -150,12 +158,15 @@ def _render_field_rows(
     reason caption - the point is a reviewer has to notice and opt in, not
     just uncheck something that would otherwise apply silently.
 
-    unverified is passed straight through to _risky_field_reason (see its
-    own docstring) so a risky field caused by an unverified geocode (see
-    master_merge.GEOCODE_UNVERIFIED_FIELDS) gets that stronger caption
+    unverified/address_conflict are passed straight through to _risky_
+    field_reason (see its own docstring) so a risky field caused by an
+    unverified geocode (see master_merge.GEOCODE_UNVERIFIED_FIELDS) or an
+    address_1 conflict against the row's own brochure (see schema.
+    ListingRow.address_conflict) gets that stronger/more specific caption
     instead of whichever generic reason its field name would otherwise
-    map to - callers with nothing unverified about this row simply never
-    pass it, leaving every existing caption exactly as it was.
+    map to - callers with nothing unverified/conflicting about this row
+    simply never pass them, leaving every existing caption exactly as it
+    was.
 
     Returns only the fields whose checkbox is checked (or bundled as
     safe), using whatever value is currently entered - letting a reviewer
@@ -207,7 +218,7 @@ def _render_field_rows(
         with label_col:
             st.markdown(f"**{display_utils.friendly_field_label(f)}**")
             if is_risky:
-                st.caption(f"⚠️ {_risky_field_reason(f, unverified)}")
+                st.caption(f"⚠️ {_risky_field_reason(f, unverified, address_conflict)}")
         with before_col:
             if is_text_diff:
                 st.caption(before_highlight)
@@ -557,7 +568,7 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
     with st.expander(label, key=f"{key_prefix}_expander"):
         approved_fields = _render_field_rows(
             m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields,
-            unverified=bool(m.new_row.geocode_unverified),
+            unverified=bool(m.new_row.geocode_unverified), address_conflict=m.new_row.address_conflict,
         )
     if approved_fields:
         entry = updates.setdefault(m.master_index, {})

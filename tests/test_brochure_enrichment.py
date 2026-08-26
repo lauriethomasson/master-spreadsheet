@@ -3181,6 +3181,12 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
     """
 
     def test_non_blank_source_values_are_never_overwritten(self):
+        # address_1 here also happens to disagree with the brochure's own
+        # value ("Already Stated Address" vs "13a St George St") - this
+        # now correctly raises address_conflict (see AddressConflictNote
+        # Tests/AddressConflictWiringTests), a real, intentional flag, not
+        # a regression. This test's own point stands unaffected: every
+        # field's own VALUE - address_1 included - is never overwritten.
         row = ListingRow(
             building="Nash House", floor_unit="2nd", size_sqft=1524, address_1="Already Stated Address",
             postcode="EC1A 1AA", submarket="Already Stated Area", rent_pcm=4000, rent_psf=50, desks_max=12,
@@ -3193,8 +3199,13 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
 
         new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
 
-        self.assertEqual(fields, [])
-        self.assertIs(new_row, row)
+        self.assertEqual(fields, ["address_conflict"])
+        self.assertEqual(new_row.address_1, "Already Stated Address")
+        self.assertEqual(new_row.postcode, "EC1A 1AA")
+        self.assertEqual(new_row.submarket, "Already Stated Area")
+        self.assertEqual(new_row.rent_pcm, 4000)
+        self.assertEqual(new_row.rent_psf, 50)
+        self.assertEqual(new_row.desks_max, 12)
 
     def test_blank_floor_with_a_unique_compatible_unit_fills(self):
         row = ListingRow(building="Nash House", floor_unit=None, size_sqft=1524)
@@ -3288,11 +3299,31 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
         self.assertEqual(new_row.address_1, "19 Wells Street")
         self.assertIn("address_1", fields)
 
-    def test_genuine_non_placeholder_address_is_completely_unaffected(self):
+    def test_genuine_non_placeholder_address_is_never_overwritten(self):
         # A row whose address_1 is already genuine (not blank, not a
-        # duplicate of building) must be left exactly as it is today -
-        # never overwritten, even by a confidently-matched brochure value.
+        # duplicate of building) must have that VALUE left exactly as it
+        # is today - never overwritten, even by a confidently-matched
+        # brochure value. This particular pair also happens to disagree
+        # (see AddressConflictNoteTests/AddressConflictWiringTests below) -
+        # confirmed as a real, intentional flag now (address_conflict),
+        # not a regression: the original point of this test (address_1
+        # ITSELF is never silently replaced) still holds completely.
         row = ListingRow(building="Nineteen Wells St", address_1="1 Some Other Road")
+        units = _brochure_units([
+            {"building": "Nineteen Wells St", "address_1": "19 Wells Street"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("address_1", fields)
+        self.assertEqual(new_row.address_1, "1 Some Other Road")
+
+    def test_genuine_non_placeholder_address_with_no_conflict_is_completely_unaffected(self):
+        # The ORIGINAL, still-valid shape this test class's own name
+        # promises: a genuine address_1 that also happens to agree with
+        # the brochure - nothing at all happens, not even an address_
+        # conflict flag.
+        row = ListingRow(building="Nineteen Wells St", address_1="19 Wells Street")
         units = _brochure_units([
             {"building": "Nineteen Wells St", "address_1": "19 Wells Street"},
         ])
@@ -3301,7 +3332,7 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
 
         self.assertEqual(fields, [])
         self.assertIs(new_row, row)
-        self.assertEqual(new_row.address_1, "1 Some Other Road")
+        self.assertEqual(new_row.address_1, "19 Wells Street")
 
     def test_placeholder_address_with_no_real_brochure_address_falls_through_cleanly(self):
         # The brochure itself doesn't state a real address either - must
@@ -3498,6 +3529,136 @@ class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
         self.assertNotIn("lng", fields)
         self.assertNotIn("provider", fields)
         self.assertNotIn("internal_ref", fields)
+
+
+class AddressConflictNoteTests(unittest.TestCase):
+    """_address_conflict_note - the confirmed real case: an Ivybridge
+    House row's own address_1 read "1 John Adam Street", but its own
+    brochure states "1 to 5 Adam Street" on its cover page and every floor
+    plan - no "John" anywhere. Conservative by design: only flags a
+    genuine disagreeing house number or a street-name word-set mismatch,
+    never a plain formatting difference."""
+
+    def test_exact_match_is_not_a_conflict(self):
+        self.assertIsNone(brochure_enrichment._address_conflict_note("19 Wells Street", "19 Wells Street"))
+
+    def test_case_and_punctuation_only_difference_is_not_a_conflict(self):
+        self.assertIsNone(brochure_enrichment._address_conflict_note("19 Wells St.", "19 wells st"))
+
+    def test_genuinely_different_house_number_is_a_conflict(self):
+        note = brochure_enrichment._address_conflict_note("27 Cannon Street", "108 Cannon Street")
+        self.assertIsNotNone(note)
+        self.assertIn("108 Cannon Street", note)
+        self.assertIn("27 Cannon Street", note)
+
+    def test_ivybridge_house_real_case_extra_word_is_a_conflict(self):
+        # The confirmed real shape: leading house numbers agree ("1" both
+        # sides), but the file's own text has a real extra word ("John")
+        # the brochure's own version has nothing corresponding to.
+        note = brochure_enrichment._address_conflict_note("1 John Adam Street", "1 to 5 Adam Street")
+        self.assertIsNotNone(note)
+        self.assertEqual(note, "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'")
+
+    def test_no_house_number_shaped_brochure_text_is_not_a_conflict(self):
+        # The brochure's own address text has nothing number-shaped to
+        # compare against at all - not evidence of a conflict, just a
+        # brochure that didn't state a number.
+        self.assertIsNone(brochure_enrichment._address_conflict_note("1 John Adam Street", "Adam Street"))
+
+    def test_blank_file_address_is_not_a_conflict(self):
+        # Nothing on file yet to conflict with - BUILDING_LEVEL_FIELDS'
+        # own ordinary blank-backfill handles this shape, not this check.
+        self.assertIsNone(brochure_enrichment._address_conflict_note(None, "1 Adam Street"))
+        self.assertIsNone(brochure_enrichment._address_conflict_note("", "1 Adam Street"))
+
+    def test_blank_brochure_address_is_not_a_conflict(self):
+        self.assertIsNone(brochure_enrichment._address_conflict_note("1 John Adam Street", None))
+        self.assertIsNone(brochure_enrichment._address_conflict_note("1 John Adam Street", ""))
+
+    def test_a_range_vs_its_own_single_endpoint_is_still_a_conflict(self):
+        # Matches master_merge.house_number_changed's own established
+        # precedent for this exact shape ("18" vs "14-18" - see that
+        # function's own docstring): a plain number vs. a hyphenated range
+        # sharing an endpoint is treated as a REAL disagreement, since the
+        # range covers a different, wider set of units than the plain
+        # number alone - never silently treated as "close enough".
+        note = brochure_enrichment._address_conflict_note("27-30 Lime Street", "27 Lime Street")
+        self.assertIsNotNone(note)
+
+    def test_street_suffix_abbreviation_alone_is_flagged_as_a_word_mismatch(self):
+        # Known, deliberate limitation: this check does its own plain
+        # word-token comparison (via normalize_key), with no separate
+        # abbreviation-expansion tolerance the way master_merge.
+        # _building_match_key has for BUILDING-name matching - "St" and
+        # "Street" are two different words here, so this flags a false
+        # positive for a source that merely abbreviates the street suffix
+        # differently than the file already does. Accepted rather than
+        # solved: the cost of a false positive here is one extra manual
+        # glance, never silent data corruption, and this wasn't part of
+        # what was asked for this check - locked in as documented,
+        # observed behavior rather than a silent gap.
+        note = brochure_enrichment._address_conflict_note("19 Wells St", "19 Wells Street")
+        self.assertIsNotNone(note)
+
+
+class AddressConflictWiringTests(EnrichmentTestCase):
+    """_apply_units_to_row's own wiring of _address_conflict_note into the
+    BUILDING_LEVEL_FIELDS address_1 step - runs regardless of whether
+    address_1 is blank, but NEVER writes address_1 itself; only ever sets
+    address_conflict."""
+
+    def test_conflicting_brochure_address_sets_address_conflict_never_touches_address_1(self):
+        row = ListingRow(building="Ivybridge House", address_1="1 John Adam Street")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "address_1": "1 to 5 Adam Street"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(fields, ["address_conflict"])
+        self.assertEqual(new_row.address_1, "1 John Adam Street")
+        self.assertEqual(
+            new_row.address_conflict, "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'",
+        )
+
+    def test_agreeing_brochure_address_never_sets_address_conflict(self):
+        row = ListingRow(building="Ivybridge House", address_1="1 to 5 Adam Street")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "address_1": "1 to 5 Adam Street"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(fields, [])
+        self.assertIsNone(new_row.address_conflict)
+
+    def test_blank_address_1_is_backfilled_normally_never_flagged_as_a_conflict(self):
+        # Nothing on file to compare against at all - the ordinary
+        # placeholder/blank backfill path handles this, completely
+        # unrelated to the conflict check.
+        row = ListingRow(building="Ivybridge House", address_1=None)
+        units = _brochure_units([
+            {"building": "Ivybridge House", "address_1": "1 to 5 Adam Street"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.address_1, "1 to 5 Adam Street")
+        self.assertIn("address_1", fields)
+        self.assertNotIn("address_conflict", fields)
+        self.assertIsNone(new_row.address_conflict)
+
+    def test_no_brochure_address_at_all_is_not_flagged_and_does_not_crash(self):
+        row = ListingRow(building="Ivybridge House", address_1="1 John Adam Street")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "floor_unit": "2nd"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("address_conflict", fields)
+        self.assertIsNone(new_row.address_conflict)
+        self.assertEqual(new_row.address_1, "1 John Adam Street")
 
 
 class RentValuesConsistentTests(unittest.TestCase):

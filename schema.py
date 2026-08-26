@@ -113,6 +113,40 @@ class ListingRow(BaseModel):
     # means "this run has real evidence the location IS verified" and
     # must be written through like any other genuine value.
     geocode_unverified: Optional[bool] = None
+    # Human-readable note (never a bare bool - see this docstring's own
+    # last paragraph for why) set by brochure_enrichment.py's own address_1
+    # cross-check whenever a row's ALREADY-STATED address_1 (right or
+    # wrong - address_1 being non-blank is normally treated as "trusted,
+    # never touched again" by BUILDING_LEVEL_FIELDS' own blank-only
+    # backfill rule) disagrees with what that row's own brochure
+    # independently states for the same building, once the brochure has
+    # been fetched anyway for other fields. Confirmed real case: an
+    # Ivybridge House row's own address_1 read "1 John Adam Street", but
+    # its own brochure states "1 to 5 Adam Street" on its cover page and
+    # every floor plan - no "John" anywhere. The brochure was always
+    # fetchable; nothing blocked reading it, the pipeline just never
+    # compared what it already had on file against what the document
+    # actually says.
+    #
+    # Purely a REVIEW FLAG, never an auto-correction - see brochure_
+    # enrichment._address_conflict_note's own docstring for exactly what
+    # counts as a genuine conflict (a disagreeing leading house number, or
+    # street-name text that doesn't substantially overlap) vs. what
+    # doesn't (an exact match, no house-number-shaped brochure text to
+    # compare against at all, or nothing on file yet to conflict with -
+    # that last case is what BUILDING_LEVEL_FIELDS' own ordinary blank-
+    # backfill already handles, not this field). address_1 ITSELF is never
+    # written by this check - see pages/2_Review_and_Master.py's own
+    # surfacing of this field for the decision a reviewer makes with it.
+    #
+    # None (never explicitly False) when no conflict was found OR this
+    # row's own address_1 was never checked this run (e.g. no brochure
+    # fetched, brochure had nothing address-shaped to compare) - same
+    # "None means this run didn't touch the question" convention as
+    # brochure_link_broken/geocode_unverified above, so master_merge.
+    # diff_fields' own blank-skip rule never lets a fresh, unchecked row
+    # silently clear a master row's own already-flagged conflict note.
+    address_conflict: Optional[str] = None
     # The overall campus/development's own brand name, distinct from any
     # individual building's own name within it (e.g. "Regent's Wharf"
     # containing "The Canal Building", "Thorley Works", ...) - only when

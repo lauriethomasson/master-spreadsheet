@@ -4278,6 +4278,89 @@ class GeocodeUnverifiedRiskyFieldsTests(unittest.TestCase):
         self.assertEqual(matched.risky_fields, frozenset())
 
 
+class AddressConflictRiskyFieldsTests(unittest.TestCase):
+    """
+    row.address_conflict (see schema.ListingRow's own docstring and
+    brochure_enrichment._address_conflict_note - the confirmed real
+    Ivybridge House case: address_1 "1 John Adam Street" on file, but the
+    row's own brochure states "1 to 5 Adam Street") forces address_1 into
+    risky_fields even when address_1 ITSELF never changed between master
+    and this upload - build_merge_plan injects a synthetic (old, old)
+    diffs["address_1"] entry specifically so the existing risky-field
+    decision UI still has something to render, since diff_fields alone
+    would never surface an unchanged field. address_conflict itself is
+    diagnostic metadata, never its own diff row (same brochure_link_
+    broken/geocode_unverified-style move into MatchedRow.silent_updates).
+    """
+
+    def _plan(self, master_extra=None, new_extra=None):
+        master_df = _master_df([{
+            "building": "Ivybridge House", "provider": "UNION", "floor_unit": "3rd Floor",
+            **(master_extra or {}),
+        }])
+        new_row = ListingRow(
+            building="Ivybridge House", provider="UNION", floor_unit="3rd Floor",
+            **(new_extra or {}),
+        )
+        return master_merge.build_merge_plan([new_row], master_df)
+
+    def test_address_conflict_flags_address_1_risky_even_though_unchanged(self):
+        plan = self._plan(
+            master_extra={"address_1": "1 John Adam Street"},
+            new_extra={
+                "address_1": "1 John Adam Street",
+                "address_conflict": "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'",
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("address_1", matched.diffs)
+        self.assertEqual(matched.diffs["address_1"], ("1 John Adam Street", "1 John Adam Street"))
+        self.assertIn("address_1", matched.risky_fields)
+
+    def test_address_conflict_itself_never_appears_as_its_own_diff_row(self):
+        plan = self._plan(
+            master_extra={"address_1": "1 John Adam Street"},
+            new_extra={
+                "address_1": "1 John Adam Street",
+                "address_conflict": "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'",
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertNotIn("address_conflict", matched.diffs)
+        self.assertNotIn("address_conflict", matched.risky_fields)
+        self.assertEqual(
+            matched.silent_updates.get("address_conflict"),
+            "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'",
+        )
+
+    def test_no_address_conflict_keeps_the_pre_existing_non_risky_behavior(self):
+        # Regression: an unchanged address_1 with no address_conflict at
+        # all must never appear in diffs/risky_fields - this row has
+        # genuinely nothing to review.
+        plan = self._plan(
+            master_extra={"address_1": "1 John Adam Street"},
+            new_extra={"address_1": "1 John Adam Street"},
+        )
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.matched_unchanged), 1)
+
+    def test_address_conflict_does_not_override_an_already_genuine_address_1_diff(self):
+        # address_1 already has a real diff for an unrelated reason (a
+        # genuine structural house-number change) - address_conflict must
+        # still flag it risky, but must never overwrite/replace the
+        # already-computed (old, new) pair with a synthetic (old, old) one.
+        plan = self._plan(
+            master_extra={"address_1": "1 John Adam Street"},
+            new_extra={
+                "address_1": "24 John Adam Street",
+                "address_conflict": "Brochure states '1 to 5 Adam Street', file has '24 John Adam Street'",
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["address_1"], ("1 John Adam Street", "24 John Adam Street"))
+        self.assertIn("address_1", matched.risky_fields)
+
+
 class GeocodeUnverifiedSelfCorrectionTests(unittest.TestCase):
     """
     geocode_row now writes an explicit False (never merely None) on a

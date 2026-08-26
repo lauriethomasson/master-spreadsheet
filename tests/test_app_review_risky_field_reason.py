@@ -82,5 +82,30 @@ class RiskyFieldReasonUnverifiedGeocodeTests(unittest.TestCase):
         self.assertEqual(_risky_field_reason("lat"), "Existing location would be replaced")
 
 
+class RiskyFieldReasonAddressConflictTests(unittest.TestCase):
+    """address_conflict (see schema.ListingRow's own docstring - the
+    confirmed real Ivybridge House case) shows its own note verbatim as
+    the caption, checked before even the unverified-geocode override -
+    the most specific, most actionable reason there is."""
+
+    def test_address_conflict_note_is_shown_verbatim(self):
+        note = "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'"
+        self.assertEqual(_risky_field_reason("address_1", address_conflict=note), note)
+
+    def test_address_conflict_takes_priority_over_unverified(self):
+        note = "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'"
+        self.assertEqual(_risky_field_reason("address_1", unverified=True, address_conflict=note), note)
+
+    def test_address_conflict_only_applies_to_address_1_never_another_field(self):
+        # A conflict note only ever describes address_1 - it must never
+        # leak onto some other field's own caption.
+        note = "Brochure states '1 to 5 Adam Street', file has '1 John Adam Street'"
+        self.assertEqual(_risky_field_reason("postcode", address_conflict=note), "Existing value differs from the new upload")
+
+    def test_no_address_conflict_keeps_the_pre_existing_wording(self):
+        self.assertEqual(_risky_field_reason("address_1", address_conflict=None), "Existing address would be replaced")
+        self.assertEqual(_risky_field_reason("address_1", address_conflict=""), "Existing address would be replaced")
+
+
 if __name__ == "__main__":
     unittest.main()
