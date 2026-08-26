@@ -304,6 +304,18 @@ class LetStatusThreeChoiceTests(IsolatedCwdTestCase):
         self.assertTrue(any(o.startswith("Remove property") for o in options))
         self.assertTrue(any(o.startswith("Keep current information") for o in options))
 
+    def test_no_raw_before_after_block_shown_for_the_let_status_field(self):
+        # The reviewer is deciding "is this property still available", not
+        # reviewing a wall of amenities text - the full before/after block
+        # for the flagged field itself must not render at all, only the
+        # summary banner (see test_only_the_trigger_phrase_is_shown_not_
+        # the_whole_field) and the radio.
+        at = self._staged_under_offer()
+        self.assertFalse(at.exception)
+        caption_text = [c.value for c in at.caption]
+        self.assertNotIn("BEFORE", caption_text)
+        self.assertNotIn(":red[AFTER]", caption_text)
+
     def test_only_the_trigger_phrase_is_shown_not_the_whole_field(self):
         # Real Workplace Plus shape: "U/O" buried in a long amenity list -
         # the warning must show just the trigger phrase, in its own real
@@ -371,6 +383,160 @@ class LetStatusThreeChoiceTests(IsolatedCwdTestCase):
         self.assertEqual(len(master_df), 1)
         # Still "Available" - this update contributed nothing at all.
         self.assertEqual(master_df.iloc[0]["special_features"], "Available")
+
+
+class LetStatusOtherDiffsDecoupledTests(IsolatedCwdTestCase):
+    """See pages/2_Review_and_Master.py's decision_let_status loop: a let-
+    status-flagged row's OTHER diffs (every field besides the let-status
+    field(s) itself) are decided independently of the apply/remove/ignore
+    choice made for the status question - a safe other diff auto-applies
+    regardless of that choice (unless the row is also removed - removal
+    still wins, see apply_merge's own precedence rule), a risky other diff
+    still gets its own genuine decision, and a row with no other diffs at
+    all behaves exactly as it did before this change."""
+
+    def _staged_under_offer_with_safe_size_change(self):
+        master_writer.write_master([
+            ListingRow(
+                building="15 Hatfields", provider="Knotel", floor_unit="3rd Floor",
+                special_features="Available", size_sqft=1000.0,
+                property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="15 Hatfields", provider="Knotel", floor_unit="3rd Floor",
+                special_features="Under Offer", size_sqft=1200.0,
+            )],
+            "knotel_size.xlsx", content_hash="let-status-safe-other-diff-hash",
+        )
+        return _run_review_page()
+
+    def test_safe_other_diff_auto_applies_even_when_status_is_ignored(self):
+        at = self._staged_under_offer_with_safe_size_change()
+        radio = next(r for r in at.radio if r.label == "What would you like to do?")
+        ignore_option = next(o for o in radio.options if o.startswith("Keep current information"))
+        radio.set_value(ignore_option)
+        at.run()
+
+        # Decoupled from the radio entirely - shows up as an ordinary
+        # automatic update, not gated behind the status decision.
+        self.assertIn("✅ Automatic updates", [s.value for s in at.subheader])
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+        self.assertFalse(at.exception)
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 1)
+        row = master_df.iloc[0]
+        self.assertEqual(row["special_features"], "Available")  # status update ignored
+        self.assertEqual(row["size_sqft"], 1200.0)  # unrelated safe field still applied
+
+    def test_removal_takes_precedence_over_an_auto_applied_safe_diff(self):
+        at = self._staged_under_offer_with_safe_size_change()
+        radio = next(r for r in at.radio if r.label == "What would you like to do?")
+        remove_option = next(o for o in radio.options if o.startswith("Remove property"))
+        radio.set_value(remove_option)
+        at.run()
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+        self.assertFalse(at.exception)
+
+        # The row is gone entirely - the safe size_sqft auto-update queued
+        # for the same master_index is moot, never resurrects the row with
+        # just the safe field applied (see apply_merge's own removal-takes-
+        # precedence docstring/test coverage).
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 0)
+
+    def _staged_under_offer_with_risky_address_change(self):
+        master_writer.write_master([
+            ListingRow(
+                building="Uncommon Liverpool St", provider="Uncommon", floor_unit="5th Floor",
+                special_features="Available", address_1="Uncommon Liverpool St",
+                property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="Uncommon Liverpool St", provider="Uncommon", floor_unit="5th Floor",
+                special_features="Under Offer", address_1="34-37 Liverpool Street",
+            )],
+            "uncommon_uo.xlsx", content_hash="let-status-risky-other-diff-hash",
+        )
+        return _run_review_page()
+
+    def test_risky_other_diff_still_gets_its_own_decision(self):
+        at = self._staged_under_offer_with_risky_address_change()
+        self.assertFalse(at.exception)
+
+        # A second, separate card for the genuinely risky address_1 change -
+        # never auto-applied just because it shares a row with a let-status
+        # flag (house_number_changed - same shape as UncommonLiverpoolSt
+        # StyleCompactDecisionTests' own risky-address fixture above).
+        expanders = [e for e in at.expander if "1 decision needed" in (e.label or "")]
+        self.assertEqual(len(expanders), 1)
+
+        radio = next(r for r in at.radio if r.label == "What would you like to do?")
+        ignore_option = next(o for o in radio.options if o.startswith("Keep current information"))
+        radio.set_value(ignore_option)
+        at.run()
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+        self.assertFalse(at.exception)
+
+        master_df = master_writer.load_master_as_dataframe()
+        row = master_df.iloc[0]
+        self.assertEqual(row["special_features"], "Available")  # status ignored
+        self.assertEqual(row["address_1"], "Uncommon Liverpool St")  # risky field never checked, so not applied
+
+    def test_checking_the_risky_other_diff_applies_it_independent_of_status_choice(self):
+        at = self._staged_under_offer_with_risky_address_change()
+        radio = next(r for r in at.radio if r.label == "What would you like to do?")
+        ignore_option = next(o for o in radio.options if o.startswith("Keep current information"))
+        radio.set_value(ignore_option)
+        at.run()
+
+        apply_checkboxes = [c for c in at.checkbox if c.label == "Apply"]
+        apply_checkboxes[0].set_value(True).run()
+
+        approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+        approve_buttons[0].click().run()
+        self.assertFalse(at.exception)
+
+        master_df = master_writer.load_master_as_dataframe()
+        row = master_df.iloc[0]
+        self.assertEqual(row["special_features"], "Available")  # status still ignored
+        self.assertEqual(row["address_1"], "34-37 Liverpool Street")  # risky field explicitly approved
+
+    def test_no_other_diffs_behaves_exactly_as_before(self):
+        # A let-status row whose ONLY diff is the let-status field itself -
+        # nothing left over, so no "Automatic updates" section and exactly
+        # the one decision, unchanged from before this fix.
+        master_writer.write_master([
+            ListingRow(
+                building="15 Hatfields", provider="Knotel", floor_unit="3rd Floor",
+                special_features="Available", property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="15 Hatfields", provider="Knotel", floor_unit="3rd Floor",
+                special_features="Under Offer",
+            )],
+            "knotel_only.xlsx", content_hash="let-status-no-other-diff-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        self.assertNotIn("✅ Automatic updates", [s.value for s in at.subheader])
+        radios = [r for r in at.radio if r.label == "What would you like to do?"]
+        self.assertEqual(len(radios), 1)
+        expanders = [e for e in at.expander if "decision" in (e.label or "")]
+        self.assertEqual(len(expanders), 0)
 
 
 if __name__ == "__main__":

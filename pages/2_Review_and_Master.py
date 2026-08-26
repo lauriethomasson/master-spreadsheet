@@ -738,9 +738,6 @@ def _render_let_status_decision(m, key_prefix: str) -> str:
     status_text = "; ".join(master_merge.let_status_display_text(m.diffs[f][1]) for f in m.let_status_fields)
 
     st.warning(f"**{label}**\n\n{provider} now lists this space as **{status_text}**.")
-    for f in m.let_status_fields:
-        old_val, new_val = m.diffs[f]
-        display_utils.render_before_after(old_val, new_val)
 
     choice = st.radio(
         "What would you like to do?",
@@ -2229,9 +2226,44 @@ def _render_pending_review(pending: list):
                 removed_indices.add(m.master_index)
             elif decision == "apply":
                 entry = decision_updates.setdefault(m.master_index, {})
-                entry.update({f: new_val for f, (old_val, new_val) in m.diffs.items()})
+                entry.update({f: new_val for f, (old_val, new_val) in m.diffs.items() if f in m.let_status_fields})
                 entry["source_file"] = m.new_row.source_file
             # "ignore" - this update contributes nothing for this row at all.
+
+            # This row's OTHER diffs (every field besides the let-status
+            # field(s) just decided above) are unrelated facts about the
+            # property - never silently bundled into whichever apply/
+            # remove/ignore choice the reviewer just made for the status
+            # question, and decided independently of it. Same "display-only
+            # remaining copy" pattern as the geocode-consolidation fallback
+            # loop below: dataclasses.replace leaves the original MatchedRow
+            # (already used elsewhere - _apply_silent, let_status_ids, etc.)
+            # completely untouched. If "remove" was also chosen above, any
+            # update queued here for the same master_index is moot once
+            # apply_merge runs - removal always takes precedence over a
+            # field-level update for the same row (see apply_merge's own
+            # docstring) - never a conflicting state.
+            other_fields = frozenset(m.diffs) - m.let_status_fields
+            if other_fields:
+                remaining = dataclasses.replace(
+                    m,
+                    diffs={f: v for f, v in m.diffs.items() if f in other_fields},
+                    risky_fields=m.risky_fields - m.let_status_fields,
+                )
+                if not remaining.risky_fields:
+                    # Only safe fields left - same shape auto_matched
+                    # already handles above; applies regardless of the
+                    # status decision, since these are unrelated safe facts.
+                    entry = {f: new_val for f, (old_val, new_val) in remaining.diffs.items()}
+                    entry["source_file"] = m.new_row.source_file
+                    auto_updates[m.master_index] = entry
+                else:
+                    # A genuinely risky field happened to share this row
+                    # with a let-status flag - still needs its own
+                    # deliberate look, never silently auto-applied.
+                    _render_matched_row(
+                        remaining, f"let_status_other_{i}_{m.property_id}", "⚠️ ", True, decision_updates,
+                    )
             st.divider()
 
         for i, u in enumerate(decision_new_property_let_status):
