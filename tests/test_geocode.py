@@ -56,6 +56,143 @@ class SkipAlreadyGeocodedRowsTests(unittest.TestCase):
         mock_places.assert_called_once()
 
 
+class IsBareStreetReferenceTests(unittest.TestCase):
+    """
+    _is_bare_street_reference - the unit-level check behind Tier 2's own
+    bare-street-name guard (see BareStreetReferenceSkipsTier2Tests below
+    for the full geocode_row integration). Confirmed real case: a MetSpace
+    email listing whose only location text was "Clerkenwell Road" - no
+    house number, no building name at all.
+    """
+
+    def test_bare_street_name_is_a_bare_reference(self):
+        self.assertTrue(geocode._is_bare_street_reference(ListingRow(building="Clerkenwell Road")))
+
+    def test_abbreviated_street_suffix_is_also_a_bare_reference(self):
+        self.assertTrue(geocode._is_bare_street_reference(ListingRow(building="Clerkenwell Rd")))
+
+    def test_real_building_name_is_not_a_bare_reference(self):
+        self.assertFalse(geocode._is_bare_street_reference(ListingRow(building="Kent House")))
+
+    def test_building_name_ending_in_a_generic_word_is_not_a_bare_reference(self):
+        # "Mill"/"Building"/etc. are not street-suffix words at all.
+        self.assertFalse(geocode._is_bare_street_reference(ListingRow(building="Discovery Mill")))
+
+    def test_building_name_ending_in_place_square_court_gardens_or_terrace_is_not_a_bare_reference(self):
+        # Deliberately narrower than master_merge._STREET_SUFFIX_
+        # EXPANSIONS' own full vocabulary (see _RELIABLE_STREET_SUFFIX_
+        # WORDS' own docstring) - "Place"/"Square"/"Court"/"Gardens"/
+        # "Terrace" are also common, genuine standalone UK BUILDING names
+        # in their own right (confirmed real: this project's own "Nexus
+        # Place" fixture, used throughout this test file as a real
+        # building), unlike street/road/avenue/lane. Using the full
+        # vocabulary here would have silently skipped Tier 2 geocoding
+        # for a genuine building like this.
+        for name in ("Nexus Place", "Fitzroy Square", "Clifford's Court", "Bedford Gardens", "Nash Terrace"):
+            with self.subTest(name=name):
+                self.assertFalse(geocode._is_bare_street_reference(ListingRow(building=name)))
+
+    def test_numbered_street_address_is_not_a_bare_reference(self):
+        # A leading house number ANYWHERE in building - via house_number.
+        # leading_house_number, reused unmodified - excludes this
+        # regardless of the last word.
+        self.assertFalse(geocode._is_bare_street_reference(ListingRow(building="27-30 Lime Street")))
+
+    def test_compound_name_and_numbered_address_is_not_a_bare_reference(self):
+        # A real confirmed regression this specific check exists for: a
+        # compound "Name, Address" building value (see split_compound_
+        # building, tried FIRST by Tier 2's own address-only query) has
+        # its own house number AFTER the separator, not at position 0 of
+        # the raw string - "Bridge House, 22 Newman Street" has no digit
+        # at the very start, but its own address part genuinely does.
+        # Caught directly by this module's own pre-existing
+        # CompoundBuildingGeocodingTests the moment this check was missing.
+        row = ListingRow(building="Bridge House, 22 Newman Street")
+        self.assertFalse(geocode._is_bare_street_reference(row))
+
+    def test_compound_name_and_bare_street_with_no_number_is_still_a_bare_reference(self):
+        # The mirror case: a compound value whose OWN address part also
+        # has no house number at all - still genuinely nothing to
+        # identify a specific building with, so this must still be
+        # treated as a bare reference.
+        row = ListingRow(building="Some Development, Newman Street")
+        self.assertTrue(geocode._is_bare_street_reference(row))
+
+    def test_development_name_present_excludes_even_a_genuine_bare_street_shape(self):
+        # A stated development name is real extra identifying evidence
+        # (see this module's own "Canal Building"/Regent's Wharf case) -
+        # must never be blocked by this guard just because building alone
+        # looks like a bare street.
+        row = ListingRow(building="Clerkenwell Road", development_name="Some Development")
+        self.assertFalse(geocode._is_bare_street_reference(row))
+
+    def test_blank_building_is_not_a_bare_reference(self):
+        self.assertFalse(geocode._is_bare_street_reference(ListingRow(building="")))
+
+
+class BareStreetReferenceSkipsTier2Tests(unittest.TestCase):
+    """
+    geocode_row's own wiring of _is_bare_street_reference - skipped BEFORE
+    Tier 2 ever queries Places at all (never merely flagged geocode_
+    unverified afterward, which is too easy to miss/click through in
+    review). Real motivating failure: Places never returns "no result"
+    for a bare-street-name query; it hands back SOME plausible-looking
+    address on that street instead (confirmed: "156 Clerkenwell Road" for
+    a listing that was actually 67 Clerkenwell Road, a real but wrong
+    building).
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_bare_street_name_never_calls_places_and_leaves_the_row_untouched(self):
+        row = ListingRow(building="Clerkenwell Road", provider="MetSpace")
+
+        with patch("geocode.call_places_text_search") as mock_places:
+            result = geocode.geocode_row(row)
+
+        mock_places.assert_not_called()
+        self.assertIsNone(result.lat)
+        self.assertIsNone(result.lng)
+        self.assertIsNone(result.address_1)
+        self.assertIsNone(result.postcode)
+        self.assertIsNone(result.geocode_unverified)
+
+    def test_bare_street_name_is_logged_with_its_own_distinct_reason(self):
+        row = ListingRow(building="Clerkenwell Road", provider="MetSpace")
+
+        with patch("geocode.call_places_text_search"):
+            geocode.geocode_row(row)
+
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("bare street name", geocode.FAILURES[0]["reason"])
+        self.assertIn("no house number", geocode.FAILURES[0]["reason"])
+
+    def test_real_building_name_still_queries_places_normally(self):
+        row = ListingRow(building="Kent House", provider="UNION")
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            geocode.geocode_row(row)
+
+        mock_places.assert_called()
+
+    def test_street_suffix_building_with_development_name_still_queries_places(self):
+        row = ListingRow(building="Clerkenwell Road", provider="MetSpace", development_name="Some Development")
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            geocode.geocode_row(row)
+
+        mock_places.assert_called()
+
+    def test_numbered_street_address_as_building_still_queries_places_normally(self):
+        row = ListingRow(building="27-30 Lime Street", provider="UNION")
+
+        with patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            geocode.geocode_row(row)
+
+        mock_places.assert_called()
+
+
 class SubmarketBackfillTests(unittest.TestCase):
     """
     Google's Geocoding/Places APIs never return neighbourhood-level detail

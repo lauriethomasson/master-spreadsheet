@@ -97,6 +97,7 @@ import sys
 import httpx
 
 from env_utils import load_dotenv
+from house_number import leading_house_number
 from master_merge import normalize_key
 from schema import ListingRow
 
@@ -729,6 +730,84 @@ def _fallback_query_texts(row: ListingRow, source_hint: dict) -> list:
     return variants
 
 
+# The street-suffix words Tier 2's own bare-street-reference guard (see
+# _is_bare_street_reference) checks a building's own last word against -
+# a DELIBERATELY NARROWER subset of master_merge._STREET_SUFFIX_
+# EXPANSIONS' own full vocabulary (street/road/avenue/lane and their
+# abbreviations only), not that dict's complete key+value set. Confirmed
+# real gap checked directly against this project's own test fixtures: the
+# dict's OTHER values - square/place/court/gardens/terrace - are also
+# common, genuine standalone UK BUILDING names in their own right (e.g.
+# this project's own "Nexus Place" fixture, used as a real building
+# throughout test_geocode.py), unlike street/road/avenue/lane, which are
+# essentially never a real building's own name on their own. Using the
+# full vocabulary here would silently skip Tier 2 geocoding entirely for
+# a genuine building like "Nexus Place" - a real regression, not a
+# hypothetical one, caught by this module's own existing test suite the
+# moment the full set was tried. See IsBareStreetReferenceTests/
+# BareStreetReferenceSkipsTier2Tests in tests/test_geocode.py.
+_RELIABLE_STREET_SUFFIX_WORDS = frozenset({"st", "street", "rd", "road", "ave", "av", "avenue", "ln", "lane"})
+
+
+def _is_bare_street_reference(row: ListingRow) -> bool:
+    """
+    True when row.building is structurally just a street name, with no
+    way to identify any SPECIFIC building on it - confirmed real case: a
+    MetSpace email listing whose only location text was "Clerkenwell
+    Road" (no house number, no building name at all). Tier 2's own Places
+    Text Search never returns "no result" for a query shaped like this;
+    it hands back SOME plausible-looking address on that street instead
+    (confirmed: "156 Clerkenwell Road" for a listing that was actually 67
+    Clerkenwell Road, a real but wrong building) - a specific-looking
+    wrong number is worse than an honest blank, so this is detected and
+    skipped BEFORE Tier 2 ever queries Places at all, rather than let
+    through and merely flagged geocode_unverified afterward (too easy to
+    miss/click through in review).
+
+    Three conditions, all required:
+    - row.building has no leading house number anywhere in it at all (via
+      house_number.leading_house_number, reused rather than reimplemented -
+      "27-30 Lime Street" is already excluded by this alone, a real
+      building reference regardless of its own last word); and
+    - a COMPOUND "Name, Address"/"Name - Address" building value (see
+      split_compound_building, tried FIRST by Tier 2's own address-only
+      query just below) has no leading house number in its own address
+      PART either - checked separately from the raw-string check above,
+      since a real compound value's own number sits after the separator
+      ("Bridge House, 22 Newman Street" has no digit at position 0, but
+      its own address part genuinely does - confirmed real regression
+      this specific check avoids, caught by this module's own existing
+      CompoundBuildingGeocodingTests the moment it was missing); and
+    - row.building's own LAST word is one of the reliable street-suffix
+      words (see _RELIABLE_STREET_SUFFIX_WORDS above - street/road/
+      avenue/lane and their abbreviations ONLY, a deliberately narrower
+      subset of master_merge._STREET_SUFFIX_EXPANSIONS' own full
+      vocabulary, see that constant's own docstring for the real "Nexus
+      Place" gap this avoids) - a real building name ending in "House"/
+      "Building"/"Mill"/"Place"/"Square"/"Court"/etc. never matches this
+      at all.
+
+    row.development_name must ALSO be blank - a stated development name
+    (e.g. "Regent's Wharf") is genuine extra identifying evidence (see
+    this module's own "Canal Building" docstring case) that could still
+    make a street-suffix-ending building name resolvable via Tier 2's own
+    development-name-first query variant; this guard must never block
+    that path just because building alone looks like a bare street.
+    """
+    if not row.building or row.development_name:
+        return False
+    if leading_house_number(row.building) is not None:
+        return False
+    compound = split_compound_building(row.building)
+    if compound and leading_house_number(compound[1]) is not None:
+        return False
+    words = row.building.strip().split()
+    if not words:
+        return False
+    last_word = re.sub(r"[^\w]", "", words[-1]).lower()
+    return last_word in _RELIABLE_STREET_SUFFIX_WORDS
+
+
 def geocode_row(row: ListingRow) -> ListingRow:
     # Already has real coordinates (e.g. a provider spreadsheet's own Lat/Lng
     # columns, mapped straight through by extract_spreadsheet.py) - calling
@@ -761,6 +840,19 @@ def geocode_row(row: ListingRow) -> ListingRow:
         # fall through to Places if Geocoding fails despite having an address
 
     # --- Tier 2: Places API Text Search (fallback) ---
+    if _is_bare_street_reference(row):
+        # See _is_bare_street_reference's own docstring for the real
+        # confirmed MetSpace "Clerkenwell Road" case this guards against -
+        # skipped BEFORE ever querying Places at all, leaving lat/lng/
+        # address_1/postcode completely untouched (never geocode_unverified
+        # either - there's no accepted candidate here to flag at all).
+        log_geocode_failure(
+            row,
+            "building is a bare street name with no house number — no way to identify a specific building "
+            "on it, skipped rather than guessing",
+        )
+        return row
+
     if row.building:
         # A compound building value tries its address portion alone
         # FIRST (see split_compound_building/this module's own
