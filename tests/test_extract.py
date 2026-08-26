@@ -131,10 +131,16 @@ class AttachPerRowPdfLinksTests(unittest.TestCase):
         finally:
             pdf_path.unlink(missing_ok=True)
 
-    def test_a_single_corroborating_unit_never_triggers_attachment(self):
-        # Two links exist, but only ONE unit is placed on this page -
-        # MIN_UNITS_FOR_PER_ROW_LINKS requires at least 2, so even a
-        # perfectly-matchable row must be left alone.
+    def test_a_single_corroborating_unit_still_attaches_its_own_unambiguous_link(self):
+        # Two links exist on the page (2 real rows), but only ONE unit was
+        # handed to this function for this page - the single-unit
+        # exception (see the module-level "EXCEPTION" comment) means this
+        # is no longer held to MIN_UNITS_FOR_PER_ROW_LINKS/MIN_LINKS_FOR_
+        # PER_ROW_LINKS at all. This is still a SAFE match, not a guess:
+        # the row_y/ROW_Y_TOLERANCE check below finds exactly one nearby
+        # link for "3rd Floor"'s own row (the "5th Floor" row's link sits
+        # well outside tolerance), so attaching it is exactly as
+        # geometrically confident as the ordinary >= 2 units case.
         pdf_path = _make_test_pdf([
             ("3rd Floor", 5000, "https://example.com/unit-a"),
             ("5th Floor", 7500, "https://example.com/unit-b"),
@@ -142,7 +148,7 @@ class AttachPerRowPdfLinksTests(unittest.TestCase):
         try:
             units = [{"floor_unit": "3rd Floor", "size_sqft": 5000, "brochure_link": None, "page_index": 0}]
             extract._attach_per_row_pdf_links(pdf_path, units)
-            self.assertIsNone(units[0]["brochure_link"])
+            self.assertEqual(units[0]["brochure_link"], "https://example.com/unit-a")
         finally:
             pdf_path.unlink(missing_ok=True)
 
@@ -195,6 +201,100 @@ class AttachPerRowPdfLinksTests(unittest.TestCase):
             extract._attach_per_row_pdf_links(pdf_path, units)
             self.assertEqual(units[0]["brochure_link"], "https://example.com/unit-a")
             self.assertEqual(units[1]["brochure_link"], "https://example.com/unit-b")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+
+def _make_single_row_two_links_pdf(floor_unit, size_sqft, link_uris: list) -> Path:
+    """
+    A single-row PDF page with `floor_unit`/`size_sqft` text, plus one
+    "Here" caption+link per entry in `link_uris`, all placed side-by-side
+    on that SAME row - no column header text anywhere on the page, so
+    neither _brochure_column_x_range nor _floor_plan_column_x_range can
+    narrow anything; every link in `link_uris` stays a genuine "nearby"
+    candidate for that one row. Models a single-unit page whose own row
+    happens to have more than one candidate link near it (ambiguous),
+    mirroring _make_multi_link_column_pdf's own row/link construction but
+    deliberately without any column headers to disambiguate by.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=500, height=70)
+    y = 30
+    page.insert_text((50, y), str(floor_unit), fontsize=11)
+    page.insert_text((150, y), str(size_sqft), fontsize=11)
+    x_positions = [250 + 60 * i for i in range(len(link_uris))]
+    for x in x_positions:
+        page.insert_text((x, y), "Here", fontsize=11)
+
+    words = page.get_text("words")
+    for x, uri in zip(x_positions, link_uris):
+        candidates = [w for w in words if w[4] == "Here" and abs(w[0] - x) < 5]
+        assert candidates, f"test setup failed to place a 'Here' caption at x={x}"
+        w = candidates[0]
+        rect = fitz.Rect(w[0] - 1, w[1] - 1, w[2] + 1, w[3] + 1)
+        page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": uri})
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    doc.save(str(tmp_path))
+    doc.close()
+    return tmp_path
+
+
+class SingleUnitPageLinkAttachmentTests(unittest.TestCase):
+    """
+    The single-unit exception (see extract.py's own module-level
+    "EXCEPTION" comment and _attach_per_row_pdf_links's own docstring) -
+    real confirmed case: a Colliers Canva-deck export ("Colliers Flex and
+    Managed Availability") uses a slide-per-building layout, one page/one
+    line item per building, with the building name itself hyperlinked to
+    a real, listing-specific colliers.com property page. The flat
+    ">= 2 units"/">= 2 links" gates skipped a page shaped like this
+    entirely, silently losing that real per-property link to the generic
+    whole-PDF rule-3 fallback instead.
+    """
+
+    def test_single_unit_page_with_one_link_gets_it_attached(self):
+        pdf_path = _make_test_pdf([
+            ("Kingsland House", 1120, "https://www.colliers.com/en-gb/properties/kingsland-house"),
+        ])
+        try:
+            units = [{"floor_unit": "Kingsland House", "size_sqft": 1120, "brochure_link": None, "page_index": 0}]
+            extract._attach_per_row_pdf_links(pdf_path, units)
+
+            self.assertEqual(units[0]["brochure_link"], "https://www.colliers.com/en-gb/properties/kingsland-house")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_single_unit_page_with_no_links_is_left_untouched(self):
+        # Falls through to whatever finalize_brochure_link's own existing
+        # fallback rules decide (untouched here) - unchanged from today.
+        pdf_path = _make_test_pdf([("Kingsland House", 1120, None)])
+        try:
+            units = [{"floor_unit": "Kingsland House", "size_sqft": 1120, "brochure_link": None, "page_index": 0}]
+            extract._attach_per_row_pdf_links(pdf_path, units)
+
+            self.assertIsNone(units[0]["brochure_link"])
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_single_unit_page_with_two_ambiguous_links_is_left_untouched(self):
+        # Two candidate links both sit near the page's own one row (no
+        # column headers to disambiguate by) - genuinely ambiguous which
+        # one is "the" brochure link, so this must be left alone, same
+        # "leaving for the PDF fallback" logging path the existing >= 2
+        # units ambiguous case already uses (see `elif len(nearby) > 1`
+        # in _attach_per_row_pdf_links).
+        pdf_path = _make_single_row_two_links_pdf(
+            "Kingsland House", 1120,
+            ["https://example.com/link-a", "https://example.com/link-b"],
+        )
+        try:
+            units = [{"floor_unit": "Kingsland House", "size_sqft": 1120, "brochure_link": None, "page_index": 0}]
+            extract._attach_per_row_pdf_links(pdf_path, units)
+
+            self.assertIsNone(units[0]["brochure_link"])
         finally:
             pdf_path.unlink(missing_ok=True)
 

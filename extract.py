@@ -56,6 +56,23 @@ _RENDER_LOCK = threading.Lock()
 # individual unit needs its row locatable on the page AND exactly one
 # candidate link near that row (never more than one - see
 # _attach_per_row_pdf_links) before a link is ever attached to it.
+#
+# EXCEPTION: a page with EXACTLY ONE unit needs only ONE caption-sized
+# link, not MIN_UNITS_FOR_PER_ROW_LINKS/MIN_LINKS_FOR_PER_ROW_LINKS. Both
+# of those thresholds exist purely to avoid cross-row ambiguity when
+# matching links to rows on a busy, tabular schedule-style page - with
+# only one unit on the page, there is only one row a link could possibly
+# belong to, so that ambiguity is structurally impossible regardless of
+# how few units/links there are. Confirmed real gap this closes: a
+# Colliers Canva-deck export ("Colliers Flex and Managed Availability")
+# uses a slide-per-building layout - one page, one line item, with the
+# building name itself hyperlinked to a real, listing-specific colliers.com
+# property page - which the flat ">= 2 units" gate skipped entirely,
+# silently losing that real link to the generic whole-PDF rule-3 fallback
+# instead. Every OTHER safeguard (row locatable on the page, exactly one
+# nearby candidate link, brochure/floorplan column x-range narrowing) is
+# completely unchanged and applies identically regardless of how many
+# units are on the page - see _attach_per_row_pdf_links's own docstring.
 PAGE_INDEX_KEY = "page_index"
 MIN_UNITS_FOR_PER_ROW_LINKS = 2
 MIN_LINKS_FOR_PER_ROW_LINKS = 2
@@ -239,6 +256,15 @@ def _attach_per_row_pdf_links(pdf_path: Path, units: list) -> None:
     clear both, or to a unit whose row can't be located, or whose row has
     zero or more than one candidate link nearby (ambiguous - left for the
     existing rule-3 PDF fallback rather than guessing).
+
+    A page with EXACTLY ONE unit is the one exception to both gates (see
+    the module-level comment's own "EXCEPTION" paragraph for the real
+    Colliers slide-deck case this exists for): it only needs 1 caption-
+    sized link, not MIN_UNITS_FOR_PER_ROW_LINKS/MIN_LINKS_FOR_PER_ROW_
+    LINKS - there is only one row on the page a link could belong to, so
+    the cross-row ambiguity those thresholds guard against cannot occur.
+    Every downstream check (row locatable, exactly one nearby candidate,
+    column x-range narrowing) still applies completely unchanged.
     """
     units_by_page = {}
     for unit in units:
@@ -252,11 +278,20 @@ def _attach_per_row_pdf_links(pdf_path: Path, units: list) -> None:
     doc = fitz.open(pdf_path)
     try:
         for page_index, page_units in units_by_page.items():
-            if len(page_units) < MIN_UNITS_FOR_PER_ROW_LINKS or not (0 <= page_index < doc.page_count):
+            if not (0 <= page_index < doc.page_count):
+                continue
+            # See the module-level comment's own "EXCEPTION" paragraph -
+            # a single-unit page has no cross-row ambiguity to guard
+            # against at all, so it's held to a single, lower link-count
+            # threshold instead of MIN_UNITS_FOR_PER_ROW_LINKS/MIN_LINKS_
+            # FOR_PER_ROW_LINKS.
+            is_single_unit_page = len(page_units) == 1
+            if not is_single_unit_page and len(page_units) < MIN_UNITS_FOR_PER_ROW_LINKS:
                 continue
             page = doc[page_index]
             links = [l for l in _page_uri_links(page) if _is_caption_sized(l["rect"])]
-            if len(links) < MIN_LINKS_FOR_PER_ROW_LINKS:
+            min_links_required = 1 if is_single_unit_page else MIN_LINKS_FOR_PER_ROW_LINKS
+            if len(links) < min_links_required:
                 continue
 
             page_words = page.get_text("words")
