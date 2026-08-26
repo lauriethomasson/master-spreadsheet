@@ -231,6 +231,55 @@ def is_gpe_flipbook_link(url: str) -> bool:
     return bool(_GPE_FLIPBOOK_VIEW_URL_RE.match(url.strip()))
 
 
+# Kitt's own brochure-preview app (e.g. "https://brochures.kittoffices.com/
+# brochures/preview?entity[9e40cdea-...]=unit&template=&display_label=
+# Open+brochure") - real, confirmed shape from a live Kitt's upload. A
+# plain HTTP fetch of this URL returns only an empty Next.js shell (page
+# title "Brochures | Kitt Offices", a placeholder "Download PDF" button
+# with no real href) - same category of problem as Canva/Pitch's own
+# client-side-rendered-only pages (see _CANVA_VIEW_URL_RE's own
+# docstring).
+#
+# CONFIRMED, via a live Playwright recon against four real production
+# links, to be Kitt's OWN custom-built Next.js application (`_next/static/
+# chunks/pages/brochures/preview-*.js`, Kitt's own "kitt-rebrand-logo"
+# asset, no pitch.com/canva.com script or API references anywhere) - NOT
+# a white-labeled Pitch or Canva instance, unlike fm.gpe.co.uk (see
+# _GPE_FLIPBOOK_VIEW_URL_RE's own docstring for that contrasting case).
+# canva_renderer/ therefore gives this its own dedicated render function
+# (render_kitt_page_async), never routed into the Canva/Pitch one.
+#
+# Also confirmed real, and genuinely different from both Canva's and
+# Pitch's own pagination: there is no "Next"/"Next page" button at all.
+# Every real example loads as ONE tall page (a real confirmed range of
+# ~7,700-10,800px) inside a single nested, independently-scrolling
+# container ("[data-scroll-id=root]", overflow-y-scroll - NOT the
+# document body's own scroll, which is why a plain full-page screenshot
+# doesn't capture it), snap-scrolled in fixed viewport-height increments
+# - four real examples' own real content (a building photo/amenities
+# section, then a per-floor spec/floor-plan section, ...) landed cleanly
+# on scroll-container-clientHeight-sized boundaries with no content ever
+# split mid-section, confirmed directly by inspecting each captured
+# screenshot. See render_kitt_page_async's own docstring for the capture
+# strategy this drives (scroll-position-based, not click-based).
+_KITT_BROCHURE_PREVIEW_URL_RE = re.compile(
+    r"^https?://(?:[\w-]+\.)*brochures\.kittoffices\.com/brochures/preview(?:[/?#].*)?$", re.IGNORECASE
+)
+
+
+def is_kitt_brochure_preview_link(url: str) -> bool:
+    """True for Kitt's own "brochures.kittoffices.com/brochures/preview"
+    brochure-preview app - see _KITT_BROCHURE_PREVIEW_URL_RE's own
+    docstring for why this is unsupported by default (exactly like
+    is_canva_view_link/is_pitch_view_link/is_gpe_flipbook_link) and how
+    canva_renderer/ opts a deployment into real support via its own
+    dedicated render_kitt_page_async. Never a fetch - matched against the
+    URL's own text only, same as the other three."""
+    if not url:
+        return False
+    return bool(_KITT_BROCHURE_PREVIEW_URL_RE.match(url.strip()))
+
+
 def looks_like_url(value) -> bool:
     """
     True only when `value` is genuinely shaped like a URL, as opposed to a

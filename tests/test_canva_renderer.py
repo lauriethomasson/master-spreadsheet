@@ -112,6 +112,38 @@ class IsRecognizedGpeFlipbookUrlTests(unittest.TestCase):
         self.assertFalse(canva_renderer._is_recognized_gpe_flipbook_url("https://fm.gpe.co.uk/"))
 
 
+class IsRecognizedKittUrlTests(unittest.TestCase):
+    def test_real_preview_link_is_recognized(self):
+        self.assertTrue(canva_renderer._is_recognized_kitt_url(
+            "https://brochures.kittoffices.com/brochures/preview?entity%5B9e40cdea-02a1-44a5-9599-"
+            "c3ed1567c117%5D=unit&display_label=Open+brochure"
+        ))
+
+    def test_variant_with_empty_template_param_is_recognized(self):
+        self.assertTrue(canva_renderer._is_recognized_kitt_url(
+            "https://brochures.kittoffices.com/brochures/preview?entity%5B7c50678c-7d16-4a8b-8f85-"
+            "16dcd98b9a99%5D=unit&template=&display_label=Open+brochure"
+        ))
+
+    def test_unrelated_url_is_rejected(self):
+        self.assertFalse(canva_renderer._is_recognized_kitt_url("https://example.com/brochure.pdf"))
+
+    def test_pitch_url_is_rejected(self):
+        self.assertFalse(canva_renderer._is_recognized_kitt_url("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+    def test_kitt_marketing_site_without_the_preview_path_is_rejected(self):
+        # The allow-list entry is exactly "/brochures/preview" - Kitt's own
+        # ordinary marketing site is a completely different, unrelated page
+        # this service has no reason to ever navigate to.
+        self.assertFalse(canva_renderer._is_recognized_kitt_url("https://www.kittoffices.com/"))
+
+    def test_bare_preview_path_with_no_entity_query_is_still_recognized(self):
+        # The path shape alone is what's matched - see _KITT_BROCHURE_
+        # PREVIEW_URL_RE's own docstring on why the query string isn't
+        # parsed precisely (too fragile across encoding variations).
+        self.assertTrue(canva_renderer._is_recognized_kitt_url("https://brochures.kittoffices.com/brochures/preview"))
+
+
 class HostAllowedSsrfTests(unittest.TestCase):
     """
     The renderer's core SSRF defense - a strict allow-list, not a
@@ -148,6 +180,27 @@ class HostAllowedSsrfTests(unittest.TestCase):
     def test_lookalike_domain_is_rejected(self):
         # "canva.com.evil.com" must NOT match ".canva.com".
         self.assertFalse(canva_renderer._host_allowed("https://canva.com.evil.com/design/x/y/view"))
+
+    def test_kittoffices_com_is_allowed(self):
+        self.assertTrue(canva_renderer._host_allowed("https://brochures.kittoffices.com/brochures/preview"))
+
+    def test_kittoffices_storage_subdomain_is_also_allowed(self):
+        # The allow-list entry is the BASE domain "kittoffices.com", not
+        # just "brochures.kittoffices.com" - confirmed real, this page's
+        # own building photos/floor plans load from a DIFFERENT
+        # kittoffices.com subdomain (storage.kittoffices.com), which must
+        # also pass or every image on the page would be blocked.
+        self.assertTrue(canva_renderer._host_allowed("https://storage.kittoffices.com/photos/4-millbank.jpg"))
+
+    def test_kittoffices_lookalike_domain_is_rejected(self):
+        self.assertFalse(canva_renderer._host_allowed("https://kittoffices.com.evil.com/brochures/preview"))
+
+    def test_unrelated_google_maps_host_is_rejected(self):
+        # Confirmed real: a live Kitt preview page also contacts
+        # maps.googleapis.com for a small "Transport Links" thumbnail -
+        # deliberately NOT allow-listed (see _ALLOWED_HOST_SUFFIXES' own
+        # docstring on why), so this must still be blocked.
+        self.assertFalse(canva_renderer._host_allowed("https://maps.googleapis.com/maps/api/staticmap"))
 
     def test_localhost_is_rejected(self):
         self.assertFalse(canva_renderer._host_allowed("http://localhost:8080/"))
@@ -517,6 +570,78 @@ def _make_async_pitch_page(
         return MagicMock()
 
     page.get_by_role = MagicMock(side_effect=_get_by_role)
+    return page
+
+
+def _make_async_kitt_page(
+    final_url="https://brochures.kittoffices.com/brochures/preview?entity%5B9e40cdea-02a1-44a5-9599-"
+              "c3ed1567c117%5D=unit&display_label=Open+brochure",
+    goto_side_effect=None,
+    goto_response_status=200,
+    screenshots=(b"\x89PNG fake",),
+    scroll_metrics=(3072, 1536),
+    page_links=None,
+):
+    """
+    Kitt's own counterpart to _make_async_page/_make_async_pitch_page -
+    but for a genuinely different capture mechanism (see render_kitt_
+    page_async's own docstring): no "Next"/"Next page" button at all,
+    scroll-position-based instead.
+
+    `scroll_metrics` is (scrollHeight, clientHeight) of Kitt's own nested
+    scroll container, as read by _kitt_scroll_metrics - defaults to
+    exactly TWO clientHeight-sized chunks (3072 / 1536), matching the
+    real shape confirmed via live recon. Pass None to simulate the scroll
+    container not being found at all (see render_kitt_page_async's own
+    single-screenshot fallback for that case).
+
+    Exposes `page._scroll_offsets_used` (a plain list, populated as the
+    render loop runs) - the sequence of scrollTop offsets render_kitt_
+    page_async actually requested, so a test can assert on it directly
+    rather than reverse-engineering it from screenshot call counts alone.
+    """
+    page = MagicMock()
+    page.url = final_url
+    page.set_default_navigation_timeout = MagicMock()
+    page.set_default_timeout = MagicMock()
+    page.route = AsyncMock()
+    page.goto = (
+        AsyncMock(side_effect=goto_side_effect) if goto_side_effect
+        else AsyncMock(return_value=MagicMock(status=goto_response_status))
+    )
+    page.close = AsyncMock()
+    cookie_locator = MagicMock()
+    cookie_locator.click = AsyncMock(side_effect=Exception("no cookie banner"))
+    page.get_by_text = MagicMock(return_value=cookie_locator)
+    page.wait_for_timeout = AsyncMock()
+
+    import itertools
+    screenshot_iter = itertools.cycle(screenshots)
+
+    async def _screenshot(*args, **kwargs):
+        return next(screenshot_iter)
+
+    page.screenshot = AsyncMock(side_effect=_screenshot)
+
+    link_candidates_iter = itertools.cycle(page_links if page_links is not None else [[]])
+    scroll_offsets_used = []
+
+    async def _evaluate(script, *args):
+        if script == canva_renderer._PAGE_LINK_CANDIDATES_JS:
+            return next(link_candidates_iter)
+        if "scrollTop = y" in script:
+            if args:
+                scroll_offsets_used.append(args[0])
+            return None
+        if "scrollHeight" in script:
+            if scroll_metrics is None:
+                return None
+            height, client_height = scroll_metrics
+            return {"scrollHeight": height, "clientHeight": client_height}
+        return None
+
+    page.evaluate = AsyncMock(side_effect=_evaluate)
+    page._scroll_offsets_used = scroll_offsets_used
     return page
 
 
@@ -1235,6 +1360,133 @@ class RenderPitchPageAsyncTests(_ResetGlobalBrowserStateTestCase):
         self.assertEqual(pages, [b"\x89PNG real bytes"])
 
 
+class RenderKittPageAsyncTests(_ResetGlobalBrowserStateTestCase):
+    """Unit-level tests against render_kitt_page_async directly - the
+    scroll-position-based capture logic (see that function's own
+    docstring), genuinely different from Canva's/Pitch's own click-based
+    pagination."""
+
+    _URL = (
+        "https://brochures.kittoffices.com/brochures/preview?entity%5B9e40cdea-02a1-44a5-9599-"
+        "c3ed1567c117%5D=unit&display_label=Open+brochure"
+    )
+
+    def _patch_browser(self, page):
+        context = _make_async_context(page)
+        browser = _make_async_browser(context)
+        return patch.object(canva_renderer, "_get_browser_async", AsyncMock(return_value=browser)), context
+
+    def test_non_kitt_url_raises_before_touching_the_browser(self):
+        mock_get_browser = AsyncMock()
+        with patch.object(canva_renderer, "_get_browser_async", mock_get_browser):
+            with self.assertRaises(canva_renderer.RenderError):
+                _run(canva_renderer.render_kitt_page_async("https://example.com/x"))
+        mock_get_browser.assert_not_called()
+
+    def test_initial_navigation_waits_for_networkidle_not_load(self):
+        # Kitt's own initial HTML is a genuinely empty Next.js shell (see
+        # render_kitt_page_async's own docstring) - same reasoning as
+        # Pitch's own choice, the opposite of Canva's.
+        page = _make_async_kitt_page(screenshots=(b"\x89PNG p1", b"\x89PNG p2"))
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertEqual(page.goto.call_args.kwargs["wait_until"], "networkidle")
+        self.assertEqual(page.goto.call_args.kwargs["timeout"], canva_renderer.NAV_TIMEOUT_MS)
+
+    def test_dead_link_http_status_raises_render_error(self):
+        page = _make_async_kitt_page(goto_response_status=404)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError) as ctx:
+                _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertIn("HTTP 404", str(ctx.exception))
+        context.close.assert_awaited_once()
+
+    def test_navigation_leaving_the_allowed_host_raises(self):
+        page = _make_async_kitt_page(final_url="https://evil.example.com/redirected")
+        patcher, _ = self._patch_browser(page)
+        with patcher:
+            with self.assertRaises(canva_renderer.RenderError) as ctx:
+                _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertIn("host", str(ctx.exception).lower())
+
+    def test_short_single_chunk_page_returns_exactly_one_page(self):
+        # scrollHeight <= clientHeight - the whole page fits in one
+        # screenshot, no further scrolling needed.
+        page = _make_async_kitt_page(screenshots=(b"\x89PNG only chunk",), scroll_metrics=(1200, 1536))
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _, detected_total = _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertEqual(pages, [b"\x89PNG only chunk"])
+        self.assertIsNone(detected_total)
+        self.assertEqual(page._scroll_offsets_used, [0])
+        context.close.assert_awaited_once()
+
+    def test_multi_chunk_page_captures_every_scroll_position_in_order(self):
+        # Real confirmed shape (33 Cavendish Square): scrollHeight=10752,
+        # clientHeight=1536 -> exactly 7 chunks. Scaled down here to 3 for
+        # a readable test.
+        screenshots = (b"\x89PNG chunk1", b"\x89PNG chunk2", b"\x89PNG chunk3")
+        page = _make_async_kitt_page(screenshots=screenshots, scroll_metrics=(4608, 1536))
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, page_links, _ = _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertEqual(pages, list(screenshots))
+        self.assertEqual(page._scroll_offsets_used, [0, 1536, 3072])
+        self.assertEqual(len(page_links), 3)
+        context.close.assert_awaited_once()
+
+    def test_no_scroll_container_falls_back_to_a_single_plain_screenshot(self):
+        # A page shape this hasn't seen before (see render_kitt_page_
+        # async's own docstring) - must still return something real
+        # rather than failing outright.
+        page = _make_async_kitt_page(screenshots=(b"\x89PNG fallback",), scroll_metrics=None)
+        patcher, context = self._patch_browser(page)
+        with patcher:
+            pages, _, detected_total = _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertEqual(pages, [b"\x89PNG fallback"])
+        self.assertIsNone(detected_total)
+        self.assertEqual(page._scroll_offsets_used, [])  # never entered the scroll loop at all
+        context.close.assert_awaited_once()
+
+    def test_page_cap_is_enforced_even_when_scroll_height_implies_more(self):
+        # A malformed/huge preview must still stop at MAX_KITT_PAGES,
+        # never loop unboundedly - same reasoning as Canva's/Pitch's own
+        # page caps.
+        screenshots = tuple(f"\x89PNG p{i}".encode() for i in range(1, 10))
+        page = _make_async_kitt_page(screenshots=screenshots, scroll_metrics=(1_000_000, 1536))
+        patcher, context = self._patch_browser(page)
+        buf = io.StringIO()
+        with patch.object(canva_renderer, "MAX_KITT_PAGES", 4), patcher, contextlib.redirect_stderr(buf):
+            pages, _, _ = _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertEqual(len(pages), 4)
+        self.assertIn("Kitt pagination capped", buf.getvalue())
+        context.close.assert_awaited_once()
+
+    def test_hitting_the_cap_on_the_pages_genuinely_last_chunk_logs_no_false_warning(self):
+        # scrollHeight is an EXACT multiple of clientHeight matching the
+        # cap - the loop's own natural break fires on the last iteration,
+        # so no "capped" warning should be logged.
+        screenshots = (b"\x89PNG p1", b"\x89PNG p2", b"\x89PNG p3")
+        page = _make_async_kitt_page(screenshots=screenshots, scroll_metrics=(4608, 1536))
+        patcher, context = self._patch_browser(page)
+        buf = io.StringIO()
+        with patch.object(canva_renderer, "MAX_KITT_PAGES", 3), patcher, contextlib.redirect_stderr(buf):
+            pages, _, _ = _run(canva_renderer.render_kitt_page_async(self._URL))
+
+        self.assertEqual(len(pages), 3)
+        self.assertNotIn("Kitt pagination capped", buf.getvalue())
+        context.close.assert_awaited_once()
+
+
 class RenderPageDispatchTests(unittest.TestCase):
     """render_page - the one call site Handler.do_POST uses, dispatching
     to whichever platform's own renderer a URL shape recognizes."""
@@ -1277,6 +1529,24 @@ class RenderPageDispatchTests(unittest.TestCase):
         self.assertEqual(result, ([b"x"], [], 1))
         mock_pitch.assert_called_once_with("https://fm.gpe.co.uk/v/gpe-nineteen-wells-street-6hqnfd")
         mock_canva.assert_not_called()
+
+    def test_kitt_url_dispatches_to_its_own_render_kitt_page(self):
+        # Confirmed NOT to be Canva or Pitch under the hood (see
+        # render_kitt_page_async's own docstring) - routed into its OWN
+        # dedicated render function, never one of the other two.
+        url = (
+            "https://brochures.kittoffices.com/brochures/preview?entity%5B9e40cdea-02a1-44a5-9599-"
+            "c3ed1567c117%5D=unit&display_label=Open+brochure"
+        )
+        with patch.object(canva_renderer, "render_canva_page") as mock_canva, \
+             patch.object(canva_renderer, "render_pitch_page") as mock_pitch, \
+             patch.object(canva_renderer, "render_kitt_page", return_value=([b"x"], [], None)) as mock_kitt:
+            result = canva_renderer.render_page(url)
+
+        self.assertEqual(result, ([b"x"], [], None))
+        mock_kitt.assert_called_once_with(url)
+        mock_canva.assert_not_called()
+        mock_pitch.assert_not_called()
 
 
 class RenderCanvaPageThreadBridgeTests(_ResetGlobalBrowserStateTestCase):
@@ -1889,6 +2159,17 @@ class MaxPagesCapsStayInSyncTests(unittest.TestCase):
             canva_renderer.MAX_PITCH_PAGES,
             brochure_enrichment._PITCH_MAX_PAGES_ACCEPTED,
             "canva_renderer.MAX_PITCH_PAGES and brochure_enrichment._PITCH_MAX_PAGES_ACCEPTED "
+            "must be raised together - a mismatch means the main app silently truncates pages "
+            "the renderer was just raised to capture.",
+        )
+
+    def test_kitt_renderer_and_main_app_page_caps_are_equal(self):
+        # Same pairing requirement, for Kitt's own independent cap pair -
+        # see brochure_enrichment._KITT_MAX_PAGES_ACCEPTED's own docstring.
+        self.assertEqual(
+            canva_renderer.MAX_KITT_PAGES,
+            brochure_enrichment._KITT_MAX_PAGES_ACCEPTED,
+            "canva_renderer.MAX_KITT_PAGES and brochure_enrichment._KITT_MAX_PAGES_ACCEPTED "
             "must be raised together - a mismatch means the main app silently truncates pages "
             "the renderer was just raised to capture.",
         )

@@ -1056,9 +1056,38 @@ class GpeFlipbookRendererConfiguredEligibilityTests(EnrichmentTestCase):
             self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_GPE_FLIPBOOK_URL))
 
 
+_KITT_URL = (
+    "https://brochures.kittoffices.com/brochures/preview?entity%5B9e40cdea-02a1-44a5-9599-"
+    "c3ed1567c117%5D=unit&display_label=Open+brochure"
+)
+
+
+class KittRendererConfiguredEligibilityTests(EnrichmentTestCase):
+    """Mirrors CanvaRendererConfiguredEligibilityTests/PitchRendererConfigured
+    EligibilityTests/GpeFlipbookRendererConfiguredEligibilityTests exactly,
+    for Kitt's own brochure-preview app link - same CANVA_RENDERER_URL env
+    var gates all four (Kitt confirmed to need its own dedicated render
+    function, but it's still the SAME deployed renderer service - see
+    is_kitt_brochure_preview_link's own docstring)."""
+
+    def test_kitt_preview_link_stays_ineligible_without_the_env_var(self):
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(_KITT_URL),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+        self.assertFalse(brochure_enrichment._is_eligible_brochure_url(_KITT_URL))
+        self.assertFalse(brochure_enrichment._is_eligible_floorplan_url(_KITT_URL))
+
+    def test_kitt_preview_link_becomes_eligible_when_renderer_is_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}):
+            self.assertIsNone(brochure_enrichment.classify_link_eligibility(_KITT_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_brochure_url(_KITT_URL))
+            self.assertTrue(brochure_enrichment._is_eligible_floorplan_url(_KITT_URL))
+
+
 class RenderPlatformLabelTests(unittest.TestCase):
-    """_render_platform_label - the single shared three-way check every
-    platform_label call site now uses, replacing what used to be three
+    """_render_platform_label - the single shared check every
+    platform_label call site now uses, replacing what used to be
     separately hand-rolled "Pitch" if is_pitch_view_link(url) else
     "Canva" ternaries."""
 
@@ -1070,6 +1099,9 @@ class RenderPlatformLabelTests(unittest.TestCase):
 
     def test_gpe_flipbook_url(self):
         self.assertEqual(brochure_enrichment._render_platform_label(_GPE_FLIPBOOK_URL), "GPE Flipbook")
+
+    def test_kitt_url(self):
+        self.assertEqual(brochure_enrichment._render_platform_label(_KITT_URL), "Kitt")
 
 
 def _canva_pages_response(pages, page_count_detected=None, status_code=200, links=None):
@@ -1498,6 +1530,73 @@ class FetchGpeFlipbookRenderedPageTests(EnrichmentTestCase):
         self.assertIn("requires an email to open", sink["detail"])
 
 
+class FetchKittRenderedPageTests(EnrichmentTestCase):
+    """_fetch_kitt_rendered_page - a thin wrapper over the exact same
+    _fetch_rendered_page implementation _fetch_canva_rendered_page/
+    _fetch_pitch_rendered_page/_fetch_gpe_flipbook_rendered_page call,
+    but with its own dedicated _KITT_MAX_PAGES_ACCEPTED cap (Kitt's
+    render_kitt_page_async is a genuinely new render function - see
+    is_kitt_brochure_preview_link's own docstring - not routed through
+    Canva's or Pitch's own renderer-side function the way GPE is). Only
+    re-checks the pieces that could plausibly differ (platform_label in
+    log text, its use of its own cap) - every retry/error-handling rule
+    is already covered by FetchCanvaRenderedPageTests/
+    FetchPitchRenderedPageTests, same code path."""
+
+    def test_successful_render_returns_png_bytes(self):
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response) as mock_post, \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result = brochure_enrichment._fetch_kitt_rendered_page(_KITT_URL)
+
+        self.assertEqual(result, [b"\x89PNG real bytes"])
+        mock_post.assert_called_once()
+        self.assertEqual(mock_post.call_args.kwargs["json"], {"url": _KITT_URL})
+
+    def test_uses_its_own_max_pages_accepted_cap_not_canvas_or_pitchs(self):
+        pages = [f"\x89PNG p{i}".encode() for i in range(1, 25)]
+        response = _canva_pages_response(pages, page_count_detected=24)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch.object(brochure_enrichment, "_KITT_MAX_PAGES_ACCEPTED", 4), \
+                patch.object(brochure_enrichment, "_CANVA_MAX_PAGES_ACCEPTED", 999), \
+                patch.object(brochure_enrichment, "_PITCH_MAX_PAGES_ACCEPTED", 999):
+            result = brochure_enrichment._fetch_kitt_rendered_page(_KITT_URL)
+
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result, pages[:4])
+
+    def test_successful_render_logs_kitt_not_canva_pitch_or_gpe(self):
+        response = _canva_pages_response([b"\x89PNG real bytes"], page_count_detected=1)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}), \
+                patch("brochure_enrichment.sys.stderr") as mock_stderr:
+            brochure_enrichment._fetch_kitt_rendered_page(_KITT_URL)
+
+        logged = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Kitt render succeeded", logged)
+        self.assertNotIn("Canva render succeeded", logged)
+        self.assertNotIn("Pitch render succeeded", logged)
+        self.assertNotIn("GPE Flipbook render succeeded", logged)
+
+    def test_renderer_reports_safe_failure_returns_none_with_kitt_labeled_reason(self):
+        response = MagicMock(
+            status_code=422, headers={"content-type": "application/json"},
+            json=MagicMock(return_value={"error": "render_failed", "reason": "no recognized scroll container"}),
+        )
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response):
+            with brochure_enrichment._StatusCapture({}) as sink:
+                result = brochure_enrichment._fetch_kitt_rendered_page(_KITT_URL)
+
+        self.assertIsNone(result)
+        self.assertEqual(sink["status"], brochure_enrichment.STATUS_RENDER_FAILED)
+        self.assertIn("Kitt render failed", sink["detail"])
+
+
 class FetchRenderedPageWithLinksTests(EnrichmentTestCase):
     """fetch_rendered_page_with_links - the new, additive entry point for
     the paste-a-link flow (see app.py's own _fetch_pasted_link). Never
@@ -1581,6 +1680,21 @@ class FetchRenderedPageWithLinksTests(EnrichmentTestCase):
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch("brochure_enrichment.httpx.post", return_value=response):
             result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_GPE_FLIPBOOK_URL)
+
+        self.assertEqual(result_pages, pages)
+        self.assertEqual(result_links, links)
+
+    def test_kitt_url_returns_pages_and_links_together(self):
+        pages = [b"\x89PNG chunk1", b"\x89PNG chunk2"]
+        links = [
+            [{"href": "https://my.matterport.com/show/?m=uhTx33agohq", "text": "View virtual tour"}],
+            [],
+        ]
+        response = _canva_pages_response(pages, page_count_detected=None, links=links)
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment.httpx.post", return_value=response), \
+                patch("brochure_enrichment._canva_renderer_auth_headers", return_value={}):
+            result_pages, result_links = brochure_enrichment.fetch_rendered_page_with_links(_KITT_URL)
 
         self.assertEqual(result_pages, pages)
         self.assertEqual(result_links, links)
@@ -1683,6 +1797,39 @@ class FetchPdfBytesGpeFlipbookDispatchTests(EnrichmentTestCase):
         self.assertEqual(result, [b"\x89PNG"])
         mock_pitch_fetch.assert_called_once_with(_PITCH_URL)
         mock_gpe_fetch.assert_not_called()
+
+
+class FetchPdfBytesKittDispatchTests(EnrichmentTestCase):
+    """_fetch_pdf_bytes's own Kitt dispatch branch - mirrors
+    FetchPdfBytesPitchDispatchTests/FetchPdfBytesGpeFlipbookDispatchTests
+    exactly, at the one new call site this feature adds."""
+
+    def test_kitt_url_is_routed_to_the_kitt_fetch_when_configured(self):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch("brochure_enrichment._fetch_kitt_rendered_page", return_value=[b"\x89PNG"]) as mock_fetch, \
+                patch("brochure_enrichment._fetch_canva_rendered_page") as mock_canva_fetch, \
+                patch("brochure_enrichment._fetch_pitch_rendered_page") as mock_pitch_fetch, \
+                patch("brochure_enrichment._fetch_gpe_flipbook_rendered_page") as mock_gpe_fetch:
+            result = brochure_enrichment._fetch_pdf_bytes(_KITT_URL)
+
+        self.assertEqual(result, [b"\x89PNG"])
+        mock_fetch.assert_called_once_with(_KITT_URL)
+        mock_canva_fetch.assert_not_called()
+        mock_pitch_fetch.assert_not_called()
+        mock_gpe_fetch.assert_not_called()
+
+    def test_kitt_url_falls_through_to_generic_fetch_when_unconfigured(self):
+        # Same "correct independent of configuration" contract Canva's/
+        # Pitch's/GPE's own branches already have (see _fetch_pdf_bytes'
+        # own docstring) - never attempts a renderer call this deployment
+        # was never told about.
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("brochure_enrichment._fetch_kitt_rendered_page") as mock_fetch, \
+                patch("brochure_enrichment.resolve_brochure_link", return_value=_KITT_URL), \
+                patch("brochure_enrichment.httpx.get", side_effect=httpx.ConnectError("dns failure")):
+            brochure_enrichment._fetch_pdf_bytes(_KITT_URL)
+
+        mock_fetch.assert_not_called()
 
 
 class TransientRendererRetryTests(EnrichmentTestCase):
@@ -5195,6 +5342,18 @@ class ClassifyLinkEligibilityTests(unittest.TestCase):
             brochure_enrichment.classify_link_eligibility(
                 "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
             ),
+            brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
+        )
+
+    def test_kitt_brochure_preview_link_is_pre_emptively_rejected(self):
+        # Same reasoning as the Canva case above, confirmed via live
+        # Playwright recon rather than assumed (see brochure_link_
+        # resolver.is_kitt_brochure_preview_link's own docstring) - a
+        # plain, unauthenticated fetch of this link shape never returns
+        # usable document content, so it's excluded before ever wasting a
+        # real fetch attempt.
+        self.assertEqual(
+            brochure_enrichment.classify_link_eligibility(_KITT_URL),
             brochure_enrichment.STATUS_UNSUPPORTED_LINK_TYPE,
         )
 

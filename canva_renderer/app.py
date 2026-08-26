@@ -2,21 +2,30 @@
 canva_renderer/app.py
 
 Small, isolated HTTP service whose only job is: given a public Canva
-"view" URL, a public Pitch.com "view" URL, OR GPE's own branded custom
+"view" URL, a public Pitch.com "view" URL, GPE's own branded custom
 domain for Pitch's "Managed Links" feature (fm.gpe.co.uk - see
 _GPE_FLIPBOOK_VIEW_URL_RE's own docstring for why this is Pitch itself,
-not a separate platform), render it in a real headless Chromium (a plain
-HTTP fetch of any of these URL shapes returns only an empty/"Unsupported
-client" shell instead of the actual content - confirmed directly, see the
-main app's brochure_link_resolver.is_canva_view_link/is_pitch_view_link/
-is_gpe_flipbook_link docstrings) and return one PNG screenshot per page.
-Pitch support was added second, reusing this exact same architecture
-(browser lifecycle, SSRF allow-list, pagination-capture loop shape) - see
-render_pitch_page_async's own docstring for the two genuine, confirmed
+not a separate platform), OR Kitt's own brochure-preview app link
+(brochures.kittoffices.com - see _KITT_BROCHURE_PREVIEW_URL_RE's own
+docstring for why this one genuinely IS a separate, custom-built
+platform, confirmed via live Playwright recon), render it in a real
+headless Chromium (a plain HTTP fetch of any of these URL shapes returns
+only an empty/"Unsupported client" shell instead of the actual content -
+confirmed directly, see the main app's brochure_link_resolver.is_canva_
+view_link/is_pitch_view_link/is_gpe_flipbook_link/is_kitt_brochure_
+preview_link docstrings) and return one PNG screenshot per page. Pitch
+support was added second, reusing this exact same architecture (browser
+lifecycle, SSRF allow-list, pagination-capture loop shape) - see render_
+pitch_page_async's own docstring for the two genuine, confirmed
 differences from Canva's own render_canva_page_async. A recognized GPE
 flipbook URL is routed straight into that same render_pitch_page_async -
 confirmed to be the identical underlying Pitch player, not a third
-platform needing its own render function.
+platform needing its own render function. Kitt support was added third,
+but with its OWN dedicated render_kitt_page_async - confirmed, not
+assumed, to be neither Canva nor Pitch under the hood, and confirmed to
+have no click-based "Next page" pagination at all (see that function's
+own docstring for the genuinely different scroll-position-based capture
+mechanism this drives).
 
 Deliberately NEVER runs inside the main spreadsheet app's own container/
 process - a stuck/misbehaving page or a Chromium OOM here must never be
@@ -146,6 +155,24 @@ _GPE_FLIPBOOK_VIEW_URL_RE = re.compile(
     r"^https?://(?:[\w-]+\.)*fm\.gpe\.co\.uk/v/[^/\s?#]+(?:/[^/\s?#]+)?(?:[/?#].*)?$", re.IGNORECASE
 )
 
+# Mirrors brochure_link_resolver.is_kitt_brochure_preview_link's own
+# narrow shape in the main app - Kitt's own brochure-preview app (e.g.
+# "https://brochures.kittoffices.com/brochures/preview?entity[9e40cdea-
+# ...]=unit&template=&display_label=Open+brochure", confirmed real
+# against four live production links). CONFIRMED, via a live Playwright
+# recon run directly against those four real URLs (not assumed the way
+# an untested new platform otherwise would be): this is Kitt's OWN
+# custom-built Next.js application (`_next/static/chunks/pages/brochures/
+# preview-*.js`, Kitt's own "kitt-rebrand-logo" asset) - no pitch.com or
+# canva.com script/API reference anywhere on the page - so this gets its
+# own dedicated render_kitt_page_async, never routed into render_canva_
+# page/render_pitch_page. Kept as an independent copy here for the same
+# reason every other regex in this module is: a separately deployed
+# service with its own repo/container boundary, not a shared import.
+_KITT_BROCHURE_PREVIEW_URL_RE = re.compile(
+    r"^https?://(?:[\w-]+\.)*brochures\.kittoffices\.com/brochures/preview(?:[/?#].*)?$", re.IGNORECASE
+)
+
 # The ONLY hostnames this service's browser is ever allowed to talk to -
 # see the module's own SSRF docstring above. Exact-or-subdomain match
 # only, same principle as the main app's own is_generic_link
@@ -158,7 +185,19 @@ _GPE_FLIPBOOK_VIEW_URL_RE = re.compile(
 # targets fm.gpe.co.uk, not pitch.com; every OTHER resource that page then
 # loads (scripts, fonts, the backend API) is already a pitch.com
 # subdomain, already covered by the existing "pitch.com" entry.
-_ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link", "pitch.com", "fm.gpe.co.uk")
+#
+# kittoffices.com (the base domain, not just "brochures.kittoffices.com")
+# added for a confirmed real reason, not preemptively: a live recon of the
+# real preview page showed it loading its own building photos/floor plans
+# from a DIFFERENT kittoffices.com subdomain ("storage.kittoffices.com"),
+# which the suffix-match below also covers. It also contacted cdn.
+# segment.com (analytics) and maps.googleapis.com (a small "Transport
+# Links" map thumbnail) - deliberately NOT added here; blocking those
+# only loses a non-essential analytics beacon and a small map image, the
+# real building content (photos, floor plans, spec text) is unaffected,
+# and keeping the allow-list to exactly what's needed is the whole point
+# of this being an allow-list rather than a denylist.
+_ALLOWED_HOST_SUFFIXES = ("canva.com", "canva.link", "pitch.com", "fm.gpe.co.uk", "kittoffices.com")
 
 # Real production evidence this covers: `Page.goto: Timeout 15000ms
 # exceeded` on a genuine public Canva "view" link that DOES eventually
@@ -193,6 +232,16 @@ MAX_CANVA_PAGES = int(os.environ.get("MAX_CANVA_PAGES", "30"))
 # gets its own bounded cap rather than an implicit assumption. Same default
 # as MAX_CANVA_PAGES - no evidence yet a different value is warranted.
 MAX_PITCH_PAGES = int(os.environ.get("MAX_PITCH_PAGES", "30"))
+# Same cap concept, for a Kitt brochure-preview page - see render_kitt_
+# page_async. This caps the number of scroll-position-based screenshots,
+# not click-based pages (see that function's own docstring) - four real
+# examples checked during recon needed 5-7 each (a single-unit brochure
+# page, genuinely smaller content than a whole multi-building Canva/Pitch
+# deck), so this is deliberately its own, smaller-in-practice cap rather
+# than reusing MAX_CANVA_PAGES/MAX_PITCH_PAGES - but still generous
+# headroom over what's been seen, same "malformed/huge input must never
+# consume unbounded time/memory" reasoning as the other two.
+MAX_KITT_PAGES = int(os.environ.get("MAX_KITT_PAGES", "20"))
 # Settle time after each Next-page click, before that page's own
 # screenshot - shorter than the initial-load SETTLE_MS above since the
 # Canva app/design is already warm; still enough for that page's own
@@ -276,6 +325,7 @@ def _render_timeout_seconds(max_pages: int) -> float:
 
 RENDER_TIMEOUT_SECONDS = _render_timeout_seconds(MAX_CANVA_PAGES)
 PITCH_RENDER_TIMEOUT_SECONDS = _render_timeout_seconds(MAX_PITCH_PAGES)
+KITT_RENDER_TIMEOUT_SECONDS = _render_timeout_seconds(MAX_KITT_PAGES)
 
 # Cloud Run's own hard ceiling on a single HTTP response body - confirmed
 # directly via real production evidence: Cloud Run's own platform-level
@@ -389,6 +439,32 @@ def _is_recognized_pitch_url(url: str) -> bool:
 
 def _is_recognized_gpe_flipbook_url(url: str) -> bool:
     return bool(_GPE_FLIPBOOK_VIEW_URL_RE.match(url.strip()))
+
+
+def _is_recognized_kitt_url(url: str) -> bool:
+    return bool(_KITT_BROCHURE_PREVIEW_URL_RE.match(url.strip()))
+
+
+def _render_platform_label(url: str) -> str:
+    """Which recognized platform `url` matches, purely for this service's
+    own "<Platform> render succeeded" log line (see Handler.do_POST) - a
+    cheap, purely-cosmetic re-check of the URL's own shape (render_page
+    already dispatched on the exact same checks), never a second network
+    call or render attempt. Mirrors the main app's own brochure_
+    enrichment._render_platform_label (an independent copy, same
+    reasoning as every other URL-shape regex in this module: no shared
+    import across this service's own repo/container boundary). Checked in
+    the same order render_page itself dispatches in, so this always
+    agrees with which render_*_page function actually ran."""
+    if _is_recognized_canva_url(url):
+        return "Canva"
+    if _is_recognized_gpe_flipbook_url(url):
+        return "GPE Flipbook"
+    if _is_recognized_pitch_url(url):
+        return "Pitch"
+    if _is_recognized_kitt_url(url):
+        return "Kitt"
+    return "Canva"  # not expected to be reached - render_page already rejected anything else
 
 
 def _run_loop_forever():
@@ -1280,27 +1356,241 @@ def render_pitch_page(url: str) -> tuple[list[bytes], list, int]:
         raise RenderError("render timed out")
 
 
+# The nested div Kitt's own preview app scrolls INSIDE of - confirmed via
+# a live Playwright recon against four real production links: unlike
+# Canva/Pitch, the page's own <body>/<html> never scrolls at all; every
+# page's real content (~7,700-10,800px tall across the four examples
+# checked) lives inside this one div, styled overflow-y-scroll. This is
+# WHY a plain full-page screenshot doesn't work here (confirmed directly:
+# it returns exactly one VIEWPORT-sized image, since Chromium's own
+# full-page capture only ever looks at the document's own scroll
+# dimensions, never an arbitrary descendant's) - see render_kitt_page_
+# async's own docstring for the scroll-and-capture approach this drives.
+_KITT_SCROLL_CONTAINER_SELECTOR = "[data-scroll-id=root]"
+
+
+async def _kitt_scroll_metrics(page):
+    """(scrollHeight, clientHeight) of Kitt's own nested scroll container
+    (see _KITT_SCROLL_CONTAINER_SELECTOR's own docstring), or (None, None)
+    if that container isn't present at all - a page shape this hasn't
+    seen before (a future Kitt frontend change, or a genuinely dead/
+    expired link rendering some other page entirely), never raises. This
+    is the ONE signal render_kitt_page_async needs to decide between its
+    normal scroll-and-capture loop and its single-screenshot fallback -
+    see that function's own docstring."""
+    try:
+        metrics = await page.evaluate(f"""() => {{
+            const el = document.querySelector('{_KITT_SCROLL_CONTAINER_SELECTOR}');
+            if (!el) return null;
+            return {{scrollHeight: el.scrollHeight, clientHeight: el.clientHeight}};
+        }}""")
+    except Exception:
+        return None, None
+    if not metrics:
+        return None, None
+    return metrics.get("scrollHeight"), metrics.get("clientHeight")
+
+
+async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
+    """
+    Kitt's own counterpart to render_canva_page_async/render_pitch_page_
+    async - same overall shape (browser/context setup, SSRF route guard,
+    navigation, dead-link status check, settle, best-effort cookie-
+    dismiss), but a GENUINELY DIFFERENT capture mechanism, confirmed via a
+    live Playwright recon against four real production brochures.kitt
+    offices.com links (not assumed the way an untested platform otherwise
+    would be):
+
+    Kitt's preview has no "Next"/"Next page" pagination control anywhere.
+    Every real example loads as ONE tall page, but - unlike Canva/Pitch -
+    the DOCUMENT itself never scrolls; all of it lives inside one nested,
+    independently-scrolling div (see _KITT_SCROLL_CONTAINER_SELECTOR's own
+    docstring), which is also why a plain Playwright full-page screenshot
+    doesn't work here (confirmed directly: it silently returns just one
+    viewport-sized image, since Chromium's full-page capture only reads
+    the document's OWN scroll dimensions). Instead, this scrolls that
+    container's own scrollTop forward in clientHeight-sized steps and
+    takes one screenshot per step, stopping once scrollTop + clientHeight
+    reaches scrollHeight (or MAX_KITT_PAGES, whichever comes first - same
+    "malformed/huge input must never consume unbounded time/memory"
+    reasoning as Canva's/Pitch's own page caps). Confirmed directly, not
+    assumed: across four real examples, every clientHeight-sized capture
+    landed cleanly on one complete content section (a building photo/
+    amenities section, then a per-floor spec/floor-plan section, ...)
+    with no content ever split mid-section - real evidence this
+    increment is the right one, not an arbitrary choice. If scrollTop
+    would overshoot scrollHeight on the final step, the browser's own
+    scrollTop setter clamps it to the max scrollable position - the last
+    screenshot may then repeat a little of the previous one rather than
+    miss anything past it, the same "prefer redundancy over a lost gap"
+    failure mode this codebase already accepts elsewhere.
+
+    If _kitt_scroll_metrics can't find the expected scroll container at
+    all (a future Kitt frontend change, or a page that didn't load the
+    way any of the four confirmed real examples did), this falls back to
+    ONE plain viewport screenshot rather than failing outright - the same
+    "start conservative, still return something real" precedent as
+    Canva's/Pitch's own safe-failure paths, not a guess at a replacement
+    selector.
+
+    detected_total is always None here - unlike Canva's/Pitch's own "N /
+    total" accessible indicator (see _detect_page_count), no equivalent
+    indicator was found anywhere on a real Kitt preview page during
+    recon, so this is never attempted rather than guessed at.
+
+    Returns/raises exactly like render_canva_page_async - see that
+    function's own docstring for the full contract.
+    """
+    if not _is_recognized_kitt_url(url):
+        raise RenderError("not a recognized Kitt brochure-preview URL")
+    if not _host_allowed(url):
+        raise RenderError("host not allowed")
+
+    browser = await _get_browser_async()
+    context = await browser.new_context(viewport=VIEWPORT)
+    page = None
+    try:
+        page = await context.new_page()
+        page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+        page.set_default_timeout(NAV_TIMEOUT_MS)
+
+        async def _guard(route):
+            if _host_allowed(route.request.url):
+                await route.continue_()
+            else:
+                await route.abort()
+
+        await page.route("**/*", _guard)
+
+        try:
+            # "networkidle", not "load" - Kitt's own initial HTML is a
+            # genuinely empty Next.js shell (confirmed directly: just a
+            # page title and a placeholder "Download PDF" button with no
+            # real content) that only ever gets real content once its OWN
+            # JS has fetched and rendered it, same reasoning as Pitch's
+            # own choice (see render_pitch_page_async's own docstring
+            # point 1) - confirmed reliable across all four real recon
+            # examples, no navigation timeouts.
+            response = await page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT_MS)
+        except Exception as e:
+            raise RenderError(f"navigation failed or timed out ({e!r})")
+
+        if response is not None and not (200 <= response.status < 300):
+            raise RenderError(f"navigation returned HTTP {response.status} (design not found or inaccessible)")
+
+        if not _host_allowed(page.url):
+            raise RenderError("navigation left the allowed Kitt host")
+
+        await page.wait_for_timeout(SETTLE_MS)
+
+        # Best-effort only, same as Canva's/Pitch's own - not confirmed
+        # present on any of the four real recon examples, but costs
+        # nothing to also attempt here if a cookie-consent banner shows up
+        # on some Kitt deployments.
+        for label in ("Reject all cookies", "Accept all cookies"):
+            try:
+                await page.get_by_text(label, exact=True).click(timeout=COOKIE_DISMISS_TIMEOUT_MS)
+                await page.wait_for_timeout(500)
+                break
+            except Exception:
+                continue
+
+        scroll_height, client_height = await _kitt_scroll_metrics(page)
+
+        if not scroll_height or not client_height:
+            # No recognized scroll container - see this function's own
+            # docstring on why this degrades to one plain screenshot
+            # rather than failing outright.
+            pages = [await page.screenshot(type="png")]
+            page_links = [await _page_link_candidates(page)]
+            return pages, page_links, None
+
+        pages = []
+        page_links = []
+        scroll_top = 0
+        while len(pages) < MAX_KITT_PAGES:
+            try:
+                await page.evaluate(
+                    f"""(y) => {{
+                        const el = document.querySelector('{_KITT_SCROLL_CONTAINER_SELECTOR}');
+                        if (el) el.scrollTop = y;
+                    }}""",
+                    scroll_top,
+                )
+            except Exception as e:
+                print(
+                    f"[canva_renderer] Kitt scroll failed for {url!r} at offset {scroll_top} ({e!r}) - "
+                    f"{len(pages)} page(s) captured, keeping them.",
+                    file=sys.stderr,
+                )
+                break
+
+            await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+            pages.append(await page.screenshot(type="png"))
+            page_links.append(await _page_link_candidates(page))
+
+            if scroll_top + client_height >= scroll_height:
+                break
+            scroll_top += client_height
+        else:
+            print(
+                f"[canva_renderer] Kitt pagination capped for {url!r}: reached MAX_KITT_PAGES="
+                f"{MAX_KITT_PAGES} with more content below (scrollHeight={scroll_height}, "
+                f"clientHeight={client_height}) - stopping here with {len(pages)} page(s) captured; "
+                "this brochure may have more content than was captured.",
+                file=sys.stderr,
+            )
+
+        return pages, page_links, None
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        await context.close()
+
+
+def render_kitt_page(url: str) -> tuple[list[bytes], list, int]:
+    """Sync-facing entry point for Kitt, mirroring render_canva_page's
+    own thread-bridging (see that function's own docstring) - the only
+    difference is its own KITT_RENDER_TIMEOUT_SECONDS budget, sized off
+    MAX_KITT_PAGES rather than MAX_CANVA_PAGES."""
+    loop = _ensure_loop()
+    future = asyncio.run_coroutine_threadsafe(render_kitt_page_async(url), loop)
+    try:
+        return future.result(timeout=KITT_RENDER_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise RenderError("render timed out")
+
+
 def render_page(url: str) -> tuple[list[bytes], list, int]:
     """
     Dispatches to whichever platform's own renderer a `url` shape
     recognizes (see _is_recognized_canva_url/_is_recognized_pitch_url/
-    _is_recognized_gpe_flipbook_url) - the one call site Handler.do_POST
-    actually needs, so it never has to know which platform-specific render
-    function to call itself. Raises RenderError (never any other
-    exception) when `url` matches none of these shapes - the same "clean,
-    expected failure" contract every other rejection path in this module
-    already uses.
+    _is_recognized_gpe_flipbook_url/_is_recognized_kitt_url) - the one
+    call site Handler.do_POST actually needs, so it never has to know
+    which platform-specific render function to call itself. Raises
+    RenderError (never any other exception) when `url` matches none of
+    these shapes - the same "clean, expected failure" contract every
+    other rejection path in this module already uses.
 
     A recognized GPE flipbook URL routes into render_pitch_page directly -
     see _GPE_FLIPBOOK_VIEW_URL_RE's own docstring for why this is
     confirmed to be the same underlying Pitch player on GPE's own branded
-    domain, never a separate render function.
+    domain, never a separate render function. A recognized Kitt URL routes
+    into its OWN render_kitt_page instead - see render_kitt_page_async's
+    own docstring for why this one is confirmed to be neither Canva nor
+    Pitch under the hood.
     """
     if _is_recognized_canva_url(url):
         return render_canva_page(url)
     if _is_recognized_pitch_url(url) or _is_recognized_gpe_flipbook_url(url):
         return render_pitch_page(url)
-    raise RenderError("not a recognized public Canva, Pitch, or GPE flipbook URL")
+    if _is_recognized_kitt_url(url):
+        return render_kitt_page(url)
+    raise RenderError("not a recognized public Canva, Pitch, GPE flipbook, or Kitt brochure-preview URL")
 
 
 def _reencode_as_jpeg(page_bytes: bytes) -> bytes:
@@ -1406,7 +1696,7 @@ class Handler(BaseHTTPRequestHandler):
             # is a cheap, purely-cosmetic re-check of the URL's own shape
             # (render_page above already dispatched on the exact same
             # check) - never a second network call or render attempt.
-            platform_label = "Pitch" if _is_recognized_pitch_url(url) else "Canva"
+            platform_label = _render_platform_label(url)
             detected_str = f"{detected_total} detected" if detected_total else "total unknown"
             page_count = len(pages)
             print(

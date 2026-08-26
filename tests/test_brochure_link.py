@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brochure_link_resolver import (
     finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, is_gpe_flipbook_link,
-    is_pitch_view_link, looks_like_url,
+    is_kitt_brochure_preview_link, is_pitch_view_link, looks_like_url,
 )
 from storage import blob_store, file_store
 
@@ -355,6 +355,46 @@ class IsGpeFlipbookLinkTests(unittest.TestCase):
     def test_blank_is_not_a_flipbook_link(self):
         self.assertFalse(is_gpe_flipbook_link(None))
         self.assertFalse(is_gpe_flipbook_link(""))
+
+
+class IsKittBrochurePreviewLinkTests(unittest.TestCase):
+    """Kitt's own "brochures.kittoffices.com/brochures/preview" brochure-
+    preview app - confirmed real shapes via live Playwright recon against
+    four real production links from a real Kitt's upload."""
+
+    def test_real_preview_link_is_recognised(self):
+        self.assertTrue(is_kitt_brochure_preview_link(
+            "https://brochures.kittoffices.com/brochures/preview?entity%5B9e40cdea-02a1-44a5-9599-"
+            "c3ed1567c117%5D=unit&display_label=Open+brochure"
+        ))
+
+    def test_variant_with_empty_template_param_is_also_recognised(self):
+        # Real second shape from the same confirmed batch - some real
+        # links carry an empty "template=" query param, some don't.
+        self.assertTrue(is_kitt_brochure_preview_link(
+            "https://brochures.kittoffices.com/brochures/preview?entity%5B7c50678c-7d16-4a8b-8f85-"
+            "16dcd98b9a99%5D=unit&template=&display_label=Open+brochure"
+        ))
+
+    def test_a_bare_preview_path_with_no_entity_query_is_still_recognised(self):
+        # The path shape alone is what's matched - the query string isn't
+        # parsed precisely (too fragile across encoding variations, same
+        # "loose" precedent as is_gpe_flipbook_link's own trailing-segment
+        # handling).
+        self.assertTrue(is_kitt_brochure_preview_link("https://brochures.kittoffices.com/brochures/preview"))
+
+    def test_kitts_ordinary_marketing_site_is_not_a_preview_link(self):
+        self.assertFalse(is_kitt_brochure_preview_link("https://www.kittoffices.com/"))
+
+    def test_a_different_path_on_the_same_host_is_not_a_preview_link(self):
+        self.assertFalse(is_kitt_brochure_preview_link("https://brochures.kittoffices.com/some-other-page"))
+
+    def test_a_plain_pitch_com_link_is_not_a_kitt_preview_link(self):
+        self.assertFalse(is_kitt_brochure_preview_link("https://pitch.com/v/1-finsbury-brochure-4jnj9d"))
+
+    def test_blank_is_not_a_preview_link(self):
+        self.assertFalse(is_kitt_brochure_preview_link(None))
+        self.assertFalse(is_kitt_brochure_preview_link(""))
 
 
 class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):
