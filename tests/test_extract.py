@@ -359,27 +359,39 @@ class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
         self.assertIsNone(row.brochure_link_is_floorplan)
 
 
-class MultiSubmarketFallbackSuppressionTests(unittest.TestCase):
+class MultiBuildingFallbackSuppressionTests(unittest.TestCase):
     """
     finalize_brochure_link's own rule 3 (nothing genuine for THIS unit ->
     default to the whole uploaded document) is correct for a real single-
     building/single-campus brochure - but confirmed real failure: a
-    "canva view" upload that was actually a combined portfolio tracker
-    spanning genuinely unrelated areas (Soho, Fitzrovia, Marylebone,
-    King's Cross, Euston, SE1, Bermondsey, Midtown) gave every unit with
-    no link of its own the SAME shared fallback link - the whole tracker,
-    not anything about that specific property. _rows_from_raw now
-    suppresses rule 3 (passes None instead of the real pdf_fallback_link)
-    for any document whose own units' submarket values span 2+ distinct
-    values - covering both extract() (real PDF upload) and extract_from_
-    png_pages() (pasted Canva/Pitch link, the real failing case's own
-    path), since both share this same function.
+    Colliers "canva view" upload was actually a combined portfolio
+    tracker covering entirely unrelated real buildings (35 Gresse Street/
+    Fitzrovia, Whites Grounds/Bermondsey, Hatchers Yard/Surrey, Thames
+    Court) and gave every unit with no link of its own the SAME shared
+    fallback link - the whole tracker, not anything about that specific
+    building. _rows_from_raw now suppresses rule 3 (passes None instead
+    of the real pdf_fallback_link) for any document whose own units span
+    2+ distinct BUILDING values with no stated development_name -
+    covering both extract() (real PDF upload) and extract_from_png_pages()
+    (pasted Canva/Pitch link, the real failing case's own path), since
+    both share this same function.
+
+    Building count, not submarket, is the signal (an earlier, narrower
+    version of this guard used distinct submarket values instead) - a
+    bulk deck can easily be confined to one broad submarket label (e.g.
+    an all-Soho tracker covering five unrelated buildings) and still not
+    be any one of those buildings' own brochure. A stated development_name
+    (see schema.ListingRow.development_name's own docstring) exempts a
+    document from this guard entirely, since that's what actually
+    distinguishes a real shared-campus brochure (e.g. Regent's Wharf, one
+    document genuinely covering several buildings on purpose) from a bulk
+    tracker of unrelated buildings that just happens to share a submarket.
     """
 
-    def test_single_submarket_document_keeps_the_shared_fallback_link(self):
-        # Regression: a real Henly House-shaped brochure (one building,
-        # one submarket across every unit) must keep today's exact
-        # behavior - the whole PDF genuinely IS this property's brochure.
+    def test_single_building_document_keeps_the_shared_fallback_link(self):
+        # Regression: a real Henly House-shaped brochure (one building
+        # across every unit) must keep today's exact behavior - the whole
+        # PDF genuinely IS this property's brochure.
         raw = {
             "provider": "Colliers", "contacts": None,
             "units": [
@@ -395,11 +407,31 @@ class MultiSubmarketFallbackSuppressionTests(unittest.TestCase):
         self.assertEqual(rows[0].brochure_link, "https://storage/henly.pdf")
         self.assertEqual(rows[1].brochure_link, "https://storage/henly.pdf")
 
-    def test_regents_wharf_shaped_campus_sharing_one_submarket_is_unaffected(self):
-        # A real multi-building campus brochure (Regent's Wharf) still
-        # counts as ONE submarket - development_name, not submarket
-        # diversity, is what distinguishes a real shared campus from a
-        # tracker (see schema.ListingRow.development_name's own docstring).
+    def test_same_building_spelled_inconsistently_still_keeps_the_fallback_link(self):
+        # Whitespace/capitalization noise in Gemini's own per-unit
+        # "building" reads must never be miscounted as distinct buildings -
+        # this is still genuinely ONE building's brochure.
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"building": "Henly House", "floor_unit": "1st Floor", "brochure_link": None},
+                {"building": " henly house", "floor_unit": "2nd Floor", "brochure_link": None},
+                {"building": "HENLY HOUSE ", "floor_unit": "3rd Floor", "brochure_link": None},
+            ],
+        }
+        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
+            rows = extract.extract(
+                Path("henly.pdf"), original_filename="henly.pdf", brochure_url="https://storage/henly.pdf",
+            )
+
+        for row in rows:
+            self.assertEqual(row.brochure_link, "https://storage/henly.pdf")
+
+    def test_regents_wharf_shaped_campus_with_a_stated_development_name_is_unaffected(self):
+        # A real multi-building campus brochure (Regent's Wharf) has 3
+        # distinct buildings - but a stated development_name is genuine
+        # evidence this is one shared-campus document on purpose, not a
+        # bulk tracker of unrelated buildings, so the guard doesn't apply.
         raw = {
             "provider": "Colliers", "contacts": None, "development_name": "Regent's Wharf",
             "units": [
@@ -417,7 +449,29 @@ class MultiSubmarketFallbackSuppressionTests(unittest.TestCase):
         for row in rows:
             self.assertEqual(row.brochure_link, "https://storage/regents-wharf.pdf")
 
-    def test_multi_submarket_tracker_gets_no_fallback_link_via_the_pasted_link_path(self):
+    def test_multi_building_tracker_sharing_one_submarket_gets_no_fallback_link(self):
+        # The submarket-based signal alone would have missed this: an
+        # all-Soho tracker covering unrelated buildings, no development_name
+        # stated, so it isn't a real shared-campus brochure either.
+        raw = {
+            "provider": None, "contacts": None,
+            "units": [
+                {"building": "35 Gresse Street", "submarket": "Soho", "brochure_link": None},
+                {"building": "22 Newman Street", "submarket": "Soho", "brochure_link": None},
+                {"building": "Ganton House", "submarket": "Soho", "brochure_link": None},
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf",
+                brochure_url="https://storage/tracker.pdf",
+            )
+
+        for row in rows:
+            self.assertIsNone(row.brochure_link)
+
+    def test_multi_building_tracker_gets_no_fallback_link_via_the_pasted_link_path(self):
         # The real failing shape, through the real failing path - a
         # combined portfolio tracker pasted as a Canva/Pitch link
         # (extract_from_png_pages, never extract() directly) with units
@@ -440,7 +494,7 @@ class MultiSubmarketFallbackSuppressionTests(unittest.TestCase):
         for row in rows:
             self.assertIsNone(row.brochure_link)
 
-    def test_a_units_own_genuine_link_is_unaffected_by_submarket_diversity(self):
+    def test_a_units_own_genuine_link_is_unaffected_by_building_diversity(self):
         # Only rule 3 (the whole-document fallback) is ever touched by
         # this feature - a unit with its own genuine, listing-specific
         # link (rule 1) is completely unaffected either way.

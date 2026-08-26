@@ -818,25 +818,46 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
     # unit -> default to the whole uploaded document) is correct for a
     # real single-building/single-campus brochure, where the document
     # genuinely IS that property's brochure - but confirmed real failure:
-    # a "canva view" upload that was actually a combined portfolio tracker
-    # spanning genuinely unrelated areas (Soho, Fitzrovia, Marylebone,
-    # King's Cross, Euston, SE1, Bermondsey, Midtown) gave every unit with
-    # no link of its own the SAME fallback link - the whole tracker, not
-    # anything about that specific property. Distinct non-null submarket
-    # values across this document's own units is the signal: 2+ means the
-    # document spans genuinely unrelated areas, so the whole-document
-    # fallback is unreliable and every unit gets None instead for rule 3
-    # (rules 1/2/4 - a unit's own genuine or generic link - are completely
-    # unaffected either way). 0 or 1 distinct value (a real Henly House-
-    # style single-building brochure, or a real Regent's Wharf-style
-    # single-campus one - see schema.ListingRow.development_name's own
-    # docstring - where every building genuinely shares one submarket)
-    # keeps today's exact behavior. Known, accepted limitation: two
-    # genuinely different buildings sharing one broad submarket label
-    # (rather than a real shared campus) still incorrectly share a
-    # fallback link under this rule - not solved here.
-    distinct_submarkets = {u.get("submarket") for u in raw.get("units", []) if u.get("submarket")}
-    effective_pdf_fallback_link = pdf_fallback_link if len(distinct_submarkets) <= 1 else None
+    # a Colliers Canva-deck upload ("www.canva.com_view.pdf") actually
+    # covered multiple, entirely unrelated real buildings (35 Gresse
+    # Street/Fitzrovia, Whites Grounds/Bermondsey, Hatchers Yard/Surrey,
+    # Thames Court) and gave every one of them with no link of its own the
+    # SAME fallback link - the whole bulk deck, not anything about that
+    # specific building. Distinct BUILDING values across this document's
+    # own units is the signal: 2+ means the document is a bulk upload by
+    # construction, so the whole-document fallback is unreliable and every
+    # unit gets None instead for rule 3 (rules 1/2/4 - a unit's own
+    # genuine or generic link - are completely unaffected either way). 0
+    # or 1 distinct building (a real Henly House-style single-building
+    # brochure) keeps today's exact behavior.
+    #
+    # Deliberately building-count-based, not submarket-based (an earlier,
+    # narrower version of this same guard used distinct submarket values
+    # instead) - a bulk deck can easily be confined to one broad submarket
+    # label (e.g. an all-Soho tracker covering five unrelated buildings)
+    # and still not be any one of those buildings' own brochure, so
+    # submarket alone under-caught this.
+    #
+    # But building count alone over-catches a real multi-building CAMPUS
+    # brochure (e.g. Regent's Wharf: The Canal Building/The Mill/The
+    # Packing House, genuinely one shared document) - so a stated
+    # development_name (see schema.ListingRow.development_name's own
+    # docstring) exempts the document from this guard entirely, the same
+    # way it's already treated as real evidence of a genuine shared entity
+    # elsewhere (e.g. geocode.py's Tier 2 disambiguation). A bulk tracker
+    # never states one, since its buildings aren't actually one campus.
+    #
+    # Each building value normalized (stripped + casefolded) before
+    # comparing, so two units of the same real building are never
+    # miscounted as different buildings purely from whitespace/
+    # capitalization differences in what Gemini returned for each - a
+    # false "multi-building" read would wrongly suppress the fallback for
+    # a genuinely single-building document.
+    distinct_buildings = {
+        (u.get("building") or "").strip().casefold() for u in raw.get("units", []) if u.get("building")
+    }
+    is_bulk_upload = len(distinct_buildings) > 1 and not raw.get("development_name")
+    effective_pdf_fallback_link = None if is_bulk_upload else pdf_fallback_link
 
     rows = []
     page_indices = []
