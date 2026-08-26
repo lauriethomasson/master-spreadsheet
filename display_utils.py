@@ -187,13 +187,22 @@ RANGE_COLUMNS = [
 # floorplan_link is a pure visibility change, not a data/logic one - the
 # field, its data, and its own enrichment (FLOORPLAN_PROMPT etc. in
 # brochure_enrichment.py) are all completely untouched; it's just no
-# longer shown as its own column here.
+# longer shown as its own column here. geocode_unverified and
+# development_name are the same idea again (see their own schema.py
+# docstrings) - internal geocoding metadata, already hidden from the
+# exported .xlsx via staging_writer.HIDDEN_COLUMNS, but that list only
+# controls Excel-native column hiding (visible only if someone downloads
+# and opens the file) - this separate list is what actually governs the
+# live on-screen "View current master" table, so it needs the same two
+# fields added here too.
 ALWAYS_HIDDEN_COLUMNS = [
     "source_file",
     "property_id",
     "brochure_link_broken",
     "brochure_link_is_floorplan",
     "floorplan_link",
+    "geocode_unverified",
+    "development_name",
 ]
 
 

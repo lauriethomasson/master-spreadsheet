@@ -137,6 +137,19 @@ class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
         df = pd.DataFrame([{"building": "A", "brochure_link_is_floorplan": True}])
         self.assertNotIn("brochure_link_is_floorplan", display_utils.visible_columns(df))
 
+    def test_geocode_unverified_is_never_shown_on_the_review_grid(self):
+        # Already hidden from the exported .xlsx via staging_writer.
+        # HIDDEN_COLUMNS, but that list only controls Excel-native column
+        # hiding (visible if someone downloads and opens the file) - this
+        # separate list governs the live on-screen "View current master"
+        # table, which needs the same field added here too.
+        df = pd.DataFrame([{"building": "A", "geocode_unverified": True}])
+        self.assertNotIn("geocode_unverified", display_utils.visible_columns(df))
+
+    def test_development_name_is_never_shown_on_the_review_grid(self):
+        df = pd.DataFrame([{"building": "The Canal Building", "development_name": "Regent's Wharf"}])
+        self.assertNotIn("development_name", display_utils.visible_columns(df))
+
     def test_an_ordinary_column_is_unaffected(self):
         df = pd.DataFrame([{"building": "A", "brochure_link_broken": True}])
         self.assertIn("building", display_utils.visible_columns(df))
