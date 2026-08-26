@@ -2881,6 +2881,25 @@ class HouseNumberChangedTests(unittest.TestCase):
     def test_no_leading_number_on_either_side_is_not_flagged(self):
         self.assertFalse(master_merge.house_number_changed("Copthall House", "Copthall Building"))
 
+    def test_spelled_out_wells_street_real_case_is_not_flagged(self):
+        # The confirmed real case house_number.py's spelled-out-number
+        # fallback exists for: master's "19 Wells Street" vs an upload's
+        # own "Nineteen Wells St" (same real building - its name already
+        # matches after the street-suffix fix) previously flagged as a
+        # risky address change purely because leading_house_number found a
+        # digit on one side and nothing at all on the other.
+        self.assertFalse(master_merge.house_number_changed("19 Wells Street", "Nineteen Wells St"))
+        self.assertFalse(master_merge.house_number_changed("Nineteen Wells St", "19 Wells Street"))
+
+    def test_spelled_out_compound_tens_plus_ones_is_not_flagged(self):
+        self.assertFalse(master_merge.house_number_changed("21 Old Street", "Twenty One Old Street"))
+        self.assertFalse(master_merge.house_number_changed("21 Old Street", "Twenty-One Old Street"))
+
+    def test_genuinely_different_spelled_out_number_is_still_flagged(self):
+        # Not a merge/equality bug - "Twenty" and "19" really are different
+        # numbers, and a spelled-out form must never blur that distinction.
+        self.assertTrue(master_merge.house_number_changed("19 Wells Street", "Twenty Wells Street"))
+
 
 class CollisionTests(unittest.TestCase):
     def test_two_new_rows_matching_same_master_row_are_a_collision(self):
