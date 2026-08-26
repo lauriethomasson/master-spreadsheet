@@ -170,6 +170,35 @@ class NeedsEnrichmentTests(EnrichmentTestCase):
         row = ListingRow(building="A", special_features="Nice", state_of_space="Cat A", contacts=None)
         self.assertTrue(brochure_enrichment.needs_enrichment(row))
 
+    def test_every_field_filled_including_special_features_but_has_a_brochure_link_still_needs_enrichment(self):
+        # Confirmed real bug: all 41 real Colliers rows already have SOME
+        # value in every single ENRICHABLE_FIELDS field, special_features
+        # included (e.g. "1 meeting room; Term 24 months") - but special_
+        # features's own combine logic (see _apply_units_to_row) is never
+        # gated on it already being non-blank, so this row must stay
+        # eligible on that basis alone whenever a brochure_link exists to
+        # check, unlike the other 8 fields which keep the plain "only if
+        # blank" rule.
+        row = ListingRow(
+            building="A", address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Nice", state_of_space="Cat A", contacts="Jane, jane@x.com",
+            brochure_link="https://example.com/brochure.pdf",
+        )
+        self.assertTrue(brochure_enrichment.needs_enrichment(row))
+
+    def test_every_field_filled_with_no_brochure_link_still_does_not_need_enrichment(self):
+        # Same fully-filled row, but nothing to check at all (no
+        # brochure_link) - special_features's decoupling must not make
+        # this True unconditionally; there has to be a real link behind it.
+        row = ListingRow(
+            building="A", address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Nice", state_of_space="Cat A", contacts="Jane, jane@x.com",
+            brochure_link=None,
+        )
+        self.assertFalse(brochure_enrichment.needs_enrichment(row))
+
 
 class EligibleBrochureUrlTests(unittest.TestCase):
     def test_direct_pdf_url_is_eligible(self):
@@ -4128,14 +4157,15 @@ class EnrichRowTests(EnrichmentTestCase):
         self.assertIsNone(new_row.special_features)
         self.assertEqual(fields, [])
 
-    def test_row_with_nothing_missing_never_triggers_extraction(self):
+    def test_row_with_nothing_missing_and_no_brochure_link_never_triggers_extraction(self):
         # Every field in ENRICHABLE_FIELDS populated, not just the original
         # three - a row missing even one of the newer fields (address_1,
         # postcode, submarket, size_sqft, desks_max, rent_pcm, rent_psf)
-        # now correctly needs_enrichment (see NeedsEnrichmentTests), so this
-        # "truly nothing missing" case must give every one of them a value.
+        # now correctly needs_enrichment (see NeedsEnrichmentTests). With no
+        # brochure_link at all, there's nothing special_features's own
+        # decoupled check could check either, so this stays excluded.
         row = ListingRow(
-            building="A", floor_unit="1st", brochure_link="https://example.com/brochure.pdf",
+            building="A", floor_unit="1st", brochure_link=None,
             address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
             size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
             special_features="Already have this", state_of_space="Cat A", contacts="Jane, jane@x.com",
@@ -4144,6 +4174,25 @@ class EnrichRowTests(EnrichmentTestCase):
             new_row, fields = brochure_enrichment.enrich_row(row)
 
         mock_extract.assert_not_called()
+        self.assertIs(new_row, row)
+        self.assertEqual(fields, [])
+
+    def test_row_with_nothing_missing_but_a_real_brochure_link_still_checks_special_features(self):
+        # Same fully-filled row, but WITH a real brochure_link - special_
+        # features's own decoupled check (see NeedsEnrichmentTests) means
+        # extraction now DOES run, but since the brochure genuinely has
+        # nothing new for this building, the row still comes back unchanged.
+        row = ListingRow(
+            building="A", floor_unit="1st", brochure_link="https://example.com/brochure.pdf",
+            address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Already have this", state_of_space="Cat A", contacts="Jane, jane@x.com",
+        )
+        units = _brochure_units([{"building": "A", "floor_unit": "1st"}])
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units) as mock_extract:
+            new_row, fields = brochure_enrichment.enrich_row(row)
+
+        mock_extract.assert_called_once()
         self.assertIs(new_row, row)
         self.assertEqual(fields, [])
 
@@ -4310,19 +4359,24 @@ class EligibleRowsAndBrochuresTests(unittest.TestCase):
         rows = [
             ListingRow(building="A", floor_unit="1st", brochure_link="https://example.com/a.pdf", special_features=None),
             ListingRow(building="A", floor_unit="2nd", brochure_link="https://example.com/a.pdf", special_features=None),
-            # Every ENRICHABLE_FIELDS entry populated - genuinely nothing
-            # missing, so this row must stay excluded (see NeedsEnrichmentTests).
+            # Every OTHER ENRICHABLE_FIELDS entry populated, special_
+            # features included - but a real, unexplored brochure_link
+            # still makes this row eligible on special_features's own
+            # account alone (see NeedsEnrichmentTests), so this must now
+            # be INCLUDED, not excluded.
             ListingRow(
                 building="B", floor_unit="1st", brochure_link="https://example.com/b.pdf",
                 address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
                 size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
                 special_features="Already there", state_of_space="Cat A", contacts="Jane, jane@x.com",
             ),
+            # No brochure_link at all - nothing to check, so this one
+            # genuinely does stay excluded regardless of special_features.
             ListingRow(building="C", floor_unit="1st", brochure_link=None, special_features=None),
         ]
         eligible, urls = brochure_enrichment.eligible_rows_and_brochures(rows)
-        self.assertEqual(len(eligible), 2)
-        self.assertEqual(urls, ["https://example.com/a.pdf"])
+        self.assertEqual(len(eligible), 3)
+        self.assertEqual(urls, ["https://example.com/a.pdf", "https://example.com/b.pdf"])
 
     def test_no_eligible_rows_returns_empty(self):
         rows = [ListingRow(building="A", special_features="x", state_of_space="y", contacts="z")]
@@ -4569,12 +4623,14 @@ class EnrichRowsGroupedTests(EnrichmentTestCase):
 
         self.assertEqual(mock_trim.call_count, 4)
 
-    def test_rows_with_nothing_missing_are_excluded_from_the_run(self):
+    def test_rows_with_nothing_missing_and_no_brochure_link_are_excluded_from_the_run(self):
         # Every ENRICHABLE_FIELDS entry populated - see EnrichRowTests' own
         # identical update for why this now needs more than the original
-        # three fields to be genuinely "nothing missing".
+        # three fields to be genuinely "nothing missing". No brochure_link
+        # at all, so special_features's own decoupled check (see
+        # NeedsEnrichmentTests) has nothing to check either.
         rows = [ListingRow(
-            building="A", brochure_link="https://example.com/a.pdf",
+            building="A", brochure_link=None,
             address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
             floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
             special_features="Done", state_of_space="Cat A", contacts="Jane, jane@x.com",
@@ -4585,6 +4641,26 @@ class EnrichRowsGroupedTests(EnrichmentTestCase):
         mock_units.assert_not_called()
         self.assertEqual(stats["unique_brochures_considered"], 0)
         self.assertEqual(stats["rows_eligible"], 0)
+
+    def test_rows_with_nothing_missing_but_a_real_brochure_link_are_still_included(self):
+        # Same fully-filled row, but WITH a real brochure_link - special_
+        # features's own decoupled check means this row IS included in the
+        # run (unique_brochures_considered/rows_eligible both reflect it),
+        # even though the brochure genuinely has nothing new to add.
+        rows = [ListingRow(
+            building="A", brochure_link="https://example.com/a.pdf",
+            address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Done", state_of_space="Cat A", contacts="Jane, jane@x.com",
+        )]
+        units = _brochure_units([{"building": "A", "floor_unit": "1st"}])
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units) as mock_units:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        mock_units.assert_called_once()
+        self.assertEqual(stats["unique_brochures_considered"], 1)
+        self.assertEqual(stats["rows_eligible"], 1)
+        self.assertEqual(enriched[0].special_features, "Done")
 
     def test_summary_stats_are_accurate(self):
         rows = [
@@ -5890,8 +5966,12 @@ class NineteenWellsStPlaceholderAddressEndToEndTests(EnrichmentTestCase):
             "brochure_link": "https://example.com/brochure.pdf",
             "lat": 51.0, "lng": -0.1, "geocode_unverified": True,
             # Every OTHER ENRICHABLE_FIELDS already filled, so the
-            # placeholder address_1 is the only reason this row is
-            # eligible at all - proves point (1) above, not just (2)/(3).
+            # placeholder address_1 is A reason this row is eligible -
+            # proves point (1) above, not just (2)/(3). (Since the special_
+            # features decoupling fix, a non-blank brochure_link alone is
+            # now also sufficient on its own - see NeedsEnrichmentTests -
+            # but this row's placeholder address_1 makes it eligible either
+            # way, so that doesn't weaken what this test demonstrates.)
             "submarket": "Fitzrovia", "size_sqft": 1000, "desks_max": 20, "rent_pcm": 5000, "rent_psf": 60,
             "special_features": "Nice", "state_of_space": "Cat A", "contacts": "Jane, jane@x.com",
         }
@@ -5942,6 +6022,83 @@ class NineteenWellsStPlaceholderAddressEndToEndTests(EnrichmentTestCase):
 
         mock_geocoding.assert_not_called()
         self.assertIs(enriched.geocode_unverified, True)  # left exactly as it was
+
+
+class FullyFilledRowSpecialFeaturesGateEndToEndTests(EnrichmentTestCase):
+    """
+    The confirmed real bug, end-to-end: a row where every single
+    ENRICHABLE_FIELDS value - special_features itself included - is
+    already filled (the real shape of all 41 real Colliers rows) used to
+    be excluded from enrichment entirely by needs_enrichment, so _apply_
+    units_to_row's own "combine, never gated on special_features already
+    being non-blank" logic (see its own docstring) never even got a
+    chance to run for it.
+    """
+
+    def _row(self, **kwargs):
+        defaults = {
+            "building": "The Canal Building", "address_1": "1 Example Street", "postcode": "EC1A 1AA",
+            "submarket": "City", "floor_unit": "5th Floor", "size_sqft": 1000, "desks_max": 20,
+            "rent_pcm": 5000, "rent_psf": 60, "special_features": "1 meeting room; Term 24 months",
+            "state_of_space": "Cat A", "contacts": "Jane, jane@x.com",
+            "brochure_link": "https://example.com/brochure.pdf",
+        }
+        defaults.update(kwargs)
+        return ListingRow(**defaults)
+
+    def test_fully_filled_row_still_gets_building_level_amenities_appended(self):
+        row = self._row()
+        units = _brochure_units(
+            [{"building": "The Canal Building", "floor_unit": "5th Floor"}],
+            building_features=[{"building": "The Canal Building", "features": "Exposed beams; canalside frontage"}],
+        )
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched_rows, _, _ = brochure_enrichment.enrich_rows_grouped([row])
+
+        enriched = enriched_rows[0]
+        self.assertEqual(
+            enriched.special_features, "1 meeting room; Term 24 months; Exposed beams; canalside frontage",
+        )
+        # Every OTHER already-filled field is completely untouched - proves
+        # this is genuinely a special_features-only gating change, not a
+        # general re-enrichment of an already-complete row (_apply_units_
+        # to_row's own per-field blank check, unaffected by this fix,
+        # already guarantees this independently of needs_enrichment).
+        self.assertEqual(enriched.address_1, "1 Example Street")
+        self.assertEqual(enriched.postcode, "EC1A 1AA")
+        self.assertEqual(enriched.submarket, "City")
+        self.assertEqual(enriched.size_sqft, 1000)
+        self.assertEqual(enriched.desks_max, 20)
+        self.assertEqual(enriched.rent_pcm, 5000)
+        self.assertEqual(enriched.rent_psf, 60)
+        self.assertEqual(enriched.state_of_space, "Cat A")
+        self.assertEqual(enriched.contacts, "Jane, jane@x.com")
+
+    def test_fully_filled_row_with_genuinely_nothing_new_is_unaffected(self):
+        # The real Kingsland House shape: enrichment now runs at all
+        # (unlike before this fix), but the brochure genuinely has no
+        # building/property-level text for this building - the row must
+        # come back with special_features byte-identical to before.
+        row = self._row()
+        units = _brochure_units([{"building": "The Canal Building", "floor_unit": "5th Floor"}])
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched_rows, _, _ = brochure_enrichment.enrich_rows_grouped([row])
+
+        self.assertEqual(enriched_rows[0].special_features, "1 meeting room; Term 24 months")
+
+    def test_fully_filled_row_with_no_brochure_link_is_never_even_attempted(self):
+        # No brochure_link at all - needs_enrichment's own decoupled
+        # special_features check requires one (see NeedsEnrichmentTests),
+        # so this row is correctly excluded from the worklist entirely,
+        # exactly as before this fix.
+        row = self._row(brochure_link=None)
+
+        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+            enriched_rows, _, _ = brochure_enrichment.enrich_rows_grouped([row])
+
+        mock_extract.assert_not_called()
+        self.assertEqual(enriched_rows[0].special_features, "1 meeting room; Term 24 months")
 
 
 if __name__ == "__main__":

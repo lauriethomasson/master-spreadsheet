@@ -967,15 +967,31 @@ def needs_enrichment(row: ListingRow) -> bool:
     just a copy of its own building (see that function's own docstring)
     still has nothing genuinely useful there, and must remain eligible for
     enrichment on that basis alone, exactly as if address_1 were blank.
+
+    special_features is handled separately from the other 8 fields, which
+    all keep the plain "only if blank" rule. enrich_row's own
+    special_features handling is never gated on row.special_features
+    already being non-blank - it always attempts to append building-/
+    property-level text pulled from the brochure on top of whatever's
+    already there. So a row stays eligible on special_features's account
+    alone whenever it has ANY brochure_link to check (URL-shape validity
+    is _is_eligible_brochure_url's job, same as for every other field -
+    not duplicated here), even when every other field - including
+    special_features itself - is already filled. Without this, that
+    combine logic would never get a chance to run for any row whose
+    initial extraction already filled every field, which in practice is
+    most real rows with a data-rich source document.
     """
     for field in ENRICHABLE_FIELDS:
+        if field == "special_features":
+            continue
         if field == "address_1":
             if _is_placeholder_address(row.address_1, row.building):
                 return True
             continue
         if _is_blank(getattr(row, field)):
             return True
-    return False
+    return _is_blank(row.special_features) or bool(row.brochure_link)
 
 
 def eligible_rows_and_brochures(rows: list):
