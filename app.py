@@ -1199,7 +1199,41 @@ with page_setup.setup_page("upload"):
                         # as superseding an earlier, stale pending copy.
                         source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
 
-                    previous_staging_path = find_previous_upload_by_hash(content_hash, source_identity_hash)
+                    # content_hash ONLY here - deliberately NOT source_
+                    # identity_hash, despite find_previous_upload_by_hash's
+                    # own docstring inviting a caller to pass it through.
+                    # source_identity_hash is the real bytes ALONE, with no
+                    # code-logic fingerprint - passing it here means find_
+                    # previous_upload_by_hash's own preferred_target becomes
+                    # source_identity_hash (see its "source_identity_hash or
+                    # content_hash" precedence), so a stale entry from
+                    # BEFORE a real extraction/geocoding fix still matches
+                    # on raw bytes alone and gets reused forever, regardless
+                    # of the fix - defeating _SPREADSHEET_LOGIC_FINGERPRINT/
+                    # _PDF_EMAIL_LOGIC_FINGERPRINT's entire purpose. Real,
+                    # confirmed regression (see tests/test_app_upload_
+                    # geocode_cache_invalidation.py's own UploadReuseAcross
+                    # AFingerprintChangeTests::test_same_bytes_but_
+                    # fingerprint_changed_does_not_reuse_and_regeocodes,
+                    # which was failing before this fix): a fingerprint
+                    # change alone (e.g. the real Beem geocoding-validation
+                    # fix) must force a fresh re-extraction on the very next
+                    # re-upload of an already-staged file, not silently keep
+                    # serving pre-fix rows. content_hash alone still does
+                    # exactly that - it's the ONE hash that's provably
+                    # sensitive to the current code, by construction (see
+                    # _spreadsheet_content_hash/_pdf_or_email_content_hash).
+                    #
+                    # source_identity_hash is still computed above and still
+                    # passed to save_staging_file below completely
+                    # unaffected by this - that's a SEPARATE concern
+                    # (avoiding a duplicate/stale PENDING copy piling up in
+                    # a merge plan across a code change, the original
+                    # Oliver's Yard duplication bug - see active_and_
+                    # superseded_staging_files/_grouping_hash's own
+                    # docstrings), which never goes through find_previous_
+                    # upload_by_hash at all.
+                    previous_staging_path = find_previous_upload_by_hash(content_hash)
                     fully_occupied_buildings = []
                     # Set below ONLY when previous_staging_path's own
                     # enrichment was left incomplete - see its own use at
