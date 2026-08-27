@@ -39,17 +39,14 @@ from storage.file_store import (
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
 
-# Increase this whenever PDF/email extraction logic changes. This prevents
-# results created by older extraction code from being reused.
-EXTRACTION_VERSION = "3"
-
 # Column-header mapping (extract_spreadsheet.py) has no Gemini call and is
 # fully deterministic - the only way its cached result could ever go stale
 # is a change to that module's own mapping/guessing logic itself (suggest_
-# mapping, guess_provider_name, FIELD_SYNONYMS, etc.), never anything
-# EXTRACTION_VERSION above is meant to track. Confirmed to have actually
-# gone stale this way: a real fix to that logic landed without EXTRACTION_
-# VERSION being bumped (it has no reason to know spreadsheet logic even
+# mapping, guess_provider_name, FIELD_SYNONYMS, etc.), never anything the
+# PDF/email path's own version counter (since removed - see
+# _PDF_EMAIL_LOGIC_FINGERPRINT below) was ever meant to track. Confirmed to
+# have actually gone stale this way: a real fix to that logic landed without
+# that counter being bumped (it had no reason to know spreadsheet logic even
 # changed), so a byte-identical re-upload of an already-staged spreadsheet
 # kept silently reusing its pre-fix cached rows - dedup working exactly as
 # designed, just against the wrong invalidation signal for this source
@@ -73,7 +70,8 @@ EXTRACTION_VERSION = "3"
 # gap: geocode_rows() runs unconditionally right after a fresh extraction
 # for BOTH source types (see the spreadsheet and PDF/email branches below),
 # but wasn't part of either invalidation mechanism at all - neither this
-# fingerprint nor EXTRACTION_VERSION. A real geocoding-validation fix
+# fingerprint nor the PDF/email path's own version counter (since removed -
+# see _PDF_EMAIL_LOGIC_FINGERPRINT below). A real geocoding-validation fix
 # (rejecting a Places candidate that contradicts the source's own postcode
 # evidence - see geocode.py's own module docstring) landed without either
 # being touched, so re-uploading an already-staged file (e.g. the real beem
@@ -87,6 +85,23 @@ _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
     + Path(extract_spreadsheet_gemini.__file__).read_bytes()
     + Path(brochure_enrichment.__file__).read_bytes()
     + Path(geocode.__file__).read_bytes()
+).hexdigest()
+
+# extract.py's/extract_email.py's own source, folded into
+# _pdf_or_email_content_hash for a PDF/email upload the exact same
+# automatic, self-maintaining way _SPREADSHEET_LOGIC_FINGERPRINT above
+# already does for extract_spreadsheet.py/extract_spreadsheet_gemini.py -
+# replacing the EXTRACTION_VERSION human-maintained counter this used to
+# rely on instead. Confirmed to have already gone stale exactly the same
+# way the spreadsheet-mapping gap above did: EXTRACTION_VERSION stayed "3"
+# across two real extract.py fixes since it was introduced (the single-
+# unit-page PDF link attachment fix, and the bulk-upload-fallback-
+# suppression fix), so a PDF re-uploaded after either fix kept silently
+# reusing its pre-fix cached extraction result - the fix was sitting in the
+# repo but never actually took effect for anything already uploaded once.
+_PDF_EMAIL_LOGIC_FINGERPRINT = hashlib.sha256(
+    Path(extract.__file__).read_bytes()
+    + Path(extract_email.__file__).read_bytes()
 ).hexdigest()
 
 # The neutral, un-decided option in an ambiguous-sheet decision radio (see
@@ -471,16 +486,14 @@ def _spreadsheet_content_hash(file_bytes: bytes, decisions: dict) -> str:
 
 def _pdf_or_email_content_hash(suffix: str, file_bytes: bytes) -> str:
     """
-    content_hash for a PDF/email upload - EXTRACTION_VERSION (a human-
-    maintained counter for extract.py's/extract_email.py's own logic - see
-    its own comment) + file_bytes + geocode.py's own source, automatically
-    folded in for the same reason _SPREADSHEET_LOGIC_FINGERPRINT already
-    folds it in for a spreadsheet upload (see that constant's own comment) -
+    content_hash for a PDF/email upload - _PDF_EMAIL_LOGIC_FINGERPRINT (a
+    hash of extract.py's/extract_email.py's own source - see its own
+    comment) + file_bytes + geocode.py's own source, automatically folded in
+    for the same reason _SPREADSHEET_LOGIC_FINGERPRINT already folds it in
+    for a spreadsheet upload (see that constant's own comment) -
     geocode_rows() runs unconditionally right after extraction for BOTH
     source types, so a geocoding-logic change must invalidate an already-
-    staged PDF/email result too, without relying on anyone remembering to
-    bump EXTRACTION_VERSION for a change that isn't really about extract.py/
-    extract_email.py at all.
+    staged PDF/email result too.
 
     brochure_enrichment.py's own source is ALSO folded in, but only for an
     email upload (suffix == ".eml") - an email upload now runs automatic
@@ -495,7 +508,8 @@ def _pdf_or_email_content_hash(suffix: str, file_bytes: bytes) -> str:
     affect its result.
     """
     versioned_content = (
-        EXTRACTION_VERSION.encode("utf-8") + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
+        _PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8")
+        + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
     )
     if suffix == ".eml":
         versioned_content += b"\0" + Path(brochure_enrichment.__file__).read_bytes()
@@ -988,12 +1002,11 @@ with page_setup.setup_page("upload"):
                     #
                     # Folded into the hash alongside the file bytes, so a
                     # logic change invalidates any already-staged result: for
-                    # PDF/email, EXTRACTION_VERSION (a human-maintained
-                    # counter - see its own comment for why spreadsheets use
-                    # a different mechanism); for a spreadsheet,
-                    # _SPREADSHEET_LOGIC_FINGERPRINT instead (a hash of
-                    # extract_spreadsheet.py's own source - automatic,
-                    # nothing to remember to bump).
+                    # PDF/email, _PDF_EMAIL_LOGIC_FINGERPRINT (a hash of
+                    # extract.py's/extract_email.py's own source); for a
+                    # spreadsheet, _SPREADSHEET_LOGIC_FINGERPRINT instead (a
+                    # hash of extract_spreadsheet.py's own source) - both
+                    # automatic, nothing to remember to bump.
                     file_bytes = uploaded_file.getvalue()
                     sheet_plans = None
                     decisions_for_this_file = {}
@@ -1027,10 +1040,10 @@ with page_setup.setup_page("upload"):
                     else:
                         content_hash = _pdf_or_email_content_hash(suffix, file_bytes)
                         # Same idea as the spreadsheet branch above - the
-                        # real bytes alone, no EXTRACTION_VERSION/geocode.py
-                        # fingerprint, so a re-upload of the same PDF/email
-                        # across a code change is still recognized as
-                        # superseding an earlier, stale pending copy.
+                        # real bytes alone, no _PDF_EMAIL_LOGIC_FINGERPRINT/
+                        # geocode.py fingerprint, so a re-upload of the same
+                        # PDF/email across a code change is still recognized
+                        # as superseding an earlier, stale pending copy.
                         source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
 
                     previous_staging_path = find_previous_upload_by_hash(content_hash, source_identity_hash)

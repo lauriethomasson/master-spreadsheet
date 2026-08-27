@@ -72,7 +72,7 @@ def save_staging_file(
             # The real uploaded bytes (+ ambiguous-sheet decisions for a
             # spreadsheet) ALONE - deliberately NOT including content_hash's
             # own code-logic fingerprint (_SPREADSHEET_LOGIC_FINGERPRINT/
-            # EXTRACTION_VERSION+geocode.py) - see active_and_superseded_
+            # _PDF_EMAIL_LOGIC_FINGERPRINT+geocode.py) - see active_and_superseded_
             # staging_files' own docstring for the real, confirmed gap this
             # closes: re-uploading the literal same source file across a
             # code change (a real fix landing between two test uploads of
@@ -355,7 +355,7 @@ def find_previous_upload_by_hash(content_hash: str, source_identity_hash: str = 
     _grouping_hash, which this function now reuses rather than
     duplicating its own copy of the same fallback logic): content_hash
     ALONE bakes in the current code's own extraction-logic fingerprint
-    (_SPREADSHEET_LOGIC_FINGERPRINT/EXTRACTION_VERSION + geocode.py, see
+    (_SPREADSHEET_LOGIC_FINGERPRINT/_PDF_EMAIL_LOGIC_FINGERPRINT + geocode.py, see
     app.py), so re-uploading the exact same source file after ANY change
     to that logic produces a different content_hash and this lookup
     wrongly returned None - the file was re-extracted from scratch

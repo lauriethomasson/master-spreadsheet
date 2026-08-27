@@ -3,8 +3,9 @@ Regression tests for a real reported gap: geocode.py's own source was not
 part of either content-hash cache-invalidation mechanism app.py uses to
 decide whether a re-uploaded file is "identical to a previous upload,
 reused rather than re-extracted" - _SPREADSHEET_LOGIC_FINGERPRINT for
-spreadsheets, EXTRACTION_VERSION (+ now geocode.py bytes too) for PDF/
-email. geocode_rows() runs unconditionally right after a fresh extraction
+spreadsheets, _PDF_EMAIL_LOGIC_FINGERPRINT (extract.py's/extract_email.py's
+own source + now geocode.py bytes too) for PDF/email.
+geocode_rows() runs unconditionally right after a fresh extraction
 for BOTH source types, so a geocoding-logic change must invalidate an
 already-staged result exactly like an extract_spreadsheet.py/
 extract_spreadsheet_gemini.py/brochure_enrichment.py change already does -
@@ -173,7 +174,7 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
     def test_email_hash_is_computed_from_brochure_enrichment_py_bytes_too(self):
         file_bytes = b"pretend .eml bytes"
         expected = hashlib.sha256(
-            app.EXTRACTION_VERSION.encode("utf-8") + b"\0" + file_bytes + b"\0"
+            app._PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes + b"\0"
             + Path(geocode.__file__).read_bytes() + b"\0" + Path(app.brochure_enrichment.__file__).read_bytes()
         ).hexdigest()
         self.assertEqual(app._pdf_or_email_content_hash(".eml", file_bytes), expected)
@@ -181,9 +182,62 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
     def test_pdf_hash_never_includes_brochure_enrichment_py(self):
         file_bytes = b"pretend .pdf bytes"
         expected = hashlib.sha256(
-            app.EXTRACTION_VERSION.encode("utf-8") + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
+            app._PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes + b"\0"
+            + Path(geocode.__file__).read_bytes()
         ).hexdigest()
         self.assertEqual(app._pdf_or_email_content_hash(".pdf", file_bytes), expected)
+
+    def test_pdf_email_fingerprint_is_computed_from_extract_and_extract_email_bytes(self):
+        # Proves _PDF_EMAIL_LOGIC_FINGERPRINT is genuinely a hash of
+        # extract.py's/extract_email.py's own source, not just mentioned in
+        # a comment - mirrors FingerprintCompositionTests' own spreadsheet
+        # counterpart above.
+        expected = hashlib.sha256(
+            Path(app.extract.__file__).read_bytes()
+            + Path(app.extract_email.__file__).read_bytes()
+        ).hexdigest()
+        self.assertEqual(app._PDF_EMAIL_LOGIC_FINGERPRINT, expected)
+
+    def test_content_hash_is_sensitive_to_the_pdf_email_fingerprint(self):
+        # _PDF_EMAIL_LOGIC_FINGERPRINT is a module-level constant computed
+        # ONCE at import time from extract.py's/extract_email.py's own
+        # source bytes (see test_pdf_email_fingerprint_is_computed_from_
+        # extract_and_extract_email_bytes above, which proves that
+        # composition directly) - so patching pathlib.Path.read_bytes after
+        # app.py is already imported can never reach it (the constant is
+        # already baked in, unlike geocode.py's fingerprint-free inclusion
+        # below, which IS re-read on every call). What CAN be tested purely
+        # is that _pdf_or_email_content_hash's result genuinely depends on
+        # that constant's current value - patching it directly here stands
+        # in for "if extract.py's/extract_email.py's bytes had been
+        # different at import time, _PDF_EMAIL_LOGIC_FINGERPRINT would have
+        # been different too" (already proven above), so together these two
+        # tests confirm a change to either file's own content changes the
+        # resulting content_hash.
+        file_bytes = b"pretend .pdf bytes"
+        original_hash = app._pdf_or_email_content_hash(".pdf", file_bytes)
+
+        with patch.object(app, "_PDF_EMAIL_LOGIC_FINGERPRINT", "a-different-fingerprint"):
+            changed_hash = app._pdf_or_email_content_hash(".pdf", file_bytes)
+
+        self.assertNotEqual(original_hash, changed_hash)
+
+    def test_current_content_hash_differs_from_old_extraction_version_formula(self):
+        # Proves this fix actually unsticks the real, confirmed stale-cache
+        # bug it was written to close (see this module's own docstring and
+        # _PDF_EMAIL_LOGIC_FINGERPRINT's own comment in app.py):
+        # EXTRACTION_VERSION stayed "3" across two real extract.py fixes
+        # that landed after it was introduced, so a PDF/email content_hash
+        # computed under the CURRENT source-hash formula must differ from
+        # what the OLD EXTRACTION_VERSION = "3" formula would have produced
+        # for the exact same bytes - every already-cached PDF/email result
+        # becomes stale exactly once on next upload, not just future ones.
+        file_bytes = b"pretend .pdf bytes"
+        old_formula_hash = hashlib.sha256(
+            "3".encode("utf-8") + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
+        ).hexdigest()
+        current_hash = app._pdf_or_email_content_hash(".pdf", file_bytes)
+        self.assertNotEqual(old_formula_hash, current_hash)
 
     def test_pdf_and_email_hash_differently_for_the_exact_same_bytes(self):
         # Since brochure_enrichment.py's bytes are only folded in for one

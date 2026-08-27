@@ -124,7 +124,7 @@ class SourceIdentityHashFallbackDedupTests(IsolatedCwdTestCase):
     """
     find_previous_upload_by_hash's own real, confirmed gap: content_hash
     ALONE bakes in the current code's own extraction-logic fingerprint
-    (_SPREADSHEET_LOGIC_FINGERPRINT/EXTRACTION_VERSION + geocode.py, see
+    (_SPREADSHEET_LOGIC_FINGERPRINT/_PDF_EMAIL_LOGIC_FINGERPRINT + geocode.py, see
     app.py), so re-uploading the exact same source file after ANY change
     to that logic produced a genuinely different content_hash and this
     lookup wrongly returned None - the file was re-extracted from scratch
