@@ -2743,12 +2743,29 @@ def _apply_units_to_row(row: ListingRow, units):
         # unlabeled column, confirmed present in real Workplace Plus rows)
         # must still get the brochure's real amenity info appended, not be
         # treated as "already has special_features, nothing to add" just
-        # because that cell wasn't genuinely blank. No deduplication against
-        # overlapping phrasing between tiers (e.g. a unit's own text already
-        # echoing a building-wide amenity) - deliberately out of scope, see
-        # this change's own commit message for why a dedup rule is its own,
-        # separate risk (wrongly stripping something real) not worth taking
-        # on here.
+        # because that cell wasn't genuinely blank.
+        #
+        # A tier whose ENTIRE text is normalize_key-equal to an earlier,
+        # already-kept tier is dropped rather than appended again - real,
+        # confirmed case: a Kitt's "The Sevens, 77 Charlotte Street" row's
+        # own spreadsheet special_features cell and the brochure's own
+        # unit-level text for that same floor are verbatim the same short
+        # blurb, so this combine used to produce "<blurb>; <blurb again>;
+        # Manned reception; showers; bike storage" - a visibly duplicated
+        # value that also tripped master_merge.is_richness_regression hard
+        # enough to skip its own auto-merge, surfacing raw, duplicated text
+        # to a reviewer as "New"/"may be missing detail" for no real
+        # reason. Deliberately WHOLE-TIER, exact-normalized equality only -
+        # never master_merge._items_similar's own looser, word-overlap
+        # "same underlying fact" comparison, which is designed for a single
+        # ITEM, not an entire tier that may itself already be several
+        # semicolon-joined facts (row_features/unit_features/building_
+        # features/property_features are all effectively multi-fact
+        # blobs) - applying a partial-overlap threshold at that granularity
+        # risks discarding a WHOLE tier over sharing just one fact with an
+        # earlier tier, silently losing every other fact that tier alone
+        # stated. Exact-match-only still fully covers the confirmed real
+        # case (a verbatim-duplicated tier) with none of that risk.
         row_features = row.special_features if isinstance(row.special_features, str) and not _is_blank(row.special_features) else None
         unit_features = _coerced_unit_value("special_features", unit.get("special_features")) if unit else None
         building_features = _match_building_feature(row, units)
@@ -2758,7 +2775,18 @@ def _apply_units_to_row(row: ListingRow, units):
         if not (isinstance(property_features, str) and not _is_blank(property_features)):
             property_features = None
 
-        combined = "; ".join(seg for seg in (row_features, unit_features, building_features, property_features) if seg)
+        kept_features = []
+        kept_keys = set()
+        for seg in (row_features, unit_features, building_features, property_features):
+            if not seg:
+                continue
+            key = normalize_key(seg)
+            if key and key in kept_keys:
+                continue
+            kept_keys.add(key)
+            kept_features.append(seg)
+
+        combined = "; ".join(kept_features)
         if combined and combined != row.special_features:
             updates["special_features"] = combined
 

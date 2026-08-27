@@ -670,12 +670,18 @@ class FetchBoxSharedPdfTests(EnrichmentTestCase):
         # The confirmed real gap: a genuine per-unit listing webpage (e.g.
         # colliers.com/en-gb/properties/...) returns real HTML, not a PDF -
         # accept_any_reachable_page=True must keep it rather than treating
-        # a non-PDF response as a fetch failure.
+        # a non-PDF response as a fetch failure. The URL isn't a direct
+        # .pdf, so _fetch_pdf_bytes tries resolve_brochure_link(url) FIRST
+        # (same httpx.get, same mocked response) - .text/.url must be real
+        # strings, not the MagicMock default, or its own BeautifulSoup
+        # parse/redirect check chokes on them before ever reaching the
+        # accept_any_reachable_page check this test is actually about.
+        url = "https://www.colliers.com/en-gb/properties/kingsland-house"
         html_response = _response(content=b"<html>Kingsland House</html>", content_type="text/html")
+        html_response.text = "<html>Kingsland House</html>"
+        html_response.url = url
         with patch("brochure_enrichment.httpx.get", return_value=html_response):
-            result = brochure_enrichment._fetch_pdf_bytes(
-                "https://www.colliers.com/en-gb/properties/kingsland-house", accept_any_reachable_page=True,
-            )
+            result = brochure_enrichment._fetch_pdf_bytes(url, accept_any_reachable_page=True)
 
         self.assertEqual(result, b"<html>Kingsland House</html>")
 
@@ -683,9 +689,12 @@ class FetchBoxSharedPdfTests(EnrichmentTestCase):
         # accept_any_reachable_page defaults to False - every OTHER caller
         # (enrichment/floorplan fetch, which parses these bytes as a
         # document) keeps today's exact PDF/image-only behavior.
+        url = "https://www.colliers.com/en-gb/properties/kingsland-house"
         html_response = _response(content=b"<html>Kingsland House</html>", content_type="text/html")
+        html_response.text = "<html>Kingsland House</html>"
+        html_response.url = url
         with patch("brochure_enrichment.httpx.get", return_value=html_response):
-            result = brochure_enrichment._fetch_pdf_bytes("https://www.colliers.com/en-gb/properties/kingsland-house")
+            result = brochure_enrichment._fetch_pdf_bytes(url)
 
         self.assertIsNone(result)
 
@@ -3255,6 +3264,57 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertEqual(new_row.special_features, "Genuine provider text")
         self.assertEqual(fields, [])
         self.assertIs(new_row, row)
+
+    def test_row_and_unit_features_verbatim_duplicate_is_not_repeated(self):
+        # Real confirmed case: Kitt's "The Sevens, 77 Charlotte Street"
+        # (floors G, 1st, 3rd) - the spreadsheet's own special_features
+        # cell and the brochure's own unit-level text for that same floor
+        # are the same short blurb verbatim, so this combine used to
+        # produce "<blurb>; <blurb again>; Manned reception; showers; bike
+        # storage" - a visible duplicate that also tripped master_merge.
+        # is_richness_regression hard enough to skip its own auto-merge.
+        # The row's own value (kept as the first, most-specific segment)
+        # survives; the identical unit-level echo is dropped; a genuinely
+        # DISTINCT building_features segment is completely unaffected.
+        row = ListingRow(
+            building="The Sevens", floor_unit="Ground", special_features="Exposed brick, high ceilings",
+        )
+        units = _brochure_units(
+            [{"building": "The Sevens", "floor_unit": "Ground", "special_features": "Exposed brick, high ceilings"}],
+            building_features=[{"building": "The Sevens", "features": "Manned reception; showers; bike storage"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(
+            new_row.special_features, "Exposed brick, high ceilings; Manned reception; showers; bike storage",
+        )
+        self.assertNotIn("Exposed brick, high ceilings; Exposed brick, high ceilings", new_row.special_features)
+
+    def test_duplicate_check_is_case_and_whitespace_tolerant(self):
+        row = ListingRow(building="The Sevens", floor_unit="1st", special_features="  Exposed BRICK,  high ceilings ")
+        units = _brochure_units(
+            [{"building": "The Sevens", "floor_unit": "1st", "special_features": "exposed brick, high ceilings"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "  Exposed BRICK,  high ceilings ")
+        self.assertEqual(fields, [])
+
+    def test_genuinely_different_tiers_sharing_some_words_are_both_kept(self):
+        # Deliberately NOT deduped via a partial-overlap/fuzzy check - two
+        # tiers sharing SOME words but stating genuinely different facts
+        # overall must never have one silently dropped, only a WHOLE-tier
+        # exact match should ever trigger this.
+        row = ListingRow(building="The Sevens", floor_unit="3rd", special_features="2 meeting rooms available")
+        units = _brochure_units(
+            [{"building": "The Sevens", "floor_unit": "3rd", "special_features": "2 meeting rooms and a kitchen"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, "2 meeting rooms available; 2 meeting rooms and a kitchen")
 
     def test_contacts_retained_without_requiring_a_floor_match(self):
         # contacts is this test's own point (document-level, no floor match
