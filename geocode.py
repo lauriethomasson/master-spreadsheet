@@ -73,6 +73,23 @@ forever with no way to clear (confirmed real gap this closes - see
 schema.ListingRow.geocode_unverified's own docstring on why False and
 None are deliberately different values here).
 
+A row whose OWN building text states a genuine street address (a leading
+house number - see leading_house_number/_street_name_words) gets one more
+check the zero-hint case above still can't cover: the accepted candidate's
+own returned street (its "route" address component) must share at least
+one significant word with the SOURCE's own stated street name, or it's
+rejected as a STREET_CONFLICT (see _best_places_result) rather than
+accepted with just a geocode_unverified flag. Confirmed real failure this
+exists for: a real Kitt's "44 Paul Street" (Shoreditch, EC2A) - with no
+address_1/postcode of its own, so nothing for the postcode-district check
+above to compare against - resolved via Places Text Search to a genuinely
+different, unrelated street (Little Britain, EC1A). Deliberately scoped to
+an address-SHAPED building value only - a bare building NAME ("Kent
+House", "Canal Building") has no street of its own to compare in the
+first place, and comparing its own name text against a returned route
+would false-positive on the ordinary case, where a building's name is
+routinely nothing like the street it actually sits on.
+
 row.development_name (see schema.ListingRow's own docstring) is tried as
 an extra Tier 2 query disambiguator, ahead of submarket - a real London
 office campus often brands an overall development name distinct from
@@ -364,6 +381,24 @@ def _hint_label(hint: dict) -> str:
     return hint["full"] or "".join(hint["district"])
 
 
+def _street_name_words(text: str) -> frozenset:
+    """
+    The normalized, digit-stripped word set of `text`'s own street-name
+    text - same idea as brochure_enrichment._street_name_words (word-
+    overlap corroboration for an address comparison, see that function's
+    own docstring for the real Ivybridge House case it was built for),
+    reimplemented here rather than imported: brochure_enrichment.py
+    already imports this module (import geocode), so the reverse import
+    would be circular.
+
+    Used by _best_places_result's own STREET_CONFLICT check - see
+    geocode_row's Tier 2 candidate loop, which only ever passes a real
+    word set here for an address-SHAPED source value (one with its own
+    leading house number), never a bare building name.
+    """
+    return frozenset(w for w in normalize_key(text).split() if not w.isdigit())
+
+
 def call_geocoding_api(address: str) -> dict:
     resp = httpx.get(GEOCODE_URL, params={"address": address, "key": _api_key()}, timeout=10)
     data = resp.json()
@@ -609,7 +644,7 @@ def log_geocode_failure(row: ListingRow, reason: str):
     print(f"[geocode] FAILED: {row.building!r} ({row.source_file}) — {reason}", file=sys.stderr)
 
 
-def _best_places_result(query: str, source_hint: dict) -> dict:
+def _best_places_result(query: str, source_hint: dict, source_street_words: frozenset = None) -> dict:
     """
     Sends ONE query to Places Text Search and returns the first candidate
     (see call_places_text_search's own "candidates" list, not just its
@@ -620,11 +655,31 @@ def _best_places_result(query: str, source_hint: dict) -> dict:
     candidate the same search already returned, even when that candidate
     was sitting right there in the same response.
 
+    source_street_words (see _street_name_words) is a THIRD, independent
+    validation, only ever passed by geocode_row for an address-shaped
+    source building value (its own leading house number - see that
+    caller's own comment): a candidate whose own returned street (its
+    "route" address component) shares NOT ONE significant word with it is
+    rejected as a STREET_CONFLICT - confirmed real failure this closes:
+    a real Kitt's "44 Paul Street" (no address_1/postcode of its own, so
+    nothing for the postcode-district check above to compare against)
+    resolved to a candidate on a genuinely different, unrelated street
+    (Little Britain). None (the default) is a pure no-op, same permissive
+    behavior as source_hint=None for the postcode check above - never a
+    new requirement to have evidence, only extra corroboration when it's
+    genuinely available. Deliberately a ZERO-overlap rejection, not exact-
+    set equality (contrast brochure_enrichment._address_conflict_note,
+    which flags ANY word difference for a human to review) - rejecting a
+    Tier 2 candidate outright here is a more consequential decision than
+    surfacing a note (a wrongly-rejected genuine match silently leaves the
+    row completely unmapped), so this only ever fires on a fully disjoint
+    match, the strongest possible signal something is actually wrong.
+
     If every candidate this query returns fails validation, returns the
     LAST one's own conflict/failure info (for log_geocode_failure's own
     message) - never a candidate this function itself hasn't checked, and
-    never blindly "the next one" without the exact same bbox/postcode
-    checks geocode_row's own single-candidate path always applied.
+    never blindly "the next one" without the exact same bbox/postcode/
+    street checks geocode_row's own single-candidate path always applied.
     """
     search = call_places_text_search(query)
     if search["status"] != "OK":
@@ -636,10 +691,15 @@ def _best_places_result(query: str, source_hint: dict) -> dict:
         if not within_london_bbox(place.get("lat"), place.get("lng")):
             last = {**place, "status": "OK"}
             continue
-        _, candidate_postcode = _address_line1_and_postcode(place.get("address_components", []))
+        candidate_address_1, candidate_postcode = _address_line1_and_postcode(place.get("address_components", []))
         if _postcode_hint_conflicts(source_hint, candidate_postcode):
             last = {**place, "status": "LOCATION_CONFLICT", "postcode": candidate_postcode}
             continue
+        if source_street_words:
+            candidate_street_words = _street_name_words(candidate_address_1) if candidate_address_1 else frozenset()
+            if candidate_street_words and not (source_street_words & candidate_street_words):
+                last = {**place, "status": "STREET_CONFLICT", "candidate_street": candidate_address_1}
+                continue
         return {**place, "status": "OK"}
     return last
 
@@ -907,6 +967,16 @@ def geocode_row(row: ListingRow) -> ListingRow:
         result = {"status": "ZERO_RESULTS"}
         for candidate in query_variants:
             matched = False
+            # Only an address-SHAPED candidate (its OWN leading house
+            # number - see _street_name_words/_best_places_result's own
+            # STREET_CONFLICT docstring) states a real street worth cross-
+            # checking a Places candidate against - a bare building NAME
+            # ("Canal Building", "Kent House") has no street of its own to
+            # compare, and comparing its own name text against a returned
+            # route would false-positive on the ordinary case.
+            candidate_street_words = (
+                _street_name_words(candidate) if leading_house_number(candidate) is not None else None
+            )
             location_texts = ([row.development_name] if row.development_name else []) + (
                 _submarket_query_variants(row.submarket)
             )
@@ -917,7 +987,7 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 query_parts.append("London, UK")
                 query = ", ".join(query_parts)
 
-                result = _best_places_result(query, source_hint)
+                result = _best_places_result(query, source_hint, candidate_street_words)
                 if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
                     matched = True
                     break
@@ -1015,6 +1085,15 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 f"lng={result.get('lng')}) contradicts the source's own location evidence "
                 f"({_hint_label(source_hint)!r}) - rejected rather than accepted on a weak "
                 "building-name-only match",
+            )
+            return row
+
+        if result["status"] == "STREET_CONFLICT":
+            log_geocode_failure(
+                row,
+                f"Places candidate's own street ({result.get('candidate_street')!r}) shares no words "
+                f"with the source's own stated street in {row.building!r} - rejected rather than "
+                "accepted on an otherwise-uncorroborated building-name-only match",
             )
             return row
 

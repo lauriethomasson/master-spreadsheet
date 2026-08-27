@@ -1092,5 +1092,134 @@ class GeocodeRowsGroupingTests(unittest.TestCase):
         mock_places.assert_not_called()
 
 
+class StreetNameConflictTests(unittest.TestCase):
+    """
+    Regression coverage for _best_places_result's own STREET_CONFLICT check
+    (see geocode.py's own module docstring, "A row whose OWN building text
+    states a genuine street address...") - confirmed real failure: a real
+    Kitt's "44 Paul Street" (Shoreditch, EC2A), with no address_1/postcode
+    of its own (so nothing for the existing postcode-district check to
+    compare against - see _postcode_hint_conflicts), resolved via Places
+    Text Search to a genuinely different, unrelated street (Little
+    Britain, EC1A) - accepted with only a geocode_unverified flag, since
+    that was the only existing safeguard for a zero-hint Tier 2 row.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_paul_street_resolving_to_an_unrelated_street_is_rejected(self):
+        row = ListingRow(building="44 Paul Street", provider="Kitt's")
+        components = [
+            {"longText": "1", "types": ["street_number"]},
+            {"longText": "Little Britain", "types": ["route"]},
+            {"longText": "EC1A 7BU", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5177, "lng": -0.0977, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("shares no words", geocode.FAILURES[0]["reason"])
+
+    def test_paul_street_resolving_to_its_own_real_street_is_accepted(self):
+        # Same shape, but the candidate's own route genuinely IS Paul
+        # Street (formatting/casing tolerated via normalize_key) - must
+        # still resolve normally, still flagged unverified (no OTHER
+        # corroboration exists), same as before this check existed.
+        row = ListingRow(building="44 Paul Street", provider="Kitt's")
+        components = [
+            {"longText": "44", "types": ["street_number"]},
+            {"longText": "Paul Street", "types": ["route"]},
+            {"longText": "EC2A 4LB", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5262, "lng": -0.0873, "address_components": components},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5262)
+        self.assertEqual(row.lng, -0.0873)
+        self.assertTrue(row.geocode_unverified)
+
+    def test_bare_building_name_candidate_is_never_street_checked(self):
+        # "Kent House" has no leading house number of its own - not
+        # address-shaped, so the street check must never even apply,
+        # regardless of what street the candidate itself resolves to
+        # (Kent House's own real record famously has no street_number/
+        # route at all - see this module's own docstring).
+        row = ListingRow(building="Kent House", provider="MetSpace")
+        components = [{"longText": "SE1 1AA", "types": ["postal_code"]}]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5, "lng": -0.1, "address_components": components},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5)
+        self.assertEqual(row.lng, -0.1)
+
+    def test_candidate_with_no_route_component_is_never_street_checked(self):
+        # An address-shaped source (a real house number), but the
+        # returned candidate has no route component of its own to compare
+        # against at all - nothing real to compare, so this is accepted
+        # exactly like before this check existed (same "nothing to
+        # compare" conservatism as brochure_enrichment._address_conflict_
+        # note).
+        row = ListingRow(building="44 Paul Street", provider="Kitt's")
+        components = [{"longText": "EC2A 4LB", "types": ["postal_code"]}]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5262, "lng": -0.0873, "address_components": components},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5262)
+        self.assertEqual(row.lng, -0.0873)
+
+    def test_falls_through_to_the_next_candidate_when_the_first_conflicts(self):
+        # Same "keep trying safer variants before giving up" principle
+        # _best_places_result's own docstring already promises for bbox/
+        # postcode conflicts - a street conflict on the FIRST candidate a
+        # query returns must not give up the whole query; the next
+        # candidate in the SAME response (see call_places_text_search's
+        # own "candidates" list) is tried before moving on.
+        row = ListingRow(building="44 Paul Street", provider="Kitt's")
+        wrong = {
+            "lat": 51.5177, "lng": -0.0977, "formatted_address": "1 Little Britain, London EC1A 7BU, UK",
+            "address_components": [
+                {"longText": "1", "types": ["street_number"]},
+                {"longText": "Little Britain", "types": ["route"]},
+                {"longText": "EC1A 7BU", "types": ["postal_code"]},
+            ],
+        }
+        right = {
+            "lat": 51.5262, "lng": -0.0873, "formatted_address": "44 Paul Street, London EC2A 4LB, UK",
+            "address_components": [
+                {"longText": "44", "types": ["street_number"]},
+                {"longText": "Paul Street", "types": ["route"]},
+                {"longText": "EC2A 4LB", "types": ["postal_code"]},
+            ],
+        }
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "candidates": [wrong, right], **wrong},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5262)
+        self.assertEqual(row.lng, -0.0873)
+
+
 if __name__ == "__main__":
     unittest.main()
