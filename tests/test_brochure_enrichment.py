@@ -6239,7 +6239,7 @@ class RegeocodeRowsWithNewlyBackfilledAddressesTests(unittest.TestCase):
 
         mock_geocoding.assert_called_once()
 
-    def test_bare_street_building_row_triggers_a_regeocode_attempt_even_though_it_cant_yet_resolve(self):
+    def test_bare_street_building_row_now_resolves_via_tier_1s_relaxed_path(self):
         # Real confirmed case: a MetSpace email row whose only location
         # text was "Clerkenwell Road" (bare street, no house number - see
         # _building_identity_matches' own tier 5) gets address_1 backfilled
@@ -6247,32 +6247,33 @@ class RegeocodeRowsWithNewlyBackfilledAddressesTests(unittest.TestCase):
         # brochure states no postcode for this floor - postcode stays
         # blank even after enrichment. This function's own trigger still
         # correctly fires (address_1 went from blank to genuinely non-
-        # placeholder), calling geocode_row exactly as designed - but
-        # geocode_row's own Tier 1 requires BOTH address_1 AND postcode
-        # (never attempted here), and Tier 2 only ever reads row.building
-        # (still the unchanged bare "Clerkenwell Road", so _is_bare_
-        # street_reference still skips it too) - row.address_1 itself is
-        # never consulted by Tier 2 at all. Confirmed directly against the
-        # real brochure: lat/lng/postcode all stay blank even after a
-        # genuine, correct address_1 backfill - a real, separate gap in
-        # geocode_row's own address usage, distinct from (and not fixed
-        # by) the building-matching tier 5 fix this test file's own
-        # BuildingIdentityMatchesTests covers.
+        # placeholder), calling geocode_row - which now (see geocode.py's
+        # own module docstring, "Tier 1 also runs for a row with a
+        # genuinely numbered address_1... but no postcode yet") resolves
+        # real coordinates via address_1 alone and backfills postcode
+        # itself via a reverse-geocode, even though row.building is still
+        # the unchanged bare "Clerkenwell Road" Tier 2 alone could never
+        # have resolved. Verified directly against the real Geocoding API
+        # with this exact real address in tests/test_geocode.py's own
+        # Tier1AddressWithoutPostcodeTests.
         original = self._row(building="Clerkenwell Road")
-        enriched = self._row(building="Clerkenwell Road", address_1="67 Clerkenwell Rd")
+        enriched = self._row(building="Clerkenwell Road", address_1="67 Clerkenwell Rd", submarket="Clerkenwell")
 
-        with patch("geocode.call_geocoding_api") as mock_geocoding_api, \
-             patch("geocode.call_places_text_search") as mock_places:
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5219197, "lng": -0.1077003},
+        ) as mock_geocoding_api, patch(
+            "geocode.call_reverse_geocoding_api",
+            return_value={"status": "OK", "address_components": [
+                {"long_name": "EC1R 5BL", "types": ["postal_code"]},
+            ]},
+        ):
             brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
 
-        # Tier 1 never even attempted (no postcode to pair address_1 with).
-        mock_geocoding_api.assert_not_called()
-        # Tier 2 never attempted either - _is_bare_street_reference still
-        # sees row.building itself as an unresolvable bare street.
-        mock_places.assert_not_called()
-        self.assertIsNone(enriched.lat)
-        self.assertIsNone(enriched.lng)
-        self.assertIsNone(enriched.postcode)
+        mock_geocoding_api.assert_called_once_with("67 Clerkenwell Rd, London, UK")
+        self.assertEqual(enriched.lat, 51.5219197)
+        self.assertEqual(enriched.lng, -0.1077003)
+        self.assertEqual(enriched.postcode, "EC1R 5BL")
+        self.assertIs(enriched.geocode_unverified, False)
 
     def test_placeholder_to_real_address_transition_triggers_a_regeocode(self):
         # The confirmed real "Nineteen Wells St" shape: address_1 wasn't

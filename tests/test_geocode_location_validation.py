@@ -255,7 +255,15 @@ class GeocodeRowLocationValidationTests(unittest.TestCase):
         self.assertIsNone(row.lat)
 
     def test_address_1_hint_is_also_checked_when_no_postcode_field_exists(self):
-        row = ListingRow(building="Ambiguous House", provider="beem", address_1="12 Somewhere Lane SE1")
+        # address_1 deliberately has NO leading house number of its own -
+        # geocode_row's own Tier 1 now also runs for a NUMBERED address_1
+        # with no postcode yet (see the module docstring's own "Tier 1
+        # also runs for a row with a genuinely numbered address_1..."
+        # paragraph), which would otherwise intercept this row before Tier
+        # 2 (this test's own actual point) is ever reached - "Ambiguous
+        # House" alone has no house number either, so this stays a genuine
+        # zero-hint-for-Tier-1 row, reaching Tier 2 exactly as intended.
+        row = ListingRow(building="Ambiguous House", provider="beem", address_1="Somewhere Lane SE1")
 
         with patch(
             "geocode.call_places_text_search",

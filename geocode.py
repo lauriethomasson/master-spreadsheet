@@ -104,6 +104,31 @@ Reach" street also in King's Cross. Never wired into _source_location_
 hint or geocode_unverified - a development-name-assisted match is a
 better GUESS, not independent evidence, so it's still flagged for manual
 confirmation exactly like any other zero-hint Tier 2 result.
+
+Tier 1 also runs for a row with a genuinely numbered address_1 (its own
+leading house number - see leading_house_number) but no postcode yet -
+not just the original "both present" case. Confirmed real gap: once
+_building_identity_matches' own bare-street-reference tier (brochure_
+enrichment.py) backfills address_1 from a bare street building name (e.g.
+"Clerkenwell Road") to a real numbered address ("67 Clerkenwell Rd") via
+the row's own linked brochure, the row could still never get real
+coordinates at all - Tier 1 used to refuse to even attempt a lookup
+without a postcode already on file, and Tier 2 only ever reads row.
+building (unchanged, still the bare street name), never address_1.
+Deliberately gated on address_1's own leading house number specifically -
+a bare address_1 with no number of its own has no more identifying power
+than the bare-street building case Tier 2 already exists to handle
+cautiously, and shouldn't bypass it. On success, row.postcode is filled
+in via a reverse-geocode of the now-trusted coordinates (see
+_backfill_postcode_via_reverse_geocode below) - the same proven,
+already-tested primitives (call_reverse_geocoding_api/_address_line1_
+and_postcode/_postcode_hint_conflicts) Tier 2's own success path already
+relies on for exactly this, reused rather than duplicated, though kept as
+its own small helper rather than forcing Tier 2's own tightly-coupled
+address_1+postcode+submarket block (a single reverse-geocode call feeding
+all three at once) to share it - Tier 1 already has address_1 and gets
+submarket filled by the same _backfill_submarket_from_coords call its
+original branch already makes, so it only ever needs postcode from this.
 """
 
 import json
@@ -868,6 +893,49 @@ def _is_bare_street_reference(row: ListingRow) -> bool:
     return last_word in _RELIABLE_STREET_SUFFIX_WORDS
 
 
+def _backfill_postcode_via_reverse_geocode(row: ListingRow, source_hint: dict) -> None:
+    """
+    Fills row.postcode (only) from a reverse-geocode of row's own already-
+    accepted, trusted lat/lng - built from the same proven primitives
+    Tier 2's own success path already relies on for this exact purpose
+    (call_reverse_geocoding_api/_address_line1_and_postcode/_postcode_
+    hint_conflicts), reused here rather than a second, differently-tuned
+    implementation. Used by Tier 1's own relaxed "address_1 has a house
+    number but no postcode yet" path (see geocode_row) - deliberately its
+    own small helper rather than forcing Tier 2's own block to share it:
+    that block is a single reverse-geocode call feeding address_1,
+    postcode, AND submarket all at once (see its own comment), which this
+    caller doesn't need - it already has address_1, and submarket is
+    already handled by the same _backfill_submarket_from_coords call
+    Tier 1's own branch already makes right after this.
+
+    A no-op whenever row.postcode is already present (never overwrites a
+    real value, including one this same call might have just set on an
+    earlier pass), the reverse-geocode itself fails, or it returns nothing
+    postcode-shaped. Same validation as Tier 2's own version: a reverse-
+    geocoded postcode that contradicts `source_hint` (see _postcode_hint_
+    conflicts) is logged and left blank rather than written - the
+    coordinate itself is untouched either way, since it already passed
+    its own acceptance check before this ever runs.
+    """
+    if row.postcode:
+        return
+    reverse = call_reverse_geocoding_api(row.lat, row.lng)
+    if reverse["status"] != "OK":
+        return
+    _, postcode = _address_line1_and_postcode(reverse.get("address_components", []), name_key="long_name")
+    if not postcode:
+        return
+    if _postcode_hint_conflicts(source_hint, postcode):
+        log_geocode_failure(
+            row,
+            f"reverse-geocode postcode {postcode!r} contradicts source location "
+            f"evidence ({_hint_label(source_hint)!r}) - postcode left blank",
+        )
+        return
+    row.postcode = postcode
+
+
 def geocode_row(row: ListingRow) -> ListingRow:
     # Already has real coordinates (e.g. a provider spreadsheet's own Lat/Lng
     # columns, mapped straight through by extract_spreadsheet.py) - calling
@@ -895,6 +963,33 @@ def geocode_row(row: ListingRow) -> ListingRow:
             # real warning), but False is a real, positive value that DOES
             # overwrite a stale True.
             row.geocode_unverified = False
+            _backfill_submarket_from_coords(row, row.lat, row.lng)
+            return row
+        # fall through to Places if Geocoding fails despite having an address
+    elif row.address_1 and leading_house_number(row.address_1) is not None:
+        # address_1 has its own house number - a genuinely specific,
+        # numbered address, not a bare street reference - but no postcode
+        # yet, e.g. a row whose address_1 was just backfilled from its own
+        # brochure (see _building_identity_matches' own bare-street-
+        # reference tier in brochure_enrichment.py) from a source document
+        # that itself never states one. Deliberately gated on address_1's
+        # own leading house number specifically, not merely "address_1 is
+        # non-blank" - a bare address_1 with no number has no more
+        # identifying power than the bare-street BUILDING case Tier 2
+        # already exists to handle cautiously (see _is_bare_street_
+        # reference below), and must still go through that path unchanged,
+        # never this one.
+        query = f"{row.address_1}, London, UK"
+        result = call_geocoding_api(query)
+        if result["status"] == "OK":
+            row.lat = result["lat"]
+            row.lng = result["lng"]
+            # Same explicit-False reasoning as the branch above - a
+            # genuinely numbered address resolving via the Geocoding API
+            # is real, corroborated evidence, same confidence level as the
+            # "postcode already on file" case, not a weaker guess.
+            row.geocode_unverified = False
+            _backfill_postcode_via_reverse_geocode(row, _source_location_hint(row))
             _backfill_submarket_from_coords(row, row.lat, row.lng)
             return row
         # fall through to Places if Geocoding fails despite having an address

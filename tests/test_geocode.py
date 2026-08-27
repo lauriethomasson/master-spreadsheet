@@ -1221,5 +1221,151 @@ class StreetNameConflictTests(unittest.TestCase):
         self.assertEqual(row.lng, -0.0873)
 
 
+class Tier1AddressWithoutPostcodeTests(unittest.TestCase):
+    """
+    Regression coverage for geocode_row's own relaxed Tier 1 branch (see
+    the module docstring's own "Tier 1 also runs for a row with a
+    genuinely numbered address_1... but no postcode yet" paragraph) -
+    confirmed real gap: once _building_identity_matches' own bare-street-
+    reference tier (brochure_enrichment.py) backfills a row's address_1
+    from a bare street building name ("Clerkenwell Road") to a real
+    numbered address ("67 Clerkenwell Rd") via its own linked brochure,
+    the row could still never get real coordinates at all - the original
+    Tier 1 refused to even attempt a lookup without a postcode already on
+    file, and Tier 2 only ever reads row.building (still the bare street
+    name), never address_1. Verified directly against the real Google
+    Geocoding API with this exact real address: resolves to
+    lat=51.5219197, lng=-0.1077003, postcode="EC1R 5BL".
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_numbered_address_1_with_no_postcode_resolves_and_backfills_postcode(self):
+        # submarket is set so _backfill_submarket_from_coords (called
+        # right after, unrelated to this test's own point) doesn't ALSO
+        # make its own independent reverse-geocode call for its own
+        # purposes (see that function's own docstring) - keeps the
+        # reverse-geocode assertion below isolated to this fix's own
+        # postcode-backfill call specifically.
+        row = ListingRow(
+            building="Clerkenwell Road", address_1="67 Clerkenwell Rd", provider="MetSpace",
+            submarket="Clerkenwell",
+        )
+        components = [
+            {"long_name": "67", "types": ["street_number"]},
+            {"long_name": "Clerkenwell Road", "types": ["route"]},
+            {"long_name": "EC1R 5BL", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5219197, "lng": -0.1077003},
+        ) as mock_geocoding, patch(
+            "geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components},
+        ) as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_geocoding.assert_called_once_with("67 Clerkenwell Rd, London, UK")
+        mock_reverse.assert_called_once_with(51.5219197, -0.1077003)
+        self.assertEqual(row.lat, 51.5219197)
+        self.assertEqual(row.lng, -0.1077003)
+        self.assertEqual(row.postcode, "EC1R 5BL")
+        # Real, corroborated evidence on a specific numbered address - same
+        # confidence level the "postcode already on file" branch already
+        # gets, not a weaker zero-hint guess.
+        self.assertIs(row.geocode_unverified, False)
+
+    def test_reverse_geocode_failure_still_leaves_the_coordinate_and_just_skips_postcode(self):
+        row = ListingRow(building="Clerkenwell Road", address_1="67 Clerkenwell Rd")
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.52, "lng": -0.1},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.52)
+        self.assertEqual(row.lng, -0.1)
+        self.assertIsNone(row.postcode)
+        self.assertIs(row.geocode_unverified, False)
+
+    def test_reverse_geocoded_postcode_contradicting_source_evidence_is_left_blank(self):
+        # Same _postcode_hint_conflicts validation Tier 2's own success
+        # path already relies on - a reverse-geocoded postcode that
+        # disagrees with a trailing postcode-district token already on
+        # row.building must never be written over that real evidence.
+        row = ListingRow(building="67 Clerkenwell Rd EC1V", address_1="67 Clerkenwell Rd")
+        components = [{"long_name": "W1S 2ER", "types": ["postal_code"]}]
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.52, "lng": -0.1},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "OK", "address_components": components}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.52)
+        self.assertIsNone(row.postcode)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("contradicts source location", geocode.FAILURES[0]["reason"])
+
+    def test_bare_address_1_with_no_house_number_never_triggers_the_relaxed_path(self):
+        # address_1 with no house number of its own has no more
+        # identifying power than the bare-street BUILDING case Tier 2
+        # already exists to handle cautiously - must fall through to that
+        # existing path unchanged, never attempt Tier 1 at all.
+        row = ListingRow(building="Clerkenwell Road", address_1="Clerkenwell Road")
+
+        with patch("geocode.call_geocoding_api") as mock_geocoding, \
+             patch("geocode.call_places_text_search") as mock_places:
+            geocode.geocode_row(row)
+
+        mock_geocoding.assert_not_called()
+        # Falls all the way through to _is_bare_street_reference's own
+        # skip - row.building is still a bare street reference too, so
+        # Tier 2 never queries Places either.
+        mock_places.assert_not_called()
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.postcode)
+
+    def test_address_1_and_postcode_both_already_present_is_completely_unchanged(self):
+        # The ORIGINAL Tier 1 branch - both fields already present - must
+        # be untouched by this change: same query shape, same single
+        # call_geocoding_api call, no reverse-geocode attempted for
+        # address/postcode (nothing missing to backfill there). submarket
+        # is set so _backfill_submarket_from_coords doesn't make its own
+        # independent reverse-geocode call for its own, unrelated purpose
+        # (see that function's own docstring) - keeps this assertion
+        # isolated to whether THIS fix changed the original branch.
+        row = ListingRow(
+            building="Clerkenwell Road", address_1="67 Clerkenwell Rd", postcode="EC1R 5BL",
+            submarket="Clerkenwell",
+        )
+
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "OK", "lat": 51.5219197, "lng": -0.1077003},
+        ) as mock_geocoding, patch("geocode.call_reverse_geocoding_api") as mock_reverse:
+            geocode.geocode_row(row)
+
+        mock_geocoding.assert_called_once_with("67 Clerkenwell Rd, EC1R 5BL, UK")
+        mock_reverse.assert_not_called()
+        self.assertEqual(row.lat, 51.5219197)
+        self.assertEqual(row.postcode, "EC1R 5BL")
+        self.assertIs(row.geocode_unverified, False)
+
+    def test_geocoding_api_failure_on_the_relaxed_path_falls_through_to_tier_2(self):
+        # Same "fall through to Places if Geocoding fails" principle the
+        # original branch already documents - a genuinely numbered
+        # address_1 whose Tier 1 attempt fails must still get a Tier 2
+        # attempt, exactly like the original branch already gets. Uses a
+        # building WITHOUT a trailing street-suffix word so it isn't
+        # caught by _is_bare_street_reference's own skip, confirming Tier
+        # 2 genuinely runs (not just "correctly skipped again").
+        row = ListingRow(building="Kent House", address_1="67 Clerkenwell Rd")
+
+        with patch("geocode.call_geocoding_api", return_value={"status": "ZERO_RESULTS"}), \
+             patch("geocode.call_places_text_search", return_value={"status": "ZERO_RESULTS"}) as mock_places:
+            geocode.geocode_row(row)
+
+        mock_places.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()
