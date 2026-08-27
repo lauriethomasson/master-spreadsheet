@@ -2770,6 +2770,68 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         )
         self.assertEqual(indices, [])
 
+    def test_tier_5_bare_street_reference_matches_its_own_numbered_building(self):
+        # Real confirmed case: a MetSpace email listing's only location
+        # text was "Clerkenwell Road" (no house number, no building name -
+        # extract_email.py correctly extracted it as such), but its own
+        # uniquely-linked brochure states the real numbered building "67
+        # Clerkenwell Road" - tiers 1-4 can never bridge this (tier 4b
+        # requires row_building's OWN house number to corroborate with,
+        # which a bare street reference has none of).
+        indices = brochure_enrichment._building_identity_matches("Clerkenwell Road", ["67 Clerkenwell Road"])
+        self.assertEqual(indices, [0])
+
+    def test_tier_5_rejects_two_different_numbered_buildings_on_the_same_street(self):
+        # A portfolio brochure spanning one street - two GENUINELY
+        # different real buildings, both on Clerkenwell Road - must stay
+        # unresolved, same "wrong guess is worse than blank" rule every
+        # other tier already follows.
+        indices = brochure_enrichment._building_identity_matches(
+            "Clerkenwell Road", ["67 Clerkenwell Road", "82 Clerkenwell Road"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_tier_5_never_fires_when_row_building_has_its_own_house_number(self):
+        # row_building already states its own house number - not a bare
+        # street reference at all, so this must go through the existing
+        # tiers only, completely unchanged. "44 Clerkenwell Road" is a
+        # DIFFERENT real building from "67 Clerkenwell Road" - tier 5
+        # firing here (ignoring the disagreeing house numbers) would be a
+        # real, dangerous regression, not just an unnecessary path.
+        indices = brochure_enrichment._building_identity_matches("44 Clerkenwell Road", ["67 Clerkenwell Road"])
+        self.assertEqual(indices, [])
+
+    def test_tier_5_accepts_several_floors_of_the_same_numbered_building(self):
+        # Several units of the SAME real building (its own several floors,
+        # each independently restating "67 Clerkenwell Road") is the
+        # expected case, not an ambiguity - same _distinct_building_group
+        # allowance tier 4 already has.
+        indices = brochure_enrichment._building_identity_matches(
+            "Clerkenwell Road", ["67 Clerkenwell Road", "67 Clerkenwell Road"],
+        )
+        self.assertEqual(indices, [0, 1])
+
+    def test_tier_5_requires_the_full_street_name_not_just_a_partial_overlap(self):
+        # "Clerkenwell" ({"clerkenwell"}) must never equal "67 Clerkenwell
+        # Road" ({"clerkenwell", "road"}) - an extra word (never stripped
+        # by _street_name_words, which only drops digit/range-connector
+        # tokens, not a genuine street-suffix word) is real evidence of a
+        # more specific, different street reference, not the same one
+        # loosely restated. ("Kings"/"Kings Road" isn't usable for this
+        # case - tier 3's own trailing-street-suffix-word stripping already
+        # resolves that pair before tier 5 is ever reached; "Clerkenwell"
+        # has only one word, so tier 3's own len>1 guard leaves it
+        # untouched, genuinely reaching tier 5.)
+        indices = brochure_enrichment._building_identity_matches("Clerkenwell", ["67 Clerkenwell Road"])
+        self.assertEqual(indices, [])
+
+    def test_tier_5_available_even_with_no_address_data_at_all(self):
+        # Unlike tier 4, tier 5 never reads candidate_addresses - a
+        # building_features-shaped caller (candidate_addresses=None, see
+        # MatchBuildingFeatureTests) must still benefit from it.
+        indices = brochure_enrichment._building_identity_matches("Clerkenwell Road", ["67 Clerkenwell Road"], None)
+        self.assertEqual(indices, [0])
+
 
 class MatchBuildingFeatureTests(unittest.TestCase):
     """_match_building_feature - the building-level (level B) counterpart
@@ -6176,6 +6238,41 @@ class RegeocodeRowsWithNewlyBackfilledAddressesTests(unittest.TestCase):
             brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
 
         mock_geocoding.assert_called_once()
+
+    def test_bare_street_building_row_triggers_a_regeocode_attempt_even_though_it_cant_yet_resolve(self):
+        # Real confirmed case: a MetSpace email row whose only location
+        # text was "Clerkenwell Road" (bare street, no house number - see
+        # _building_identity_matches' own tier 5) gets address_1 backfilled
+        # to "67 Clerkenwell Rd" from its own brochure, but that SAME
+        # brochure states no postcode for this floor - postcode stays
+        # blank even after enrichment. This function's own trigger still
+        # correctly fires (address_1 went from blank to genuinely non-
+        # placeholder), calling geocode_row exactly as designed - but
+        # geocode_row's own Tier 1 requires BOTH address_1 AND postcode
+        # (never attempted here), and Tier 2 only ever reads row.building
+        # (still the unchanged bare "Clerkenwell Road", so _is_bare_
+        # street_reference still skips it too) - row.address_1 itself is
+        # never consulted by Tier 2 at all. Confirmed directly against the
+        # real brochure: lat/lng/postcode all stay blank even after a
+        # genuine, correct address_1 backfill - a real, separate gap in
+        # geocode_row's own address usage, distinct from (and not fixed
+        # by) the building-matching tier 5 fix this test file's own
+        # BuildingIdentityMatchesTests covers.
+        original = self._row(building="Clerkenwell Road")
+        enriched = self._row(building="Clerkenwell Road", address_1="67 Clerkenwell Rd")
+
+        with patch("geocode.call_geocoding_api") as mock_geocoding_api, \
+             patch("geocode.call_places_text_search") as mock_places:
+            brochure_enrichment._regeocode_rows_with_newly_backfilled_addresses([original], [enriched])
+
+        # Tier 1 never even attempted (no postcode to pair address_1 with).
+        mock_geocoding_api.assert_not_called()
+        # Tier 2 never attempted either - _is_bare_street_reference still
+        # sees row.building itself as an unresolvable bare street.
+        mock_places.assert_not_called()
+        self.assertIsNone(enriched.lat)
+        self.assertIsNone(enriched.lng)
+        self.assertIsNone(enriched.postcode)
 
     def test_placeholder_to_real_address_transition_triggers_a_regeocode(self):
         # The confirmed real "Nineteen Wells St" shape: address_1 wasn't

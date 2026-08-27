@@ -134,7 +134,7 @@ from brochure_link_resolver import (
 )
 import geocode
 from house_number import leading_house_number
-from master_merge import normalize_key
+from master_merge import _STREET_SUFFIX_EXPANSIONS, normalize_key
 from schema import ListingRow
 from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
 
@@ -909,6 +909,34 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        all - a real building-name match is always more specific evidence
        than a cross-field address match, so tier 4 never competes with or
        overrides one.
+    5. BARE STREET REFERENCE (row_building has no leading house number of
+       its own AT ALL - see house_number.leading_house_number). Confirmed
+       real gap: a MetSpace email listing whose only location text was
+       "Clerkenwell Road" (no house number, no building name) never
+       matched its own uniquely-linked brochure's real numbered building
+       ("67 Clerkenwell Road") - tier 4b's own sub-tier requires row_
+       building's OWN leading house number to corroborate a candidate
+       address's, which a genuinely bare street reference has none of, by
+       definition, to corroborate WITH. Compares STREET-NAME WORD SETS
+       (_expanded_street_name_words, defined below - builds on the same
+       word-overlap corroboration _address_conflict_note already uses
+       elsewhere in this file, PLUS street-suffix-abbreviation expansion -
+       a real brochure's own Gemini extraction routinely abbreviates "67
+       Clerkenwell Rd" even when the row's own source spells it in full)
+       against candidate_buildings itself (never candidate_addresses - a
+       brochure's own extracted unit "building" text is exactly where a
+       real numbered name like "67 Clerkenwell Road" actually shows up),
+       requiring EXACT set equality, not mere overlap - "Kings" ({"kings"})
+       must never equal "Kings Road" ({"kings", "road"}), an extra word is
+       real evidence of a more specific, different street reference. Same
+       _distinct_building_group
+       uniqueness guard as tier 4: two DIFFERENT numbered buildings on the
+       same street among the candidates stays unresolved, never guessed.
+       Available regardless of whether candidate_addresses was even
+       provided at all - unlike tier 4, this tier never reads it. Tried
+       strictly last (weakest evidence: a bare street name alone identifies
+       a specific building only when there's exactly one on it among the
+       candidates).
 
     Returns [] when row_building has no genuine key at all (blank/
     whitespace-only).
@@ -938,28 +966,78 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     if len(street_suffix) == 1:
         return street_suffix
 
-    if candidate_addresses is None:
-        return []
-
-    addr_exact = _distinct_building_group(
-        [i for i, a in enumerate(candidate_addresses) if normalize_key(a) == row_key],
-        candidate_buildings,
-    )
-    if addr_exact:
-        return addr_exact
-
     row_house_number = leading_house_number(row_building)
+
+    if candidate_addresses is not None:
+        addr_exact = _distinct_building_group(
+            [i for i, a in enumerate(candidate_addresses) if normalize_key(a) == row_key],
+            candidate_buildings,
+        )
+        if addr_exact:
+            return addr_exact
+
+        if row_house_number is not None:
+            addr_street_suffix = _distinct_building_group(
+                [
+                    i for i, a in enumerate(candidate_addresses)
+                    if _strip_trailing_street_suffix_word(normalize_key(a)) == row_street_key
+                    and leading_house_number(a) == row_house_number
+                ],
+                candidate_buildings,
+            )
+            if addr_street_suffix:
+                return addr_street_suffix
+
     if row_house_number is None:
-        return []
-    addr_street_suffix = _distinct_building_group(
-        [
-            i for i, a in enumerate(candidate_addresses)
-            if _strip_trailing_street_suffix_word(normalize_key(a)) == row_street_key
-            and leading_house_number(a) == row_house_number
-        ],
-        candidate_buildings,
-    )
-    return addr_street_suffix
+        # 5. BARE STREET REFERENCE (row_building has no house number of its
+        #    own at all). Confirmed real gap: a MetSpace email listing
+        #    whose only location text was "Clerkenwell Road" (no house
+        #    number, no building name - see extract_email.py's own
+        #    extraction) never matched its own uniquely-linked brochure
+        #    ("67 Clerkenwell Rd - 4th Floor - Brochure.pdf", building
+        #    "67 Clerkenwell Road" once Gemini extracts it) - address_1/
+        #    postcode/lat/lng all stayed blank, even though the real
+        #    numbered address was sitting right there in the one document
+        #    this row points to. Tier 4b above can never bridge this shape
+        #    at all: it requires row_building's OWN leading house number to
+        #    corroborate a candidate address's (see its own comment) -
+        #    there's nothing here to corroborate WITH by definition.
+        #
+        #    Compares STREET-NAME WORD SETS (_street_name_words - the same
+        #    word-overlap corroboration _address_conflict_note already uses
+        #    elsewhere in this file, which already drops a pure-digit token
+        #    like a leading house number) against candidate_buildings
+        #    itself, not candidate_addresses - a brochure's own extracted
+        #    unit "building" text is exactly where a real numbered name
+        #    like "67 Clerkenwell Road" actually shows up. "Clerkenwell
+        #    Road" -> {"clerkenwell", "road"} equals "67 Clerkenwell Road"
+        #    -> {"clerkenwell", "road"} (its own "67" already dropped) -
+        #    genuinely the same street, not just a coincidental prefix.
+        #    Deliberately EXACT set equality, not mere overlap - "Kings" ->
+        #    {"kings"} must never equal "Kings Road" -> {"kings", "road"},
+        #    an extra word is real evidence of a DIFFERENT, more specific
+        #    street reference, not the same one loosely restated. Uses
+        #    _expanded_street_name_words, not the bare _street_name_words -
+        #    a real brochure's own Gemini-extracted text routinely
+        #    abbreviates the street-suffix word ("67 Clerkenwell Rd") even
+        #    when the row's own source text spells it in full
+        #    ("Clerkenwell Road") or vice versa - see that function's own
+        #    docstring for the confirmed real case. Reuses
+        #    _distinct_building_group for the same uniqueness guard tier 4
+        #    already applies: two DIFFERENT numbered buildings on the same
+        #    street among the candidates (a portfolio brochure spanning one
+        #    street) stays unresolved, never guessed - only a SINGLE
+        #    distinct building sharing this exact street-word set is ever
+        #    accepted. Available regardless of whether candidate_addresses
+        #    was even provided (unlike tier 4) - this tier never reads it.
+        row_street_words = _expanded_street_name_words(row_building)
+        if row_street_words:
+            return _distinct_building_group(
+                [i for i, c in enumerate(candidate_buildings) if _expanded_street_name_words(c) == row_street_words],
+                candidate_buildings,
+            )
+
+    return []
 
 
 def needs_enrichment(row: ListingRow) -> bool:
@@ -2473,12 +2551,34 @@ def _street_name_words(address: str) -> frozenset:
     (a house number, or the second half of a word-form range like "1 to
     5") and range-connector word (_ADDRESS_RANGE_CONNECTOR_WORDS) removed
     - leaving just the street-name text itself, independent of exactly how
-    a leading house number/range happens to be phrased. Used only for the
-    word-overlap half of _address_conflict_note's own comparison; the
+    a leading house number/range happens to be phrased. Used for the
+    word-overlap half of _address_conflict_note's own comparison (the
     house-number half is handled separately, via house_number.leading_
-    house_number, never by this function."""
+    house_number, never by this function) and, expanded further via
+    _expanded_street_name_words below, _building_identity_matches' own
+    tier 5."""
     words = normalize_key(address).split()
     return frozenset(w for w in words if w not in _ADDRESS_RANGE_CONNECTOR_WORDS and not w.isdigit())
+
+
+def _expanded_street_name_words(text: str) -> frozenset:
+    """
+    _street_name_words(text) with every standalone street-suffix
+    abbreviation (see master_merge._STREET_SUFFIX_EXPANSIONS - "rd" ->
+    "road", "st" -> "street", ...) expanded to its full form - used only
+    by _building_identity_matches' own tier 5 (bare street reference),
+    never by _address_conflict_note (that function's own comparison is
+    deliberately left exactly as it already is - this is a new, narrower
+    use, not a behavior change to an existing one).
+
+    Confirmed real gap this closes: a real MetSpace brochure's own
+    Gemini-extracted unit states its building as "67 Clerkenwell Rd" (the
+    abbreviated form) while the source email's own bare-street reference
+    is written out in full ("Clerkenwell Road") - without expansion,
+    {"clerkenwell", "rd"} would never equal {"clerkenwell", "road"}, and
+    tier 5 would never fire for the exact real case it exists for.
+    """
+    return frozenset(_STREET_SUFFIX_EXPANSIONS.get(w, w) for w in _street_name_words(text))
 
 
 def _address_conflict_note(file_address, brochure_address):
