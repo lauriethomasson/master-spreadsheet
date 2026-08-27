@@ -24,7 +24,7 @@ from display_utils import LONDON_TZ
 from gemini_client import QuotaExceededError
 import geocode
 from geocode import geocode_rows
-from master_merge import canonicalize_providers, normalize_key
+from master_merge import RISKY_TEXT_FIELDS, canonicalize_providers, draft_merge_text, normalize_key, richest_listing_index
 from schema import ListingRow
 from storage.file_store import (
     dataframe_to_listing_rows,
@@ -218,6 +218,149 @@ def fill_missing_address_from_building(rows: list[ListingRow], apply_building_fa
             continue
         if row.building and _ADDRESS_LIKE_RE.search(row.building):
             row.address_1 = row.building
+
+
+# At least this fraction of the SMALLER of two header-mapped sheets' own
+# rows must share an identity with the OTHER sheet before _rows_dropped_
+# as_duplicate_sheet_extractions treats them as duplicative at all - see
+# that function's own docstring for why this is deliberately a large-
+# majority-overlap signal, not a per-row one.
+_SHEET_OVERLAP_DUPLICATE_THRESHOLD = 0.5
+
+
+def _row_identity_key(row: ListingRow):
+    """(building, floor_unit) normalize_key-tolerant identity - the signal
+    _rows_dropped_as_duplicate_sheet_extractions uses to compare two
+    header-mapped sheets in the same uploaded file for real content
+    overlap. None (never groupable) for a row with no building at all -
+    normalize_key("") is already falsy, but spelled out here so two blank-
+    building rows are never treated as sharing an identity purely from
+    both being blank."""
+    building_key = normalize_key(row.building)
+    if not building_key:
+        return None
+    return building_key, normalize_key(row.floor_unit)
+
+
+def _rows_dropped_as_duplicate_sheet_extractions(header_mapped_sheets: list) -> set:
+    """
+    id()s of rows to drop as redundant re-extractions of the SAME real
+    listing from ANOTHER header-mapped sheet in this same uploaded file.
+
+    Confirmed real case: a real Kitt's "Kitts_Availability_External.xlsx"
+    has two sheets - "Source_Availability" (950 rows, pulling live from a
+    Google Sheet via IMPORTRANGE formulas, an internal working tracker)
+    and "Live Availability" (1000 rows, clean static values, the polished
+    published-for-external-use view) - that independently list the exact
+    same real units. Every sheet in a multi-sheet workbook is already
+    processed unconditionally and independently (see the Extract loop
+    above - deliberately so, a real Copthall Estates file genuinely has 4
+    different-area sheets that must all merge), so both Kitt's sheets got
+    extracted as if they were separate real data, producing two rows per
+    shared unit. For most of that file's own real units this went
+    completely unnoticed - both sheets' own text happened to be byte-
+    identical, so the two rows silently matched with no visible conflict
+    at Review & Master's own intra-batch duplicate-detection stage (see
+    master_merge._group_unmatched_duplicates) - but "8 Laurence Pountney
+    Hill" had a real difference (one sheet's own "Space video" cell has a
+    genuine embedded YouTube hyperlink, the other doesn't), which
+    correctly, but unnecessarily, tripped that same stage's "possible
+    duplicate listings, can't safely tell" human-review card - unnecessary
+    because these were never two independently-entered listings needing a
+    human's judgment call at all, just the SAME row counted twice by this
+    app's own sheet processing.
+
+    Deliberately a SHEET-vs-SHEET overlap signal, not a per-row one - a
+    single coincidentally-shared (building, floor_unit) pair between two
+    otherwise-unrelated sheets is nowhere near enough evidence the SHEETS
+    themselves are duplicative (that's exactly what master_merge's own
+    row-level duplicate detection already exists to judge safely, case by
+    case - see _SHEET_OVERLAP_DUPLICATE_THRESHOLD), so this only ever acts
+    when a large majority of one sheet's own rows are also found on
+    another - strong, structural evidence the two sheets describe the same
+    underlying data, not just two listings that happen to share an
+    address. A real Copthall Estates file (4 genuinely different per-area
+    sheets: City, Mid Town, Westend Soho, Blackfriars) has NO cross-sheet
+    overlap at all under this signal, since each sheet covers different
+    buildings - a pure no-op for it, same as for any other multi-sheet
+    file whose sheets genuinely aren't duplicates of each other.
+    Deliberately NOT a sheet-NAME heuristic (e.g. preferring a sheet named
+    "Live"/"External" over "Source") - naming conventions are provider-
+    specific and won't generalize; actual row overlap does.
+
+    Only ever compares header-mapped sheets against each other, never
+    against a Gemini-fallback sheet - a repeating-block layout (e.g. the
+    real Copthall "Portfolio" rollup tab) is a structurally different kind
+    of duplicate risk already handled by is_non_authoritative_rollup_
+    sheet/classify_sheet_for_extraction upstream of this (see the Extract
+    loop's own unresolved branch).
+
+    For each pair of sheets whose overlap clears _SHEET_OVERLAP_DUPLICATE_
+    THRESHOLD, only the rows that ACTUALLY share an identity with the
+    other sheet are collapsed to one - the base row is whichever of the
+    two is richer (master_merge.richest_listing_index, the same tie-break
+    the Review & Master page's own "Same listing — merge" choice already
+    trusts, reused here rather than a second, separately-invented one),
+    but every RISKY_TEXT_FIELDS field (special_features, contacts) that
+    genuinely differs between the two is combined via master_merge.
+    draft_merge_text FIRST and written onto that base row, exactly like a
+    reviewer's own "merge" choice would produce - never silently dropped
+    by richest_listing_index alone, which only ever weighs _LISTING_
+    DIFFERENCE_FIELDS (size/desks/rent) and has no notion of free text at
+    all. This is what actually closes the confirmed 8 Laurence Pountney
+    Hill case: richness alone ties (identical size/rent on both sheets),
+    so without this, which sheet's own special_features text happened to
+    survive would be arbitrary - draft_merge_text's own "uncleaned
+    concatenation, never assumed final" caveat (see its own docstring) is
+    a non-issue here specifically, since two sheets independently re-
+    extracting the SAME source document are never a genuine two-sided
+    disagreement the way two DIFFERENT providers' own listings could be -
+    one side simply has strictly more text than the other (e.g. an
+    embedded hyperlink one extraction pass happened to pick up), so
+    joining them is lossless, not a values judgment a human still needs to
+    make. A row with no counterpart on the other sheet is real, non-
+    redundant data either way and is never touched, even between two
+    sheets confidently judged duplicative overall.
+    """
+    if len(header_mapped_sheets) < 2:
+        return set()
+
+    dropped_ids = set()
+    for i in range(len(header_mapped_sheets)):
+        for j in range(i + 1, len(header_mapped_sheets)):
+            sheet_a, sheet_b = header_mapped_sheets[i], header_mapped_sheets[j]
+            if not sheet_a or not sheet_b:
+                continue
+
+            keys_a = {_row_identity_key(r) for r in sheet_a} - {None}
+            keys_b = {_row_identity_key(r) for r in sheet_b} - {None}
+            shared_keys = keys_a & keys_b
+            if not shared_keys:
+                continue
+
+            overlap_ratio = len(shared_keys) / min(len(sheet_a), len(sheet_b))
+            if overlap_ratio < _SHEET_OVERLAP_DUPLICATE_THRESHOLD:
+                continue
+
+            rows_by_key_a, rows_by_key_b = {}, {}
+            for r in sheet_a:
+                rows_by_key_a.setdefault(_row_identity_key(r), []).append(r)
+            for r in sheet_b:
+                rows_by_key_b.setdefault(_row_identity_key(r), []).append(r)
+
+            for key in shared_keys:
+                candidates = rows_by_key_a[key] + rows_by_key_b[key]
+                if len(candidates) < 2:
+                    continue
+                dicts = [r.model_dump() for r in candidates]
+                keep_row = candidates[richest_listing_index(dicts)]
+                for field in RISKY_TEXT_FIELDS:
+                    merged = draft_merge_text([d.get(field) for d in dicts])
+                    if merged:
+                        setattr(keep_row, field, merged)
+                dropped_ids.update(id(r) for r in candidates if r is not keep_row)
+
+    return dropped_ids
 
 
 def _run_automatic_brochure_enrichment(
@@ -701,12 +844,22 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
     from_png_pages's own page_links param) is trusted by LABEL alone up
     to this point, never by having actually been fetched - this is where
     that happens, reusing brochure_enrichment._fetch_pdf_bytes wholesale
-    (the exact same real-document check, and direct-vs-landing-page-scan
-    precedence, any other brochure_link fetch already uses) rather than
-    a second, differently-tuned validation. A link that fails - a real
-    page but blocked to a plain fetch, a dead link, anything that
-    doesn't resolve to real document bytes - loses to the shared
-    document-level fallback link instead of staging a dead one.
+    (the exact same direct-vs-landing-page-scan precedence any other
+    brochure_link fetch already uses) rather than a second, differently-
+    tuned validation. A link that fails - blocked to a plain fetch, a dead
+    link, anything that doesn't even resolve to a live response - loses to
+    the shared document-level fallback link instead of staging a dead one.
+
+    accept_any_reachable_page=True (see _looks_like_fetchable_document's
+    own docstring) - this call only needs to confirm the link is genuinely
+    reachable, never that it's literally a PDF/image: the extraction
+    PROMPT's own brochure_link instructions already treat a real per-unit
+    listing webpage (not just a document URL) as valid, so requiring an
+    actually-fetchable DOCUMENT here was strictly narrower than what was
+    ever extracted, and confirmed to silently discard a genuine, live
+    per-unit link (a real colliers.com listing page) in favor of the
+    shared fallback purely for not being a PDF. The bytes themselves are
+    never used below - only whether the fetch returned None at all.
 
     A row whose brochure_link already equals shared_fallback_link never
     had a genuine per-unit pick at all (see finalize_brochure_link's own
@@ -719,7 +872,7 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
     for row in rows:
         if not row.brochure_link or row.brochure_link == shared_fallback_link or row.brochure_link_is_floorplan:
             continue
-        if brochure_enrichment._fetch_pdf_bytes(row.brochure_link) is None:
+        if brochure_enrichment._fetch_pdf_bytes(row.brochure_link, accept_any_reachable_page=True) is None:
             row.brochure_link = shared_fallback_link
 
 
@@ -1116,6 +1269,13 @@ with page_setup.setup_page("upload"):
                         rows = []
                         header_mapped_rows = []
                         gemini_rows = []
+                        # Same rows already being accumulated into header_
+                        # mapped_rows above, ALSO kept grouped per sheet -
+                        # never a second extraction - so the redundant-sheet
+                        # overlap check below (_rows_dropped_as_duplicate_
+                        # sheet_extractions) can compare one sheet's own
+                        # rows against another's.
+                        header_mapped_sheets = []
                         # sheet_plans (see _scan_spreadsheet_sheets) was
                         # already computed above, before Extract was even
                         # clickable, for the ambiguous-sheet decision UI - the
@@ -1186,10 +1346,29 @@ with page_setup.setup_page("upload"):
                                 sheet_rows = extract_spreadsheet.build_rows(df, mapping, source_file=sheet_label)
                                 fill_missing_submarket_from_structural_header(sheet_rows, headers, uploaded_file.name)
                                 header_mapped_rows.extend(sheet_rows)
+                                header_mapped_sheets.append(sheet_rows)
 
                             rows.extend(sheet_rows)
 
                         sheet_progress.empty()
+
+                        # Drops a row wherever it's a redundant re-
+                        # extraction of the SAME real listing from ANOTHER
+                        # header-mapped sheet in this same file - see
+                        # _rows_dropped_as_duplicate_sheet_extractions' own
+                        # docstring for the real confirmed Kitt's Kitts_
+                        # Availability_External.xlsx case. A no-op (empty
+                        # set) for the overwhelmingly common case of one
+                        # sheet, or several genuinely different-content
+                        # sheets (e.g. Copthall Estates' own 4 per-area
+                        # sheets) - filters both rows and header_mapped_rows
+                        # by identity so the dropped row's own object never
+                        # reaches geocoding/staging via EITHER list.
+                        dropped_ids = _rows_dropped_as_duplicate_sheet_extractions(header_mapped_sheets)
+                        if dropped_ids:
+                            rows = [r for r in rows if id(r) not in dropped_ids]
+                            header_mapped_rows = [r for r in header_mapped_rows if id(r) not in dropped_ids]
+
                         geocode_rows(rows)
                         # fill_missing_provider applies to EVERY spreadsheet
                         # row here, header-mapped or Gemini-fallback alike -
