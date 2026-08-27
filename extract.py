@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link
 from gemini_client import ResponseTruncatedError, call_gemini, compute_rent, get_client
+from master_merge import normalize_key
 from schema import ExtractedFields, ListingRow
 
 RENDER_DPI = 72
@@ -781,6 +782,50 @@ class _ExtractedRows(list):
     page_indices = None
 
 
+def _match_building_features(unit_building: str, building_features: list) -> str | None:
+    """
+    The building-wide features text (a plain str) confidently identified as
+    describing `unit_building`, or None - the extract.py counterpart to
+    brochure_enrichment.py's own _match_building_feature, used for the same
+    reason: a unit's own special_features (below) never repeats text the
+    prompt already asks Gemini to place at building_features instead (see
+    the extraction PROMPT's own building_features section) - it belongs
+    combined in, not lost.
+
+    Deliberately only the EXACT-match tier of brochure_enrichment.py's own
+    _building_identity_matches (normalize_key on both sides - case/
+    whitespace/punctuation-tolerant, never fuzzy), not its weaker address-
+    suffix-stripped tiers: those exist there specifically to bridge a row's
+    building name (e.g. typed into a landlord's own spreadheet, or matched
+    against a SEPARATELY fetched enrichment brochure) against a genuinely
+    different document's own spelling of it. Here, unit_building and
+    building_features both come from the exact same single Gemini call over
+    the exact same document, so that cross-document drift a stripped-suffix
+    tier is for doesn't apply - and reusing brochure_enrichment.py's own
+    function directly isn't possible without creating a circular import
+    (brochure_enrichment.py already imports extract.py).
+
+    Two or more entries matching the same normalized building name
+    (shouldn't occur - the prompt asks for one entry per distinct building -
+    but never assumed) is treated as ambiguous and returns None, same
+    "incorrect enrichment is worse than a blank field" policy as
+    brochure_enrichment.py's own version.
+    """
+    if not building_features:
+        return None
+    key = normalize_key(unit_building)
+    if not key:
+        return None
+    matches = [
+        bf.get("features") for bf in building_features
+        if isinstance(bf, dict) and normalize_key(bf.get("building")) == key
+    ]
+    if len(matches) != 1:
+        return None
+    features = matches[0]
+    return features if isinstance(features, str) and features.strip() else None
+
+
 def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[list[ListingRow], list]:
     """
     The raw Gemini JSON's own "units" (plus document-level provider/
@@ -859,6 +904,23 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
     is_bulk_upload = len(distinct_buildings) > 1 and not raw.get("development_name")
     effective_pdf_fallback_link = None if is_bulk_upload else pdf_fallback_link
 
+    # The prompt asks Gemini for building_features/property_features
+    # alongside every unit's own special_features (see the PROMPT's own
+    # building_features/property_features sections, above) - but unlike
+    # brochure_enrichment.py's equivalent combine (see its own enrich_row),
+    # nothing here previously read either back out, so this per-document
+    # descriptive text was extracted and then silently discarded for every
+    # PDF/Canva-sourced row. Confirmed via real Colliers master-spreadsheet
+    # data: a multi-page campus brochure's real per-building/per-property
+    # text never reached special_features at all, even though Gemini's own
+    # raw JSON response already had it. building_features/property_features
+    # themselves are read once here, outside the loop - both are document-
+    # level, identical for every unit.
+    building_features = raw.get("building_features") or []
+    property_features = raw.get("property_features")
+    if not (isinstance(property_features, str) and property_features.strip()):
+        property_features = None
+
     rows = []
     page_indices = []
     last_building = None
@@ -873,6 +935,22 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
                 continue
             unit["building"] = last_building
         last_building = unit["building"]
+
+        # Combined unconditionally, never gated on unit["special_features"]
+        # being blank - a short but genuinely non-blank per-unit value (e.g.
+        # "Cat A fit-out") must still pick up real building/property text
+        # alongside it, same never-gate-on-blank policy as brochure_
+        # enrichment.py's own combine (see its own enrich_row docstring for
+        # why: gating on blank alone would silently drop this text for
+        # every unit that already has SOME of its own, which is most units).
+        unit["special_features"] = "; ".join(
+            seg for seg in (
+                unit.get("special_features"),
+                _match_building_features(unit["building"], building_features),
+                property_features,
+            )
+            if isinstance(seg, str) and seg.strip()
+        ) or None
 
         page_index = unit.get(PAGE_INDEX_KEY)
         if not isinstance(page_index, int):

@@ -1089,5 +1089,114 @@ class ExtractFromPngPagesTests(unittest.TestCase):
         self.assertFalse(hasattr(rows, "page_indices"))
 
 
+class BuildingAndPropertyFeaturesMergeTests(unittest.TestCase):
+    """
+    _rows_from_raw now folds raw["building_features"]/raw["property_
+    features"] into each unit's own special_features (see _match_building_
+    features/_rows_from_raw's own combine, both in extract.py) - the
+    PDF/Canva-sourced counterpart to brochure_enrichment.py's own enrich_row
+    combine, which never runs for this source type at all (see app.py's own
+    is_spreadsheet_source/is_email_source gating - "Never for PDF... already
+    extracted from the actual brochure itself"). Confirmed real gap: a real
+    Colliers multi-page campus brochure's own per-building/per-property
+    descriptive text was extracted into raw["building_features"]/raw
+    ["property_features"] by Gemini and then silently discarded - neither
+    ever reached any row's special_features.
+    """
+
+    def _extract(self, raw):
+        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
+            return extract.extract(
+                Path("doc.pdf"), original_filename="doc.pdf", brochure_url="https://storage/doc.pdf",
+            )
+
+    def test_building_features_text_is_appended_to_matching_unit(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "building_features": [
+                {"building": "The Canal Building", "features": "original steel columns, exposed beams"},
+            ],
+            "units": [
+                {"building": "The Canal Building", "floor_unit": "1st Floor", "special_features": "Cat A fit-out"},
+                {"building": "The Mill", "floor_unit": "2nd Floor", "special_features": "Cat A fit-out"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].special_features, "Cat A fit-out; original steel columns, exposed beams")
+        # The Mill has no building_features entry of its own - unaffected.
+        self.assertEqual(rows[1].special_features, "Cat A fit-out")
+
+    def test_property_features_is_appended_to_every_unit(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "property_features": "WiredScore Platinum; 160 cycle spaces",
+            "units": [
+                {"building": "The Canal Building", "floor_unit": "1st Floor", "special_features": "Cat A fit-out"},
+                {"building": "The Mill", "floor_unit": "2nd Floor", "special_features": None},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].special_features, "Cat A fit-out; WiredScore Platinum; 160 cycle spaces")
+        self.assertEqual(rows[1].special_features, "WiredScore Platinum; 160 cycle spaces")
+
+    def test_short_but_non_blank_special_features_still_gets_building_and_property_text(self):
+        # The same "never gate on blank" trap already reasoned through for
+        # brochure_enrichment.py's own combine (see its enrich_row
+        # docstring) - a short, genuinely non-blank value must not skip
+        # this enrichment, only an actually-blank one would ever look
+        # exempt.
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "property_features": "BREEAM Excellent",
+            "building_features": [{"building": "The Mill", "features": "Grade II listed"}],
+            "units": [
+                {"building": "The Mill", "floor_unit": "3rd Floor", "special_features": "Lift access"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].special_features, "Lift access; Grade II listed; BREEAM Excellent")
+
+    def test_no_building_or_property_features_leaves_special_features_unaffected(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"building": "Henly House", "floor_unit": "1st Floor", "special_features": "2 meeting rooms"},
+                {"building": "Henly House", "floor_unit": "2nd Floor", "special_features": None},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].special_features, "2 meeting rooms")
+        self.assertIsNone(rows[1].special_features)
+
+    def test_building_name_matching_is_case_and_whitespace_tolerant(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "building_features": [{"building": " the canal building ", "features": "canalside frontage"}],
+            "units": [
+                {"building": "THE CANAL BUILDING", "floor_unit": "1st Floor", "special_features": None},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].special_features, "canalside frontage")
+
+    def test_ambiguous_building_features_match_is_never_guessed(self):
+        # Two building_features entries normalizing to the same key is
+        # treated as ambiguous and skipped entirely - same "incorrect
+        # enrichment is worse than a blank field" policy as brochure_
+        # enrichment.py's own _match_building_feature.
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "building_features": [
+                {"building": "The Mill", "features": "first entry"},
+                {"building": "the mill", "features": "second entry"},
+            ],
+            "units": [
+                {"building": "The Mill", "floor_unit": "1st Floor", "special_features": "Cat A fit-out"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].special_features, "Cat A fit-out")
+
+
 if __name__ == "__main__":
     unittest.main()
