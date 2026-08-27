@@ -27,6 +27,8 @@ _spec.loader.exec_module(review_and_master_page)
 
 _word_diff_highlight = review_and_master_page._word_diff_highlight
 _has_shared_words = review_and_master_page._has_shared_words
+_char_diff_highlight = review_and_master_page._char_diff_highlight
+_looks_identical_but_differs = review_and_master_page._looks_identical_but_differs
 
 
 class WordDiffHighlightTests(unittest.TestCase):
@@ -91,6 +93,68 @@ class HasSharedWordsTests(unittest.TestCase):
     def test_identical_values_are_shared(self):
         value = "Fully fitted; 24 desks; 1 boardroom"
         self.assertTrue(_has_shared_words(value, value))
+
+
+class LooksIdenticalButDiffersTests(unittest.TestCase):
+    """
+    Regression coverage for a real reported confusion: a geocode-
+    unverified decision card showing Address Current='1 Broadgate' / New=
+    '1 Broadgate' with no visible difference at all - master_merge.
+    diff_fields correctly found a real difference (that's the only reason
+    this field is in a diffs dict at all - see master_merge._values_equal's
+    own docstring on why punctuation/hidden characters are deliberately
+    never normalized away), but nothing in the UI told the reviewer WHERE.
+    """
+
+    def test_hidden_character_within_a_word_looks_identical(self):
+        # A zero-width space inside "Broadgate" - invisible in normal
+        # rendering, but a genuinely different string _values_equal
+        # correctly refuses to treat as equal.
+        self.assertTrue(_looks_identical_but_differs("1 Broadgate", "1 Broad​gate"))
+
+    def test_curly_vs_straight_apostrophe_looks_identical(self):
+        self.assertTrue(_looks_identical_but_differs("16 Dufour's Place", "16 Dufour’s Place"))
+
+    def test_en_dash_vs_hyphen_looks_identical(self):
+        self.assertTrue(_looks_identical_but_differs("24-30 Great Titchfield Street", "24–30 Great Titchfield Street"))
+
+    def test_genuinely_different_address_is_never_flagged(self):
+        # Real, visible difference (different house numbers) - digits
+        # survive _alphanumeric_only, so this must never be treated as
+        # "looks identical".
+        self.assertFalse(_looks_identical_but_differs("138 Cheapside", "134-136 Cheapside"))
+
+    def test_exactly_equal_values_are_never_flagged(self):
+        # Byte-identical values are never even in a diffs dict in the
+        # first place (see master_merge.diff_fields), but this must still
+        # be a safe no-op if ever called with them.
+        self.assertFalse(_looks_identical_but_differs("1 Broadgate", "1 Broadgate"))
+
+    def test_blank_values_are_never_flagged(self):
+        self.assertFalse(_looks_identical_but_differs("", "1 Broadgate"))
+        self.assertFalse(_looks_identical_but_differs("1 Broadgate", None))
+
+    def test_non_string_values_are_never_flagged(self):
+        self.assertFalse(_looks_identical_but_differs(14600, 14600.0))
+
+
+class CharDiffHighlightTests(unittest.TestCase):
+    def test_a_single_differing_character_is_localized(self):
+        before, after = _char_diff_highlight("1 Broadgate", "1 Broad​gate")
+
+        self.assertIn("1 Broad", before)
+        self.assertIn("gate", before)
+        self.assertNotIn(":red[", before)  # nothing REMOVED - only an insertion
+        self.assertIn("​", after)
+        self.assertIn(":green[", after)
+
+    def test_identical_values_produce_no_highlighting_at_all(self):
+        value = "1 Broadgate"
+
+        before, after = _char_diff_highlight(value, value)
+
+        self.assertEqual(before, value)
+        self.assertEqual(after, value)
 
 
 if __name__ == "__main__":

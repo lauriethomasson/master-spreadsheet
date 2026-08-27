@@ -2,6 +2,7 @@ import dataclasses
 import difflib
 import hashlib
 import html
+import re
 import uuid
 
 import pandas as pd
@@ -124,6 +125,75 @@ def _has_shared_words(old_val: str, new_val: str) -> bool:
     return any(tag == "equal" for tag, _, _, _, _ in matcher.get_opcodes())
 
 
+def _alphanumeric_only(text: str) -> str:
+    """text lowercased with every character that isn't a plain ASCII
+    letter/digit removed - used only by _looks_identical_but_differs
+    below, never for what's actually stored/compared elsewhere (that's
+    master_merge._values_equal's own, deliberately punctuation-sensitive
+    job - see its docstring)."""
+    return re.sub(r"[^0-9a-z]", "", text.lower())
+
+
+def _looks_identical_but_differs(old_val, new_val) -> bool:
+    """
+    True when old_val/new_val are both non-blank strings that master_
+    merge._values_equal already confirmed genuinely differ (that's the
+    only reason this field would be in a diffs dict at all) but read as
+    the exact same text to a human glancing at the "Current"/"New"
+    columns - the underlying letters and digits, in order, are identical;
+    only punctuation, whitespace, or a hidden/invisible character differs
+    (deliberately NOT normalized away by _values_equal itself - see that
+    function's own docstring on why a punctuation difference stays a real,
+    flagged change: "a dash swapped for a space... can indicate an actual
+    typo or a different source worth a human's attention"). This function
+    never changes THAT decision (a real, if easy-to-miss, difference still
+    needs a human's own review) - it only decides whether _render_field_
+    rows owes the reviewer an extra visual cue for it.
+
+    Confirmed real case: a geocode-unverified decision card showing
+    Address Current='1 Broadgate' / New='1 Broadgate' with literally no
+    visible difference at all - confusing enough to read as a bug ("why is
+    it asking me to decide on nothing changing"), even though _values_
+    equal correctly found a real difference somewhere in the raw text.
+
+    A genuinely different address ("138 Cheapside" vs "134-136 Cheapside")
+    still has different DIGITS once punctuation/whitespace/case are
+    stripped, so this correctly returns False for it - only a difference
+    confined to punctuation/whitespace/hidden characters ever qualifies.
+    """
+    if not (isinstance(old_val, str) and old_val.strip() and isinstance(new_val, str) and new_val.strip()):
+        return False
+    if old_val == new_val:
+        return False
+    return _alphanumeric_only(old_val) == _alphanumeric_only(new_val)
+
+
+def _char_diff_highlight(old_val: str, new_val: str) -> tuple:
+    """
+    Character-level counterpart to _word_diff_highlight - same contiguous-
+    run-gets-one-span convention, but per CHARACTER rather than per word.
+    Used only for _looks_identical_but_differs' own case: a word-level diff
+    would just re-render the SAME-LOOKING word in red on one side and green
+    on the other, with no way to tell WHERE within it the two actually
+    differ - character granularity at least visually localizes the exact
+    position of a hidden/punctuation difference a reviewer can't otherwise
+    see, even when the highlighted character(s) themselves still look
+    identical (or near-identical) to the eye.
+    """
+    matcher = difflib.SequenceMatcher(None, old_val, new_val, autojunk=False)
+    before_parts, after_parts = [], []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            before_parts.append(old_val[i1:i2])
+            after_parts.append(new_val[j1:j2])
+            continue
+        if i1 != i2:
+            before_parts.append(f"**:red[{old_val[i1:i2]}]**")
+        if j1 != j2:
+            after_parts.append(f"**:green[{new_val[j1:j2]}]**")
+    return "".join(before_parts), "".join(after_parts)
+
+
 def _render_field_rows(
     diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
     unverified: bool = False, address_conflict: str = None,
@@ -189,6 +259,18 @@ def _render_field_rows(
     falls back to the plain old value, and nothing extra renders below the
     "after" input, since highlighting the WHOLE new value in green there
     would only duplicate what the input already shows.
+
+    Checked BEFORE any of that: _looks_identical_but_differs - a field
+    master_merge.diff_fields genuinely flagged as changed, but whose old/
+    new text reads as the exact same thing to a human (a hidden character,
+    or punctuation _values_equal deliberately never normalizes away - see
+    that function's own docstring). Confirmed real case: a geocode-
+    unverified decision card showing Address Current='1 Broadgate' / New=
+    '1 Broadgate' with no visible difference at all, confusing enough to
+    read as a bug. Word-level highlighting would be useless here (the one
+    differing WORD still looks identical, just colored) - _char_diff_
+    highlight is used instead, plus an explicit label-column caption, so
+    the reviewer at least sees WHERE within the value the two differ.
     """
     approved = {}
     bundle_safe_fields = default_checked
@@ -206,12 +288,24 @@ def _render_field_rows(
         old_val, new_val = diffs[f]
         is_risky = f in risky_fields
         kind = master_merge.field_kind(f)
+        # _looks_identical_but_differs FIRST, ahead of the ordinary word-
+        # diff case below - a value that reads as the same text to a human
+        # (see that function's own docstring - the confirmed real "Address
+        # Current='1 Broadgate' / New='1 Broadgate'" case) needs character-
+        # level highlighting to even show WHERE the two differ; word-level
+        # highlighting would just re-render the one differing word in red
+        # on one side and green on the other, looking like a no-op change
+        # since the word itself still reads identically either way.
+        looks_identical = _looks_identical_but_differs(old_val, new_val)
         is_text_diff = (
-            isinstance(old_val, str) and old_val.strip() and isinstance(new_val, str) and new_val.strip()
+            not looks_identical
+            and isinstance(old_val, str) and old_val.strip() and isinstance(new_val, str) and new_val.strip()
             and _has_shared_words(old_val, new_val)
         )
         before_highlight = after_highlight = None
-        if is_text_diff:
+        if looks_identical:
+            before_highlight, after_highlight = _char_diff_highlight(old_val, new_val)
+        elif is_text_diff:
             before_highlight, after_highlight = _word_diff_highlight(old_val, new_val)
 
         label_col, before_col, after_col, apply_col = st.columns([2, 2, 3, 1])
@@ -219,8 +313,13 @@ def _render_field_rows(
             st.markdown(f"**{display_utils.friendly_field_label(f)}**")
             if is_risky:
                 st.caption(f"⚠️ {_risky_field_reason(f, unverified, address_conflict)}")
+            if looks_identical:
+                st.caption(
+                    "⚠️ Looks identical, but the underlying text differs (hidden character, punctuation, or "
+                    "formatting) - see the highlighted character(s) below."
+                )
         with before_col:
-            if is_text_diff:
+            if before_highlight is not None:
                 st.caption(before_highlight)
             else:
                 st.caption(display_utils.format_field_value_for_display(f, old_val))
@@ -228,7 +327,7 @@ def _render_field_rows(
             value = display_utils.render_new_value_input(
                 new_val, kind, key=f"{key_prefix}_{f}_value", multiline=f in display_utils.WIDE_TEXT_COLUMNS,
             )
-            if is_text_diff:
+            if after_highlight is not None:
                 st.caption(after_highlight)
         with apply_col:
             apply_field = st.checkbox(
