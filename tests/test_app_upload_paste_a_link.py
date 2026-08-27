@@ -30,7 +30,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import fitz
 from streamlit.testing.v1 import AppTest
@@ -175,8 +175,38 @@ class ValidatePastedLinkBrochureLinksTests(unittest.TestCase):
         with patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real") as mock_fetch:
             app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
 
-        mock_fetch.assert_called_once_with("https://blob.example.com/gloucester.pdf")
+        mock_fetch.assert_called_once_with(
+            "https://blob.example.com/gloucester.pdf", accept_any_reachable_page=True,
+        )
         self.assertEqual(row.brochure_link, "https://blob.example.com/gloucester.pdf")
+
+    def test_a_reachable_listing_webpage_that_isnt_a_pdf_is_kept_not_reverted(self):
+        # The confirmed real Colliers gap this fix closes: a genuine per-
+        # unit listing webpage (colliers.com/en-gb/properties/...) that
+        # fetches successfully but isn't a PDF/image must be KEPT, not
+        # silently reverted to the shared fallback purely for its content
+        # type - exactly what the extraction PROMPT's own brochure_link
+        # instructions already treat as valid. _fetch_pdf_bytes itself is
+        # NOT mocked here (unlike the other tests in this class) - only
+        # httpx.get, so this exercises the real accept_any_reachable_page
+        # wiring through _looks_like_fetchable_document end-to-end.
+        url = "https://www.colliers.com/en-gb/properties/kingsland-house"
+        row = self._row(url)
+        html_response = MagicMock(status_code=200, content=b"<html>Kingsland House</html>", text="<html>Kingsland House</html>", url=url)
+        html_response.headers = {"content-type": "text/html"}
+        html_response.raise_for_status.side_effect = None
+        # resolve_brochure_link's own landing-page scan (brochure_link_
+        # resolver.py) is tried first for a non-.pdf URL like this one -
+        # it shares the same httpx module object, so patching brochure_
+        # enrichment.httpx.get here also intercepts that internal fetch
+        # (no separate patch needed), and with no real <a> tags in this
+        # fake HTML it correctly finds nothing to resolve and keeps the
+        # original URL, exactly like a real landing page with no document
+        # link would.
+        with patch("brochure_enrichment.httpx.get", return_value=html_response):
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        self.assertEqual(row.brochure_link, url)
 
     def test_a_link_that_fails_to_fetch_falls_back_to_the_shared_link(self):
         row = self._row("https://www.colliers.com/en-gb/properties/kingsland-house")
@@ -215,7 +245,7 @@ class ValidatePastedLinkBrochureLinksTests(unittest.TestCase):
         good_row = self._row("https://blob.example.com/good.pdf")
         bad_row = self._row("https://www.colliers.com/en-gb/properties/blocked")
 
-        def fake_fetch(url):
+        def fake_fetch(url, accept_any_reachable_page=False):
             return b"%PDF-1.4" if url == "https://blob.example.com/good.pdf" else None
 
         with patch("brochure_enrichment._fetch_pdf_bytes", side_effect=fake_fetch):
@@ -498,11 +528,15 @@ class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
             ],
         }
 
-        def fake_validate_fetch(fetch_url):
+        def fake_validate_fetch(fetch_url, accept_any_reachable_page=False):
             # Kingsland's own Colliers.com page is blocked to a plain
-            # fetch (real, confirmed HTTP 403); Gloucester's own Azure
-            # blob URL is a real, directly-fetchable PDF (also real,
-            # confirmed) - see the PR's own recon findings.
+            # fetch (real, confirmed HTTP 403 - a genuinely dead/blocked
+            # link, not the "reachable but not a PDF" gap _validate_pasted_
+            # link_brochure_links's own accept_any_reachable_page=True now
+            # rescues - see PageThatIsReachableButNotAPdfIsNowKeptTests
+            # below for that case); Gloucester's own Azure blob URL is a
+            # real, directly-fetchable PDF (also real, confirmed) - see
+            # the PR's own recon findings.
             return b"%PDF-1.4 real" if fetch_url == "https://blob.example.com/gloucester.pdf" else None
 
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \

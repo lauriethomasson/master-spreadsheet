@@ -1073,7 +1073,9 @@ _IMAGE_MAGIC_BYTES = (
 )
 
 
-def _looks_like_fetchable_document(content_type, data: bytes, accept_image_formats: bool = False) -> bool:
+def _looks_like_fetchable_document(
+    content_type, data: bytes, accept_image_formats: bool = False, accept_any_reachable_page: bool = False,
+) -> bool:
     """
     True when `data` is genuinely readable by extract.render_pages/render_
     and_extract - a real PDF always, and (only when accept_image_formats is
@@ -1097,7 +1099,29 @@ def _looks_like_fetchable_document(content_type, data: bytes, accept_image_forma
     are accepted, and only for the floorplan fetch path, since 0 of 9 real
     brochure documents traced were images while 2 of 2 real floorplan
     documents traced were.
+
+    accept_any_reachable_page (only ever set by app.py's own _validate_
+    pasted_link_brochure_links, via its _fetch_pdf_bytes call - see that
+    function's own docstring) is a genuinely different question from the
+    two checks above: True for ANY successfully-fetched response, real
+    document or not. That caller never opens/parses these bytes at all - it
+    only needs to confirm a per-unit link Gemini attributed from a page's
+    own real link candidates (see extract.py's own page_links mechanism)
+    resolves to a live page rather than a dead/blocked one, before trusting
+    it over the shared document-level fallback. Confirmed real gap this
+    closes: a genuine Colliers per-unit listing webpage (colliers.com/
+    en-gb/properties/...) - exactly the case the extraction PROMPT's own
+    brochure_link instructions already treat as valid ("a URL for this
+    specific unit/listing... if one is clearly given for it", never
+    restricted to a literal PDF/document URL) - was being discarded here
+    for the shared whole-document fallback purely because a webpage isn't a
+    PDF/image, even though it was genuinely reachable, real, and exactly
+    what was extracted. Every OTHER caller (enrichment/floorplan fetch,
+    which DOES go on to parse these bytes as a document) never sets this,
+    so their own PDF/image-only requirement is completely unaffected.
     """
+    if accept_any_reachable_page:
+        return True
     if content_type and "pdf" in content_type.lower():
         return True
     if data[:5] == b"%PDF-":
@@ -1932,13 +1956,30 @@ def fetch_rendered_page_with_links(url: str) -> tuple:
     return None, None
 
 
-def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_image_formats: bool = False):
+def _fetch_pdf_bytes(
+    url: str,
+    reject_floorplan_filename: bool = True,
+    accept_image_formats: bool = False,
+    accept_any_reachable_page: bool = False,
+):
     """
     PDF bytes fetched from `url`, or None on ANY failure - a network error,
     a timeout, or content that isn't actually a PDF once fetched (a
     provider preview/landing page that never resolves to a real document, a
-    generic marketing page, a dead link) - never raises. A Box "shared
-    link" URL (see _box_share_token) is read via _fetch_box_shared_pdf
+    generic marketing page, a dead link) - never raises, UNLESS
+    accept_any_reachable_page is set (see _looks_like_fetchable_document's
+    own docstring - only ever set by app.py's own _validate_pasted_link_
+    brochure_links), in which case any successfully-fetched response's raw
+    bytes are returned regardless of content type - this caller only ever
+    checks the result for None (link reachable or not), never opens these
+    bytes as a document, so a non-PDF response is a perfectly valid result
+    here, not a failure. Threaded through only the generic httpx fetch path
+    below (never the Box/Canva/Pitch/GPE/Kitt branches, which each read
+    document bytes via a mechanism of their own, not this function's
+    generic PDF/image check) - not a source shape this fix's own confirmed
+    case (a plain colliers.com listing-webpage URL) goes through anyway.
+
+    A Box "shared link" URL (see _box_share_token) is read via _fetch_box_shared_pdf
     instead of the generic path below - a plain GET on the share URL itself
     never returns the PDF directly (see that function's own docstring).
     resolve_brochure_link (already used for exactly this kind of one-hop
@@ -2047,7 +2088,8 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
         return None
 
     if not _looks_like_fetchable_document(
-        response.headers.get("content-type"), response.content, accept_image_formats=accept_image_formats,
+        response.headers.get("content-type"), response.content,
+        accept_image_formats=accept_image_formats, accept_any_reachable_page=accept_any_reachable_page,
     ):
         if drive_file_id:
             confirm_params = _google_drive_confirm_params(response.content)
@@ -2070,7 +2112,7 @@ def _fetch_pdf_bytes(url: str, reject_floorplan_filename: bool = True, accept_im
 
                 if _looks_like_fetchable_document(
                     retry_response.headers.get("content-type"), retry_response.content,
-                    accept_image_formats=accept_image_formats,
+                    accept_image_formats=accept_image_formats, accept_any_reachable_page=accept_any_reachable_page,
                 ):
                     return retry_response.content
 

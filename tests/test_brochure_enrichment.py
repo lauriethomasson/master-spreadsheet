@@ -666,6 +666,43 @@ class FetchBoxSharedPdfTests(EnrichmentTestCase):
 
         self.assertIsNone(result)
 
+    def test_fetch_pdf_bytes_accepts_a_reachable_html_page_when_flag_set(self):
+        # The confirmed real gap: a genuine per-unit listing webpage (e.g.
+        # colliers.com/en-gb/properties/...) returns real HTML, not a PDF -
+        # accept_any_reachable_page=True must keep it rather than treating
+        # a non-PDF response as a fetch failure.
+        html_response = _response(content=b"<html>Kingsland House</html>", content_type="text/html")
+        with patch("brochure_enrichment.httpx.get", return_value=html_response):
+            result = brochure_enrichment._fetch_pdf_bytes(
+                "https://www.colliers.com/en-gb/properties/kingsland-house", accept_any_reachable_page=True,
+            )
+
+        self.assertEqual(result, b"<html>Kingsland House</html>")
+
+    def test_fetch_pdf_bytes_still_rejects_html_by_default(self):
+        # accept_any_reachable_page defaults to False - every OTHER caller
+        # (enrichment/floorplan fetch, which parses these bytes as a
+        # document) keeps today's exact PDF/image-only behavior.
+        html_response = _response(content=b"<html>Kingsland House</html>", content_type="text/html")
+        with patch("brochure_enrichment.httpx.get", return_value=html_response):
+            result = brochure_enrichment._fetch_pdf_bytes("https://www.colliers.com/en-gb/properties/kingsland-house")
+
+        self.assertIsNone(result)
+
+    def test_fetch_pdf_bytes_still_returns_none_on_a_genuine_fetch_failure_even_with_the_flag(self):
+        # accept_any_reachable_page only widens what counts as a valid
+        # RESPONSE - it can never rescue a request that never got one at
+        # all (a real HTTP error, a timeout, a dead link) - raise_for_
+        # status already fails before _looks_like_fetchable_document is
+        # ever reached, exactly as before.
+        forbidden_response = _response(status_code=403, content=b"Forbidden", content_type="text/plain")
+        with patch("brochure_enrichment.httpx.get", return_value=forbidden_response):
+            result = brochure_enrichment._fetch_pdf_bytes(
+                "https://www.colliers.com/en-gb/properties/blocked", accept_any_reachable_page=True,
+            )
+
+        self.assertIsNone(result)
+
 
 class DropboxAndGoogleDriveShareUrlTests(unittest.TestCase):
     def test_dropbox_s_share_url_matches(self):
@@ -2256,6 +2293,32 @@ class LooksLikeFetchableDocumentTests(unittest.TestCase):
 
     def test_html_error_page_never_accepted(self):
         self.assertFalse(brochure_enrichment._looks_like_fetchable_document("text/html", b"<html>404</html>"))
+
+    def test_html_page_accepted_with_accept_any_reachable_page(self):
+        # A genuine per-unit listing webpage (e.g. a real colliers.com
+        # property page) - the confirmed gap this param closes - is real
+        # HTML, not a PDF/image, but must still count as valid here.
+        self.assertTrue(
+            brochure_enrichment._looks_like_fetchable_document(
+                "text/html", b"<html>Kingsland House</html>", accept_any_reachable_page=True,
+            ),
+        )
+
+    def test_accept_any_reachable_page_overrides_every_other_check(self):
+        # Even content that would otherwise be rejected outright (a docx,
+        # an explicit 404 page) counts as reachable - this param is
+        # deliberately about reachability alone, not content type at all.
+        self.assertTrue(
+            brochure_enrichment._looks_like_fetchable_document(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04...",
+                accept_any_reachable_page=True,
+            ),
+        )
+
+    def test_pdf_still_accepted_when_accept_any_reachable_page_is_false(self):
+        # The new param's default (False) leaves every existing behavior
+        # in this class completely unchanged.
+        self.assertTrue(brochure_enrichment._looks_like_fetchable_document("application/pdf", b"anything"))
 
 
 class MatchUnitTests(unittest.TestCase):
