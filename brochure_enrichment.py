@@ -2649,6 +2649,45 @@ def _expanded_street_name_words(text: str) -> frozenset:
     return frozenset(_STREET_SUFFIX_EXPANSIONS.get(w, w) for w in _street_name_words(text))
 
 
+def _address_conflict_street_words(address: str) -> frozenset:
+    """
+    _street_name_words(address)'s own filtering (pure-digit/range-
+    connector tokens dropped), PLUS "st" treated as equivalent to "saint"
+    whenever it appears as a NON-LAST word - the mirror case of master_
+    merge._expand_street_suffix (~line 1471), which deliberately only
+    expands a TRAILING "st" ("Charterhouse St" -> "Charterhouse Street")
+    and leaves a leading/mid "st" alone, since there it means "Saint", not
+    a trailing street-type suffix (that function's own docstring: "'st
+    james's' (a name, not a trailing street suffix) is left completely
+    alone"). This is the opposite position: "st" as a NON-last word is
+    always "Saint" ("St James's Square"), never the street-type suffix -
+    only the LAST word can ever mean that, which is exactly why this
+    function leaves the last word untouched in both directions (a
+    genuinely differing trailing "...St" vs "...Street" still correctly
+    registers as different tokens here, same as before this existed -
+    that's master_merge._expand_street_suffix's own, unrelated concern,
+    not this function's).
+
+    Confirmed real case this closes: a real Review & Master row's own
+    file address ("26 Saint James's Square") flagged a false conflict
+    against its brochure's own spelling ("26 St James's Square") -
+    genuinely the same address, "St"/"Saint" simply spelled two different
+    real ways - with the resulting "Apply" button changing nothing at all
+    (Current and New already identical text), confusing UX and a wasted
+    review decision.
+
+    Used only by _address_conflict_note's own comparison below - never
+    _street_name_words itself (also used by _expanded_street_name_words/
+    _building_identity_matches' own tier 5, a different, narrower concern
+    - same "don't widen an existing shared helper" precedent _expanded_
+    street_name_words's own docstring already sets for itself).
+    """
+    words = [w for w in normalize_key(address).split() if w not in _ADDRESS_RANGE_CONNECTOR_WORDS and not w.isdigit()]
+    if len(words) > 1:
+        words[:-1] = ["saint" if w == "st" else w for w in words[:-1]]
+    return frozenset(words)
+
+
 def _address_conflict_note(file_address, brochure_address):
     """
     A human-readable note (see schema.ListingRow.address_conflict's own
@@ -2666,8 +2705,11 @@ def _address_conflict_note(file_address, brochure_address):
       second, independently-drifting implementation) - e.g. "27 Cannon
       Street" vs "108 Cannon Street".
     - street-name text that doesn't substantially overlap (a WORD-SET
-      comparison via _street_name_words, once each side's own house
-      number/range has been filtered out) - the confirmed real Ivybridge
+      comparison via _address_conflict_street_words, once each side's own
+      house number/range has been filtered out - and "st"/"saint" folded
+      together as the same non-last-word token, see that function's own
+      docstring for the real "26 Saint James's Square" vs "26 St James's
+      Square" false-positive it exists for) - the confirmed real Ivybridge
       House case this exists for: address_1 "1 John Adam Street" vs its
       own brochure's "1 to 5 Adam Street" - the leading house numbers
       agree ("1" both sides), but "john" is a real word on the file's own
@@ -2683,8 +2725,8 @@ def _address_conflict_note(file_address, brochure_address):
       a conflict, just a brochure that didn't state a number;
     - both checks above find no disagreement - a genuine match, including
       one that only differs by formatting (case, punctuation, a range vs.
-      its own first number) already tolerated by normalize_key/leading_
-      house_number themselves.
+      its own first number, "St"/"Saint") already tolerated by normalize_
+      key/leading_house_number/_address_conflict_street_words themselves.
 
     Never called when file_address is blank/a placeholder (see _is_
     placeholder_address) - that shape is already handled by BUILDING_
@@ -2702,7 +2744,7 @@ def _address_conflict_note(file_address, brochure_address):
     if file_number is not None and file_number != brochure_number:
         return f"Brochure states '{brochure_address}', file has '{file_address}'"
 
-    if _street_name_words(file_address) != _street_name_words(brochure_address):
+    if _address_conflict_street_words(file_address) != _address_conflict_street_words(brochure_address):
         return f"Brochure states '{brochure_address}', file has '{file_address}'"
 
     return None

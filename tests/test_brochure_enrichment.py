@@ -4049,6 +4049,46 @@ class AddressConflictNoteTests(unittest.TestCase):
         note = brochure_enrichment._address_conflict_note("19 Wells St", "19 Wells Street")
         self.assertIsNotNone(note)
 
+    def test_saint_vs_st_as_a_non_last_word_is_not_a_conflict(self):
+        # Real confirmed Review & Master case: the file's own address
+        # ("26 Saint James's Square") flagged a false conflict against its
+        # brochure's own spelling ("26 St James's Square") - genuinely the
+        # same address, "St"/"Saint" simply spelled two different real
+        # ways, with an "Apply" button that changed nothing at all
+        # (Current and New already identical text).
+        self.assertIsNone(
+            brochure_enrichment._address_conflict_note("26 Saint James's Square", "26 St James's Square"),
+        )
+        # Symmetric - whichever side abbreviates, the other spells in
+        # full, must be tolerated either way.
+        self.assertIsNone(
+            brochure_enrichment._address_conflict_note("26 St James's Square", "26 Saint James's Square"),
+        )
+
+    def test_genuine_conflict_still_flagged_when_saint_st_is_also_present(self):
+        # The Saint/St tolerance must never mask an ACTUAL disagreement
+        # elsewhere in the same address - a real different house number,
+        # here, alongside the exact same "Saint"/"St" spelling difference
+        # that alone would be tolerated.
+        note = brochure_enrichment._address_conflict_note("26 Saint James's Square", "44 St James's Square")
+        self.assertIsNotNone(note)
+        self.assertIn("44 St James's Square", note)
+        self.assertIn("26 Saint James's Square", note)
+
+    def test_trailing_st_is_never_treated_as_saint(self):
+        # The Saint/St tolerance is deliberately position-aware - only a
+        # NON-last "st" means "Saint" ("St James's"); the LAST word is
+        # left completely untouched (mirrors master_merge._expand_street_
+        # suffix's own opposite convention: only the LAST word can mean
+        # the street-type suffix "Street"). Two genuinely different real
+        # streets that merely happen to share a "St"/"Street" TRAILING
+        # spelling difference (see test_street_suffix_abbreviation_alone_
+        # is_flagged_as_a_word_mismatch above - a pre-existing, documented
+        # limitation this fix must not silently paper over) must still be
+        # flagged as different, never conflated via this new tolerance.
+        note = brochure_enrichment._address_conflict_note("1 Kings St", "1 Kings Street")
+        self.assertIsNotNone(note)
+
 
 class AddressConflictWiringTests(EnrichmentTestCase):
     """_apply_units_to_row's own wiring of _address_conflict_note into the
