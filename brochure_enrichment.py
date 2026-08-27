@@ -773,6 +773,38 @@ def _strip_trailing_street_suffix_word(key: str) -> str:
     return key
 
 
+# A trailing "(...)" segment on a row's own building text - see
+# _strip_trailing_parenthetical's own docstring for the real MetSpace
+# convention this exists for.
+_TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _strip_trailing_parenthetical(building):
+    """
+    `building` with a trailing "(...)" segment removed, when present -
+    e.g. "141 Fenchurch Street (Monument)" -> "141 Fenchurch Street".
+    Returns `building` unchanged (never None/"") when there's no trailing
+    parenthetical at all, or stripping it would leave nothing behind.
+
+    Confirmed real gap this closes: a real MetSpace email's own building
+    text routinely appends a nearby Tube/landmark station name in
+    parentheses purely for the READER's own area orientation ("141
+    Fenchurch Street (Monument)" - Monument being the nearest Underground
+    station) - a convention with nothing to do with the building's own
+    real identity or address. The SAME real building's own brochure
+    (Gemini-extracted) never carries this at all ("141 Fenchurch
+    Street") - confirmed against three real floors of this exact
+    building, all three of which enriched with ZERO fields changed
+    despite each one's own brochure containing real, matchable unit
+    content, purely because none of tiers 1-3's own building-to-building
+    text comparisons could bridge the parenthetical.
+    """
+    if not building:
+        return building
+    stripped = _TRAILING_PARENTHETICAL_RE.sub("", str(building)).strip()
+    return stripped or building
+
+
 def _is_placeholder_address(address_1, building) -> bool:
     """
     True when `address_1` is either genuinely blank OR just a duplicate of
@@ -871,6 +903,21 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        baking a full address onto a building name, the other is one side
        simply omitting a trailing street-type word) and neither building's
        real text needs both stripped at once for any case seen so far.
+    3b. TRAILING-PARENTHETICAL-STRIPPED (see _strip_trailing_parenthetical)
+       - e.g. "141 Fenchurch Street (Monument)" (a row) vs "141 Fenchurch
+       Street" (a brochure's own extraction) - confirmed against three
+       real floors of this exact real building, ALL THREE of which
+       enriched with zero fields changed despite each one's own brochure
+       containing real, matchable unit content. A real MetSpace email's
+       own building text routinely appends a nearby Tube/landmark station
+       name in parentheses purely for the reader's own area orientation -
+       a convention with nothing to do with the building's own real
+       identity, which its brochure (Gemini-extracted) never carries at
+       all. Same weak-signal, corroborated-by-uniqueness treatment as
+       tiers 2/3 - only row_building's own side is ever stripped (a
+       candidate carrying this kind of suffix itself would be real
+       evidence of an actually distinct name, already caught by tier 1's
+       own exact comparison if genuinely shared).
     4. BUILDING-VS-ADDRESS (row_building compared against each candidate's
        own address_1, via `candidate_addresses` - a parallel list, one
        entry per candidate_buildings, or None from a caller with no address
@@ -965,6 +1012,27 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     ]
     if len(street_suffix) == 1:
         return street_suffix
+
+    # 3b. TRAILING PARENTHETICAL STRIPPED (see _strip_trailing_
+    # parenthetical's own docstring for the real MetSpace "141 Fenchurch
+    # Street (Monument)" case) - only row_building's own side is ever
+    # stripped; a candidate's own text is never expected to carry this
+    # kind of area-disambiguation suffix at all (if it genuinely did,
+    # that's real evidence of an actually distinct name, not the same
+    # building loosely restated, and tier 1 would already have matched
+    # it via an exact comparison). Same weak-signal, corroborated-by-
+    # uniqueness treatment as tiers 2/3 - only accepted when it's the
+    # SOLE candidate sharing the stripped key. Tried independently of
+    # tiers 2/3 above, on the ORIGINAL (non-address-suffix-stripped,
+    # non-street-suffix-stripped) key - the gaps are unrelated and no
+    # real case seen so far needs more than one of them stripped at once.
+    row_parenthetical_key = normalize_key(_strip_trailing_parenthetical(row_building))
+    if row_parenthetical_key and row_parenthetical_key != row_key:
+        parenthetical_stripped = [
+            i for i, c in enumerate(candidate_buildings) if normalize_key(c) == row_parenthetical_key
+        ]
+        if len(parenthetical_stripped) == 1:
+            return parenthetical_stripped
 
     row_house_number = leading_house_number(row_building)
 

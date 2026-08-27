@@ -2832,6 +2832,64 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         indices = brochure_enrichment._building_identity_matches("Clerkenwell Road", ["67 Clerkenwell Road"], None)
         self.assertEqual(indices, [0])
 
+    def test_tier_3b_trailing_parenthetical_is_stripped(self):
+        # Real confirmed case: a real MetSpace email's own "141 Fenchurch
+        # Street (Monument)" (Monument being the nearest Underground
+        # station, appended purely for the reader's own area orientation)
+        # never matched its own real brochure's building text ("141
+        # Fenchurch Street") at all - three real floors of this exact
+        # building enriched with ZERO fields changed despite each one's
+        # own brochure containing real, matchable unit content.
+        indices = brochure_enrichment._building_identity_matches(
+            "141 Fenchurch Street (Monument)", ["141 Fenchurch Street"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_tier_3b_two_matching_candidates_stays_ambiguous(self):
+        # Same weak-signal philosophy as tiers 2/3 (a plain len(...) == 1
+        # check, never _distinct_building_group's own same-building-
+        # multiple-floors allowance, which is specific to tier 4's
+        # different, cross-field corroboration mechanism) - a WEAK signal
+        # shared by 2+ candidates is exactly as unsafe to guess from as
+        # tier 2/3's own ambiguous case, even when both candidates happen
+        # to name the same building. Never actually needed for the real
+        # confirmed case this tier exists for (each of the real MetSpace
+        # Fenchurch Street floors has its own SEPARATE single-unit
+        # brochure, never one PDF with multiple floors of the same
+        # building).
+        indices = brochure_enrichment._building_identity_matches(
+            "141 Fenchurch Street (Monument)", ["141 Fenchurch Street", "141 Fenchurch Street"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_tier_3b_ambiguous_match_is_rejected(self):
+        # Two DIFFERENT buildings that both happen to strip to the same
+        # parenthetical-stripped key - same "incorrect enrichment is worse
+        # than a blank field" rejection every other weak tier already
+        # applies.
+        indices = brochure_enrichment._building_identity_matches(
+            "Example House (Monument)", ["Example House - 10 Alpha Street", "Example House - 50 Beta Street"],
+        )
+        self.assertEqual(indices, [])
+
+    def test_tier_3b_never_fires_when_row_building_has_no_parenthetical(self):
+        # A plain row_building with nothing to strip must fall through to
+        # whatever tier (if any) genuinely applies, never be affected by
+        # this tier at all.
+        indices = brochure_enrichment._building_identity_matches("141 Fenchurch Street", ["Somewhere Else"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3b_never_applied_to_the_candidate_side(self):
+        # Only row_building's own side is ever stripped - a candidate
+        # that itself carries a parenthetical suffix the row doesn't must
+        # never be treated as a coincidental match via this tier (it
+        # would already have matched via tier 1's own exact comparison if
+        # the row genuinely stated the same parenthetical too).
+        indices = brochure_enrichment._building_identity_matches(
+            "141 Fenchurch Street", ["141 Fenchurch Street (Monument)"],
+        )
+        self.assertEqual(indices, [])
+
 
 class MatchBuildingFeatureTests(unittest.TestCase):
     """_match_building_feature - the building-level (level B) counterpart
@@ -3528,6 +3586,36 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         # blank just because this document also happens to contain floor
         # plan pages.
         self.assertEqual(no_floor_match.special_features, "WiredScore Platinum; BREEAM Excellent; manned reception")
+
+    def test_real_metspace_fenchurch_street_parenthetical_now_enriches(self):
+        # Real confirmed case (see BuildingIdentityMatchesTests' own tier
+        # 3b tests): a real MetSpace email row's building text is "141
+        # Fenchurch Street (Monument)" (Monument being the nearest
+        # Underground station, appended purely for the reader's own area
+        # orientation) - its own real brochure (Gemini-extracted, never
+        # carrying this parenthetical) states building "141 Fenchurch
+        # Street" with real, matchable special_features/state_of_space -
+        # confirmed to previously enrich with ZERO fields changed across
+        # all three real floors of this building traced.
+        row = ListingRow(
+            building="141 Fenchurch Street (Monument)", floor_unit="Ground Floor", special_features="Available: Now",
+        )
+        units = _brochure_units(
+            [{
+                "building": "141 Fenchurch Street", "floor_unit": "Ground Floor",
+                "special_features": "1 meeting room; bike racks; showers", "state_of_space": "Fully Fitted",
+            }],
+            building_features=[{"building": "141 Fenchurch Street", "features": "Multi storey office building"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIn("special_features", fields)
+        self.assertEqual(
+            new_row.special_features,
+            "Available: Now; 1 meeting room; bike racks; showers; Multi storey office building",
+        )
+        self.assertEqual(new_row.state_of_space, "Fully Fitted")
 
 
 class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
