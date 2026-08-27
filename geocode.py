@@ -90,6 +90,21 @@ first place, and comparing its own name text against a returned route
 would false-positive on the ordinary case, where a building's name is
 routinely nothing like the street it actually sits on.
 
+A candidate with NO route component of its own at all (only e.g.
+street_number/postal_code) used to slip straight past the STREET_CONFLICT
+check above with nothing to compare - the exact confirmed real shape of
+the "44 Paul Street" incident above, live-traced after the fact: the
+route-less candidate itself was accepted at real coordinates ~1km away,
+and a LATER, separate reverse-geocode of those now-trusted-but-wrong
+coordinates is what actually produced the "20 Little Britain, EC1A 7DH"
+address a reviewer saw - the STREET_CONFLICT check itself never even saw
+that text. Now either accepted on the candidate's own postcode DISTRICT
+alone (weaker evidence than a genuine street match, but real - flagged
+geocode_unverified and recorded via log_geocode_weak_match/WEAK_MATCHES,
+so a repeat of this is never invisible again) or, with nothing at all to
+corroborate against, rejected outright as STREET_UNVERIFIABLE - same
+"can't verify, don't guess" philosophy as STREET_CONFLICT.
+
 row.development_name (see schema.ListingRow's own docstring) is tried as
 an extra Tier 2 query disambiguator, ahead of submarket - a real London
 office campus often brands an overall development name distinct from
@@ -738,6 +753,32 @@ def log_geocode_failure(row: ListingRow, reason: str):
     print(f"[geocode] FAILED: {row.building!r} ({row.source_file}) — {reason}", file=sys.stderr)
 
 
+# Real, confirmed gap this closes: a Tier 2 candidate accepted on
+# genuinely weaker-than-usual corroboration (see _best_places_result's
+# own "weak_corroboration" - a candidate with no route to check row's own
+# stated street against at all, corroborated only by its postcode
+# district agreeing with source_hint) left NO trace anywhere once
+# accepted - a real Kitt's "44 Paul Street" incident (accepted onto a
+# genuinely wrong "20 Little Britain" address/coordinate this exact way)
+# had to be reconstructed entirely by hand afterward, with nothing in any
+# log to point at. Deliberately a SEPARATE list/function from FAILURES/
+# log_geocode_failure above - this is a genuine ACCEPTANCE, not a
+# rejection, so folding it into "FAILED" logging would misdescribe it.
+WEAK_MATCHES = []
+
+
+def log_geocode_weak_match(row: ListingRow, reason: str):
+    entry = {
+        "building": row.building,
+        "floor_unit": row.floor_unit,
+        "submarket": row.submarket,
+        "source_file": row.source_file,
+        "reason": reason,
+    }
+    WEAK_MATCHES.append(entry)
+    print(f"[geocode] WEAK MATCH ACCEPTED: {row.building!r} ({row.source_file}) — {reason}", file=sys.stderr)
+
+
 def _best_places_result(query: str, source_hint: dict, source_street_words: frozenset = None) -> dict:
     """
     Sends ONE query to Places Text Search and returns the first candidate
@@ -769,6 +810,28 @@ def _best_places_result(query: str, source_hint: dict, source_street_words: froz
     row completely unmapped), so this only ever fires on a fully disjoint
     match, the strongest possible signal something is actually wrong.
 
+    A candidate with NO route component at all (only e.g. street_number/
+    postal_code) makes candidate_street_words an EMPTY set - falsy, so the
+    check above silently no-ops and the candidate was accepted exactly as
+    if source_street_words had never been passed at all. Real, confirmed
+    incident this closes: live-traced against the actual Places/Geocoding
+    APIs for the exact "44 Paul Street" case above - a route-less candidate
+    at real coordinates ~1km away (a genuinely different, unrelated place)
+    was accepted this way, and a LATER, separate reverse-geocode of those
+    now-trusted-but-wrong coordinates is what produced the "20 Little
+    Britain, EC1A 7DH" address actually shown to a reviewer - a route-less
+    candidate can still corroborate via its own postcode DISTRICT (already
+    confirmed non-conflicting against source_hint above) - weaker evidence
+    than a genuine street-word match, but real and independent, so this is
+    still accepted, just flagged ("weak_corroboration" in the returned
+    dict, checked by geocode_row - see log_geocode_weak_match) rather than
+    left as invisible as the original incident was. With NOTHING to
+    corroborate against at all (no source_hint, or the candidate has no
+    postcode of its own either - the exact real Paul Street shape), this
+    is rejected outright instead (STREET_UNVERIFIABLE) - the same "can't
+    verify, don't guess" philosophy the STREET_CONFLICT branch above
+    already uses.
+
     If every candidate this query returns fails validation, returns the
     LAST one's own conflict/failure info (for log_geocode_failure's own
     message) - never a candidate this function itself hasn't checked, and
@@ -789,12 +852,22 @@ def _best_places_result(query: str, source_hint: dict, source_street_words: froz
         if _postcode_hint_conflicts(source_hint, candidate_postcode):
             last = {**place, "status": "LOCATION_CONFLICT", "postcode": candidate_postcode}
             continue
+        weak_corroboration = None
         if source_street_words:
             candidate_street_words = _street_name_words(candidate_address_1) if candidate_address_1 else frozenset()
-            if candidate_street_words and not (source_street_words & candidate_street_words):
-                last = {**place, "status": "STREET_CONFLICT", "candidate_street": candidate_address_1}
+            if candidate_street_words:
+                if not (source_street_words & candidate_street_words):
+                    last = {**place, "status": "STREET_CONFLICT", "candidate_street": candidate_address_1}
+                    continue
+            elif source_hint and candidate_postcode:
+                weak_corroboration = "no_route_postcode_district_only"
+            else:
+                last = {**place, "status": "STREET_UNVERIFIABLE", "candidate_postcode": candidate_postcode}
                 continue
-        return {**place, "status": "OK"}
+        result = {**place, "status": "OK"}
+        if weak_corroboration:
+            result["weak_corroboration"] = weak_corroboration
+        return result
     return last
 
 
@@ -1169,8 +1242,16 @@ def geocode_row(row: ListingRow) -> ListingRow:
             # page can give it its own stronger caution (see schema.
             # ListingRow.geocode_unverified's own docstring) rather than
             # treating it with the same confidence as a hint-corroborated
-            # result.
-            if not source_hint:
+            # result. A weak_corroboration accept (see _best_places_
+            # result's own docstring - a route-less candidate corroborated
+            # only by its postcode DISTRICT, never a genuine street-word
+            # match) gets the same treatment, even though source_hint IS
+            # present here - postcode-district agreement alone is real but
+            # weaker evidence than the street-level corroboration every
+            # OTHER hint-corroborated match actually has, so it still
+            # deserves a reviewer's own closer look, not the full
+            # confidence an explicit False elsewhere implies.
+            if not source_hint or result.get("weak_corroboration"):
                 row.geocode_unverified = True
             else:
                 # A genuinely hint-corroborated Tier 2 match is real
@@ -1180,6 +1261,21 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 # geocode_row's own Tier 1 success branch for the same
                 # explicit-False reasoning).
                 row.geocode_unverified = False
+
+            if result.get("weak_corroboration"):
+                # Real, confirmed gap this closes: the exact "44 Paul
+                # Street" -> "20 Little Britain" incident this whole
+                # mechanism exists for left NO trace anywhere once
+                # accepted - reconstructing what actually happened took
+                # tracing it by hand, well after the fact, with nothing in
+                # any log to point at. This is that record.
+                log_geocode_weak_match(
+                    row,
+                    f"Places candidate at (lat={result['lat']}, lng={result['lng']}) has no route/street "
+                    f"of its own to verify against the source's own stated street in {row.building!r} - "
+                    f"accepted only on its postcode district agreeing with source evidence "
+                    f"({_hint_label(source_hint)!r}), not a genuine street match",
+                )
 
             if not row.address_1 or not row.postcode:
                 address_1, postcode = _address_line1_and_postcode(
@@ -1258,6 +1354,16 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 f"Places candidate's own street ({result.get('candidate_street')!r}) shares no words "
                 f"with the source's own stated street in {row.building!r} - rejected rather than "
                 "accepted on an otherwise-uncorroborated building-name-only match",
+            )
+            return row
+
+        if result["status"] == "STREET_UNVERIFIABLE":
+            log_geocode_failure(
+                row,
+                f"Places candidate (postcode={result.get('candidate_postcode')!r}) has no route/street "
+                f"of its own to verify against the source's own stated street in {row.building!r}, and "
+                "nothing else to corroborate it with either - rejected rather than accepted on a "
+                "completely uncorroborated building-name-only match",
             )
             return row
 

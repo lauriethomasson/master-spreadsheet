@@ -609,7 +609,22 @@ class CompoundBuildingGeocodingTests(unittest.TestCase):
 
         def fake_places(query):
             if query == "22 Newman Street, Fitzrovia, London, UK":
-                return {"status": "OK", "lat": 51.5176665, "lng": -0.1354706, "address_components": []}
+                # A real route component ("Newman Street") - matching the
+                # real confirmed Places response this case is based on
+                # (see split_compound_building's own docstring) - the
+                # address-only candidate "22 Newman Street" has its own
+                # leading house number, so it's checked against the
+                # STREET_CONFLICT/STREET_UNVERIFIABLE machinery too; an
+                # empty address_components here would now be rejected as
+                # uncorroborated rather than accepted, which isn't this
+                # test's own point at all.
+                return {
+                    "status": "OK", "lat": 51.5176665, "lng": -0.1354706,
+                    "address_components": [
+                        {"longText": "22", "types": ["street_number"]},
+                        {"longText": "Newman Street", "types": ["route"]},
+                    ],
+                }
             raise AssertionError(f"must not query the full compound value: {query!r}")
 
         with patch("geocode.call_places_text_search", side_effect=fake_places):
@@ -1167,13 +1182,20 @@ class StreetNameConflictTests(unittest.TestCase):
         self.assertEqual(row.lat, 51.5)
         self.assertEqual(row.lng, -0.1)
 
-    def test_candidate_with_no_route_component_is_never_street_checked(self):
-        # An address-shaped source (a real house number), but the
-        # returned candidate has no route component of its own to compare
-        # against at all - nothing real to compare, so this is accepted
-        # exactly like before this check existed (same "nothing to
-        # compare" conservatism as brochure_enrichment._address_conflict_
-        # note).
+    def test_candidate_with_no_route_component_and_no_source_hint_is_rejected(self):
+        # Real confirmed incident this now closes: a route-less candidate
+        # (only street_number/postal_code, no route at all) used to be
+        # accepted with NOTHING corroborating it - the exact shape that
+        # let a real Kitt's "44 Paul Street" (no address_1/postcode/
+        # submarket, so no source_hint either) get silently accepted onto
+        # a genuinely wrong, ~1km-away address ("20 Little Britain"),
+        # only discovered well after the fact since nothing was ever
+        # rejected or logged. With nothing at all to corroborate a route-
+        # less candidate against, this must now be rejected
+        # (STREET_UNVERIFIABLE) rather than accepted blind - see
+        # WeakStreetCorroborationTests below for the case where a
+        # source_hint IS available and this can still be accepted, just
+        # flagged and logged instead.
         row = ListingRow(building="44 Paul Street", provider="Kitt's")
         components = [{"longText": "EC2A 4LB", "types": ["postal_code"]}]
 
@@ -1183,8 +1205,10 @@ class StreetNameConflictTests(unittest.TestCase):
         ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
             geocode.geocode_row(row)
 
-        self.assertEqual(row.lat, 51.5262)
-        self.assertEqual(row.lng, -0.0873)
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("no route/street", geocode.FAILURES[0]["reason"])
 
     def test_falls_through_to_the_next_candidate_when_the_first_conflicts(self):
         # Same "keep trying safer variants before giving up" principle
@@ -1219,6 +1243,77 @@ class StreetNameConflictTests(unittest.TestCase):
 
         self.assertEqual(row.lat, 51.5262)
         self.assertEqual(row.lng, -0.0873)
+
+
+class WeakStreetCorroborationTests(unittest.TestCase):
+    """
+    Regression coverage for _best_places_result's own "weak_corroboration"
+    accept path (see geocode.py's own module docstring) - a route-less
+    Places candidate (no route component at all, so nothing for the
+    street-word check to compare) can still be accepted when its own
+    postcode DISTRICT agrees with a real source_hint - weaker evidence
+    than a genuine street-word match, but real - flagged geocode_
+    unverified and recorded via log_geocode_weak_match/WEAK_MATCHES,
+    closing the exact "invisible once accepted" gap the real "44 Paul
+    Street" -> "20 Little Britain" incident exposed (nothing was ever
+    logged when that candidate was silently accepted - reconstructing
+    what happened took tracing it by hand well after the fact).
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+        geocode.WEAK_MATCHES.clear()
+
+    def test_route_less_candidate_with_matching_postcode_district_is_accepted_and_logged(self):
+        row = ListingRow(building="44 Paul Street", provider="Kitt's", postcode="EC2A 4LB")
+        components = [
+            {"longText": "44", "types": ["street_number"]},
+            {"longText": "EC2A 4LB", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5262, "lng": -0.0873, "address_components": components},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5262)
+        self.assertEqual(row.lng, -0.0873)
+        # Flagged for a reviewer's own closer look - weaker evidence than
+        # a genuine street-level match, even though a source_hint exists.
+        self.assertIs(row.geocode_unverified, True)
+        self.assertEqual(len(geocode.WEAK_MATCHES), 1)
+        self.assertIn("no route/street", geocode.WEAK_MATCHES[0]["reason"])
+        # A SEPARATE, pre-existing, unrelated log entry is still expected
+        # here too - address_1 genuinely never got filled (no route to
+        # build one from, and the mocked reverse-geocode fallback found
+        # nothing either), which geocode_row's own existing "still missing
+        # address_1/postcode" check already logs regardless of this fix.
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("no street", geocode.FAILURES[0]["reason"])
+
+    def test_route_less_candidate_with_conflicting_postcode_district_is_rejected_not_logged_as_weak(self):
+        # The EXISTING postcode-conflict check (checked before the street
+        # logic at all) still takes priority - a route-less candidate
+        # whose OWN postcode disagrees with source evidence is rejected
+        # for THAT reason (LOCATION_CONFLICT), never silently accepted as
+        # a "weak match".
+        row = ListingRow(building="44 Paul Street", provider="Kitt's", postcode="EC2A 4LB")
+        components = [
+            {"longText": "20", "types": ["street_number"]},
+            {"longText": "EC1A 7DH", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.517221, "lng": -0.098351, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertEqual(geocode.WEAK_MATCHES, [])
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("contradicts", geocode.FAILURES[0]["reason"])
 
 
 class Tier1AddressWithoutPostcodeTests(unittest.TestCase):
