@@ -10,6 +10,7 @@ import streamlit as st
 
 import brochure_enrichment
 import display_utils
+import geocode
 import master_merge
 import master_writer
 import page_flow
@@ -886,7 +887,126 @@ def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix:
     return "remove" if choice.startswith("Remove") else "keep"
 
 
-def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
+def _render_missing_location_lookup(row_dict: dict, key_prefix: str) -> dict:
+    """
+    Interactive address/postcode lookup for a genuinely NEW property
+    missing its own location (see master_merge.new_property_missing_
+    location) - replaces the old plain, non-interactive "📍 Missing:
+    ... — added anyway" caption with something a reviewer can actually
+    resolve before Approve, via the app's own real Geocoding API
+    (geocode.geocode_address_lookup) rather than forcing a manual lookup
+    elsewhere and pasting values back in by hand. Shared by both of this
+    page's own call sites (the brand-new-property let-status decision
+    card and the plain "View new properties" expander) rather than
+    duplicated - the two only ever differ in what surrounds this, never
+    in the lookup UI itself.
+
+    Returns a {field: value} dict of exactly what the reviewer has
+    explicitly accepted via "✓ Use this location" THIS run (address_1,
+    postcode, lat, lng, geocode_unverified=False, plus submarket when the
+    lookup resolved one) - {} whenever nothing's been accepted yet
+    (including every run before that click, and every run for a row with
+    nothing missing at all). The caller applies this onto the row's own
+    new_row via model_copy(update=...), the exact same pattern every
+    other field-level accept action on this page already uses. Never
+    mutates row_dict itself - this is a preview until explicitly accepted.
+
+    Only ever prompts for whichever of address_1/postcode is ACTUALLY
+    still blank (see master_merge.NEW_PROPERTY_LOCATION_FIELDS) - a row
+    missing only its map location (lat/lng) with a real address_1/
+    postcode already on file skips straight to a lookup using those
+    existing values, never asking the reviewer to retype something
+    already known.
+
+    State survives Streamlit reruns between clicking "📍 Look up" and
+    clicking "✓ Use this location" (two separate reruns) via st.session_
+    state, keyed by key_prefix - the caller's own STABLE per-row key.
+    property_id isn't assigned yet for a brand-new row at this stage (see
+    schema.ListingRow.property_id's own docstring - "assigned once a row
+    lands in the master... never set by extraction"), so callers use a
+    stable per-row index instead; same convention as this page's own
+    per-row keys elsewhere (e.g. _render_single_file_discard's own
+    confirm_key, suffixed by a real unique value, never anything that can
+    collide across two different rows).
+    """
+    if not master_merge.new_property_missing_location(row_dict):
+        return {}
+
+    accepted_key = f"{key_prefix}_loc_accepted"
+    if st.session_state.get(accepted_key):
+        accepted = st.session_state[accepted_key]
+        detail = accepted["address_1"] + (f", {accepted['postcode']}" if accepted.get("postcode") else "")
+        st.caption(f"📍 Using: {detail}")
+        return accepted
+
+    missing = ", ".join(master_merge.missing_location_labels(row_dict))
+    st.caption(f"📍 Missing: {missing}")
+
+    address_1_blank = master_merge._is_blank(row_dict.get("address_1"))
+    postcode_blank = master_merge._is_blank(row_dict.get("postcode"))
+
+    if address_1_blank:
+        address_input = st.text_input(
+            "Address", value="", placeholder="e.g. 67 Clerkenwell Rd", key=f"{key_prefix}_loc_address",
+        ).strip()
+    else:
+        address_input = row_dict.get("address_1")
+
+    if postcode_blank:
+        postcode_input = st.text_input(
+            "Postcode (optional)", value="", key=f"{key_prefix}_loc_postcode",
+        ).strip()
+    else:
+        postcode_input = row_dict.get("postcode")
+
+    result_key = f"{key_prefix}_loc_result"
+    if st.button("📍 Look up", key=f"{key_prefix}_loc_lookup_btn"):
+        if not address_input:
+            st.session_state[result_key] = {"status": "EMPTY"}
+        else:
+            st.session_state[result_key] = geocode.geocode_address_lookup(address_input, postcode_input or None)
+        st.rerun()
+
+    result = st.session_state.get(result_key)
+    if result:
+        # A genuine, specific match always has its own address_1 - Google's
+        # Geocoding API confirmed to still answer "OK" for a nonsense query
+        # with a broad country-level fallback location and no address_1/
+        # postcode of its own at all, which must read as "no match" here,
+        # not a real result.
+        if result.get("status") == "OK" and result.get("address_1"):
+            preview = result["address_1"]
+            if result.get("postcode"):
+                preview += f", {result['postcode']}"
+            st.success(f"Found: {preview} (lat {result['lat']:.5f}, lng {result['lng']:.5f})")
+            if result.get("submarket"):
+                st.caption(f"Submarket: {result['submarket']}")
+            with st.container(horizontal=True):
+                use_clicked = st.button("✓ Use this location", key=f"{key_prefix}_loc_use_btn", type="primary")
+                retry_clicked = st.button("Try a different address", key=f"{key_prefix}_loc_retry_btn")
+            if use_clicked:
+                accepted = {
+                    "address_1": result["address_1"],
+                    "postcode": result.get("postcode"),
+                    "lat": result["lat"],
+                    "lng": result["lng"],
+                    "geocode_unverified": False,
+                }
+                if result.get("submarket"):
+                    accepted["submarket"] = result["submarket"]
+                st.session_state[accepted_key] = accepted
+                st.session_state.pop(result_key, None)
+                st.rerun()
+            if retry_clicked:
+                st.session_state.pop(result_key, None)
+                st.rerun()
+        else:
+            st.warning("No match found — check the address and try again.")
+
+    return {}
+
+
+def _render_new_property_let_status_decision(u, key_prefix: str) -> tuple:
     """
     Like _render_let_status_decision, for a genuinely NEW property (see
     master_merge.UnmatchedRow.let_status_fields) rather than a matched one -
@@ -899,6 +1019,13 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
     decision, same precedent as _render_stale_candidate_decision already
     being its own sibling rather than a reuse of that one - the two share
     no rendering logic once "there's an old value to show" is gone.
+
+    Returns (decision, location_overrides) - decision is "add"/"skip"
+    exactly as before; location_overrides is whatever _render_missing_
+    location_lookup returns ({} unless the reviewer explicitly accepted a
+    lookup this run - see that function's own docstring), for the caller
+    to apply via model_copy(update=...) alongside the property_id it
+    already sets, only when decision == "add".
     """
     row_dict = u.new_row.model_dump()
     label = display_utils.row_label(row_dict)
@@ -910,9 +1037,7 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
     status_text = "; ".join(master_merge.let_status_display_text(getattr(u.new_row, f)) for f in u.let_status_fields)
 
     st.warning(f"**{label}**\n\n{provider} lists this brand-new property as **{status_text}**.")
-    if master_merge.new_property_missing_location(row_dict):
-        missing = ", ".join(master_merge.missing_location_labels(row_dict))
-        st.caption(f"📍 Missing: {missing} — added anyway")
+    location_overrides = _render_missing_location_lookup(row_dict, key_prefix)
 
     choice = st.radio(
         "What would you like to do?",
@@ -922,7 +1047,8 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> str:
         ],
         key=f"{key_prefix}_new_let_decision",
     )
-    return "skip" if choice.startswith("Don't add") else "add"
+    decision = "skip" if choice.startswith("Don't add") else "add"
+    return decision, location_overrides
 
 
 # Search fields for the one master search bar - this used to be two
@@ -2377,9 +2503,10 @@ def _render_pending_review(pending: list):
             st.divider()
 
         for i, u in enumerate(decision_new_property_let_status):
-            decision = _render_new_property_let_status_decision(u, f"new_let_status_{i}")
+            decision, location_overrides = _render_new_property_let_status_decision(u, f"new_let_status_{i}")
             if decision == "add":
-                new_rows_final.append(u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}))
+                update = {"property_id": str(uuid.uuid4()), **location_overrides}
+                new_rows_final.append(u.new_row.model_copy(update=update))
             # "skip" - never added to master at all.
             st.divider()
 
@@ -2567,16 +2694,23 @@ def _render_pending_review(pending: list):
         n = len(plain_new)
         st.subheader("📄 New properties")
         st.info(f"{n} new propert{'y' if n == 1 else 'ies'} will be added.")
+        # {index into plain_new: location_overrides} - collected while
+        # rendering the lookup UI below (inside the expander), applied
+        # once building new_rows_final further down (outside it) - see
+        # _render_missing_location_lookup's own docstring for what this
+        # dict holds and why it's empty until "✓ Use this location".
+        location_overrides_by_index = {}
         with st.expander("View new properties"):
             labels = master_merge.new_property_labels([u.new_row for u in plain_new])
-            for label, u in zip(labels, plain_new):
+            for i, (label, u) in enumerate(zip(labels, plain_new)):
                 st.write(label)
                 row_dict = u.new_row.model_dump()
-                if master_merge.new_property_missing_location(row_dict):
-                    missing = ", ".join(master_merge.missing_location_labels(row_dict))
-                    st.caption(f"📍 Missing: {missing} — added anyway")
+                overrides = _render_missing_location_lookup(row_dict, f"plain_new_{i}")
+                if overrides:
+                    location_overrides_by_index[i] = overrides
         new_rows_final.extend(
-            u.new_row.model_copy(update={"property_id": str(uuid.uuid4())}) for u in plain_new
+            u.new_row.model_copy(update={"property_id": str(uuid.uuid4()), **location_overrides_by_index.get(i, {})})
+            for i, u in enumerate(plain_new)
         )
 
     # ==== 4. No changes ====

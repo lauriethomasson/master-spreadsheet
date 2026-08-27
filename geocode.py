@@ -433,8 +433,77 @@ def call_geocoding_api(address: str) -> dict:
     if status != "OK" or not data.get("results"):
         return {"status": status}
 
-    location = data["results"][0]["geometry"]["location"]
-    return {"status": "OK", "lat": location["lat"], "lng": location["lng"]}
+    top = data["results"][0]
+    location = top["geometry"]["location"]
+    # address_components (the top result's own, never pooled across
+    # results the way call_reverse_geocoding_api's own version is - a
+    # forward address lookup has one clearly-best result, unlike a
+    # reverse lookup, which returns several at different specificity
+    # levels) is purely additive - every existing caller/test already
+    # only ever reads "status"/"lat"/"lng" from this dict, so this adds
+    # nothing any of them needs to change for. Lets a caller that already
+    # has a trusted address (e.g. geocode_address_lookup below, or
+    # geocode_row's own relaxed Tier 1 branch) pull a clean address_1/
+    # postcode back out via _address_line1_and_postcode without a
+    # separate reverse-geocode call.
+    return {
+        "status": "OK", "lat": location["lat"], "lng": location["lng"],
+        "address_components": top.get("address_components", []),
+    }
+
+
+def geocode_address_lookup(address: str, postcode: str = None) -> dict:
+    """
+    A real Geocoding API (Tier 1) lookup for a plain address string a
+    REVIEWER typed in - never used by geocode_row itself, which always
+    works from a ListingRow's own fields. See pages/2_Review_and_Master.py's
+    own missing-location lookup UI for a genuinely new property, the one
+    caller of this function.
+
+    Query built exactly like geocode_row's own Tier 1 (see that function's
+    own two branches): "{address}, {postcode}, UK" when postcode is given
+    (even from an address alone, since the whole point of this path is
+    a reviewer who may not know/have a postcode yet), else "{address}, UK"
+    alone.
+
+    Returns {"status": "OK", "address_1", "postcode", "lat", "lng",
+    "submarket"} on success - address_1/postcode/submarket may still
+    individually be None when the API's own result doesn't state one
+    (never guessed/fabricated) - or {"status": <call_geocoding_api's own
+    non-OK status>} otherwise, the exact same "no match" contract that
+    function already has, so a caller only ever needs to check
+    status == "OK".
+
+    address_1/postcode are read from the API's own top result via
+    _address_line1_and_postcode (name_key="long_name" - the legacy
+    Geocoding API's own component shape, same as call_reverse_geocoding_
+    api's own caller uses), never a second, independently-drifting parser.
+    submarket is resolved via the SAME _fill_submarket/_backfill_
+    submarket_from_coords machinery geocode_row itself trusts for every
+    other source of coordinates - tried against a throwaway ListingRow
+    built from this lookup's OWN freshly-resolved address_1/postcode
+    (the most specific, current location text available here), never the
+    caller's own possibly-blank row.
+    """
+    query = f"{address}, {postcode}, UK" if postcode else f"{address}, UK"
+    result = call_geocoding_api(query)
+    if result["status"] != "OK":
+        return result
+
+    address_1, resolved_postcode = _address_line1_and_postcode(
+        result.get("address_components", []), name_key="long_name"
+    )
+    scratch_row = ListingRow(building=address_1 or address, address_1=address_1, postcode=resolved_postcode)
+    _backfill_submarket_from_coords(scratch_row, result["lat"], result["lng"])
+
+    return {
+        "status": "OK",
+        "address_1": address_1,
+        "postcode": resolved_postcode,
+        "lat": result["lat"],
+        "lng": result["lng"],
+        "submarket": scratch_row.submarket,
+    }
 
 
 def call_reverse_geocoding_api(lat: float, lng: float) -> dict:

@@ -14,7 +14,7 @@ Run with:
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -1365,6 +1365,125 @@ class Tier1AddressWithoutPostcodeTests(unittest.TestCase):
             geocode.geocode_row(row)
 
         mock_places.assert_called()
+
+
+class GeocodeAddressLookupTests(unittest.TestCase):
+    """
+    geocode_address_lookup - the reviewer-facing lookup pages/2_Review_
+    and_Master.py's own missing-location UI calls (see that module's own
+    _render_missing_location_lookup). httpx.get itself is never mocked
+    here - geocode.call_geocoding_api is the one real network boundary,
+    same convention every other test in this file already uses.
+    """
+
+    def _components(self, number="67", route="Clerkenwell Road", postcode="EC1R 5BL"):
+        return [
+            {"long_name": number, "types": ["street_number"]},
+            {"long_name": route, "types": ["route"]},
+            {"long_name": postcode, "types": ["postal_code"]},
+        ]
+
+    def test_successful_lookup_returns_a_clean_address_postcode_and_coordinates(self):
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={
+                "status": "OK", "lat": 51.5219197, "lng": -0.1077003,
+                "address_components": self._components(),
+            },
+        ) as mock_geocoding, patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            result = geocode.geocode_address_lookup("67 Clerkenwell Rd")
+
+        mock_geocoding.assert_called_once_with("67 Clerkenwell Rd, UK")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["address_1"], "67 Clerkenwell Road")
+        self.assertEqual(result["postcode"], "EC1R 5BL")
+        self.assertEqual(result["lat"], 51.5219197)
+        self.assertEqual(result["lng"], -0.1077003)
+
+    def test_postcode_argument_is_folded_into_the_query_when_given(self):
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={"status": "OK", "lat": 51.5, "lng": -0.1, "address_components": self._components()},
+        ) as mock_geocoding:
+            geocode.geocode_address_lookup("67 Clerkenwell Rd", "EC1R 5BL")
+
+        mock_geocoding.assert_called_once_with("67 Clerkenwell Rd, EC1R 5BL, UK")
+
+    def test_submarket_is_resolved_via_the_existing_backfill_machinery(self):
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={"status": "OK", "lat": 51.5, "lng": -0.1, "address_components": self._components()},
+        ), patch(
+            "geocode.call_reverse_geocoding_api",
+            return_value={
+                "status": "OK",
+                "address_components": [{"long_name": "Farringdon", "types": ["sublocality"]}],
+            },
+        ):
+            result = geocode.geocode_address_lookup("67 Clerkenwell Rd")
+
+        self.assertEqual(result["submarket"], "Farringdon")
+
+    def test_zero_results_is_passed_straight_through(self):
+        with patch("geocode.call_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            result = geocode.geocode_address_lookup("complete nonsense")
+
+        self.assertEqual(result, {"status": "ZERO_RESULTS"})
+
+    def test_a_broad_fallback_result_with_no_address_components_still_returns_ok_with_blank_fields(self):
+        # Real confirmed Google Geocoding API behavior: a nonsense query
+        # can still come back "status": "OK" with a broad country-level
+        # location and no address_components at all - this function
+        # itself doesn't decide "no match" (that's the UI's own job, see
+        # pages/2_Review_and_Master.py) - it just reports address_1/
+        # postcode as genuinely blank, never fabricated.
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={"status": "OK", "lat": 55.378051, "lng": -3.435973, "address_components": []},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            result = geocode.geocode_address_lookup("zzzqqxxyy nonsense")
+
+        self.assertEqual(result["status"], "OK")
+        self.assertIsNone(result["address_1"])
+        self.assertIsNone(result["postcode"])
+
+
+class CallGeocodingApiAddressComponentsTests(unittest.TestCase):
+    """call_geocoding_api's own address_components addition - purely
+    additive, see that function's own docstring."""
+
+    def test_status_lat_lng_are_unaffected(self):
+        response = MagicMock()
+        response.json.return_value = {
+            "status": "OK",
+            "results": [{"geometry": {"location": {"lat": 51.5, "lng": -0.1}}, "address_components": []}],
+        }
+        with patch("geocode.httpx.get", return_value=response):
+            result = geocode.call_geocoding_api("67 Clerkenwell Rd, UK")
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["lat"], 51.5)
+        self.assertEqual(result["lng"], -0.1)
+
+    def test_address_components_are_now_included(self):
+        components = [{"long_name": "Clerkenwell Road", "types": ["route"]}]
+        response = MagicMock()
+        response.json.return_value = {
+            "status": "OK",
+            "results": [{"geometry": {"location": {"lat": 51.5, "lng": -0.1}}, "address_components": components}],
+        }
+        with patch("geocode.httpx.get", return_value=response):
+            result = geocode.call_geocoding_api("67 Clerkenwell Rd, UK")
+
+        self.assertEqual(result["address_components"], components)
+
+    def test_zero_results_is_unaffected(self):
+        response = MagicMock()
+        response.json.return_value = {"status": "ZERO_RESULTS", "results": []}
+        with patch("geocode.httpx.get", return_value=response):
+            result = geocode.call_geocoding_api("nonsense")
+
+        self.assertEqual(result, {"status": "ZERO_RESULTS"})
 
 
 if __name__ == "__main__":

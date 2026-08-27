@@ -22,6 +22,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -34,7 +37,11 @@ BASE = Path(__file__).resolve().parent.parent
 
 
 def _note(missing: str) -> str:
-    return f"📍 Missing: {missing} — added anyway"
+    # No longer "— added anyway" - the reviewer can now actually resolve
+    # this via the interactive address/postcode lookup UI (see pages/2_
+    # Review_and_Master.py's own _render_missing_location_lookup) rather
+    # than just being told it'll be added regardless.
+    return f"📍 Missing: {missing}"
 
 
 class IsolatedCwdTestCase(unittest.TestCase):
@@ -129,6 +136,152 @@ class PlainNewPropertyMissingLocationCombinationsTests(IsolatedCwdTestCase):
         master_df = master_writer.load_master_as_dataframe()
         self.assertEqual(len(master_df), 1)
         self.assertEqual(master_df.iloc[0]["building"], "9 Example Yard")
+
+
+class MissingLocationLookupTests(IsolatedCwdTestCase):
+    """
+    The interactive address/postcode lookup UI itself (see pages/2_
+    Review_and_Master.py's own _render_missing_location_lookup) - real
+    Geocoding API calls mocked via geocode.call_geocoding_api, the one
+    network boundary geocode.geocode_address_lookup is built on.
+    """
+
+    def test_accepted_lookup_is_applied_to_the_row_written_to_master(self):
+        _stage_new_property()
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={
+                "status": "OK", "lat": 51.5219197, "lng": -0.1077003,
+                "address_components": [
+                    {"long_name": "67", "types": ["street_number"]},
+                    {"long_name": "Clerkenwell Road", "types": ["route"]},
+                    {"long_name": "EC1R 5BL", "types": ["postal_code"]},
+                ],
+            },
+        ):
+            at = _run_review_page()
+            at.text_input(key="plain_new_0_loc_address").set_value("67 Clerkenwell Rd").run()
+            lookup_buttons = [b for b in at.button if b.label == "📍 Look up"]
+            lookup_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+            use_buttons = [b for b in at.button if b.label == "✓ Use this location"]
+            self.assertEqual(len(use_buttons), 1)
+            use_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+            approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+            approve_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 1)
+        row = master_df.iloc[0]
+        self.assertEqual(row["address_1"], "67 Clerkenwell Road")
+        self.assertEqual(row["postcode"], "EC1R 5BL")
+        self.assertAlmostEqual(row["lat"], 51.5219197)
+        self.assertAlmostEqual(row["lng"], -0.1077003)
+        # A DataFrame value, not a plain Python bool - assertEqual (not
+        # assertIs) so a numpy bool_(False) correctly counts as equal.
+        self.assertEqual(row["geocode_unverified"], False)
+
+    def test_a_lookup_never_confirmed_leaves_the_row_exactly_as_it_was(self):
+        # "Look up" is clicked and a genuine match is found, but "✓ Use
+        # this location" never is - nothing here must reach master at all,
+        # same as if the reviewer had never touched this UI.
+        _stage_new_property()
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={
+                "status": "OK", "lat": 51.5219197, "lng": -0.1077003,
+                "address_components": [
+                    {"long_name": "67", "types": ["street_number"]},
+                    {"long_name": "Clerkenwell Road", "types": ["route"]},
+                    {"long_name": "EC1R 5BL", "types": ["postal_code"]},
+                ],
+            },
+        ):
+            at = _run_review_page()
+            at.text_input(key="plain_new_0_loc_address").set_value("67 Clerkenwell Rd").run()
+            lookup_buttons = [b for b in at.button if b.label == "📍 Look up"]
+            lookup_buttons[0].click().run()
+            self.assertFalse(at.exception)
+            self.assertTrue(any(b.label == "✓ Use this location" for b in at.button))
+
+            approve_buttons = [b for b in at.button if b.label == "Approve → Master"]
+            approve_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        master_df = master_writer.load_master_as_dataframe()
+        self.assertEqual(len(master_df), 1)
+        row = master_df.iloc[0]
+        self.assertTrue(row["address_1"] is None or (isinstance(row["address_1"], float) and pd.isna(row["address_1"])))
+        self.assertTrue(row["postcode"] is None or (isinstance(row["postcode"], float) and pd.isna(row["postcode"])))
+
+    def test_failed_lookup_shows_a_plain_message_and_applies_nothing(self):
+        _stage_new_property()
+        with patch(
+            "geocode.call_geocoding_api", return_value={"status": "ZERO_RESULTS"},
+        ):
+            at = _run_review_page()
+            at.text_input(key="plain_new_0_loc_address").set_value("complete nonsense address").run()
+            lookup_buttons = [b for b in at.button if b.label == "📍 Look up"]
+            lookup_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        self.assertFalse(any(b.label == "✓ Use this location" for b in at.button))
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("No match found — check the address and try again.", warning_text)
+
+    def test_a_result_with_no_specific_address_reads_as_no_match(self):
+        # Real confirmed Google Geocoding API behavior: a nonsense query
+        # can still come back "status": "OK" with a broad country-level
+        # fallback location and no address_1/postcode of its own at all -
+        # this must still read as "no match", not a false positive.
+        _stage_new_property()
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={"status": "OK", "lat": 55.378051, "lng": -3.435973, "address_components": []},
+        ):
+            at = _run_review_page()
+            at.text_input(key="plain_new_0_loc_address").set_value("zzzqqxxyy nonsense").run()
+            lookup_buttons = [b for b in at.button if b.label == "📍 Look up"]
+            lookup_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        self.assertFalse(any(b.label == "✓ Use this location" for b in at.button))
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("No match found", warning_text)
+
+    def test_lookup_skips_straight_to_search_when_only_map_location_is_missing(self):
+        # address_1/postcode already present - no text inputs needed at
+        # all, the lookup uses the existing values directly.
+        save_staging_file(
+            [ListingRow(
+                building="9 Example Yard", provider="Test Provider", floor_unit="2nd Floor",
+                address_1="9 Example Yard", postcode="EC1A 1AA",
+            )],
+            "new_property_address_only.xlsx", content_hash="new-property-address-only-hash",
+        )
+        with patch(
+            "geocode.call_geocoding_api",
+            return_value={
+                "status": "OK", "lat": 51.5219197, "lng": -0.1077003,
+                "address_components": [
+                    {"long_name": "9", "types": ["street_number"]},
+                    {"long_name": "Example Yard", "types": ["route"]},
+                    {"long_name": "EC1A 1AA", "types": ["postal_code"]},
+                ],
+            },
+        ) as mock_geocoding:
+            at = _run_review_page()
+            self.assertFalse(any(t.key == "plain_new_0_loc_address" for t in at.text_input))
+            lookup_buttons = [b for b in at.button if b.label == "📍 Look up"]
+            lookup_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        mock_geocoding.assert_called_once_with("9 Example Yard, EC1A 1AA, UK")
+        self.assertTrue(any(b.label == "✓ Use this location" for b in at.button))
 
 
 class NewPropertyLetStatusMissingLocationTests(IsolatedCwdTestCase):
