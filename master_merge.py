@@ -1021,6 +1021,42 @@ def is_detail_loss(old_val, new_val, field_name: str = None) -> bool:
     return any(not any(_items_similar(old_item, new_item) for new_item in new_items) for old_item in old_items)
 
 
+def _has_suspicious_duplicate_items(text, field_name: str = None) -> bool:
+    """
+    True when `text` (split via _detail_items - the SAME semicolon/newline
+    [/comma for special_features] split is_detail_loss itself already uses)
+    restates the exact same item twice - a THIRD, independent detail-loss
+    signal alongside is_detail_loss/is_richness_regression, needed because
+    neither of those reliably catches a pure accidental duplication:
+    is_detail_loss only fires when an OLD item goes unrestated (a duplicate
+    that also restates everything old_val had triggers nothing there), and
+    is_richness_regression only fires on an overall SHORTER new_val (a
+    duplicated item can make new_val even LONGER than old_val, the opposite
+    signal). Confirmed real case this exists for: a genuine Thirty
+    Lighterman re-extraction whose special_features stated "Penthouse
+    suite, private terrace" twice.
+
+    Deliberately CONSERVATIVE - exact, normalize-via-_detail_items
+    duplication only (case/whitespace-insensitive, but never a fuzzy/
+    reworded near-duplicate - see _items_similar for that separate, much
+    weaker-evidence concern, used only for old-vs-new comparison, never for
+    this same-text-twice check). A literal repeated item is strong,
+    unambiguous evidence of an accidental extraction duplication; a merely
+    SIMILAR pair of items is common and legitimate (e.g. two genuinely
+    different meeting-room features that both happen to mention "meeting
+    room") and must never be flagged here.
+
+    Works on a SINGLE value, not an old/new pair - callers use it two ways:
+    directly on a freshly extracted value (no old_val needed at all - a
+    self-duplicating extraction is suspicious regardless of what master
+    already has, including when old_val is blank), and by build_merge_plan
+    as one more risky_fields signal alongside is_detail_loss/is_richness_
+    regression.
+    """
+    items = _detail_items(str(text), field_name)
+    return len(items) != len(set(items))
+
+
 def _split_list_items(text: str, field_name: str = None) -> list[str]:
     """
     Case-PRESERVING counterpart to _detail_items - same splitting rules
@@ -2739,9 +2775,11 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             # text's own docstring): is_detail_loss says old_val has a
             # genuine item new_val doesn't restate, but is_richness_
             # regression says new_val isn't a drastic, all-round terser
-            # replacement (the one shape that must stay a manual review,
-            # unmerged, exactly as before this existed - see that
-            # function's own docstring). Mutating diffs[f] here, rather
+            # replacement, AND _has_suspicious_duplicate_items says new_val
+            # doesn't restate one of its OWN items twice (either shape must
+            # stay a manual review, unmerged, exactly as before this
+            # existed - see those functions' own docstrings). Mutating
+            # diffs[f] here, rather
             # than adding a separate resolved-value field, is what lets the
             # EXISTING risky_fields expression right below re-evaluate
             # against the MERGED value with no changes of its own: a merged
@@ -2775,12 +2813,26 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                     continue
                 if is_richness_regression(old_val, new_val):
                     continue
+                # A suspicious duplicate WITHIN new_val (see _has_
+                # suspicious_duplicate_items) blocks auto-merge the same
+                # way is_richness_regression already does, just above -
+                # merge_compatible_text's own merged output starts from
+                # new_val's own items verbatim (see its own docstring), so
+                # a self-duplicating extraction would otherwise carry its
+                # duplicate straight into an auto-applied value with
+                # nobody ever reviewing it.
+                if _has_suspicious_duplicate_items(new_val, f):
+                    continue
                 if is_detail_loss(old_val, new_val, field_name=f):
                     diffs[f] = (old_val, merge_compatible_text(old_val, new_val, field_name=f))
 
             risky_fields = frozenset(
                 f for f in diffs
-                if f in DETAIL_LOSS_MERGE_FIELDS and (is_detail_loss(*diffs[f]) or is_richness_regression(*diffs[f]))
+                if f in DETAIL_LOSS_MERGE_FIELDS and (
+                    is_detail_loss(*diffs[f])
+                    or is_richness_regression(*diffs[f])
+                    or _has_suspicious_duplicate_items(diffs[f][1], f)
+                )
             ) | frozenset(
                 f for f in diffs
                 if f in HOUSE_NUMBER_FIELDS and house_number_changed(*diffs[f])

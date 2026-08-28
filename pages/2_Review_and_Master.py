@@ -37,7 +37,9 @@ def _empty_master_df() -> pd.DataFrame:
     return pd.DataFrame(columns=list(ListingRow.model_fields.keys()))
 
 
-def _risky_field_reason(field: str, unverified: bool = False, address_conflict: str = None) -> str:
+def _risky_field_reason(
+    field: str, unverified: bool = False, address_conflict: str = None, new_val: str = None,
+) -> str:
     """
     Short, plain-English reason ONE specific risky field needs a manual
     decision - derived directly from WHICH of master_merge's own risk
@@ -59,6 +61,18 @@ def _risky_field_reason(field: str, unverified: bool = False, address_conflict: 
     implies the OLD value is the one to trust and the new one is merely
     different, which is backwards here, since it's the NEW value that
     actually needs the reviewer's own manual confirmation.
+
+    new_val, for a RISKY_TEXT_FIELDS field, is independently re-checked
+    against master_merge._has_suspicious_duplicate_items (the SAME signal
+    build_merge_plan's own risky_fields computation already used to flag
+    this field at all - re-derived here rather than threaded through as a
+    separate reason string, same "never a second, independently-drifting
+    copy of the decision" precedent as _looks_identical_but_differs) -
+    the generic "looks shorter" wording below would be actively
+    misleading for a duplicate-only case, where new_val is often LONGER
+    than old_val, not shorter. Optional/defaults to None so a caller with
+    nothing to check (a field not in RISKY_TEXT_FIELDS at all) is
+    unaffected.
     """
     if address_conflict and field == "address_1":
         return address_conflict
@@ -69,6 +83,8 @@ def _risky_field_reason(field: str, unverified: bool = False, address_conflict: 
     if field in master_merge.GEOCODE_RISK_FIELDS:
         return "Existing location would be replaced"
     if field in master_merge.RISKY_TEXT_FIELDS:
+        if new_val is not None and master_merge._has_suspicious_duplicate_items(new_val, field):
+            return "New extraction contains repeated feature text and may be malformed"
         return "New text looks shorter than what's there now — may be missing detail, not just an update."
     return "Existing value differs from the new upload"
 
@@ -313,7 +329,7 @@ def _render_field_rows(
         with label_col:
             st.markdown(f"**{display_utils.friendly_field_label(f)}**")
             if is_risky:
-                st.caption(f"⚠️ {_risky_field_reason(f, unverified, address_conflict)}")
+                st.caption(f"⚠️ {_risky_field_reason(f, unverified, address_conflict, new_val)}")
             if looks_identical:
                 st.caption(
                     "⚠️ Looks identical, but the underlying text differs (hidden character, punctuation, or "

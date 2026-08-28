@@ -2835,6 +2835,79 @@ class IsRichnessRegressionTests(unittest.TestCase):
         self.assertFalse(master_merge.is_richness_regression(BOND_STREET_AMENITIES, None))
 
 
+class HasSuspiciousDuplicateItemsTests(unittest.TestCase):
+    """
+    _has_suspicious_duplicate_items - the third, independent detail-loss
+    signal alongside is_detail_loss/is_richness_regression (see its own
+    docstring). Confirmed real case: a genuine Thirty Lighterman re-
+    extraction whose special_features stated "Penthouse suite, private
+    terrace" twice.
+    """
+
+    THIRTY_LIGHTERMAN_OLD = (
+        "Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; minimum term 24 months; "
+        "legal structure: co-lease; excellent natural light; Thirty Lighterman offers a fresh "
+        "alternative to the traditional office. With flexible spaces and room to make it your own, "
+        "it's designed to support collaboration, creativity, and growth as your needs evolve.; "
+        "private outdoor spaces; high-spec showers"
+    )
+    THIRTY_LIGHTERMAN_NEW = (
+        "Penthouse suite, private terrace; Penthouse suite, private terrace; 3 meeting rooms; "
+        "1 tea point; minimum term 24 months; excellent natural light; private outdoor spaces; "
+        "high-spec showers"
+    )
+
+    def test_the_real_thirty_lighterman_extraction_is_flagged(self):
+        self.assertTrue(
+            master_merge._has_suspicious_duplicate_items(self.THIRTY_LIGHTERMAN_NEW, "special_features")
+        )
+
+    def test_a_simple_repeated_item_is_flagged(self):
+        self.assertTrue(
+            master_merge._has_suspicious_duplicate_items(
+                "Private terrace; private terrace; 3 meeting rooms", "special_features"
+            )
+        )
+
+    def test_case_and_whitespace_only_repeat_is_still_flagged(self):
+        self.assertTrue(
+            master_merge._has_suspicious_duplicate_items(
+                "Private terrace; PRIVATE TERRACE ; 3 meeting rooms", "special_features"
+            )
+        )
+
+    def test_no_repeated_item_is_not_flagged(self):
+        self.assertFalse(
+            master_merge._has_suspicious_duplicate_items("3 meeting rooms; private terrace", "special_features")
+        )
+
+    def test_merely_similar_but_not_identical_items_are_not_flagged(self):
+        # A conservative, EXACT-duplicate-only check - two genuinely
+        # different items that happen to share most of their wording are
+        # common and legitimate, never flagged here (contrast is_detail_
+        # loss's own _items_similar, a deliberately weaker/fuzzier bar,
+        # used only for old-vs-new comparison, never for this check).
+        self.assertFalse(
+            master_merge._has_suspicious_duplicate_items(
+                "Large meeting room on the 3rd floor; small meeting room on the 4th floor", "special_features"
+            )
+        )
+
+    def test_harmless_whitespace_only_difference_is_not_flagged(self):
+        self.assertFalse(
+            master_merge._has_suspicious_duplicate_items("3 meeting rooms;  private terrace", "special_features")
+        )
+
+    def test_blank_text_is_not_flagged(self):
+        self.assertFalse(master_merge._has_suspicious_duplicate_items("", "special_features"))
+
+    def test_works_without_a_field_name_too(self):
+        # Falls back to the plain semicolon/newline-only split (see
+        # _detail_items' own docstring) - still catches a whole-item
+        # repeat with no field_name given at all.
+        self.assertTrue(master_merge._has_suspicious_duplicate_items("Private terrace; Private terrace"))
+
+
 class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
     """The exact reported scenario: a re-upload of an existing floor whose
     special_features shrinks from a full amenity list to a one-line
@@ -2916,6 +2989,121 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
         matched = plan.matched_changed[0]
         self.assertIn("special_features", matched.diffs)
         self.assertEqual(matched.risky_fields, frozenset())
+
+    def test_the_real_thirty_lighterman_extraction_is_flagged_and_not_auto_merged(self):
+        # Test 1 (this session's own PART 11) - the actual real-world
+        # failure this whole fix exists for. Genuine item loss (legal
+        # structure/the descriptive paragraph) already makes this risky
+        # via is_detail_loss - this confirms it stays that way AND that
+        # the diff is left UNMERGED (verbatim new_val, not merge_
+        # compatible_text's own output) because of the duplicate, not
+        # silently "fixed up" into a cleaned merged value nobody reviews.
+        old_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_OLD
+        new_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_NEW
+        master_df = _master_df([{
+            "building": "Thirty Lighterman", "provider": "UNION", "special_features": old_val,
+        }])
+        new_row = ListingRow(building="Thirty Lighterman", provider="UNION", special_features=new_val)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs["special_features"], (old_val, new_val))
+
+    def test_a_pure_duplicate_with_no_detectable_item_loss_is_still_flagged(self):
+        # The genuine gap neither is_detail_loss nor is_richness_regression
+        # can catch alone: every old item is still restated (no loss) and
+        # new_val is actually LONGER (not a richness regression), so only
+        # the duplicate-detection signal catches this.
+        old_val = "3 meeting rooms; private terrace"
+        new_val = "3 meeting rooms; private terrace; private terrace"
+        self.assertFalse(master_merge.is_detail_loss(old_val, new_val, field_name="special_features"))
+        self.assertFalse(master_merge.is_richness_regression(old_val, new_val))
+
+        master_df = _master_df([{"building": "1 Example Street", "provider": "Test Provider", "special_features": old_val}])
+        new_row = ListingRow(building="1 Example Street", provider="Test Provider", special_features=new_val)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.risky_fields)
+        # Left unmerged/verbatim, exactly like the other risky-text cases.
+        self.assertEqual(matched.diffs["special_features"], (old_val, new_val))
+
+    def test_a_duplicate_blocks_auto_merge_even_when_detail_loss_would_otherwise_qualify(self):
+        # A genuinely lost old item WOULD normally auto-merge (see
+        # test_normal_special_features_update_is_not_flagged's own sibling
+        # cases in IsDetailLossTests) - but new_val's own duplicate must
+        # still block that, since merge_compatible_text starts from
+        # new_val's own items verbatim and would otherwise carry the
+        # duplicate straight into an auto-applied value.
+        old_val = "3 meeting rooms; private terrace; bike storage"
+        new_val = "3 meeting rooms; 3 meeting rooms; private terrace"  # dropped "bike storage", AND duplicated
+        master_df = _master_df([{"building": "1 Example Street", "provider": "Test Provider", "special_features": old_val}])
+        new_row = ListingRow(building="1 Example Street", provider="Test Provider", special_features=new_val)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.risky_fields)
+        # Verbatim new_val, NOT merge_compatible_text's own merged output -
+        # the auto-merge path never ran.
+        self.assertEqual(matched.diffs["special_features"], (old_val, new_val))
+
+    def test_blank_new_special_features_never_erases_the_old_value(self):
+        # Test 8 (PART 11) - diff_fields' own pre-existing blank-new-value-
+        # skip rule already gives this for free, unrelated to this fix -
+        # confirmed here explicitly since the task calls it out by name.
+        old_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_OLD
+        master_df = _master_df([{"building": "Thirty Lighterman", "provider": "UNION", "special_features": old_val}])
+        new_row = ListingRow(building="Thirty Lighterman", provider="UNION", special_features=None)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("special_features", matched.diffs)
+        self.assertNotIn("special_features", matched.silent_updates)
+
+    def test_unrelated_fields_are_unaffected_by_a_flagged_special_features_change(self):
+        # Test 9 (PART 11) - address/postcode/lat/lng/rent/desks/floor_unit
+        # all still diff normally, completely independent of special_
+        # features' own risky-field status.
+        master_df = _master_df([{
+            "building": "Thirty Lighterman", "provider": "UNION", "address_1": "1 Lighterman Way",
+            "postcode": "N1C 4BQ", "lat": 51.5, "lng": -0.12, "rent_pcm": 5000.0, "desks_max": 20.0,
+            "floor_unit": "3rd Floor",
+            "special_features": HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_OLD,
+        }])
+        new_row = ListingRow(
+            building="Thirty Lighterman", provider="UNION", address_1="1 Lighterman Way",
+            postcode="N1C 4BQ", lat=51.51, lng=-0.13, rent_pcm=5500.0, desks_max=25.0,
+            floor_unit="3rd Floor",
+            special_features=HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_NEW,
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs.get("rent_pcm"), (5000.0, 5500.0))
+        self.assertEqual(matched.diffs.get("desks_max"), (20.0, 25.0))
+        self.assertNotIn("rent_pcm", matched.risky_fields)
+        self.assertNotIn("desks_max", matched.risky_fields)
+
+    def test_a_reviewer_can_still_explicitly_approve_a_flagged_change(self):
+        # PART 12's own full loop, the last step: risky_fields only holds a
+        # change back from AUTO-apply - a reviewer who deliberately approves
+        # it anyway must have that decision honored verbatim by apply_merge,
+        # exactly like any other approved field. Proves this is a genuine
+        # review gate, never a silent permanent block.
+        old_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_OLD
+        new_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_NEW
+        master_records = [ListingRow(building="Thirty Lighterman", provider="UNION", special_features=old_val).model_dump()]
+
+        merged = master_merge.apply_merge(master_records, {0: {"special_features": new_val}}, [])
+
+        self.assertEqual(merged[0].special_features, new_val)
 
     def test_non_risky_field_shrinking_is_never_flagged(self):
         # address_1 isn't in RISKY_TEXT_FIELDS - a much shorter new value
