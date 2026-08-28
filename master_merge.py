@@ -765,6 +765,46 @@ def _normalize_text(value) -> str:
     return re.sub(r"\s+", "", str(value).strip().lower())
 
 
+# address_1 ONLY - never every str field (see _values_equal's own docstring
+# on why punctuation otherwise stays a real, flagged difference elsewhere).
+# Confirmed real false-positive review this exists for: a re-upload
+# restating the exact same "33 Cavendish Square" with a single harmless
+# trailing comma ("33 Cavendish Square,") produced a decision card with
+# nothing a reviewer could actually see or act on - _normalize_text alone
+# already left the trailing comma in place (deliberately, for every OTHER
+# field), so this was a genuine, if invisible-to-_values_equal, difference.
+ADDRESS_TRAILING_PUNCTUATION_FIELDS = ("address_1",)
+
+# Trailing punctuation only - a full address line's own harmless closing
+# mark(s) (a stray comma/period/semicolon a source appends or omits) -
+# never a hyphen (would corrupt a real range like "27-30") and never
+# anything mid-string (an address with genuinely different embedded text,
+# e.g. an appended locality one side states and the other doesn't, is left
+# as a real, flagged difference - this only forgives the harmless trailing
+# case the real "33 Cavendish Square,"/"33 Cavendish Square" pair is).
+# Applied AFTER _normalize_text has already discarded all whitespace, so
+# there is never any left to strip here - the set is punctuation only.
+_ADDRESS_HARMLESS_TRAILING_CHARS = ",.;:"
+
+
+def _normalize_address_for_comparison(value) -> str:
+    """
+    address_1's own tolerant-comparison form: _normalize_text's case/
+    whitespace folding, PLUS a harmless trailing punctuation mark stripped
+    (see _ADDRESS_HARMLESS_TRAILING_CHARS/ADDRESS_TRAILING_PUNCTUATION_
+    FIELDS' own docstring for the real "33 Cavendish Square," case this
+    exists for). Deliberately NOT a general remove_all_punctuation() - a
+    hyphen inside the string (a real house-number range, "27-30") is left
+    completely untouched, and so is any OTHER mid-string punctuation/
+    content difference; only the trailing mark(s) are stripped, so two
+    genuinely different addresses ("33 Cavendish Square" vs "34 Cavendish
+    Square", or vs "33 Cavendish Street", or vs "35-37 Cavendish Square")
+    still compare different exactly as before - only the digits/letters
+    themselves ever decide that, completely unaffected by this.
+    """
+    return _normalize_text(value).rstrip(_ADDRESS_HARMLESS_TRAILING_CHARS)
+
+
 # Confirmed real case (Kitt's Availability file): rent_pcm/rent_psf
 # routinely come from two different sheets computed to different
 # precision - one sheet states rent_psf as 243.108108... (a live
@@ -786,6 +826,8 @@ def _values_equal(old, new, field_name: str = None) -> bool:
         if field_name in _WHOLE_NUMBER_TOLERANCE_FIELDS:
             return round(float(old)) == round(float(new))
         return abs(float(old) - float(new)) < 1e-6
+    if field_name in ADDRESS_TRAILING_PUNCTUATION_FIELDS:
+        return _normalize_address_for_comparison(old) == _normalize_address_for_comparison(new)
     return _normalize_text(old) == _normalize_text(new)
 
 
@@ -835,7 +877,7 @@ def silent_field_updates(old: dict, new: dict) -> dict:
             continue
         if str(old_val) == str(new_val):
             continue
-        if _values_equal(old_val, new_val):
+        if _values_equal(old_val, new_val, f):
             updates[f] = new_val
     return updates
 

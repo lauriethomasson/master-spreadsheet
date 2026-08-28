@@ -1316,6 +1316,263 @@ class WeakStreetCorroborationTests(unittest.TestCase):
         self.assertIn("contradicts", geocode.FAILURES[0]["reason"])
 
 
+class HouseNumberConflictFullPipelineTests(unittest.TestCase):
+    """
+    geocode_row -> master_merge.build_merge_plan, end to end - proves the
+    real "138 Cheapside" invariant holds all the way through a merge, not
+    just that geocode_row itself rejects the wrong candidate in isolation.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_wrong_candidate_never_reaches_master_through_a_full_merge(self):
+        import pandas as pd
+
+        import master_merge
+
+        master_df = pd.DataFrame(
+            [ListingRow(building="138 Cheapside", provider="UNION", address_1="138 Cheapside").model_dump()]
+        )
+        new_row = ListingRow(building="138 Cheapside", provider="UNION")
+        components = [
+            {"longText": "134-136", "types": ["street_number"]},
+            {"longText": "Cheapside", "types": ["route"]},
+            {"longText": "EC2V 6BJ", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5140, "lng": -0.0928, "address_components": components},
+        ):
+            geocoded_row = geocode.geocode_row(new_row)
+
+        self.assertIsNone(geocoded_row.lat)
+        self.assertIsNone(geocoded_row.address_1)
+
+        plan = master_merge.build_merge_plan([geocoded_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        # address_1 was never populated on the geocoded row at all (the
+        # wrong candidate was rejected before it could backfill anything),
+        # so diff_fields' own blank-new-value-skip rule leaves master's
+        # "138 Cheapside" completely untouched - no diff, no silent update,
+        # nothing to review.
+        self.assertNotIn("address_1", matched.diffs)
+        self.assertNotIn("address_1", matched.silent_updates)
+        merged = master_merge.apply_merge(master_df.to_dict("records"), {}, [])
+        self.assertEqual(merged[0].address_1, "138 Cheapside")
+
+
+class HouseNumberConflictTests(unittest.TestCase):
+    """
+    Regression coverage for _best_places_result's own HOUSE_NUMBER_CONFLICT
+    check (see geocode.py's own module docstring, the paragraph right after
+    the STREET_CONFLICT one) - confirmed real failure: a real "138
+    Cheapside" (no address_1/postcode of its own) resolved via Places Text
+    Search to a genuinely different, adjacent "134-136 Cheapside" - same
+    street, so the pre-existing STREET_CONFLICT check (street WORDS only)
+    passed it straight through with nothing to catch the wrong building
+    number.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_exact_numbered_address_is_accepted(self):
+        # Test 1 - source and candidate agree exactly.
+        row = ListingRow(building="138 Cheapside", provider="UNION")
+        components = [
+            {"longText": "138", "types": ["street_number"]},
+            {"longText": "Cheapside", "types": ["route"]},
+            {"longText": "EC2V 6BJ", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5142, "lng": -0.0931, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5142)
+        self.assertEqual(row.lng, -0.0931)
+        self.assertEqual(row.address_1, "138 Cheapside")
+        self.assertEqual(row.postcode, "EC2V 6BJ")
+
+    def test_wrong_house_number_on_the_same_street_is_rejected(self):
+        # Test 2 - the real "138 Cheapside" -> "134-136 Cheapside" failure.
+        # Must not overwrite the source's own address, and must not accept
+        # the wrong candidate's coordinates either.
+        row = ListingRow(building="138 Cheapside", provider="UNION")
+        components = [
+            {"longText": "134-136", "types": ["street_number"]},
+            {"longText": "Cheapside", "types": ["route"]},
+            {"longText": "EC2V 6BJ", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5140, "lng": -0.0928, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertIsNone(row.address_1)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("house number that conflicts", geocode.FAILURES[0]["reason"])
+
+    def test_completely_wrong_street_is_rejected_by_the_existing_street_check(self):
+        # Test 3 - a different street entirely is still caught by the
+        # pre-existing STREET_CONFLICT check, unaffected by this change.
+        row = ListingRow(building="138 Cheapside", provider="UNION")
+        components = [
+            {"longText": "20", "types": ["street_number"]},
+            {"longText": "Little Britain", "types": ["route"]},
+            {"longText": "EC1A 7BU", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5177, "lng": -0.0977, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.address_1)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("shares no words", geocode.FAILURES[0]["reason"])
+
+    def test_legitimate_expanded_google_address_is_accepted(self):
+        # Test 4 - Google's own fuller formatted address (extra locality
+        # text) still parses to the same leading house number.
+        row = ListingRow(building="138 Cheapside", provider="UNION")
+        components = [
+            {"longText": "138", "types": ["street_number"]},
+            {"longText": "Cheapside", "types": ["route"]},
+            {"longText": "City of London", "types": ["postal_town"]},
+            {"longText": "EC2V 6BJ", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5142, "lng": -0.0931, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5142)
+        self.assertEqual(row.address_1, "138 Cheapside")
+
+    def test_a_number_within_a_stated_range_is_accepted(self):
+        # Test 5 - a legitimate UK range: the candidate's own single number
+        # genuinely falls inside the source's own stated range.
+        row = ListingRow(building="14-18 Copthall Avenue", provider="UNION")
+        components = [
+            {"longText": "16", "types": ["street_number"]},
+            {"longText": "Copthall Avenue", "types": ["route"]},
+            {"longText": "EC2R 7DJ", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5175, "lng": -0.0895, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5175)
+        # address_1 was blank on row, so the accepted candidate's own
+        # (narrower, but non-conflicting) address backfills it verbatim -
+        # same pre-existing Tier 2 backfill behavior as every other
+        # accepted candidate, unrelated to this check's own accept/reject
+        # decision.
+        self.assertEqual(row.address_1, "16 Copthall Avenue")
+
+    def test_a_genuinely_disjoint_range_is_rejected(self):
+        row = ListingRow(building="14-18 Copthall Avenue", provider="UNION")
+        components = [
+            {"longText": "20-24", "types": ["street_number"]},
+            {"longText": "Copthall Avenue", "types": ["route"]},
+            {"longText": "EC2R 7DJ", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5175, "lng": -0.0895, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.address_1)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("house number that conflicts", geocode.FAILURES[0]["reason"])
+
+    def test_paul_street_regression_still_fails_safely(self):
+        # Test 6 - the pre-existing "44 Paul Street" -> "20 Little Britain"
+        # regression (see StreetNameConflictTests above) must remain
+        # rejected under this change too - a different street, caught by
+        # the existing STREET_CONFLICT check before HOUSE_NUMBER_CONFLICT
+        # ever runs.
+        row = ListingRow(building="44 Paul Street", provider="Kitt's")
+        components = [
+            {"longText": "1", "types": ["street_number"]},
+            {"longText": "Little Britain", "types": ["route"]},
+            {"longText": "EC1A 7BU", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5177, "lng": -0.0977, "address_components": components},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.address_1)
+
+    def test_candidate_with_no_house_number_of_its_own_is_still_accepted(self):
+        # A route-level candidate with no street_number component at all
+        # (candidate_house_number is None) has nothing for this check to
+        # compare - must no-op exactly as before this check existed, same
+        # permissive-on-missing-evidence precedent as every other check.
+        row = ListingRow(building="138 Cheapside", provider="UNION")
+        components = [{"longText": "Cheapside", "types": ["route"]}]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5142, "lng": -0.0931, "address_components": components},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5142)
+
+    def test_falls_through_to_the_next_candidate_when_the_first_house_number_conflicts(self):
+        # Same "keep trying safer variants before giving up" principle as
+        # STREET_CONFLICT's own fallthrough test.
+        row = ListingRow(building="138 Cheapside", provider="UNION")
+        wrong = {
+            "lat": 51.5140, "lng": -0.0928,
+            "address_components": [
+                {"longText": "134-136", "types": ["street_number"]},
+                {"longText": "Cheapside", "types": ["route"]},
+            ],
+        }
+        right = {
+            "lat": 51.5142, "lng": -0.0931,
+            "address_components": [
+                {"longText": "138", "types": ["street_number"]},
+                {"longText": "Cheapside", "types": ["route"]},
+            ],
+        }
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "candidates": [wrong, right], **wrong},
+        ):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5142)
+        self.assertEqual(row.address_1, "138 Cheapside")
+
+
 class BareNameCorroborationTests(unittest.TestCase):
     """
     Regression coverage for _best_places_result's own NAME_CONFLICT check

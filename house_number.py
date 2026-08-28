@@ -146,3 +146,54 @@ def leading_house_number(text):
     if match:
         return match.group(1).lower()
     return _spelled_out_leading_number(stripped)
+
+
+# A leading_house_number()-shaped token, parsed back out into its own
+# (low, high) integer range - "89" -> (89, 89), "27-30" -> (27, 30), "56a"
+# -> (56, 56). Anchored full-string (unlike LEADING_HOUSE_NUMBER_RE, which
+# only anchors the START - this is only ever fed a token leading_house_
+# number() itself already produced, never raw free text, so nothing should
+# trail).
+_HOUSE_NUMBER_TOKEN_RE = re.compile(r"^(\d+)[a-z]?(?:-(\d+)[a-z]?)?$")
+
+
+def _house_number_range(token: str):
+    if not token:
+        return None
+    match = _HOUSE_NUMBER_TOKEN_RE.match(token.strip().lower())
+    if not match:
+        return None
+    low = int(match.group(1))
+    high = int(match.group(2)) if match.group(2) else low
+    return (low, high) if low <= high else (high, low)
+
+
+def house_numbers_conflict(a, b) -> bool:
+    """
+    True only when `a` and `b` (each a leading_house_number()-shaped token -
+    "89", "27-30", "56a", or None) parse to a genuinely DISJOINT numeric
+    range - never true when either side is missing or fails to parse (a
+    token leading_house_number() itself produced always parses; this only
+    guards a caller passing something else). A trailing letter suffix
+    ("56a") is dropped for this comparison - it marks a sub-unit of the SAME
+    numbered building, not a different one. Two overlapping ranges (a single
+    number falling inside a wider range, or two ranges sharing any number
+    at all) are never a conflict - confirmed real UK convention: a single
+    postal address is routinely quoted as one number from within a wider
+    range a different source states for the same building, and a naive
+    "ranges must match exactly" check would incorrectly reject that.
+
+    Confirmed real failure this exists for: a real "138 Cheapside" (no
+    range, no ambiguity at all) geocoded via Places Text Search to a
+    genuinely different, nearby "134-136 Cheapside" - same street, adjacent
+    but numerically DISJOINT (138 falls outside 134-136), previously
+    accepted since the existing STREET_CONFLICT check (geocode._street_
+    name_words) only ever compares the STREET NAME, never the house number
+    itself - see geocode.py's own module docstring and _best_places_
+    result's HOUSE_NUMBER_CONFLICT check, the one caller of this function.
+    """
+    range_a = _house_number_range(a)
+    range_b = _house_number_range(b)
+    if not range_a or not range_b:
+        return False
+    return range_a[1] < range_b[0] or range_b[1] < range_a[0]

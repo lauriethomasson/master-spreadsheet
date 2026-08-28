@@ -90,6 +90,25 @@ first place, and comparing its own name text against a returned route
 would false-positive on the ordinary case, where a building's name is
 routinely nothing like the street it actually sits on.
 
+The STREET_CONFLICT check above only ever compares the STREET NAME, which
+is not enough on its own: two adjacent, genuinely DIFFERENT numbered
+buildings on the same street ("138 Cheapside" and "134-136 Cheapside")
+share every street word, so nothing above catches a candidate resolving to
+the wrong one. The same address-shaped building value also gets its own
+house number (see house_number.leading_house_number/house_numbers_
+conflict) checked against the accepted candidate's own returned house
+number - a genuinely DISJOINT numeric range (not merely a different
+string - "27-30" and "28" legitimately overlap) is rejected as a
+HOUSE_NUMBER_CONFLICT, same "rejected outright rather than accepted with
+just a flag" treatment as STREET_CONFLICT. Confirmed real failure this
+closes: a real "138 Cheapside" (no address_1/postcode of its own) resolved
+via Places Text Search to a genuinely different, adjacent "134-136
+Cheapside" - same street, so the existing STREET_CONFLICT check alone
+passed it straight through. Only checked once a route already matched (a
+different street is already caught above, more specifically), and only
+when the candidate's own address has a house number of its own to compare
+- same permissive-on-missing-evidence precedent as every other check here.
+
 A candidate with NO route component of its own at all (only e.g.
 street_number/postal_code) used to slip straight past the STREET_CONFLICT
 check above with nothing to compare - the exact confirmed real shape of
@@ -181,7 +200,7 @@ import sys
 import httpx
 
 from env_utils import load_dotenv
-from house_number import leading_house_number
+from house_number import house_numbers_conflict, leading_house_number
 from master_merge import normalize_key
 from schema import ListingRow
 
@@ -860,7 +879,11 @@ def log_geocode_weak_match(row: ListingRow, reason: str):
 
 
 def _best_places_result(
-    query: str, source_hint: dict, source_street_words: frozenset = None, source_name_words: frozenset = None
+    query: str,
+    source_hint: dict,
+    source_street_words: frozenset = None,
+    source_name_words: frozenset = None,
+    source_house_number: str = None,
 ) -> dict:
     """
     Sends ONE query to Places Text Search and returns the first candidate
@@ -941,6 +964,28 @@ def _best_places_result(
     source_name_words is only ever passed when source_hint is ALREADY
     absent.
 
+    source_house_number (see house_number.leading_house_number/house_
+    numbers_conflict) is a FIFTH, independent validation, passed alongside
+    source_street_words whenever the source building value has its own
+    leading house number: the accepted candidate's own address_1 must not
+    parse to a numeric range genuinely DISJOINT from the source's own -
+    rejected as HOUSE_NUMBER_CONFLICT otherwise. This closes a real gap
+    source_street_words alone cannot: two adjacent buildings on the SAME
+    street share every street word (source_street_words would find no
+    conflict at all) while being genuinely different numbered buildings.
+    Confirmed real failure this closes: a real "138 Cheapside" (no
+    address_1/postcode of its own) resolved via Places Text Search to a
+    genuinely different, nearby "134-136 Cheapside" - same street, so
+    STREET_CONFLICT alone never caught it. Only checked once the street-
+    word check above has already passed (a genuinely different street is
+    already rejected there, more specifically, before this ever runs) and
+    only when the candidate's own address_1 has a house number of its own
+    to compare (house_numbers_conflict itself is a pure no-op, never a
+    conflict, when either side fails to parse - see that function's own
+    docstring) - same "no new requirement to have evidence, only extra
+    corroboration when it's genuinely available" permissive-on-missing-
+    evidence precedent as every check above.
+
     If every candidate this query returns fails validation, returns the
     LAST one's own conflict/failure info (for log_geocode_failure's own
     message) - never a candidate this function itself hasn't checked, and
@@ -968,6 +1013,11 @@ def _best_places_result(
             if candidate_street_words:
                 if not (source_street_words & candidate_street_words):
                     last = {**place, "status": "STREET_CONFLICT", "candidate_street": candidate_address_1}
+                    continue
+                if source_house_number and house_numbers_conflict(
+                    source_house_number, leading_house_number(candidate_address_1)
+                ):
+                    last = {**place, "status": "HOUSE_NUMBER_CONFLICT", "candidate_address": candidate_address_1}
                     continue
             elif source_hint and candidate_postcode:
                 weak_corroboration = "no_route_postcode_district_only"
@@ -1327,9 +1377,8 @@ def geocode_row(row: ListingRow) -> ListingRow:
             # ("Canal Building", "Kent House") has no street of its own to
             # compare, and comparing its own name text against a returned
             # route would false-positive on the ordinary case.
-            candidate_street_words = (
-                _street_name_words(candidate) if leading_house_number(candidate) is not None else None
-            )
+            candidate_house_number = leading_house_number(candidate)
+            candidate_street_words = _street_name_words(candidate) if candidate_house_number is not None else None
             # A bare-name candidate with NEITHER a development_name NOR a
             # source_hint to disambiguate the query has zero corroboration
             # available at all once a Places candidate comes back - see
@@ -1343,7 +1392,7 @@ def geocode_row(row: ListingRow) -> ListingRow:
             # they already helped corroborate.
             candidate_name_words = (
                 _building_name_words(candidate)
-                if leading_house_number(candidate) is None and not row.development_name and not source_hint
+                if candidate_house_number is None and not row.development_name and not source_hint
                 else None
             )
             location_texts = ([row.development_name] if row.development_name else []) + (
@@ -1356,7 +1405,9 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 query_parts.append("London, UK")
                 query = ", ".join(query_parts)
 
-                result = _best_places_result(query, source_hint, candidate_street_words, candidate_name_words)
+                result = _best_places_result(
+                    query, source_hint, candidate_street_words, candidate_name_words, candidate_house_number
+                )
                 if result["status"] == "OK" and within_london_bbox(result.get("lat"), result.get("lng")):
                     matched = True
                     break
@@ -1486,6 +1537,16 @@ def geocode_row(row: ListingRow) -> ListingRow:
                 f"Places candidate's own street ({result.get('candidate_street')!r}) shares no words "
                 f"with the source's own stated street in {row.building!r} - rejected rather than "
                 "accepted on an otherwise-uncorroborated building-name-only match",
+            )
+            return row
+
+        if result["status"] == "HOUSE_NUMBER_CONFLICT":
+            log_geocode_failure(
+                row,
+                f"Places candidate's own address ({result.get('candidate_address')!r}) has a house "
+                f"number that conflicts with the source's own stated number in {row.building!r} - "
+                "same street, but a genuinely different building - rejected rather than accepted on "
+                "an otherwise-uncorroborated building-name-only match",
             )
             return row
 

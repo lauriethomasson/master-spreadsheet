@@ -244,6 +244,64 @@ class ValuesEqualTests(unittest.TestCase):
         self.assertTrue(master_merge._values_equal(243.0, 243.0, "rent_psf"))
 
 
+class AddressTrailingPunctuationEqualityTests(unittest.TestCase):
+    """
+    _values_equal's own address_1-specific tolerance (see ADDRESS_TRAILING_
+    PUNCTUATION_FIELDS/_normalize_address_for_comparison) - confirmed real
+    false-positive review: a re-upload restating the exact same "33
+    Cavendish Square" with a harmless trailing comma produced a decision
+    card with nothing a reviewer could actually see or act on. Scoped to
+    address_1 only, and to TRAILING punctuation only - see the "genuine
+    difference" tests below for what must still be flagged.
+    """
+
+    def test_trailing_comma_is_equal(self):
+        self.assertTrue(master_merge._values_equal("33 Cavendish Square", "33 Cavendish Square,", "address_1"))
+
+    def test_trailing_period_is_equal(self):
+        self.assertTrue(master_merge._values_equal("33 Cavendish Square", "33 Cavendish Square.", "address_1"))
+
+    def test_double_whitespace_is_equal(self):
+        self.assertTrue(master_merge._values_equal("33 Cavendish Square", "33  Cavendish Square", "address_1"))
+
+    def test_case_only_difference_is_equal(self):
+        self.assertTrue(master_merge._values_equal("33 Cavendish Square", "33 CAVENDISH SQUARE", "address_1"))
+
+    def test_without_field_name_trailing_comma_is_still_a_real_difference(self):
+        # Backward compatibility - an existing caller that doesn't name the
+        # field keeps the exact prior, stricter punctuation-sensitive
+        # comparison (see _normalize_text's own docstring on why).
+        self.assertFalse(master_merge._values_equal("33 Cavendish Square", "33 Cavendish Square,"))
+
+    def test_other_fields_are_not_widened_even_when_named(self):
+        # Deliberately scoped to address_1 only - a trailing comma on, say,
+        # building or state_of_space must remain a real, flagged difference.
+        self.assertFalse(master_merge._values_equal("33 Cavendish Square", "33 Cavendish Square,", "building"))
+
+    def test_different_house_number_is_still_a_genuine_difference(self):
+        self.assertFalse(master_merge._values_equal("33 Cavendish Square", "34 Cavendish Square", "address_1"))
+
+    def test_different_street_is_still_a_genuine_difference(self):
+        self.assertFalse(master_merge._values_equal("33 Cavendish Square", "33 Cavendish Street", "address_1"))
+
+    def test_a_range_replacing_a_plain_number_is_still_a_genuine_difference(self):
+        self.assertFalse(master_merge._values_equal("33 Cavendish Square", "35-37 Cavendish Square", "address_1"))
+
+    def test_a_genuine_internal_hyphen_is_never_touched(self):
+        # Only TRAILING punctuation is stripped - an internal hyphen (a real
+        # house-number range) is left completely alone either way, so two
+        # genuinely different ranges never collapse to equal.
+        self.assertFalse(master_merge._values_equal("14-18 Copthall Avenue", "14-19 Copthall Avenue", "address_1"))
+        self.assertTrue(master_merge._values_equal("14-18 Copthall Avenue", "14-18 Copthall Avenue,", "address_1"))
+
+    def test_appended_locality_is_still_a_genuine_difference(self):
+        # Only a HARMLESS trailing mark is forgiven - genuinely different
+        # trailing CONTENT (not just punctuation) still counts.
+        self.assertFalse(
+            master_merge._values_equal("33 Cavendish Square", "33 Cavendish Square, London", "address_1")
+        )
+
+
 class MergeFieldChoiceTests(unittest.TestCase):
     def test_all_equal_needs_no_choice(self):
         self.assertEqual(master_merge.merge_field_choice(["Fully Managed", "Fully Managed"]), (False, "Fully Managed"))
@@ -2010,6 +2068,45 @@ class DiffFieldsTests(unittest.TestCase):
         diffs = master_merge.diff_fields({"size_sqft": 1000.0}, {"size_sqft": 1000.3})
         self.assertEqual(diffs, {"size_sqft": (1000.0, 1000.3)})
 
+    def test_address_1_trailing_comma_is_not_a_diff(self):
+        # The real "33 Cavendish Square" / "33 Cavendish Square," false-
+        # positive review card this closes.
+        diffs = master_merge.diff_fields(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "33 Cavendish Square,"}
+        )
+        self.assertEqual(diffs, {})
+
+    def test_address_1_double_whitespace_is_not_a_diff(self):
+        diffs = master_merge.diff_fields(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "33  Cavendish Square"}
+        )
+        self.assertEqual(diffs, {})
+
+    def test_address_1_case_only_difference_is_not_a_diff(self):
+        diffs = master_merge.diff_fields(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "33 CAVENDISH SQUARE"}
+        )
+        self.assertEqual(diffs, {})
+
+    def test_address_1_house_number_change_is_still_a_genuine_diff(self):
+        diffs = master_merge.diff_fields(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "34 Cavendish Square"}
+        )
+        self.assertEqual(diffs, {"address_1": ("33 Cavendish Square", "34 Cavendish Square")})
+
+    def test_address_1_street_change_is_still_a_genuine_diff(self):
+        diffs = master_merge.diff_fields(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "33 Cavendish Street"}
+        )
+        self.assertEqual(diffs, {"address_1": ("33 Cavendish Square", "33 Cavendish Street")})
+
+    def test_building_trailing_comma_is_still_a_genuine_diff(self):
+        # Confirms the address_1-only scoping - a punctuation-only
+        # difference on a DIFFERENT field must remain flagged exactly as
+        # before this fix.
+        diffs = master_merge.diff_fields({"building": "Nexus Place"}, {"building": "Nexus Place,"})
+        self.assertEqual(diffs, {"building": ("Nexus Place", "Nexus Place,")})
+
 
 class SilentFieldUpdatesTests(unittest.TestCase):
     def test_case_only_change_is_silent(self):
@@ -2018,6 +2115,23 @@ class SilentFieldUpdatesTests(unittest.TestCase):
 
     def test_real_change_is_not_silent(self):
         updates = master_merge.silent_field_updates({"provider": "A"}, {"provider": "B"})
+        self.assertEqual(updates, {})
+
+    def test_address_1_trailing_comma_is_a_silent_update_not_a_diff(self):
+        # diff_fields already excludes this (see DiffFieldsTests above) -
+        # this confirms the SAME field-aware equality is used consistently
+        # by silent_field_updates too, so the newer formatting still
+        # reaches master, just without ever surfacing as a reviewable
+        # change.
+        updates = master_merge.silent_field_updates(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "33 Cavendish Square,"}
+        )
+        self.assertEqual(updates, {"address_1": "33 Cavendish Square,"})
+
+    def test_address_1_genuine_change_is_not_silent(self):
+        updates = master_merge.silent_field_updates(
+            {"address_1": "33 Cavendish Square"}, {"address_1": "34 Cavendish Square"}
+        )
         self.assertEqual(updates, {})
 
 
@@ -2067,6 +2181,55 @@ class BuildMergePlanBrochureLinkBrokenTests(unittest.TestCase):
         merged = master_merge.apply_merge(master_records, {0: {"brochure_link_broken": False}}, [])
 
         self.assertIs(merged[0].brochure_link_broken, False)
+
+
+class AddressFormattingFullPipelineTests(unittest.TestCase):
+    """
+    Full build_merge_plan pipeline coverage for the address_1 trailing-
+    punctuation tolerance (see AddressTrailingPunctuationEqualityTests/
+    DiffFieldsTests above for the underlying unit-level behavior) - proves
+    the fix reaches an actual MatchedRow, not just the diff_fields()/
+    silent_field_updates() helpers in isolation.
+    """
+
+    def test_formatting_equivalent_address_produces_no_diff_and_no_risky_field(self):
+        # Case B (see this session's own PART 6) - a re-upload restating
+        # "33 Cavendish Square" with only a harmless trailing comma must
+        # generate no diff at all, and therefore no review card.
+        master_df = _master_df([{"building": "Cavendish House", "provider": "UNION", "address_1": "33 Cavendish Square"}])
+        new_row = ListingRow(building="Cavendish House", provider="UNION", address_1="33 Cavendish Square,")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("address_1", matched.diffs)
+        self.assertNotIn("address_1", matched.risky_fields)
+        # Still reaches master via the silent-update path, just never as a
+        # reviewable change - see SilentFieldUpdatesTests above.
+        self.assertEqual(matched.silent_updates.get("address_1"), "33 Cavendish Square,")
+
+    def test_genuine_house_number_change_still_produces_a_risky_diff(self):
+        # Case C - a genuinely different house number on the same street
+        # must still generate a real, reviewable diff, flagged risky by
+        # the pre-existing house_number_changed/HOUSE_NUMBER_FIELDS
+        # machinery, completely unaffected by this fix.
+        master_df = _master_df([{"building": "Cavendish House", "provider": "UNION", "address_1": "33 Cavendish Square"}])
+        new_row = ListingRow(building="Cavendish House", provider="UNION", address_1="34 Cavendish Square")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.diffs.get("address_1"), ("33 Cavendish Square", "34 Cavendish Square"))
+        self.assertIn("address_1", matched.risky_fields)
+
+    def test_genuine_street_change_still_produces_a_diff(self):
+        master_df = _master_df([{"building": "Cavendish House", "provider": "UNION", "address_1": "33 Cavendish Square"}])
+        new_row = ListingRow(building="Cavendish House", provider="UNION", address_1="33 Cavendish Street")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.diffs.get("address_1"), ("33 Cavendish Square", "33 Cavendish Street"))
 
 
 class IsBarePostcodeDistrictTests(unittest.TestCase):

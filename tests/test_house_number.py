@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from house_number import leading_house_number
+from house_number import house_numbers_conflict, leading_house_number
 
 
 class LeadingHouseNumberDigitFormTests(unittest.TestCase):
@@ -109,6 +109,62 @@ class SpelledOutNumberTests(unittest.TestCase):
         # future change to this tradeoff is a deliberate, visible decision.
         self.assertEqual(leading_house_number("Nine Elms"), "9")
         self.assertEqual(leading_house_number("Nine Elms Lane"), "9")
+
+
+class HouseNumbersConflictTests(unittest.TestCase):
+    """
+    Regression coverage for house_numbers_conflict - the leading_house_
+    number()-shaped range-overlap check geocode.py's own HOUSE_NUMBER_
+    CONFLICT check builds on. Confirmed real failure this exists for: a
+    real "138 Cheapside" resolved via Places Text Search to a genuinely
+    different, adjacent "134-136 Cheapside" - same street (so the existing
+    STREET_CONFLICT check alone never caught it), but a numerically
+    disjoint building.
+    """
+
+    def test_identical_plain_numbers_do_not_conflict(self):
+        self.assertFalse(house_numbers_conflict("138", "138"))
+
+    def test_disjoint_plain_number_and_range_conflict(self):
+        # The real "138 Cheapside" vs "134-136 Cheapside" failure.
+        self.assertTrue(house_numbers_conflict("138", "134-136"))
+
+    def test_disjoint_plain_numbers_conflict(self):
+        # The real "44 Paul Street" vs "20 Little Britain" shape - same
+        # numeric disjointness, even though that real case is already
+        # caught earlier by STREET_CONFLICT (different street entirely).
+        self.assertTrue(house_numbers_conflict("44", "20"))
+
+    def test_identical_ranges_do_not_conflict(self):
+        self.assertFalse(house_numbers_conflict("14-18", "14-18"))
+
+    def test_a_number_inside_a_wider_range_does_not_conflict(self):
+        # A single postal address quoted as one number from within a wider
+        # range a different source states for the same building is a real,
+        # legitimate UK convention - never a conflict.
+        self.assertFalse(house_numbers_conflict("27-30", "28"))
+        self.assertFalse(house_numbers_conflict("28", "27-30"))
+
+    def test_overlapping_but_not_identical_ranges_do_not_conflict(self):
+        self.assertFalse(house_numbers_conflict("14-18", "16-20"))
+
+    def test_disjoint_ranges_conflict(self):
+        self.assertTrue(house_numbers_conflict("14-18", "20-24"))
+
+    def test_letter_suffix_is_ignored(self):
+        # "56a" marks a sub-unit of the SAME numbered building, not a
+        # different one.
+        self.assertFalse(house_numbers_conflict("138", "138a"))
+        self.assertFalse(house_numbers_conflict("56a", "56b"))
+
+    def test_either_side_missing_is_never_a_conflict(self):
+        self.assertFalse(house_numbers_conflict("138", None))
+        self.assertFalse(house_numbers_conflict(None, "138"))
+        self.assertFalse(house_numbers_conflict(None, None))
+
+    def test_either_side_unparseable_is_never_a_conflict(self):
+        self.assertFalse(house_numbers_conflict("138", "not-a-number"))
+        self.assertFalse(house_numbers_conflict("not-a-number", "138"))
 
 
 if __name__ == "__main__":
