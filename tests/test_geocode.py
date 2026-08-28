@@ -1316,6 +1316,164 @@ class WeakStreetCorroborationTests(unittest.TestCase):
         self.assertIn("contradicts", geocode.FAILURES[0]["reason"])
 
 
+class BareNameCorroborationTests(unittest.TestCase):
+    """
+    Regression coverage for _best_places_result's own NAME_CONFLICT check
+    (see geocode.py's own module docstring, the paragraph right after the
+    "Canal Building"/development_name one) - confirmed real failures, both
+    live-traced against the real Places API: "Packing House" and "Canal
+    Building" (same real Colliers upload, same "Regent's Wharf" campus on
+    All Saints Street, King's Cross - neither building's own brochure
+    states a street number OR the overall development name anywhere), each
+    a bare building name with no leading house number and no development_
+    name/source_hint of its own to disambiguate the query - the one shape
+    with ZERO other corroboration available at all once a Places candidate
+    comes back.
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def test_packing_house_resolving_to_kings_house_is_rejected(self):
+        # The real live Places Text Search result for "Packing House,
+        # King's Cross, London, UK" - top candidate is a genuinely
+        # different, unrelated "King's House" at 242 Pentonville Road.
+        # Shares "house" with "Packing House", which is exactly why the
+        # word-set check must filter generic building-type words out
+        # first (see _GENERIC_BUILDING_WORDS) - a naive overlap would
+        # have let this exact wrong match straight through.
+        row = ListingRow(building="Packing House", provider="Colliers")
+        components = [
+            {"longText": "242", "types": ["street_number"]},
+            {"longText": "Pentonville Road", "types": ["route"]},
+            {"longText": "N1 9JY", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.53, "lng": -0.12, "address_components": components,
+                "name": "King's House",
+            },
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("shares no words", geocode.FAILURES[0]["reason"])
+
+    def test_canal_building_resolving_to_an_unrelated_name_is_rejected(self):
+        row = ListingRow(building="Canal Building", provider="Colliers")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.535, "lng": -0.123, "address_components": [],
+                "name": "Lewis Cubitt Square",
+            },
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("shares no words", geocode.FAILURES[0]["reason"])
+
+    def test_bare_name_resolving_to_its_own_genuine_name_is_still_accepted(self):
+        # The ordinary, correct case must keep working - "Kent House"
+        # resolving to a Places candidate genuinely named "Kent House"
+        # (minor formatting differences tolerated via normalize_key)
+        # shares "kent" and is accepted normally, same as before this
+        # check existed.
+        row = ListingRow(building="Kent House", provider="MetSpace")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.5, "lng": -0.1, "address_components": [],
+                "name": "Kent House",
+            },
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5)
+        self.assertEqual(row.lng, -0.1)
+        self.assertTrue(row.geocode_unverified)
+
+    def test_candidate_with_no_name_at_all_is_still_accepted(self):
+        # No displayName on the candidate at all (empty word set, falsy) -
+        # nothing to check, so this must no-op exactly like before this
+        # check existed, same permissive-on-missing-evidence precedent as
+        # the route-less STREET_CONFLICT case.
+        row = ListingRow(building="Kent House", provider="MetSpace")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5, "lng": -0.1, "address_components": []},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5)
+        self.assertEqual(row.lng, -0.1)
+
+    def test_development_name_present_skips_the_name_check_entirely(self):
+        # A development_name is real, already-trusted disambiguating
+        # evidence (see this module's own docstring) - the weaker
+        # name-only check must never second-guess a match it already
+        # helped corroborate, even if the returned candidate's own name
+        # happens to look nothing like row.building.
+        row = ListingRow(building="Canal Building", provider="Colliers", development_name="Regent's Wharf")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.535, "lng": -0.123, "address_components": [],
+                "name": "Totally Unrelated Name",
+            },
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.535)
+        self.assertEqual(row.lng, -0.123)
+
+    def test_source_hint_present_skips_the_name_check_entirely(self):
+        # A postcode-district source_hint is also real, independent
+        # evidence - same "already corroborated, don't second-guess"
+        # treatment as development_name above.
+        row = ListingRow(building="Canal Building", provider="Colliers", postcode="N1 9RL")
+        components = [{"longText": "N1 9RL", "types": ["postal_code"]}]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.535, "lng": -0.123, "address_components": components,
+                "name": "Totally Unrelated Name",
+            },
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.535)
+        self.assertEqual(row.lng, -0.123)
+
+    def test_falls_through_to_the_next_candidate_when_the_first_name_conflicts(self):
+        # Same "keep trying safer variants before giving up" principle as
+        # STREET_CONFLICT's own fallthrough - a name conflict on the FIRST
+        # candidate a query returns must not give up the whole query.
+        row = ListingRow(building="Canal Building", provider="Colliers")
+        wrong = {"lat": 51.535, "lng": -0.123, "address_components": [], "name": "Lewis Cubitt Square"}
+        right = {"lat": 51.536, "lng": -0.124, "address_components": [], "name": "Canal Building"}
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "candidates": [wrong, right], **wrong},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.536)
+        self.assertEqual(row.lng, -0.124)
+
+
 class Tier1AddressWithoutPostcodeTests(unittest.TestCase):
     """
     Regression coverage for geocode_row's own relaxed Tier 1 branch (see
