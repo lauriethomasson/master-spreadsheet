@@ -830,9 +830,7 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
 
     rows = []
     for unit in units:
-        unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=False, pdf_fallback_link=filename
-        )
+        unit["brochure_link"] = finalize_brochure_link(unit.get("brochure_link"))
         unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
         # No genuine brochure, but a real floor plan exists - shown as

@@ -1,9 +1,11 @@
 """
-Regression tests for the brochure_link PDF-fallback fix: rule 3 must
-produce a genuinely fetchable https:// URL (when GCS-backed storage is
-available), not a bare filename with no scheme/host - see
-brochure_link_resolver.finalize_brochure_link, storage/blob_store.py
-(write_bytes public=True, public_url), and storage/file_store.save_original_pdf.
+Regression tests for brochure_link_resolver.finalize_brochure_link
+(including the REMOVAL of its former PDF-fallback default - see
+FinalizeBrochureLinkNoFallbackTests' own docstring) and storage/
+blob_store.py (write_bytes public=True, public_url)/storage/file_store.
+save_original_pdf, which finalize_brochure_link's own former fallback used
+to consume and are now only used by app.py's own separate paste-a-link
+validation flow.
 
 No network calls, no real GCS - GCS interaction is mocked throughout (this
 dev environment has no GCS credentials/bucket configured at all - see the
@@ -33,54 +35,47 @@ def _fake_bucket():
     return bucket, blob
 
 
-class FinalizeBrochureLinkRule3Tests(unittest.TestCase):
-    """The actual bug: rule 3 used to return the bare uploaded filename with
-    no scheme/host, which a browser resolves as a relative path on the
-    Streamlit app itself (hence 404). It must now return whatever real
-    fallback link the caller provides."""
+class FinalizeBrochureLinkNoFallbackTests(unittest.TestCase):
+    """
+    Regression tests for the REMOVAL of finalize_brochure_link's former
+    "rule 3" PDF-fallback default (defaulting brochure_link to the whole
+    uploaded PDF itself when no genuine per-unit link was found) - a
+    deliberate reversal of a prior intentional design decision, confirmed
+    before removing it (see the function's own docstring for the full
+    reasoning). No genuine link found (rule 1 empty) and no generic link
+    discarded either (rule 2) now always returns None, regardless of
+    source type - the same behavior a spreadsheet/email upload already
+    had; finalize_brochure_link no longer even takes an is_pdf/
+    pdf_fallback_link parameter to distinguish them.
 
-    def test_pdf_with_no_genuine_link_uses_the_provided_fallback_url(self):
-        result = finalize_brochure_link(
-            None, is_pdf=True, pdf_fallback_link="https://storage.googleapis.com/bucket/brochures/x.pdf"
-        )
-        self.assertEqual(result, "https://storage.googleapis.com/bucket/brochures/x.pdf")
-        self.assertTrue(result.startswith("https://"))
+    This class used to be FinalizeBrochureLinkRule3Tests, asserting the
+    OPPOSITE (that a missing/generic link fell back to a provided URL) -
+    renamed rather than just flipping the assertions in place, since the
+    old name describes behavior that no longer exists at all.
+    """
 
-    def test_generic_link_discarded_falls_back_to_provided_url(self):
+    def test_no_genuine_or_generic_link_returns_none(self):
+        # Renamed from test_pdf_with_no_genuine_link_uses_the_provided_
+        # fallback_url - the exact case the removed rule 3 used to catch.
+        self.assertIsNone(finalize_brochure_link(None))
+
+    def test_generic_link_discarded_returns_none(self):
         # "workplaceplus.co.uk" has no listing-specific path - is_generic_link
         # discards it, same as if nothing had been found at all.
-        result = finalize_brochure_link(
-            "workplaceplus.co.uk", is_pdf=True, pdf_fallback_link="https://storage.googleapis.com/bucket/x.pdf"
-        )
-        self.assertEqual(result, "https://storage.googleapis.com/bucket/x.pdf")
+        self.assertIsNone(finalize_brochure_link("workplaceplus.co.uk"))
 
-    def test_local_dev_mode_still_falls_back_to_bare_filename(self):
-        # save_original_pdf returns None with no GCS bucket configured (see
-        # SaveOriginalPdfTests below) - extract.py then passes the bare
-        # filename through as before, so local dev/CLI usage is unaffected.
-        result = finalize_brochure_link(None, is_pdf=True, pdf_fallback_link="Business Cube.pdf")
-        self.assertEqual(result, "Business Cube.pdf")
-
-    def test_email_never_falls_back_to_a_link_at_all(self):
-        result = finalize_brochure_link(None, is_pdf=False, pdf_fallback_link="ignored.eml")
-        self.assertIsNone(result)
-
-    def test_genuine_direct_pdf_link_is_unaffected_by_the_fallback(self):
+    def test_genuine_direct_pdf_link_is_unaffected(self):
         # Already a direct .pdf link - resolve_brochure_link returns it as-is
         # with no network fetch (see its own "already a direct document link"
-        # short-circuit), so this stays network-free.
-        result = finalize_brochure_link(
-            "https://example.com/real-brochure.pdf", is_pdf=True, pdf_fallback_link="Business Cube.pdf"
-        )
+        # short-circuit), so this stays network-free. Never affected by the
+        # removed fallback either way - only the signature changed (no more
+        # is_pdf/pdf_fallback_link kwargs), not this test's own assertion.
+        result = finalize_brochure_link("https://example.com/real-brochure.pdf")
         self.assertEqual(result, "https://example.com/real-brochure.pdf")
 
-    def test_admin_link_discarded_still_falls_back(self):
-        result = finalize_brochure_link(
-            "https://example.com/unsubscribe?id=1",
-            is_pdf=True,
-            pdf_fallback_link="https://storage.googleapis.com/bucket/x.pdf",
-        )
-        self.assertEqual(result, "https://storage.googleapis.com/bucket/x.pdf")
+    def test_admin_link_discarded_returns_none(self):
+        result = finalize_brochure_link("https://example.com/unsubscribe?id=1")
+        self.assertIsNone(result)
 
 
 class PublicUrlTests(unittest.TestCase):
@@ -399,17 +394,14 @@ class IsKittBrochurePreviewLinkTests(unittest.TestCase):
 
 class FinalizeBrochureLinkFloorplanGuardTests(unittest.TestCase):
     def test_unambiguous_floorplan_link_is_discarded(self):
-        result = finalize_brochure_link(
-            "https://example.com/floorplans/a.pdf", is_pdf=True,
-            pdf_fallback_link="https://storage.googleapis.com/bucket/x.pdf",
-        )
-        self.assertEqual(result, "https://storage.googleapis.com/bucket/x.pdf")
+        # Discarded, and with no more fallback to catch it, correctly None.
+        result = finalize_brochure_link("https://example.com/floorplans/a.pdf")
+        self.assertIsNone(result)
 
     def test_combined_brochure_and_floorplan_link_is_kept(self):
-        result = finalize_brochure_link(
-            "https://example.com/Building-Brochure-and-Floorplans.pdf", is_pdf=True,
-            pdf_fallback_link="https://storage.googleapis.com/bucket/x.pdf",
-        )
+        # A genuine link (rule 1) - never affected by the removed fallback
+        # either way.
+        result = finalize_brochure_link("https://example.com/Building-Brochure-and-Floorplans.pdf")
         self.assertEqual(result, "https://example.com/Building-Brochure-and-Floorplans.pdf")
 
 

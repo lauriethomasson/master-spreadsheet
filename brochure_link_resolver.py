@@ -568,7 +568,7 @@ def resolve_email_tracking_links(text: str) -> str:
     return re.sub(r"<(https?://\S+?)>", _replace, text)
 
 
-def finalize_brochure_link(raw_link, *, is_pdf: bool, pdf_fallback_link: str):
+def finalize_brochure_link(raw_link):
     """
     Applies the full brochure_link priority order to whatever Gemini
     returned for one unit:
@@ -581,17 +581,18 @@ def finalize_brochure_link(raw_link, *, is_pdf: bool, pdf_fallback_link: str):
     2. A generic link (bare company homepage/top-level domain, no
        listing-specific path) - discarded entirely, treated as though
        nothing was found.
-    3. Nothing genuine found (1 empty, 2 discarded) and the source is a
-       PDF - defaults to pdf_fallback_link, since the PDF genuinely is the
-       brochure for the majority of PDF uploads. This is the expected
-       default, not a last-resort fallback. pdf_fallback_link should be a
-       real, directly-fetchable URL to the uploaded PDF itself (see
-       storage/file_store.save_original_pdf) whenever one is available -
-       a bare filename with no scheme/host isn't a clickable link at all,
-       just the closest thing callers had before original uploads started
-       being persisted anywhere.
-    4. Nothing genuine found and the source is an email - stays null; an
-       email is not itself a brochure.
+    3. Nothing genuine found (1 empty, 2 discarded) - stays null,
+       regardless of source type (PDF, email, or spreadsheet). A PDF
+       upload no longer defaults brochure_link to the uploaded file
+       itself here - REMOVED, a deliberate reversal of a prior
+       intentional design decision (the previous rule 3, "the PDF
+       genuinely is the brochure for the majority of PDF uploads"),
+       confirmed explicitly before removing it: existing master rows
+       whose brochure_link only exists because of that old rule are
+       untouched by this (nothing here is retroactive), but any FRESH
+       PDF extraction that finds no genuine per-unit link now leaves
+       brochure_link blank, the same as a spreadsheet/email upload
+       already did.
 
     Belt-and-suspenders guards: regardless of what Gemini decided, a link
     that is itself shaped like an unsubscribe/preferences-center URL (see
@@ -636,9 +637,6 @@ def finalize_brochure_link(raw_link, *, is_pdf: bool, pdf_fallback_link: str):
 
     if raw_link and not is_generic_link(raw_link):
         return resolve_brochure_link(raw_link)
-
-    if is_pdf:
-        return pdf_fallback_link
 
     return None
 

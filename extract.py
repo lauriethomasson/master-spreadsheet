@@ -34,9 +34,9 @@ _RENDER_LOCK = threading.Lock()
 # per row) embed a genuine, distinct hyperlink per unit as a PDF link
 # annotation - invisible to Gemini's vision-based extraction (see extract(),
 # which only ever shows Gemini rendered page IMAGES, never the underlying
-# text/link layer), so without this step every such unit falls through to
-# finalize_brochure_link's rule 3 (the whole uploaded PDF as a fallback
-# link), losing the real per-row destination entirely.
+# text/link layer), so without this step every such unit's own brochure_
+# link would fall straight through to finalize_brochure_link's own rule 2/
+# "nothing genuine" path, losing the real per-row destination entirely.
 #
 # The join problem this solves: Gemini's returned units carry no page/
 # position back-reference on their own, so a link found via PyMuPDF (tied
@@ -692,40 +692,43 @@ def extract_raw_units(pdf_path: Path) -> dict:
     return render_and_extract(images, client=client)
 
 
-def extract(pdf_path: Path, original_filename: str = None, brochure_url: str = None) -> list[ListingRow]:
+def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
     """
     original_filename is the name the user actually uploaded — pdf_path itself
     is often a temp file (pages/1_Upload.py copies the upload there before
     calling this), so pdf_path.name is a randomly-generated temp name, not
-    something a person should ever see in a brochure_link fallback or in the
-    source_file column. Defaults to pdf_path.name for CLI usage, where pdf_path
-    already is the real file.
+    something a person should ever see in the source_file column. Defaults
+    to pdf_path.name for CLI usage, where pdf_path already is the real file.
 
-    brochure_url is the uploaded PDF's own persisted-file URL (see
-    storage/file_store.save_original_pdf), used as the PDF-fallback rule's
-    brochure_link value (see finalize_brochure_link's rule 3) whenever the
-    caller has one - i.e. whenever storage is GCS-backed. Falls back to the
-    bare filename for CLI usage and local-disk dev mode, where there's
-    nothing to point a real URL at.
+    No longer accepts a brochure_url parameter - the uploaded PDF's own
+    persisted-file URL used to be finalize_brochure_link's own PDF-fallback
+    default (its former "rule 3": no genuine per-unit link found -> default
+    to the whole uploaded document) whenever a unit had no genuine link of
+    its own. That rule was REMOVED (a deliberate reversal of a prior
+    intentional design decision, confirmed before removing it) - a PDF
+    upload with no genuine per-unit link now leaves brochure_link blank,
+    the same as a spreadsheet/email upload already did. Callers that still
+    persist the uploaded PDF (see storage/file_store.save_original_pdf) for
+    OTHER reasons (e.g. app.py's own paste-a-link validation/propagation)
+    keep doing so independently of this function.
     """
     filename = original_filename or pdf_path.name
-    pdf_fallback_link = brochure_url or filename
 
     raw = extract_raw_units(pdf_path)
 
-    # Runs BEFORE finalize_brochure_link below, and mutates page_index out of
-    # each unit dict as it goes - so a unit that gets a genuine per-row link
-    # here has it in place as "brochure_link" by the time finalize_brochure_
-    # link's rule 1 sees it, skipping rule 3's PDF-fallback entirely; a unit
-    # this doesn't apply to is completely unaffected either way.
+    # Runs BEFORE finalize_brochure_link inside _rows_from_raw, and mutates
+    # page_index out of each unit dict as it goes - so a unit that gets a
+    # genuine per-row link here has it in place as "brochure_link" by the
+    # time finalize_brochure_link's rule 1 sees it; a unit this doesn't
+    # apply to is completely unaffected either way.
     _attach_per_row_pdf_links(pdf_path, raw.get("units", []))
 
-    rows, _ = _rows_from_raw(raw, filename, pdf_fallback_link)
+    rows, _ = _rows_from_raw(raw, filename)
     return rows
 
 
 def extract_from_png_pages(
-    png_pages: list, original_filename: str, brochure_url: str = None, page_links: list = None,
+    png_pages: list, original_filename: str, page_links: list = None,
 ) -> list[ListingRow]:
     """
     Like extract(), but for a set of already-rendered page images (a
@@ -740,11 +743,12 @@ def extract_from_png_pages(
     at render time instead, and is handed to Gemini itself rather than
     joined by page position after the fact.
 
-    brochure_url here is the pasted link's own persisted-copy URL (see
-    app.py's own save_original_pdf call for its assembled synthetic
-    PDF) - the same "whole document" fallback rule 3 of finalize_
-    brochure_link already applies for an ordinary PDF upload with no
-    per-unit link of its own.
+    No longer accepts a brochure_url parameter - see extract()'s own
+    docstring on why (finalize_brochure_link's former PDF-fallback default
+    was removed entirely). A caller that still needs the pasted link's own
+    persisted-copy URL for OTHER purposes (see app.py's own paste-a-link
+    validation/propagation below) keeps and passes it around independently
+    of this function.
 
     Returns rows exactly like extract() does, as a plain list[ListingRow] a
     caller can iterate/index/len() exactly like any other - EXCEPT this one
@@ -752,17 +756,16 @@ def extract_from_png_pages(
     length as the rows themselves, each entry the originating raw Gemini
     unit's own page_index, or None) - see _ExtractedRows below. A caller
     wanting to validate/replace a per-unit brochure_link this produced (see
-    the Review page's own paste-a-link validation, comparing each row's
-    brochure_link against the same brochure_url passed in here), or to
-    backfill a validated per-unit link across other rows sharing the same
-    page/building (see app.py's own _propagate_validated_links_within_page),
+    the Review page's own paste-a-link validation), or to backfill a
+    validated per-unit link across other rows sharing the same page/
+    building (see app.py's own _propagate_validated_links_within_page),
     does so afterward, on the returned rows; this function itself never
     fetches anything over the network.
     """
     client = get_client()
     images = images_from_png_pages(png_pages, page_links=page_links)
     raw = render_and_extract(images, client=client)
-    rows, page_indices = _rows_from_raw(raw, original_filename, brochure_url or original_filename)
+    rows, page_indices = _rows_from_raw(raw, original_filename)
     result = _ExtractedRows(rows)
     result.page_indices = page_indices
     return result
@@ -826,7 +829,7 @@ def _match_building_features(unit_building: str, building_features: list) -> str
     return features if isinstance(features, str) and features.strip() else None
 
 
-def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[list[ListingRow], list]:
+def _rows_from_raw(raw: dict, filename: str) -> tuple[list[ListingRow], list]:
     """
     The raw Gemini JSON's own "units" (plus document-level provider/
     contacts) turned into (rows, page_indices) - rows shared by extract() (a
@@ -858,51 +861,6 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
         "contacts": raw.get("contacts"),
         "development_name": raw.get("development_name"),
     }
-
-    # finalize_brochure_link's own rule 3 (nothing genuine found for THIS
-    # unit -> default to the whole uploaded document) is correct for a
-    # real single-building/single-campus brochure, where the document
-    # genuinely IS that property's brochure - but confirmed real failure:
-    # a Colliers Canva-deck upload ("www.canva.com_view.pdf") actually
-    # covered multiple, entirely unrelated real buildings (35 Gresse
-    # Street/Fitzrovia, Whites Grounds/Bermondsey, Hatchers Yard/Surrey,
-    # Thames Court) and gave every one of them with no link of its own the
-    # SAME fallback link - the whole bulk deck, not anything about that
-    # specific building. Distinct BUILDING values across this document's
-    # own units is the signal: 2+ means the document is a bulk upload by
-    # construction, so the whole-document fallback is unreliable and every
-    # unit gets None instead for rule 3 (rules 1/2/4 - a unit's own
-    # genuine or generic link - are completely unaffected either way). 0
-    # or 1 distinct building (a real Henly House-style single-building
-    # brochure) keeps today's exact behavior.
-    #
-    # Deliberately building-count-based, not submarket-based (an earlier,
-    # narrower version of this same guard used distinct submarket values
-    # instead) - a bulk deck can easily be confined to one broad submarket
-    # label (e.g. an all-Soho tracker covering five unrelated buildings)
-    # and still not be any one of those buildings' own brochure, so
-    # submarket alone under-caught this.
-    #
-    # But building count alone over-catches a real multi-building CAMPUS
-    # brochure (e.g. Regent's Wharf: The Canal Building/The Mill/The
-    # Packing House, genuinely one shared document) - so a stated
-    # development_name (see schema.ListingRow.development_name's own
-    # docstring) exempts the document from this guard entirely, the same
-    # way it's already treated as real evidence of a genuine shared entity
-    # elsewhere (e.g. geocode.py's Tier 2 disambiguation). A bulk tracker
-    # never states one, since its buildings aren't actually one campus.
-    #
-    # Each building value normalized (stripped + casefolded) before
-    # comparing, so two units of the same real building are never
-    # miscounted as different buildings purely from whitespace/
-    # capitalization differences in what Gemini returned for each - a
-    # false "multi-building" read would wrongly suppress the fallback for
-    # a genuinely single-building document.
-    distinct_buildings = {
-        (u.get("building") or "").strip().casefold() for u in raw.get("units", []) if u.get("building")
-    }
-    is_bulk_upload = len(distinct_buildings) > 1 and not raw.get("development_name")
-    effective_pdf_fallback_link = None if is_bulk_upload else pdf_fallback_link
 
     # The prompt asks Gemini for building_features/property_features
     # alongside every unit's own special_features (see the PROMPT's own
@@ -956,9 +914,7 @@ def _rows_from_raw(raw: dict, filename: str, pdf_fallback_link: str) -> tuple[li
         if not isinstance(page_index, int):
             page_index = None
 
-        unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=True, pdf_fallback_link=effective_pdf_fallback_link
-        )
+        unit["brochure_link"] = finalize_brochure_link(unit.get("brochure_link"))
         unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
         # No genuine brochure, but a real floor plan exists - shown as

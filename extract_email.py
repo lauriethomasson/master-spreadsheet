@@ -240,9 +240,7 @@ def extract(eml_path: Path, original_filename: str = None) -> list[ListingRow]:
             unit["building"] = last_building
         last_building = unit["building"]
 
-        unit["brochure_link"] = finalize_brochure_link(
-            unit.get("brochure_link"), is_pdf=False, pdf_fallback_link=filename
-        )
+        unit["brochure_link"] = finalize_brochure_link(unit.get("brochure_link"))
         unit["floorplan_link"] = finalize_floorplan_link(unit.get("floorplan_link"))
 
         # No genuine brochure, but a real floor plan exists - shown as

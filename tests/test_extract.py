@@ -308,15 +308,6 @@ class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
     link_is_floorplan's own schema.py docstring), added here identically so
     all three extraction paths behave the same way.
 
-    Structural note specific to this (PDF) extraction path: finalize_
-    brochure_link's own rule 3 (is_pdf=True) already defaults brochure_link
-    to pdf_fallback_link (the uploaded PDF's own file) whenever nothing
-    genuine was found, so brochure_link is essentially never blank here in
-    ordinary use - this fallback exists purely for identical behavior
-    across all three paths, not because it's commonly reachable on this
-    one. Exercised below via an empty pdf_fallback_link (Path("") has an
-    empty .name, and no original_filename/brochure_url is given) - the one
-    way to genuinely reach a blank brochure_link on this path at all.
     extract_raw_units (real PDF rendering + the Gemini vision call) is
     mocked wholesale, same principle as every other test in this file/
     module - no real PDF page rendering or network call involved.
@@ -359,39 +350,37 @@ class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
         self.assertIsNone(row.brochure_link_is_floorplan)
 
 
-class MultiBuildingFallbackSuppressionTests(unittest.TestCase):
+class NoPdfFallbackLinkTests(unittest.TestCase):
     """
-    finalize_brochure_link's own rule 3 (nothing genuine for THIS unit ->
-    default to the whole uploaded document) is correct for a real single-
-    building/single-campus brochure - but confirmed real failure: a
-    Colliers "canva view" upload was actually a combined portfolio
-    tracker covering entirely unrelated real buildings (35 Gresse Street/
-    Fitzrovia, Whites Grounds/Bermondsey, Hatchers Yard/Surrey, Thames
-    Court) and gave every unit with no link of its own the SAME shared
-    fallback link - the whole tracker, not anything about that specific
-    building. _rows_from_raw now suppresses rule 3 (passes None instead
-    of the real pdf_fallback_link) for any document whose own units span
-    2+ distinct BUILDING values with no stated development_name -
-    covering both extract() (real PDF upload) and extract_from_png_pages()
-    (pasted Canva/Pitch link, the real failing case's own path), since
-    both share this same function.
+    Regression tests for the REMOVAL of finalize_brochure_link's former
+    "rule 3" PDF-fallback default (defaulting brochure_link to the whole
+    uploaded document whenever no genuine per-unit link was found) - a
+    deliberate reversal of a prior intentional design decision, confirmed
+    before removing it (see finalize_brochure_link's own docstring for the
+    full reasoning). A unit with no genuine link of its own now gets
+    brochure_link=None regardless of the document's own building count -
+    single-building (a real Henly House-shaped brochure, previously the
+    exact case rule 3 was "the expected default" for) and multi-building
+    (a real Colliers bulk-tracker upload, previously handled by a NARROWER
+    is_bulk_upload suppression guard - see git history for that guard's own
+    prior implementation/tests) both now collapse to the same, simpler
+    outcome, covering both extract() (real PDF upload) and extract_from_
+    png_pages() (pasted Canva/Pitch link) since both share the same
+    underlying _rows_from_raw.
 
-    Building count, not submarket, is the signal (an earlier, narrower
-    version of this guard used distinct submarket values instead) - a
-    bulk deck can easily be confined to one broad submarket label (e.g.
-    an all-Soho tracker covering five unrelated buildings) and still not
-    be any one of those buildings' own brochure. A stated development_name
-    (see schema.ListingRow.development_name's own docstring) exempts a
-    document from this guard entirely, since that's what actually
-    distinguishes a real shared-campus brochure (e.g. Regent's Wharf, one
-    document genuinely covering several buildings on purpose) from a bulk
-    tracker of unrelated buildings that just happens to share a submarket.
+    This class replaces the former MultiBuildingFallbackSuppressionTests,
+    which tested the NOW-REMOVED is_bulk_upload suppression guard
+    specifically (a mechanism that existed only to narrow rule 3's own
+    reach) - that guard's entire reason to exist went away alongside rule
+    3 itself, so those tests were exercising dead code; this class covers
+    the new, simpler behavior those old tests' real-world scenarios
+    (Henly House/Regent's Wharf/a Soho tracker) actually motivate now.
     """
 
-    def test_single_building_document_keeps_the_shared_fallback_link(self):
-        # Regression: a real Henly House-shaped brochure (one building
-        # across every unit) must keep today's exact behavior - the whole
-        # PDF genuinely IS this property's brochure.
+    def test_single_building_document_now_gets_no_fallback_link(self):
+        # The exact real Henly House-shaped case rule 3 used to treat as
+        # its own expected default - now correctly None instead, the same
+        # as a spreadsheet/email upload with nothing genuine already got.
         raw = {
             "provider": "Colliers", "contacts": None,
             "units": [
@@ -400,82 +389,17 @@ class MultiBuildingFallbackSuppressionTests(unittest.TestCase):
             ],
         }
         with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
-            rows = extract.extract(
-                Path("henly.pdf"), original_filename="henly.pdf", brochure_url="https://storage/henly.pdf",
-            )
+            rows = extract.extract(Path("henly.pdf"), original_filename="henly.pdf")
 
-        self.assertEqual(rows[0].brochure_link, "https://storage/henly.pdf")
-        self.assertEqual(rows[1].brochure_link, "https://storage/henly.pdf")
+        self.assertIsNone(rows[0].brochure_link)
+        self.assertIsNone(rows[1].brochure_link)
 
-    def test_same_building_spelled_inconsistently_still_keeps_the_fallback_link(self):
-        # Whitespace/capitalization noise in Gemini's own per-unit
-        # "building" reads must never be miscounted as distinct buildings -
-        # this is still genuinely ONE building's brochure.
-        raw = {
-            "provider": "Colliers", "contacts": None,
-            "units": [
-                {"building": "Henly House", "floor_unit": "1st Floor", "brochure_link": None},
-                {"building": " henly house", "floor_unit": "2nd Floor", "brochure_link": None},
-                {"building": "HENLY HOUSE ", "floor_unit": "3rd Floor", "brochure_link": None},
-            ],
-        }
-        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
-            rows = extract.extract(
-                Path("henly.pdf"), original_filename="henly.pdf", brochure_url="https://storage/henly.pdf",
-            )
-
-        for row in rows:
-            self.assertEqual(row.brochure_link, "https://storage/henly.pdf")
-
-    def test_regents_wharf_shaped_campus_with_a_stated_development_name_is_unaffected(self):
-        # A real multi-building campus brochure (Regent's Wharf) has 3
-        # distinct buildings - but a stated development_name is genuine
-        # evidence this is one shared-campus document on purpose, not a
-        # bulk tracker of unrelated buildings, so the guard doesn't apply.
-        raw = {
-            "provider": "Colliers", "contacts": None, "development_name": "Regent's Wharf",
-            "units": [
-                {"building": "The Canal Building", "submarket": "King's Cross", "brochure_link": None},
-                {"building": "The Mill", "submarket": "King's Cross", "brochure_link": None},
-                {"building": "The Packing House", "submarket": "King's Cross", "brochure_link": None},
-            ],
-        }
-        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
-            rows = extract.extract(
-                Path("regents-wharf.pdf"), original_filename="regents-wharf.pdf",
-                brochure_url="https://storage/regents-wharf.pdf",
-            )
-
-        for row in rows:
-            self.assertEqual(row.brochure_link, "https://storage/regents-wharf.pdf")
-
-    def test_multi_building_tracker_sharing_one_submarket_gets_no_fallback_link(self):
-        # The submarket-based signal alone would have missed this: an
-        # all-Soho tracker covering unrelated buildings, no development_name
-        # stated, so it isn't a real shared-campus brochure either.
-        raw = {
-            "provider": None, "contacts": None,
-            "units": [
-                {"building": "35 Gresse Street", "submarket": "Soho", "brochure_link": None},
-                {"building": "22 Newman Street", "submarket": "Soho", "brochure_link": None},
-                {"building": "Ganton House", "submarket": "Soho", "brochure_link": None},
-            ],
-        }
-        with patch("extract.get_client", return_value="fake-client"), \
-                patch("extract.call_gemini", return_value=raw):
-            rows = extract.extract_from_png_pages(
-                [b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf",
-                brochure_url="https://storage/tracker.pdf",
-            )
-
-        for row in rows:
-            self.assertIsNone(row.brochure_link)
-
-    def test_multi_building_tracker_gets_no_fallback_link_via_the_pasted_link_path(self):
-        # The real failing shape, through the real failing path - a
-        # combined portfolio tracker pasted as a Canva/Pitch link
-        # (extract_from_png_pages, never extract() directly) with units
-        # spanning genuinely unrelated areas across London.
+    def test_multi_building_tracker_also_gets_no_fallback_link(self):
+        # The real Colliers bulk-tracker case (35 Gresse Street/Fitzrovia,
+        # Whites Grounds/Bermondsey, Hatchers Yard/Surrey, Thames Court)
+        # that originally motivated the now-removed is_bulk_upload guard -
+        # this and the single-building case above now behave identically,
+        # since there's no fallback left for building count to suppress.
         raw = {
             "provider": None, "contacts": None,
             "units": [
@@ -486,18 +410,14 @@ class MultiBuildingFallbackSuppressionTests(unittest.TestCase):
         }
         with patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw):
-            rows = extract.extract_from_png_pages(
-                [b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf",
-                brochure_url="https://storage/tracker.pdf",
-            )
+            rows = extract.extract_from_png_pages([b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf")
 
         for row in rows:
             self.assertIsNone(row.brochure_link)
 
-    def test_a_units_own_genuine_link_is_unaffected_by_building_diversity(self):
-        # Only rule 3 (the whole-document fallback) is ever touched by
-        # this feature - a unit with its own genuine, listing-specific
-        # link (rule 1) is completely unaffected either way.
+    def test_a_units_own_genuine_link_is_still_unaffected(self):
+        # Only the removed fallback ever changed - a unit with its own
+        # genuine, listing-specific link (rule 1) is completely unaffected.
         raw = {
             "provider": None, "contacts": None,
             "units": [
@@ -508,10 +428,7 @@ class MultiBuildingFallbackSuppressionTests(unittest.TestCase):
         }
         with patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw):
-            rows = extract.extract_from_png_pages(
-                [b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf",
-                brochure_url="https://storage/tracker.pdf",
-            )
+            rows = extract.extract_from_png_pages([b"\x89PNG\r\n\x1a\n rest"], original_filename="tracker.pdf")
 
         self.assertEqual(rows[0].brochure_link, "https://example.com/gresse-street.pdf")
         self.assertIsNone(rows[1].brochure_link)
@@ -976,16 +893,14 @@ class ExtractFromPngPagesTests(unittest.TestCase):
         }
         with patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw) as mock_call_gemini:
-            rows = extract.extract_from_png_pages(
-                [self._PNG_BYTES], original_filename="colliers.pdf", brochure_url="https://storage/colliers.pdf",
-            )
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="colliers.pdf")
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].building, "Kingsland House")
         self.assertEqual(rows[0].source_file, "colliers.pdf")
-        # No genuine per-unit link and no page_links given - falls back to
-        # the shared document link, exactly like extract()'s own rule 3.
-        self.assertEqual(rows[0].brochure_link, "https://storage/colliers.pdf")
+        # No genuine per-unit link and no page_links given - correctly
+        # None, the (former) PDF-fallback default was removed entirely.
+        self.assertIsNone(rows[0].brochure_link)
         mock_call_gemini.assert_called_once()
 
     def test_development_name_from_gemini_output_flows_through_to_every_row(self):
@@ -1042,19 +957,21 @@ class ExtractFromPngPagesTests(unittest.TestCase):
         }
         with patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw):
-            rows = extract.extract_from_png_pages(
-                [self._PNG_BYTES], original_filename="deck.pdf", brochure_url="https://storage/deck.pdf",
-            )
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="deck.pdf")
 
         self.assertEqual(rows[0].brochure_link, "https://blob.example.com/gloucester.pdf")
 
-    def test_no_original_filename_or_brochure_url_falls_back_to_the_filename_itself(self):
+    def test_no_genuine_link_and_no_page_links_gets_no_fallback_link(self):
+        # Renamed from test_no_original_filename_or_brochure_url_falls_
+        # back_to_the_filename_itself - that name/assertion described the
+        # removed PDF-fallback default, which used to default all the way
+        # down to the bare filename in this shape specifically.
         raw = {"provider": None, "contacts": None, "units": [{"building": "X", "brochure_link": None}]}
         with patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw):
             rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="pasted.pdf")
 
-        self.assertEqual(rows[0].brochure_link, "pasted.pdf")
+        self.assertIsNone(rows[0].brochure_link)
 
     def test_page_indices_attribute_mirrors_each_units_own_page_index(self):
         # app._propagate_validated_links_within_page (Upload page) relies on
@@ -1106,9 +1023,7 @@ class BuildingAndPropertyFeaturesMergeTests(unittest.TestCase):
 
     def _extract(self, raw):
         with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
-            return extract.extract(
-                Path("doc.pdf"), original_filename="doc.pdf", brochure_url="https://storage/doc.pdf",
-            )
+            return extract.extract(Path("doc.pdf"), original_filename="doc.pdf")
 
     def test_building_features_text_is_appended_to_matching_unit(self):
         raw = {

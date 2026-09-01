@@ -861,13 +861,15 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
     shared fallback purely for not being a PDF. The bytes themselves are
     never used below - only whether the fetch returned None at all.
 
-    A row whose brochure_link already equals shared_fallback_link never
-    had a genuine per-unit pick at all (see finalize_brochure_link's own
-    rule 3 - the fallback IS the value already) - nothing to validate,
-    and nothing to fall back FROM either. A row flagged brochure_link_
-    is_floorplan (a floorplan link substituted in because no genuine
-    brochure link existed at all) is left alone too - a separate, pre-
-    existing mechanism this feature doesn't touch.
+    A row whose brochure_link already equals shared_fallback_link (rare
+    now that finalize_brochure_link no longer has any PDF-fallback default
+    of its own to produce this coincidentally - see its own docstring on
+    why that was removed; still guarded against here defensively, e.g. if
+    Gemini's own per-unit pick happens to equal it) has nothing to
+    validate, and nothing to fall back FROM either. A row flagged
+    brochure_link_is_floorplan (a floorplan link substituted in because no
+    genuine brochure link existed at all) is left alone too - a separate,
+    pre-existing mechanism this feature doesn't touch.
     """
     for row in rows:
         if not row.brochure_link or row.brochure_link == shared_fallback_link or row.brochure_link_is_floorplan:
@@ -1458,14 +1460,6 @@ with page_setup.setup_page("upload"):
 
                         try:
                             if suffix == ".pdf":
-                                # Persisted before extraction (from the bytes
-                                # we already have in memory, not the temp
-                                # file about to be deleted below) so the
-                                # PDF-fallback brochure_link rule has a real,
-                                # permanent URL to point at instead of just
-                                # the bare filename - see
-                                # finalize_brochure_link's rule 3.
-                                brochure_url = save_original_pdf(uploaded_file.getvalue(), uploaded_file.name)
                                 png_pages = getattr(uploaded_file, "png_pages", None)
                                 if png_pages is not None:
                                     # A pasted Canva/Pitch link (see
@@ -1480,11 +1474,26 @@ with page_setup.setup_page("upload"):
                                     # pages's own docstring). page_links
                                     # (each page's own real <a href>
                                     # candidates) lets Gemini attribute a
-                                    # genuine per-property brochure_link
-                                    # instead of every unit falling back to
-                                    # this one shared brochure_url.
+                                    # genuine per-property brochure_link.
+                                    #
+                                    # Persisted here (from the bytes already
+                                    # in memory, not the temp file about to
+                                    # be deleted below) ONLY for this
+                                    # branch's own validation/propagation
+                                    # just below, which compares each row's
+                                    # own brochure_link against this exact
+                                    # persisted URL - no longer for
+                                    # finalize_brochure_link's own PDF-
+                                    # fallback default, which was removed
+                                    # entirely (see extract.py's own
+                                    # docstring on why) - a plain PDF
+                                    # upload (the else branch below) has no
+                                    # remaining use for this persisted copy
+                                    # at all, so it's no longer computed
+                                    # there.
+                                    brochure_url = save_original_pdf(uploaded_file.getvalue(), uploaded_file.name)
                                     rows = extract.extract_from_png_pages(
-                                        png_pages, original_filename=uploaded_file.name, brochure_url=brochure_url,
+                                        png_pages, original_filename=uploaded_file.name,
                                         page_links=uploaded_file.page_links,
                                     )
                                     # Gemini's own per-unit pick is trusted
@@ -1509,9 +1518,7 @@ with page_setup.setup_page("upload"):
                                         rows, getattr(rows, "page_indices", None), brochure_url,
                                     )
                                 else:
-                                    rows = extract.extract(
-                                        tmp_path, original_filename=uploaded_file.name, brochure_url=brochure_url,
-                                    )
+                                    rows = extract.extract(tmp_path, original_filename=uploaded_file.name)
                             elif suffix == ".eml":
                                 rows = extract_email.extract(tmp_path, original_filename=uploaded_file.name)
                             else:

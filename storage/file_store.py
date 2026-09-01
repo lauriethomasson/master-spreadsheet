@@ -414,11 +414,18 @@ def _find_previous_upload_by_hash_cached(content_hash: str, source_identity_hash
 def save_original_pdf(data: bytes, original_filename: str) -> str:
     """
     Persists the original uploaded PDF's own bytes (not the rows extracted
-    from it), so brochure_link's PDF-fallback rule (see
-    brochure_link_resolver.finalize_brochure_link's rule 3) has a real,
-    permanently-fetchable file to point at - previously the upload's temp
-    file was deleted right after extraction with nothing kept anywhere, so
-    that fallback could only ever be the bare original filename.
+    from it) to a real, permanently-fetchable URL. Originally existed to
+    feed brochure_link's own PDF-fallback rule (see brochure_link_
+    resolver.finalize_brochure_link's own docstring) - that rule was
+    REMOVED entirely (a deliberate reversal of a prior intentional design
+    decision), so this is no longer called for a plain PDF upload with no
+    per-unit link of its own at all (see app.py's own upload flow). Still
+    called for a pasted Canva/Pitch link upload specifically, where the
+    persisted URL is needed for that flow's own separate per-unit
+    validation/propagation against the assembled synthetic PDF (see app.py's
+    own _validate_pasted_link_brochure_links/_propagate_validated_links_
+    within_page) - a different, still-genuine consumer, unrelated to the
+    removed fallback.
 
     Uploaded public=True (see blob_store.write_bytes) - unlike staging/master/
     versions, this one specific prefix is meant to be linked to directly

@@ -25,11 +25,12 @@ class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
     found a real floor plan - the same fallback extract_spreadsheet_gemini.
     py's own extract_sheet_with_metadata applies (see ListingRow.brochure_
     link_is_floorplan's own schema.py docstring), added here identically so
-    all three extraction paths behave the same way. Unlike extract.py's own
-    PDF path, finalize_brochure_link's rule 3 (PDF-fallback default) never
-    applies here (is_pdf=False) - an email genuinely stays null when
-    nothing was found, exactly like the spreadsheet path, so this fallback
-    is reachable the same way here too.
+    all three extraction paths behave the same way - now genuinely
+    identical across all three, since finalize_brochure_link's former PDF-
+    fallback default (once PDF-specific) was removed entirely; an email
+    (like every source type now) genuinely stays null when nothing was
+    found, so this fallback is reachable the same way here as everywhere
+    else.
     """
 
     def _extract(self, brochure_link, floorplan_link):
