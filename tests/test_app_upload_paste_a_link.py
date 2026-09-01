@@ -91,6 +91,41 @@ def _make_png(color) -> bytes:
     return png_bytes
 
 
+class FilenameFromUrlTests(unittest.TestCase):
+    """
+    Regression coverage for a real, confirmed bug: _filename_from_url used
+    to derive its fallback filename from ONLY the URL's own last path
+    segment, which for a real Canva "view" link (always
+    "/design/{design_id}/{share_token}/view" - see brochure_link_resolver.
+    _CANVA_VIEW_URL_RE's own docstring) is the fixed literal "view" on
+    every single distinct Canva design, since both distinguishing
+    segments (design_id, share_token) sit earlier in the path, never last.
+    That collapsed EVERY distinct Canva link pasted through this page down
+    to the byte-identical "www.canva.com_view.pdf" filename -
+    save_original_pdf's own second-resolution timestamp prefix was the
+    ONLY thing left telling two different pastes apart, so two paste-a-
+    link calls (for two genuinely different, unrelated buildings' own
+    Canva decks) landing in the same wall-clock second silently collided
+    on the exact same GCS object, leaving unrelated rows sharing one
+    saved brochure_link. Fixed by keeping the full sanitized path, not
+    just its last segment.
+    """
+
+    def test_distinct_canva_design_links_produce_distinct_filenames(self):
+        url_a = "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view?utm_content=abc#7"
+        url_b = "https://www.canva.com/design/DAG111111/tokenAAAAAAAAAAAAAAAAAAAA/view"
+        self.assertNotEqual(app._filename_from_url(url_a), app._filename_from_url(url_b))
+
+    def test_canva_view_link_filename_still_ends_in_pdf_and_reflects_the_host(self):
+        url = "https://www.canva.com/design/DAGzsWW-Yp8/s8tPVTQe6HUQa939xX0XQw/view"
+        name = app._filename_from_url(url)
+        self.assertTrue(name.lower().endswith(".pdf"))
+        self.assertTrue(name.startswith("www.canva.com_"))
+
+    def test_direct_pdf_link_still_uses_its_own_last_path_segment_unchanged(self):
+        self.assertEqual(app._filename_from_url("https://example.com/brochure.pdf"), "brochure.pdf")
+
+
 class FetchPastedLinkUnitTests(unittest.TestCase):
     """
     Direct, non-AppTest unit tests of app._fetch_pasted_link itself -

@@ -754,14 +754,32 @@ def _filename_from_url(url: str) -> str:
     """A sensible, always-.pdf-suffixed filename derived from `url` - the
     URL's own last path segment when it already looks like a real
     filename (the common case: a direct document link, or a resolved
-    landing-page link), otherwise the host plus whatever slug the path
-    offers (a Canva/Pitch "view" link's own path is never a filename)."""
+    landing-page link), otherwise the host plus the FULL path, sanitized
+    (a Canva/Pitch "view" link's own last path segment is never a
+    filename - every real Canva "view" link ends in the literal, fixed
+    "/view" segment, e.g. "/design/{design_id}/{share_token}/view" - see
+    brochure_link_resolver._CANVA_VIEW_URL_RE's own docstring for the
+    exact shape - so using ONLY that last segment collapsed EVERY
+    distinct Canva design down to the byte-identical stem
+    "www.canva.com_view.pdf" regardless of its own unique design_id/
+    share_token, both of which sit in EARLIER path segments this used to
+    discard entirely. Confirmed a real bug this way - not just a
+    theoretical risk: save_original_pdf's own filename only gets a
+    second-resolution timestamp prefix, so any two paste-a-link calls
+    landing in the same wall-clock second (plausible for a fast multi-
+    link paste/extract batch) silently overwrote each other's GCS object
+    under this identical stem, leaving several genuinely unrelated
+    buildings' own rows pointing at the SAME saved brochure_link even
+    though each was pasted from its own distinct Canva design. Using the
+    full path (not just its last segment) keeps every distinct URL's own
+    distinguishing segments in the generated filename."""
     parsed = urlparse(url)
     base = Path(parsed.path).name
     if base.lower().endswith(".pdf"):
         return base
     host = (parsed.netloc or "link").replace(":", "_")
-    return f"{host}_{base}.pdf" if base else f"{host}.pdf"
+    path_slug = re.sub(r"[^A-Za-z0-9]+", "_", parsed.path).strip("_")
+    return f"{host}_{path_slug}.pdf" if path_slug else f"{host}.pdf"
 
 
 def _pdf_bytes_from_png_pages(png_pages: list) -> bytes:
