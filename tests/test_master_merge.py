@@ -3109,10 +3109,19 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
         # Test 1 (this session's own PART 11) - the actual real-world
         # failure this whole fix exists for. Genuine item loss (legal
         # structure/the descriptive paragraph) already makes this risky
-        # via is_detail_loss - this confirms it stays that way AND that
-        # the diff is left UNMERGED (verbatim new_val, not merge_
-        # compatible_text's own output) because of the duplicate, not
-        # silently "fixed up" into a cleaned merged value nobody reviews.
+        # via is_detail_loss - this confirms it stays that way.
+        #
+        # UPDATED (self-duplication path-independent repair - see
+        # master_merge._deduped_special_features/build_merge_plan's own
+        # call site): new_val's own duplicate is now silently repaired
+        # BEFORE diffs/risky_fields ever see it, regardless of what other
+        # problems remain - the diff's new value is therefore the DEDUPED
+        # text, not the raw still-duplicated extraction. This row stays
+        # risky/unmerged for a reason UNRELATED to the duplicate itself -
+        # the genuine, irrecoverable item loss (legal structure/the
+        # descriptive paragraph) - proving the two concerns are
+        # independent: the duplicate no longer masks the real issue, and
+        # the real issue is exactly what still (correctly) blocks this.
         old_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_OLD
         new_val = HasSuspiciousDuplicateItemsTests.THIRTY_LIGHTERMAN_NEW
         master_df = _master_df([{
@@ -3124,13 +3133,21 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
 
         matched = plan.matched_changed[0]
         self.assertIn("special_features", matched.risky_fields)
-        self.assertEqual(matched.diffs["special_features"], (old_val, new_val))
+        deduped_new_val = master_merge._deduped_special_features(new_val)
+        self.assertEqual(matched.diffs["special_features"], (old_val, deduped_new_val))
+        # The duplicate itself is gone from what a reviewer actually sees.
+        self.assertEqual(deduped_new_val.count("Penthouse suite"), 1)
 
-    def test_a_pure_duplicate_with_no_detectable_item_loss_is_still_flagged(self):
-        # The genuine gap neither is_detail_loss nor is_richness_regression
-        # can catch alone: every old item is still restated (no loss) and
-        # new_val is actually LONGER (not a richness regression), so only
-        # the duplicate-detection signal catches this.
+    def test_a_pure_duplicate_with_no_detectable_item_loss_becomes_a_silent_no_op(self):
+        # UPDATED (self-duplication path-independent repair): previously,
+        # neither is_detail_loss nor is_richness_regression alone could
+        # catch a pure accidental duplication with nothing else wrong, so
+        # only the duplicate-detection signal flagged it for review
+        # forever, even though the review had nothing real to decide.
+        # Repairing the duplicate BEFORE diffs are computed means the
+        # cleaned new value is now BYTE-IDENTICAL to old_val - correctly
+        # "nothing to change at all" (matched_unchanged, no diff, no
+        # review) rather than a manual decision over pure noise.
         old_val = "3 meeting rooms; private terrace"
         new_val = "3 meeting rooms; private terrace; private terrace"
         self.assertFalse(master_merge.is_detail_loss(old_val, new_val, field_name="special_features"))
@@ -3141,18 +3158,25 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
-        matched = plan.matched_changed[0]
-        self.assertIn("special_features", matched.risky_fields)
-        # Left unmerged/verbatim, exactly like the other risky-text cases.
-        self.assertEqual(matched.diffs["special_features"], (old_val, new_val))
+        self.assertEqual(plan.matched_changed, [])
+        matched = plan.matched_unchanged[0]
+        self.assertNotIn("special_features", matched.diffs)
+        self.assertEqual(matched.risky_fields, frozenset())
 
-    def test_a_duplicate_blocks_auto_merge_even_when_detail_loss_would_otherwise_qualify(self):
+    def test_a_duplicate_alongside_a_genuine_unrecoverable_loss_still_blocks_auto_merge(self):
         # A genuinely lost old item WOULD normally auto-merge (see
         # test_normal_special_features_update_is_not_flagged's own sibling
-        # cases in IsDetailLossTests) - but new_val's own duplicate must
-        # still block that, since merge_compatible_text starts from
-        # new_val's own items verbatim and would otherwise carry the
-        # duplicate straight into an auto-applied value.
+        # cases in IsDetailLossTests) - here "bike storage" is dropped
+        # with NOTHING new offered in its place (a pure subset loss, see
+        # _safe_to_auto_merge_detail_loss's own docstring), so this stays
+        # risky/unmerged regardless of the duplicate.
+        #
+        # UPDATED (self-duplication path-independent repair): the
+        # duplicate itself is silently repaired first, so the diff's new
+        # value is the DEDUPED text ("3 meeting rooms; private terrace"),
+        # not the raw still-duplicated extraction - the row remains risky
+        # for the genuine "bike storage" loss, a reason independent of the
+        # duplicate that used to be the only thing this test could catch.
         old_val = "3 meeting rooms; private terrace; bike storage"
         new_val = "3 meeting rooms; 3 meeting rooms; private terrace"  # dropped "bike storage", AND duplicated
         master_df = _master_df([{"building": "1 Example Street", "provider": "Test Provider", "special_features": old_val}])
@@ -3162,9 +3186,9 @@ class BuildMergePlanRiskyFieldsTests(unittest.TestCase):
 
         matched = plan.matched_changed[0]
         self.assertIn("special_features", matched.risky_fields)
-        # Verbatim new_val, NOT merge_compatible_text's own merged output -
-        # the auto-merge path never ran.
-        self.assertEqual(matched.diffs["special_features"], (old_val, new_val))
+        deduped_new_val = master_merge._deduped_special_features(new_val)
+        self.assertEqual(matched.diffs["special_features"], (old_val, deduped_new_val))
+        self.assertEqual(deduped_new_val, "3 meeting rooms; private terrace")
 
     def test_blank_new_special_features_never_erases_the_old_value(self):
         # Test 8 (PART 11) - diff_fields' own pre-existing blank-new-value-
@@ -4353,7 +4377,24 @@ class SpecialFeaturesAutoMergePermissivenessTests(unittest.TestCase):
         matched = self._matched(old, new)
         self.assertIn("special_features", matched.risky_fields)
 
-    def test_4_self_duplication_requires_review(self):
+    def test_4_self_duplication_alone_is_repaired_not_flagged(self):
+        # UPDATED: build_merge_plan now repairs a self-duplicating
+        # special_features value BEFORE risky_fields is ever computed (see
+        # master_merge._deduped_special_features and master_merge_dedup_
+        # ->special_features tests in SelfDuplicatingSpecialFeaturesRepair
+        # Tests) - a path-independent safety net for extractors with no
+        # tier-combining step of their own (e.g. extract_spreadsheet_
+        # gemini.py's single Gemini call per row), alongside brochure_
+        # enrichment.py's own tier-combining dedup (commit 085272b).
+        # Every one of old's own items is either an exact/reworded match
+        # once the duplicate is removed, or safely auto-merged back in by
+        # the pre-existing auto-merge logic (commit 6343366) - nothing is
+        # genuinely, irrecoverably lost, so this now correctly auto-
+        # applies rather than sitting in review forever purely because of
+        # a raw extraction artifact. A self-duplication ALONGSIDE a
+        # genuine, unrecoverable loss still requires review - see
+        # SelfDuplicatingSpecialFeaturesRepairTests/BuildMergePlanRisky
+        # FieldsTests' own Thirty Lighterman case.
         old = (
             "Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; minimum term 24 months; legal "
             "structure: co-lease; excellent natural light; private outdoor spaces; high-spec showers"
@@ -4363,8 +4404,9 @@ class SpecialFeaturesAutoMergePermissivenessTests(unittest.TestCase):
             "24 month minimum term; co-lease; private outdoor spaces; high-spec showers"
         )
         matched = self._matched(old, new)
-        self.assertIn("special_features", matched.risky_fields)
-        self.assertEqual(matched.diffs["special_features"], (old, new))
+        self.assertNotIn("special_features", matched.risky_fields)
+        merged = matched.diffs["special_features"][1]
+        self.assertEqual(merged.count("Penthouse suite"), 1)
 
     def test_5_numeric_contradiction_requires_review(self):
         old = "5 meeting rooms; 36 month term; Bike storage"
@@ -4417,6 +4459,97 @@ class SpecialFeaturesAutoMergePermissivenessTests(unittest.TestCase):
         merged = matched.diffs["special_features"][1]
         self.assertIn("newly fitted kitchen", merged)
         self.assertIn("10-person boardroom", merged)
+
+
+class SelfDuplicatingSpecialFeaturesRepairTests(unittest.TestCase):
+    """
+    build_merge_plan's own PATH-INDEPENDENT repair for a self-duplicating
+    special_features value (see master_merge._deduped_special_features'
+    own docstring) - a final safety net alongside brochure_enrichment.
+    _apply_units_to_row's item-level dedup (commit 085272b), which only
+    ever runs for the brochure-link tier-COMBINING path. A raw single-
+    source extraction (extract_spreadsheet_gemini.py: one Gemini call per
+    row, nothing to combine) never passes through that fix at all, so a
+    self-duplicating raw Gemini response (a known LLM failure mode)
+    previously reached a reviewer completely uncleaned - correctly
+    flagged as risky by _has_suspicious_duplicate_items, but with nothing
+    that ever repaired it, leaving the row stuck in manual review forever.
+    """
+
+    def _matched(self, old_val, new_val):
+        master_df = _master_df([{"building": "X", "provider": "UNION", "special_features": old_val}]) if old_val else \
+            _master_df([{"building": "X", "provider": "UNION"}])
+        new_row = ListingRow(building="X", provider="UNION", special_features=new_val)
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        return (plan.matched_changed + plan.matched_unchanged)[0]
+
+    def test_the_exact_reported_33_cavendish_square_case_is_cleaned_and_not_flagged(self):
+        # Confirmed real case: "33 Cavendish Square - 11th North and
+        # South" - a raw spreadsheet upload (Kitt's Availability), ingested
+        # via extract_spreadsheet_gemini.py, never touching brochure_
+        # enrichment.py's own tier-combining/dedup at all.
+        sentence = "Prime West End location. Impressive views across London. Fit out to be completed September"
+        new_val = f"{sentence}; {sentence}"
+
+        matched = self._matched(None, new_val)
+
+        self.assertEqual(matched.diffs["special_features"], (None, sentence))
+        self.assertNotIn("special_features", matched.risky_fields)
+
+    def test_self_duplication_alongside_master_s_own_existing_value_is_cleaned_too(self):
+        # old_val is genuinely different content, so build_merge_plan's
+        # own pre-existing auto-merge (commit 6343366) legitimately folds
+        # it back into the result once the new value is deduped - a
+        # SEPARATE, already-tested concern (see
+        # SpecialFeaturesAutoMergePermissivenessTests). What THIS test
+        # covers is narrower: the sentence must appear exactly ONCE in the
+        # final result, not the still-duplicated raw extraction.
+        sentence = "Prime West End location. Impressive views across London. Fit out to be completed September"
+        new_val = f"{sentence}; {sentence}"
+        old_val = "Old description entirely unrelated to the new one"
+
+        matched = self._matched(old_val, new_val)
+
+        result = matched.diffs["special_features"][1]
+        self.assertEqual(result.count(sentence), 1)
+
+    def test_items_that_merely_share_words_but_are_not_exact_duplicates_are_untouched(self):
+        # Same conservative, exact-match-only philosophy as _has_
+        # suspicious_duplicate_items itself - two genuinely different
+        # items that happen to share some words must never be collapsed.
+        new_val = "5 meeting rooms available on this floor; 2 meeting rooms available on the floor below"
+
+        matched = self._matched(None, new_val)
+
+        self.assertEqual(matched.diffs["special_features"], (None, new_val))
+        self.assertNotIn("special_features", matched.risky_fields)
+
+    def test_a_value_with_no_duplication_at_all_is_returned_byte_identical(self):
+        # No _has_suspicious_duplicate_items match at all -> _deduped_
+        # special_features must never even be called, so a value with
+        # internal commas (which _split_list_items would otherwise ALSO
+        # comma-split for special_features - see _MERGE_COMMA_SPLIT_
+        # FIELDS) is never cosmetically reformatted just for passing
+        # through build_merge_plan.
+        new_val = "Great natural light, spacious meeting rooms"
+
+        matched = self._matched(None, new_val)
+
+        self.assertEqual(matched.diffs["special_features"], (None, new_val))
+
+    def test_already_deduped_by_the_brochure_path_is_a_safe_no_op(self):
+        # A value that already went through brochure_enrichment.py's own
+        # item-level dedup (commit 085272b) has no duplicate items left -
+        # this new, later safety net must be a complete no-op on it.
+        already_clean = (
+            "Prime West End location. Impressive views across London. Fit out to be completed September; "
+            "Min. Term 36 months; 5 meeting rooms"
+        )
+
+        matched = self._matched(None, already_clean)
+
+        self.assertEqual(matched.diffs["special_features"], (None, already_clean))
+        self.assertNotIn("special_features", matched.risky_fields)
 
 
 class ContactsMergeTests(unittest.TestCase):

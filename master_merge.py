@@ -1232,6 +1232,58 @@ def _split_list_items(text: str, field_name: str = None) -> list[str]:
     return expanded
 
 
+def _deduped_special_features(text: str) -> str:
+    """
+    text with every EXACT (normalize_key-equal) repeated item collapsed to
+    its first occurrence - a final, ingestion-PATH-INDEPENDENT safety net,
+    used by build_merge_plan on new_dict's own incoming special_features
+    value before diffs/risky_fields ever see it (see that function's own
+    call site comment for exactly why/where).
+
+    Confirmed real gap this closes: brochure_enrichment._apply_units_to_
+    row's own item-level dedup (commit 085272b) only ever runs for the
+    brochure-link tier-COMBINING path - a raw single-source extraction
+    (e.g. extract_spreadsheet_gemini.py, one Gemini call per row with
+    nothing to combine at all) never passes through it, so a self-
+    duplicating raw Gemini response (a known LLM failure mode - the same
+    sentence restated back-to-back) previously reached a reviewer
+    completely uncleaned. _has_suspicious_duplicate_items already detects
+    this correctly and blocks it from auto-applying - that detection was
+    always working; nothing ever REPAIRED it, so the row sat in manual
+    review forever with no path to clearing itself, even on a re-upload
+    (the same source is likely to reproduce the same duplication again).
+
+    Only ever called once _has_suspicious_duplicate_items has ALREADY
+    confirmed `text` genuinely contains a repeated item (see that call
+    site) - never called speculatively on a value that might already be
+    clean, so a genuinely clean value (including one 085272b's own dedup
+    already cleaned - this is a safe no-op there) is never reformatted by
+    passing through here at all. This matters concretely: _split_list_
+    items also comma-splits special_features specifically (see
+    _MERGE_COMMA_SPLIT_FIELDS), so rebuilding via split-then-rejoin would
+    otherwise cosmetically turn "a, b" into "a; b" even on a value with no
+    duplication whatsoever - gating the whole rebuild behind an already-
+    confirmed duplicate keeps that side effect confined to rows that were
+    already going to be flagged as malformed, never a universal rewrite.
+
+    Same conservative, exact-match-only philosophy as _has_suspicious_
+    duplicate_items itself (see its own docstring - never a fuzzy/reworded
+    match) - reuses _split_list_items/normalize_key directly rather than
+    reimplementing splitting or normalization.
+    """
+    items = _split_list_items(text, "special_features")
+    seen = set()
+    deduped = []
+    for item in items:
+        key = normalize_key(item)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        deduped.append(item)
+    return "; ".join(deduped) if deduped else text
+
+
 # Small, explicit, hand-maintained EXTRA signal that a NEW item is stating
 # a feature's removal/unavailability rather than just omitting it - things
 # LET_STATUS_KEYWORDS doesn't already cover, since that list is about the
@@ -2825,6 +2877,28 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             confirmed_casing = submarket_casing_lookup.get(normalize_key(submarket))
             if confirmed_casing and confirmed_casing != submarket:
                 new_row = new_row.model_copy(update={"submarket": confirmed_casing})
+
+        # A self-duplicating special_features value - the SAME item
+        # restated twice, verbatim (see _has_suspicious_duplicate_items'
+        # own docstring) - is repaired HERE, on new_row itself before
+        # new_dict is built, for the exact same reason the submarket
+        # corrections just above are applied to new_row rather than a
+        # local dict: this must reach BOTH downstream paths equally, a
+        # MATCHED row's diff (built from new_dict below) and an UNMATCHED
+        # row's own eventual master entry (built directly from new_row.
+        # model_dump() elsewhere - see UnmatchedRow's own call sites), and
+        # it must run regardless of which extractor produced this row
+        # (brochure_enrichment.py, extract_spreadsheet_gemini.py,
+        # extract.py, extract_email.py all funnel through here - see
+        # _deduped_special_features' own docstring for why this specific,
+        # single, path-independent location was chosen). Gated on _has_
+        # suspicious_duplicate_items itself, so a genuinely clean value
+        # (including one brochure_enrichment.py's own dedup, commit
+        # 085272b, already cleaned) is never touched at all.
+        if new_row.special_features and _has_suspicious_duplicate_items(new_row.special_features, "special_features"):
+            new_row = new_row.model_copy(
+                update={"special_features": _deduped_special_features(new_row.special_features)}
+            )
 
         new_dict = new_row.model_dump()
         master_idx, tier = None, None
