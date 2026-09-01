@@ -1810,6 +1810,68 @@ def house_number_changed(old_val, new_val) -> bool:
     return _leading_house_number(old_val) != _leading_house_number(new_val)
 
 
+def _house_number_silently_dropped(old_val, new_val) -> bool:
+    """
+    True ONLY when a house number that was genuinely present in old_val has
+    gone missing entirely in new_val, with the REST of the street text
+    otherwise unchanged - the narrow "122-124 Regent Street" -> "Regent
+    Street" shape (confirmed against real listings: Kitt's own "122-124
+    Regent Street"/"Regent Street" pair, also seen with Parker Street's own
+    "40-42" prefix). A legitimate address correction virtually always still
+    states SOME house number, even a wrong one, so a number vanishing
+    entirely while the rest of the street name stays byte-for-byte the same
+    (once tolerantly normalized) is strong, narrow evidence of a bad/
+    incomplete extraction, not a real edit - see build_merge_plan's own
+    kept_as_is_fields for what this actually drives (the OLD value is kept
+    automatically, but still surfaced as a non-blocking FYI, never a fully
+    silent no-op, since there's a real if small chance the new value is
+    actually a genuine renumbering).
+
+    Deliberately much narrower than house_number_changed itself, which this
+    does NOT alter or weaken in any way - a separate function layered on
+    top, never a modification to what THAT one returns (other callers may
+    depend on its current "any difference at all" semantics):
+    - old_val must have had a REAL leading house number (leading_house_
+      number(old_val) is not None) - nothing to "drop" otherwise.
+    - new_val must have NONE at all (leading_house_number(new_val) is
+      None) - a genuine number CHANGE ("18" -> "24") is a real edit, not
+      this shape, and still falls straight through to house_number_
+      changed's own existing "any difference" check, completely
+      unaffected.
+    - old_val's own remainder, with its leading house-number token
+      stripped off (via LEADING_HOUSE_NUMBER_RE, matched against the RAW
+      string first - same reason _address_street_key's own comment gives:
+      normalize_key would destroy a hyphenated range's "-" before this
+      pattern ever saw it), must normalize_key() to the EXACT same thing
+      as new_val itself. Deliberately exact-match only, same conservative
+      philosophy as _has_suspicious_duplicate_items/_safe_to_auto_merge_
+      detail_loss elsewhere in this file - if the street name differs even
+      slightly once the number's gone, this returns False and the
+      existing risky-review path is completely untouched. Never
+      _address_street_key - that function's own docstring explicitly
+      documents it as unsafe for anything except intra-batch dedup
+      grouping; this is a different, narrower, already-safe comparison
+      (the number's absence is independently confirmed above before the
+      remainder is ever compared), using normalize_key directly to keep
+      the two concerns visibly separate.
+
+    Callers must ALSO check address_conflict separately before trusting
+    this (see build_merge_plan's own kept_as_is_fields computation) - a
+    row whose own brochure has independently flagged a genuine address
+    disagreement must always still force review, even on a field that
+    also happens to match this shape.
+    """
+    if _leading_house_number(old_val) is None:
+        return False
+    if _leading_house_number(new_val) is not None:
+        return False
+    remainder = str(old_val)
+    match = _LEADING_HOUSE_NUMBER_RE.match(remainder)
+    if match:
+        remainder = remainder[match.end():]
+    return normalize_key(remainder) == normalize_key(new_val)
+
+
 def _address_street_key(building) -> str:
     """
     normalize_key(building) with a leading house number stripped and a
@@ -2255,6 +2317,12 @@ class MatchedRow:
     silent_updates: dict = field(default_factory=dict)  # see silent_field_updates - never shown in the diff-review UI
     risky_fields: frozenset = field(default_factory=frozenset)  # see is_detail_loss - forces manual review, like a collision
     let_status_fields: frozenset = field(default_factory=frozenset)  # see mentions_let_status - forces manual review, like a collision
+    # see _house_number_silently_dropped - the OLD value is kept
+    # automatically (never applied, never blocks a review decision), but
+    # still surfaced as a non-blocking FYI caption, a third bucket
+    # alongside risky_fields ("needs a decision") and the ordinary bundled-
+    # safe-changes summary ("will apply automatically").
+    kept_as_is_fields: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -3065,6 +3133,29 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 ):
                     diffs[f] = (old_val, merge_compatible_text(old_val, new_val, field_name=f))
 
+            # A house number silently dropped while the rest of the street
+            # text stays unchanged (see _house_number_silently_dropped's
+            # own docstring - the "122-124 Regent Street" -> "Regent
+            # Street" shape) is kept-as-is: the OLD value is never applied
+            # and never blocks a review decision, but still surfaced as a
+            # non-blocking FYI (see pages/2_Review_and_Master.py's own
+            # kept_as_is_fields wiring) - a THIRD bucket alongside risky_
+            # fields ("needs a decision") and the ordinary bundled-safe-
+            # changes summary ("will apply automatically"), never a fully
+            # silent no-op, since there's a real if small chance the new
+            # value is actually a genuine renumbering.
+            #
+            # address_conflict (see that clause's own comment below) is a
+            # stronger, already-CONFIRMED-genuine disagreement - explicitly
+            # excluded here so address_1 can never land in kept_as_is_
+            # fields merely because it ALSO happens to match this shape;
+            # the address_conflict clause below still independently adds
+            # it to risky_fields regardless of this exclusion.
+            kept_as_is_fields = frozenset(
+                f for f in diffs
+                if f in HOUSE_NUMBER_FIELDS and _house_number_silently_dropped(*diffs[f])
+                and not (f == "address_1" and new_dict.get("address_conflict"))
+            )
             risky_fields = frozenset(
                 f for f in diffs
                 if f in DETAIL_LOSS_MERGE_FIELDS and (
@@ -3075,6 +3166,7 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             ) | frozenset(
                 f for f in diffs
                 if f in HOUSE_NUMBER_FIELDS and house_number_changed(*diffs[f])
+                and f not in kept_as_is_fields
             ) | frozenset(
                 # lat/lng get no provenance tag distinguishing an explicit
                 # provider-stated coordinate from one this pipeline
@@ -3129,6 +3221,7 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             )
             matched = MatchedRow(
                 master_idx, old_rec["property_id"], new_row, diffs, tier, silent, risky_fields, let_status_fields,
+                kept_as_is_fields,
             )
             (matched_changed if diffs else matched_unchanged).append(matched)
         else:

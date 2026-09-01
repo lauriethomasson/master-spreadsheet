@@ -3391,6 +3391,133 @@ class HouseNumberChangedTests(unittest.TestCase):
         self.assertTrue(master_merge.house_number_changed("19 Wells Street", "Twenty Wells Street"))
 
 
+class HouseNumberSilentlyDroppedTests(unittest.TestCase):
+    """
+    master_merge._house_number_silently_dropped - a narrow addition
+    layered ON TOP of house_number_changed (never a change to what THAT
+    function itself returns - see its own tests above, all still passing
+    unmodified). Confirmed real cases: Kitt's own "122-124 Regent Street"
+    -> "Regent Street", and Parker Street's own "40-42" prefix.
+    """
+
+    def test_the_exact_reported_regent_street_case(self):
+        self.assertTrue(
+            master_merge._house_number_silently_dropped("122-124 Regent Street", "Regent Street")
+        )
+
+    def test_a_plain_single_number_dropped_too(self):
+        self.assertTrue(master_merge._house_number_silently_dropped("18 Bruton Street", "Bruton Street"))
+
+    def test_genuine_number_change_is_not_a_silent_drop(self):
+        # A different number, not a MISSING one - house_number_changed's
+        # own "any difference" territory, completely unaffected.
+        self.assertFalse(master_merge._house_number_silently_dropped("18 Bruton Street", "24 Bruton Street"))
+
+    def test_number_gone_and_street_name_also_different_is_not_a_silent_drop(self):
+        # The remainder doesn't match once the number's gone - this must
+        # return False and fall straight through to the ordinary risky-
+        # review path, same conservative exact-match-only philosophy as
+        # _has_suspicious_duplicate_items/_safe_to_auto_merge_detail_loss.
+        self.assertFalse(master_merge._house_number_silently_dropped("18 Old Street", "Kingsland Road"))
+
+    def test_no_old_house_number_at_all_is_not_a_silent_drop(self):
+        # Nothing to "drop" - old_val never had a real leading number.
+        self.assertFalse(master_merge._house_number_silently_dropped("Copthall House", "Copthall House"))
+        self.assertFalse(master_merge._house_number_silently_dropped(None, "5 Example Street"))
+
+    def test_new_val_still_has_a_number_is_not_a_silent_drop(self):
+        # new_val has SOME number, even a wrong one - a genuine correction,
+        # not this shape at all.
+        self.assertFalse(master_merge._house_number_silently_dropped("122-124 Regent Street", "126 Regent Street"))
+
+    def test_case_and_whitespace_tolerant_on_the_remainder(self):
+        self.assertTrue(
+            master_merge._house_number_silently_dropped("122-124 Regent Street", "regent   street")
+        )
+
+    def test_same_positive_shape_for_a_bare_building_value(self):
+        # Scoped to the whole HOUSE_NUMBER_FIELDS tuple, not address_1
+        # alone - the helper itself is field-agnostic.
+        self.assertTrue(master_merge._house_number_silently_dropped("44 Paul Street", "Paul Street"))
+
+
+class HouseNumberSilentlyDroppedInBuildMergePlanTests(unittest.TestCase):
+    """
+    build_merge_plan's own wiring: a silently-dropped house number lands
+    in MatchedRow.kept_as_is_fields, is EXCLUDED from risky_fields, but
+    still appears in diffs (so it CAN be rendered as a non-blocking FYI -
+    see pages/2_Review_and_Master.py's own kept_as_is_fields threading).
+    """
+
+    def _matched(self, old_address, new_address, address_conflict=None):
+        master_df = _master_df([{
+            "building": "X", "provider": "UNION", "floor_unit": "1st", "address_1": old_address,
+        }])
+        new_row = ListingRow(
+            building="X", provider="UNION", floor_unit="1st", address_1=new_address,
+            address_conflict=address_conflict,
+        )
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        return (plan.matched_changed + plan.matched_unchanged)[0]
+
+    def test_the_exact_reported_case_is_kept_as_is_not_risky_but_still_in_diffs(self):
+        matched = self._matched("122-124 Regent Street", "Regent Street")
+
+        self.assertNotIn("address_1", matched.risky_fields)
+        self.assertIn("address_1", matched.kept_as_is_fields)
+        self.assertIn("address_1", matched.diffs)
+        self.assertEqual(matched.diffs["address_1"], ("122-124 Regent Street", "Regent Street"))
+
+    def test_genuine_number_change_still_forces_review_unaffected(self):
+        matched = self._matched("18 Bruton Street", "24 Bruton Street")
+
+        self.assertIn("address_1", matched.risky_fields)
+        self.assertNotIn("address_1", matched.kept_as_is_fields)
+
+    def test_number_gone_and_street_also_different_still_forces_review(self):
+        matched = self._matched("18 Old Street", "Kingsland Road")
+
+        self.assertIn("address_1", matched.risky_fields)
+        self.assertNotIn("address_1", matched.kept_as_is_fields)
+
+    def test_legitimate_first_time_fill_in_is_unaffected(self):
+        matched = self._matched(None, "5 Example Street")
+
+        self.assertIn("address_1", matched.risky_fields)
+        self.assertNotIn("address_1", matched.kept_as_is_fields)
+
+    def test_address_conflict_always_wins_even_matching_the_silent_drop_shape(self):
+        # A stronger, already-CONFIRMED-genuine disagreement (the row's own
+        # brochure) must still always force review, even on a field that
+        # also happens to match the silently-dropped-number shape.
+        matched = self._matched(
+            "122-124 Regent Street", "Regent Street", address_conflict="Brochure says 126 Regent Street",
+        )
+
+        self.assertIn("address_1", matched.risky_fields)
+        self.assertNotIn("address_1", matched.kept_as_is_fields)
+
+    def test_building_field_helper_logic_matches_address_1(self):
+        # The same positive case for the OTHER HOUSE_NUMBER_FIELDS member.
+        # Note: building is itself part of the master-matching IDENTITY
+        # key (_building_match_key deliberately does NOT strip a leading
+        # house number - see its own docstring: doing so would be unsafe
+        # for identity matching), so a row whose OWN building silently
+        # drops its house number cannot realistically reach build_merge_
+        # plan's matched-row path at all in practice - it would fail to
+        # match master and land as a new/unmatched property instead. This
+        # confirms the underlying helper/set-computation logic is exactly
+        # as field-agnostic as address_1's own case, independent of that
+        # separate, structural matching concern.
+        self.assertTrue(master_merge._house_number_silently_dropped("44 Paul Street", "Paul Street"))
+        diffs = {"building": ("44 Paul Street", "Paul Street")}
+        kept_as_is_fields = frozenset(
+            f for f in diffs
+            if f in master_merge.HOUSE_NUMBER_FIELDS and master_merge._house_number_silently_dropped(*diffs[f])
+        )
+        self.assertEqual(kept_as_is_fields, frozenset({"building"}))
+
+
 class CollisionTests(unittest.TestCase):
     def test_two_new_rows_matching_same_master_row_are_a_collision(self):
         master_df = _master_df([{

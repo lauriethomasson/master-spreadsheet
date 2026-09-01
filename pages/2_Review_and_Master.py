@@ -381,7 +381,7 @@ def _render_combined_location_row(
 
 def _render_field_rows(
     diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
-    unverified: bool = False, address_conflict: str = None,
+    unverified: bool = False, address_conflict: str = None, kept_as_is_fields: frozenset = frozenset(),
 ) -> dict:
     """
     Renders one compact row per field that genuinely needs a reviewer's
@@ -456,11 +456,28 @@ def _render_field_rows(
     differing WORD still looks identical, just colored) - _char_diff_
     highlight is used instead, plus an explicit label-column caption, so
     the reviewer at least sees WHERE within the value the two differ.
+
+    kept_as_is_fields (see master_merge._house_number_silently_dropped -
+    the "122-124 Regent Street" -> "Regent Street" shape) is a THIRD
+    bucket, alongside risky_fields ("needs a decision") and the ordinary
+    bundled-safe-changes summary ("will apply automatically"): the OLD
+    value is kept automatically - never rendered as a blocking individual
+    row, and (unlike a bundled-safe field) never added to `approved`
+    either, so nothing overwrites it - but still surfaced as its own
+    non-blocking FYI caption, since there's a real if small chance the new
+    value is actually a genuine renumbering a reviewer should be able to
+    spot-check later. Takes priority over both other buckets for any
+    field it contains.
     """
     approved = {}
     bundle_safe_fields = default_checked
-    individually_rendered = [f for f in diffs if f in risky_fields or not bundle_safe_fields]
-    bundled_fields = [f for f in diffs if f not in risky_fields and bundle_safe_fields]
+    individually_rendered = [
+        f for f in diffs if (f in risky_fields or not bundle_safe_fields) and f not in kept_as_is_fields
+    ]
+    bundled_fields = [
+        f for f in diffs if f not in risky_fields and bundle_safe_fields and f not in kept_as_is_fields
+    ]
+    kept_as_is_rendered = [f for f in diffs if f in kept_as_is_fields]
 
     # lat+lng are ALWAYS reviewed as one combined "Location" map row, never
     # as two separate Lat/Lng before/after rows - see _render_combined_
@@ -555,6 +572,20 @@ def _render_field_rows(
         shown_labels = [display_utils.friendly_field_label(f) for f in bundled_fields[:3]]
         names = ", ".join(shown_labels) + (", etc." if n > len(shown_labels) else "")
         st.caption(f"✓ {n} other change{'s' if n != 1 else ''} ({names}) will apply automatically.")
+
+    if kept_as_is_rendered:
+        # Deliberately NOTHING added to `approved` here - the point is the
+        # OLD value stays untouched (see master_merge._house_number_
+        # silently_dropped's own docstring), which happens automatically
+        # by simply never mentioning this field in `approved` at all
+        # (confirmed against how `approved`'s result gets applied back to
+        # master - every existing caller merges it onto the row's own
+        # EXISTING values, so an absent field is already left as-is).
+        names = ", ".join(display_utils.friendly_field_label(f) for f in kept_as_is_rendered)
+        st.caption(
+            f"ℹ️ Kept as-is: {names} - the new upload dropped the house number, so the existing address was "
+            "left unchanged. Double-check this wasn't a genuine renumbering."
+        )
 
     return approved
 
@@ -861,9 +892,21 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
       of the nonsensical "0 decisions needed", naming the very count
       _render_field_rows' own bundled-safe-changes caption already shows.
     """
-    decisions_needed = len(m.risky_fields) if (m.risky_fields or default_checked) else len(m.diffs)
+    # m.kept_as_is_fields (see master_merge._house_number_silently_dropped)
+    # is excluded here too - neither "needs a decision" nor "will apply
+    # automatically" fits it (see its own dedicated FYI caption inside
+    # _render_field_rows instead).
+    # Intersected with m.diffs, not a raw len(m.kept_as_is_fields) - a
+    # dataclasses.replace()-narrowed "remaining" MatchedRow (see the
+    # let-status/geocode-consolidation fallback loops below) can drop a
+    # field from diffs without correspondingly narrowing kept_as_is_fields
+    # (a field CAN be in both risky_fields, via an unrelated geocode_
+    # unverified flag, and kept_as_is_fields, via the house-number check,
+    # at once) - counting a field no longer even present would be wrong.
+    real_diffs = len(m.diffs) - len(frozenset(m.kept_as_is_fields) & frozenset(m.diffs))
+    decisions_needed = len(m.risky_fields) if (m.risky_fields or default_checked) else real_diffs
     if decisions_needed == 0:
-        n = len(m.diffs)
+        n = real_diffs
         label = (
             f"{prefix}{display_utils.row_label(m.new_row.model_dump())} — no decisions needed — "
             f"{n} other change{'s' if n != 1 else ''} will apply automatically"
@@ -875,6 +918,7 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
         approved_fields = _render_field_rows(
             m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields,
             unverified=bool(m.new_row.geocode_unverified), address_conflict=m.new_row.address_conflict,
+            kept_as_is_fields=m.kept_as_is_fields,
         )
     if approved_fields:
         entry = updates.setdefault(m.master_index, {})
@@ -905,6 +949,14 @@ def _render_geocode_consolidated_decision(members: list, key_prefix: str, update
     representative = members[0]
     geo_fields = frozenset(f for f in master_merge.GEOCODE_UNVERIFIED_FIELDS if f in representative.diffs)
     shared_diffs = {f: representative.diffs[f] for f in geo_fields}
+    # geocode_consolidation_groups only ever groups rows whose diffs are
+    # IDENTICAL by construction, so every member shares the same kept_as_
+    # is_fields status for address_1 too - representative's own stands in
+    # for the whole group, same as its diffs already do above. Intersected
+    # with geo_fields since kept_as_is_fields could in principle also name
+    # "building", which never appears in this card's own shared_diffs at
+    # all (GEOCODE_UNVERIFIED_FIELDS doesn't include it).
+    kept_as_is_fields = geo_fields & representative.kept_as_is_fields
 
     label = (
         f"⚠️ {representative.new_row.building} ({representative.new_row.provider}) — "
@@ -917,7 +969,7 @@ def _render_geocode_consolidated_decision(members: list, key_prefix: str, update
         )
         approved_fields = _render_field_rows(
             shared_diffs, key_prefix, default_checked=False, risky_fields=geo_fields,
-            unverified=bool(representative.new_row.geocode_unverified),
+            unverified=bool(representative.new_row.geocode_unverified), kept_as_is_fields=kept_as_is_fields,
         )
     if approved_fields:
         for m in members:
@@ -960,6 +1012,11 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
     dicts = [m.new_row.model_dump() for m in group]
     labels = [d.get("source_file") or f"Row {i + 1}" for i, d in enumerate(dicts)]
     risky_fields = frozenset().union(*(m.risky_fields for m in group))
+    # Same union-across-the-group derivation as risky_fields just above -
+    # every member compares against the SAME old_rec, so if they all agree
+    # on a resolved value (the only case agree_diffs is used for), their
+    # own individual kept_as_is_fields verdicts for it agree too.
+    kept_as_is_fields = frozenset().union(*(m.kept_as_is_fields for m in group))
 
     agree_diffs = {}    # {field: (old_val, resolved_val)} - agree, or only one has an opinion
     choice_fields = []  # [(field, values)] - genuine disagreement, needs a human pick
@@ -971,7 +1028,7 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
         else:
             agree_diffs[f] = (old_rec.get(f), resolved)
 
-    if auto_accept and not choice_fields and not risky_fields:
+    if auto_accept and not choice_fields and not risky_fields and not kept_as_is_fields:
         entry = updates.setdefault(master_index, {})
         entry.update({f: v for f, (_, v) in agree_diffs.items()})
         entry["source_file"] = " + ".join(labels)
@@ -1015,6 +1072,7 @@ def _render_collision_group(group: list, idx: int, plan, updates: dict, auto_acc
                 _render_field_rows(
                     agree_diffs, f"{key_prefix}_agree", default_checked=True, risky_fields=risky_fields,
                     unverified=any(bool(mm.new_row.geocode_unverified) for mm in group),
+                    kept_as_is_fields=kept_as_is_fields,
                 )
             )
 
@@ -2461,9 +2519,20 @@ def _render_near_miss_link_diff(u, row_dict: dict, target_index: int, plan, key_
         ) | frozenset(
             f for f in diffs if f in master_merge.GEOCODE_UNVERIFIED_FIELDS and unverified
         )
+        # See master_merge.build_merge_plan's own kept_as_is_fields
+        # computation - computed independently here (this card builds
+        # diffs directly via diff_fields, never through build_merge_plan/
+        # MatchedRow at all, so there's no m.kept_as_is_fields to reuse),
+        # same address_conflict guard so a stronger, already-confirmed
+        # disagreement still always wins.
+        kept_as_is_fields = frozenset(
+            f for f in diffs
+            if f in master_merge.HOUSE_NUMBER_FIELDS and master_merge._house_number_silently_dropped(*diffs[f])
+            and not (f == "address_1" and row_dict.get("address_conflict"))
+        )
         approved_fields = _render_field_rows(
             diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields,
-            unverified=unverified,
+            unverified=unverified, kept_as_is_fields=kept_as_is_fields,
         )
         if approved_fields:
             entry = decision_updates.setdefault(target_index, {})
@@ -2532,7 +2601,17 @@ def _render_pending_review(pending: list):
     # contacts update looks like it dropped real information needs a manual
     # look rather than being auto-appliable, exactly like a same-batch
     # collision.
-    risky_changed_ids = {id(m) for m in plan.matched_changed if m.risky_fields}
+    #
+    # ALSO true for m.kept_as_is_fields (see master_merge._house_number_
+    # silently_dropped), even though nothing about it actually blocks a
+    # decision - a row landing in auto_matched instead skips _render_
+    # field_rows entirely (see the auto_matched loop just below, which
+    # applies every one of m.diffs unconditionally with no rendering step
+    # at all) - without this, a kept-as-is field would be SILENTLY AUTO-
+    # APPLIED with its dropped-house-number value, and its own FYI caption
+    # would never render anywhere - exactly the fully-silent outcome this
+    # feature must never produce.
+    risky_changed_ids = {id(m) for m in plan.matched_changed if m.risky_fields or m.kept_as_is_fields}
 
     # See master_merge.mentions_let_status - wording suggesting a property
     # is no longer available always forces an explicit decision, same
@@ -2610,6 +2689,12 @@ def _render_pending_review(pending: list):
                 # actually rendered under it for this group.
                 dicts = [g.new_row.model_dump() for g in group]
                 group_risky = frozenset().union(*(g.risky_fields for g in group))
+                # See risky_changed_ids' own comment above on why kept_as_
+                # is_fields must ALSO route away from the silent auto_
+                # updates branch just below - otherwise a kept-as-is field
+                # here would be auto-applied with its dropped-house-number
+                # value with no FYI caption ever rendered for this group.
+                group_kept_as_is = frozenset().union(*(g.kept_as_is_fields for g in group))
                 agree_diffs = {}
                 needs_choice_any = False
                 for f in master_merge.collision_group_fields(group):
@@ -2619,7 +2704,7 @@ def _render_pending_review(pending: list):
                         needs_choice_any = True
                     else:
                         agree_diffs[f] = resolved
-                if needs_choice_any or group_risky:
+                if needs_choice_any or group_risky or group_kept_as_is:
                     decision_collision_groups.append(group)
                 elif agree_diffs:
                     labels = [d.get("source_file") or f"Row {gi + 1}" for gi, d in enumerate(dicts)]
@@ -2700,14 +2785,23 @@ def _render_pending_review(pending: list):
                     m,
                     diffs={f: v for f, v in m.diffs.items() if f in other_fields},
                     risky_fields=m.risky_fields - m.let_status_fields,
+                    kept_as_is_fields=m.kept_as_is_fields & other_fields,
                 )
-                if not remaining.risky_fields:
+                if not remaining.risky_fields and not remaining.kept_as_is_fields:
                     # Only safe fields left - same shape auto_matched
                     # already handles above; applies regardless of the
                     # status decision, since these are unrelated safe facts.
                     entry = {f: new_val for f, (old_val, new_val) in remaining.diffs.items()}
                     entry["source_file"] = m.new_row.source_file
                     auto_updates[m.master_index] = entry
+                elif not remaining.risky_fields:
+                    # Nothing risky, but a kept-as-is field is present (see
+                    # risky_changed_ids' own comment) - must still reach
+                    # _render_matched_row so its own FYI caption renders,
+                    # never silently auto-applied via auto_updates above.
+                    _render_matched_row(
+                        remaining, f"let_status_other_kept_{i}_{m.property_id}", "⚠️ ", True, decision_updates,
+                    )
                 else:
                     # A genuinely risky field happened to share this row
                     # with a let-status flag - still needs its own
@@ -2759,10 +2853,11 @@ def _render_pending_review(pending: list):
                 m,
                 diffs={f: v for f, v in m.diffs.items() if f not in geo_fields},
                 risky_fields=m.risky_fields - geo_fields,
+                kept_as_is_fields=m.kept_as_is_fields - geo_fields,
             )
             if not remaining.diffs:
                 continue  # every one of this row's own diffs was a geocode field - nothing left to decide
-            if not remaining.risky_fields:
+            if not remaining.risky_fields and not remaining.kept_as_is_fields:
                 # Nothing left needs a deliberate look - only safe fields
                 # (the same shape auto_matched already handles above) -
                 # these belong in the "Automatic updates" summary, never
@@ -2772,6 +2867,10 @@ def _render_pending_review(pending: list):
                 entry["source_file"] = m.new_row.source_file
                 auto_updates[m.master_index] = entry
                 continue
+            # Falls through here for either a genuinely risky field OR a
+            # kept-as-is-only field (see risky_changed_ids' own comment) -
+            # both must still reach _render_matched_row/_render_field_rows
+            # so a kept-as-is field's own FYI caption actually renders.
             _render_matched_row(remaining, f"risky_{i}_{m.property_id}", "⚠️ ", True, decision_updates)
 
         # near_miss (against an existing master property) and
