@@ -6,6 +6,7 @@ import re
 import uuid
 
 import pandas as pd
+import pydeck
 import streamlit as st
 
 import brochure_enrichment
@@ -221,11 +222,23 @@ def _char_diff_highlight(old_val: str, new_val: str) -> tuple:
 _CURRENT_LOCATION_PIN_COLOR = "#808495"
 _NEW_LOCATION_PIN_COLOR = "#FFA500"
 
-# st.map's own per-point circle size, in meters (see its "size" parameter
-# docstring) - large enough to stay visible at the auto-fit zoom level two
-# building-scale points typically land on, small enough not to visually
-# merge two pins that are only tens of meters apart into one blob.
-_LOCATION_PIN_SIZE_METERS = 25
+# Pin circle radius, in SCREEN PIXELS - a fixed pixel size, never a real-
+# world meter size (see radius_units='"pixels"' at the pydeck.Layer call
+# below). Confirmed real bug this closes: st.map's own `size` parameter is
+# a radius in real-world METERS, which is inherently zoom-dependent on
+# screen - the same 25m circle covered a huge fraction of the screen at
+# the tight zoom two CLOSE points (e.g. 33 Cavendish Square, 187m apart)
+# auto-fit to, nearly merging the two pins into one blob, while looking
+# tiny at the zoomed-out view two FAR-apart points (e.g. 44 Paul Street,
+# 1,222m apart) auto-fit to instead - the same underlying data producing a
+# wildly different-looking card purely because of how far apart that
+# particular pair of points happens to be. A pixel-radius circle stays a
+# constant, small dot on screen regardless of zoom level, so two pins are
+# always clearly separate and neither ever visually swallows the other,
+# whether they're 187m or 1,222m apart. 8px chosen by eye against both of
+# those real cases - clearly visible without dominating this card's own
+# modestly-sized map.
+_LOCATION_PIN_RADIUS_PIXELS = 8
 
 
 def _render_combined_location_row(
@@ -250,13 +263,20 @@ def _render_combined_location_row(
     never reaches this function at all, and keeps using the ordinary
     single-field row instead, completely unaffected by this.
 
-    st.map (built into Streamlit, no new API key/dependency - see this
-    module's own docstring on why the Maps Static/JavaScript API was
-    deliberately avoided) auto-centers and auto-zooms to fit every point
-    in its own dataframe with sensible padding when no explicit zoom is
-    given, which is exactly the "fit both pins, however close together"
-    behavior this needs - a fixed zoom level could crop one pin out of
-    view for two points only tens of meters apart.
+    st.pydeck_chart + a manually-built pydeck.Layer (still no new API key/
+    dependency - pydeck is already a transitive dependency of Streamlit
+    itself, confirmed available; see this module's own docstring on why
+    the Maps Static/JavaScript API was deliberately avoided) - NOT plain
+    st.map, whose own `size` parameter is a real-world-meter radius with
+    no pixel option (see _LOCATION_PIN_RADIUS_PIXELS' own docstring for
+    the confirmed real bug this replacement fixes). pydeck.data_utils.
+    compute_view (the same "fit every point in view, with padding"
+    utility st.map itself is built on) computes the auto-center/auto-zoom
+    from the two points' own positions - still no fixed zoom level passed
+    anywhere, so this is exactly as "fit both pins, however close
+    together" as before; a fixed zoom could still crop one pin out of
+    view for two points only tens of meters apart, and nothing here
+    changes that guarantee.
 
     old_lat/old_lng can be blank - a row getting real coordinates for the
     FIRST time ever, never a replacement (diff_fields' own blank-skip rule
@@ -285,10 +305,27 @@ def _render_combined_location_row(
                     "color": _CURRENT_LOCATION_PIN_COLOR,
                 },
             )
-        st.map(
-            pd.DataFrame(points), latitude="lat", longitude="lng", color="color",
-            size=_LOCATION_PIN_SIZE_METERS,
+        points_df = pd.DataFrame(points)
+        layer = pydeck.Layer(
+            "ScatterplotLayer",
+            data=points_df,
+            get_position="[lng, lat]",
+            get_fill_color="color",
+            get_radius=_LOCATION_PIN_RADIUS_PIXELS,
+            # A plain Python string kwarg is otherwise treated as a JS
+            # accessor expression by pydeck's own Layer (see @deck.gl/json
+            # - any bare string becomes "@@=<value>"), which is wrong for
+            # a literal enum value like this one - wrapping it in actual
+            # quote characters is pydeck's own documented escape for "this
+            # is a literal string, not an expression" (see pydeck.bindings.
+            # layer.Layer.__init__'s own QUOTE_CHARS handling).
+            radius_units='"pixels"',
+            radius_min_pixels=_LOCATION_PIN_RADIUS_PIXELS,
+            radius_max_pixels=_LOCATION_PIN_RADIUS_PIXELS,
+            pickable=False,
         )
+        view_state = pydeck.data_utils.compute_view(points_df[["lng", "lat"]].values.tolist())
+        st.pydeck_chart(pydeck.Deck(layers=[layer], initial_view_state=view_state, tooltip=False))
         if has_current:
             distance_m = master_merge.haversine_distance_meters(
                 float(old_lat), float(old_lng), float(new_lat), float(new_lng),

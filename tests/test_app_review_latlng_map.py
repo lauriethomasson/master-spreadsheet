@@ -128,6 +128,26 @@ class CombinedLocationRowTests(IsolatedCwdTestCase):
         coords = {(p["lat"], p["lng"]) for p in points}
         self.assertEqual(coords, {(51.52, -0.1), (51.5158796, -0.1442492)})
 
+    def test_pins_use_pixel_based_radius_not_meter_based_size(self):
+        # Confirmed real bug (fixed here): st.map's own `size` is a real-
+        # world-meter radius, which balloons at a tight auto-fit zoom for
+        # two CLOSE points (e.g. 33 Cavendish Square, 187m apart) and
+        # shrinks to near-invisible at a zoomed-out view for two FAR
+        # points (e.g. 44 Paul Street, 1,222m apart) - the same data
+        # looking wildly different from card to card. A pydeck.Layer with
+        # radiusUnits="pixels" stays a constant screen size regardless of
+        # zoom, so this is exactly what has to hold for the fix to work.
+        at = self._staged_row_with_a_real_latlng_change()
+
+        deck_elements = _deck_gl_elements(at)
+        self.assertEqual(len(deck_elements), 1)
+        layer = json.loads(deck_elements[0].proto.json)["layers"][0]
+
+        self.assertEqual(layer["radiusUnits"], "pixels")
+        self.assertGreater(layer["radiusMinPixels"], 0)
+        self.assertEqual(layer["radiusMinPixels"], layer["radiusMaxPixels"])
+        self.assertEqual(layer["getRadius"], layer["radiusMinPixels"])
+
     def test_raw_coordinates_and_distance_direction_still_shown_in_small_print(self):
         at = self._staged_row_with_a_real_latlng_change()
 
