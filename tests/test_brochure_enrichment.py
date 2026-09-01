@@ -3618,6 +3618,334 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertEqual(new_row.state_of_space, "Fully Fitted")
 
 
+class RealWorldSelfDuplicationRegressionTests(unittest.TestCase):
+    """
+    Real-world regression coverage for the root cause of the "CURRENT
+    DESCRIPTION; CURRENT DESCRIPTION; new structured details..." shape
+    reported across many unrelated real buildings - confirmed root cause:
+    row.special_features (this upload's own short descriptive blurb, e.g.
+    from the provider's own spreadsheet cell) and the brochure's own
+    Gemini-extracted unit_features (which independently restates that same
+    blurb as a PREFIX before its own genuinely new facts) are different
+    WHOLE-TIER strings, so the prior whole-tier-only dedup in
+    _apply_units_to_row never caught it. Each case here reproduces the
+    real row_features/unit_features shape (row_features = the short blurb
+    alone, unit_features = the real, previously-malformed brochure
+    extraction) and asserts the fix's own two guarantees: no duplicated
+    item survives, and no genuinely new item is lost.
+    """
+
+    CASES = [
+        (
+            "138 Cheapside 1st",
+            "High end new fit out with sit stand desks",
+            "High end new fit out with sit stand desks; High end new fit out with sit stand desks; Min term 36 months; "
+            "2x teapoints; 6x meeting rooms; 4x phone booths; 100x current sit/stand desks; Short-Form All-Inclusive "
+            "Lease; Distinctive hallmark 1950s façade; Plentiful windows offering natural light and views of St. "
+            "Paul's Cathedral; Manned reception; Secure bike racks; End-of-trip facilities; DDA compliant",
+            ["Short-Form All-Inclusive Lease", "100x current sit/stand desks", "DDA compliant"],
+        ),
+        (
+            "138 Cheapside 6th",
+            "High end new fit out with sit stand desks, fantastic views over St Pauls Cathedral",
+            "High end new fit out with sit stand desks, fantastic views over St Pauls Cathedral; High end new fit out "
+            "with sit stand desks, fantastic views over St Pauls Cathedral; Min term 36 months; 1x teapoint; 6x "
+            "meeting rooms; 4x phone booths; 92x current sit/stand desks; Short-Form All-Inclusive Lease; "
+            "Distinctive hallmark 1950s façade; Plentiful windows offering natural light and views of St. Paul's "
+            "Cathedral; Manned reception; Secure bike racks; End-of-trip facilities; DDA compliant",
+            ["Short-Form All-Inclusive Lease", "92x current sit/stand desks", "DDA compliant"],
+        ),
+        (
+            "108 Cannon Street",
+            "Prominent building in a fantastic location on Cannon Street with sharerd roof terrace",
+            "Prominent building in a fantastic location on Cannon Street with sharerd roof terrace; Prominent "
+            "building in a fantastic location on Cannon Street with sharerd roof terrace; 36 month term; Short-Form "
+            "All-Inclusive Lease; Communal roof terrace; Manned reception; Secure bike racks; Hireable ground-floor "
+            "event space; Shower and end-of-trip facilities; DDA compliant",
+            ["Communal roof terrace", "Hireable ground-floor event space", "DDA compliant"],
+        ),
+        (
+            "120 Cannon Street",
+            "BREEAM excellent and manned reception",
+            "BREEAM excellent and manned reception; BREEAM excellent and manned reception; Min. Term: 36 months; "
+            "Legal structure: Lease + MSA; 1 teapoint; An elegant, recently-refurbished office in a prime location "
+            "on bustling Cannon Street. 120 Cannon Street boasts modern and spacious offices, exposed ceilings and "
+            "fantastic natural light. Clients enter via a sleek reception with high-end finishes.; BREEAM "
+            "(Excellent); DDA compliant; Lift; Manned reception; Bike storage; Shower",
+            ["Legal structure: Lease + MSA", "BREEAM (Excellent)", "Lift", "Shower"],
+        ),
+        (
+            "4 Moorgate 2nd",
+            "Well connected, brand new fitted fitted floor, excellent natural light. ",
+            "Well connected, brand new fitted fitted floor, excellent natural light. ; Well connected, brand new "
+            "fitted fitted floor, excellent natural light. ; Minimum term 36 months; 2 meeting rooms; 1 tea point; "
+            "30 current desks; 1 phone booth; Manned reception; Secure bicycle storage; Shower facilities",
+            ["30 current desks", "Secure bicycle storage"],
+        ),
+        (
+            "4 Moorgate 4th",
+            "Well connected, brand new fitted fitted floor, excellent natural light. ",
+            "Well connected, brand new fitted fitted floor, excellent natural light. ; Well connected, brand new "
+            "fitted fitted floor, excellent natural light. ; Minimum term 36 months; 2 meeting rooms; 1 breakout "
+            "area; 30 current desks; 1 phone booth; Manned reception; Secure bicycle storage; Shower facilities",
+            ["30 current desks", "1 breakout area"],
+        ),
+        (
+            "4 Moorgate 5th",
+            "Well connected, brand new fitted fitted floor, excellent natural light. ",
+            "Well connected, brand new fitted fitted floor, excellent natural light. ; Well connected, brand new "
+            "fitted fitted floor, excellent natural light. ; Minimum term 36 months; 3 meeting rooms; 1 tea point; "
+            "30 current desks; 1 phone booth; Manned reception; Secure bicycle storage; Shower facilities",
+            ["30 current desks", "3 meeting rooms"],
+        ),
+        (
+            "44 Paul Street G",
+            "Newly rennovated space with exposed brick",
+            "Newly rennovated space with exposed brick; Newly rennovated space with exposed brick; Min. Term 24 "
+            "months; Short form all-inclusive lease; 2 meeting rooms; 1 tea point; Manned reception; Shower; Bike "
+            "storage; DDA compliant; Great natural light; Air Conditioning",
+            ["Short form all-inclusive lease", "Air Conditioning"],
+        ),
+        (
+            "44 Paul Street 5th",
+            "New fitout, bright floor, well connected location",
+            "New fitout, bright floor, well connected location; New fitout, bright floor, well connected location; "
+            "18 current desks; 2 meeting rooms; 1 tea point; Min. term 24 months; Short form all-inclusive lease; "
+            "Located at the intersection of Old Street, Shoreditch and Moorgate, 44 Paul Street offers a generous "
+            "open plan layout. Perfect for collaborative and social teams who will benefit from the multifunctional "
+            "space – from the exposed brick boardroom to the generous kitchen breakout.; Manned reception; Shower; "
+            "Bike storage; DDA compliant; Great natural light; Air Conditioning",
+            ["18 current desks", "generous kitchen breakout"],
+        ),
+        (
+            "26 Finsbury Square 1st",
+            "Bright, cost effective. Prominent corner position overlooking Finsbury Square",
+            "Bright, cost effective. Prominent corner position overlooking Finsbury Square; Bright, cost effective. "
+            "Prominent corner position overlooking Finsbury Square; Min. Term 36 months; Legal structure: Lease + "
+            "MSA; Striking corner building overlooking one of the City's most recognisable garden squares with "
+            "double-height reception, 24-hour commissionaire, floor-to-ceiling glazing, and modern end-of-trip "
+            "facilities.; Manned reception; Shower; Bike storage; BREEAM Very Good; Air Conditioning",
+            ["Legal structure: Lease + MSA", "BREEAM Very Good"],
+        ),
+        (
+            "26 Finsbury Square 3rd",
+            "Bright, cost effective. Prominent corner position overlooking Finsbury Square",
+            "Bright, cost effective. Prominent corner position overlooking Finsbury Square; Bright, cost effective. "
+            "Prominent corner position overlooking Finsbury Square; Minimum term 36 months; Lease + MSA legal "
+            "structure; 52 current desks; 6 meeting rooms; 2 exec offices; 1 teapoint; 1 phone booth; Striking "
+            "corner building overlooking one of the City's most recognisable garden squares with an impressive "
+            "double-height reception, 24-hour commissionaire, floor-to-ceiling glazing, and modern end-of-trip "
+            "facilities.; 24-hour commissionaire; Manned reception; Shower; Bike storage; BREEAM Very Good; Air "
+            "Conditioning",
+            ["52 current desks", "2 exec offices", "BREEAM Very Good"],
+        ),
+        (
+            "Albion Mills",
+            "Manned reception, converted warehouse with exposed brick",
+            "Manned reception, converted warehouse with exposed brick; Manned reception, converted warehouse with "
+            "exposed brick; 1 meeting room; 1 breakout area; Excellent natural light; Minimum term 12 months; "
+            "Originally built in 1905 as a warehouse for Israel Hyman & Sons and later home to a thriving clothing "
+            "factory; factory-style windows, cast-iron columns and exposed original brickwork thoughtfully restored "
+            "for modern working life.; Manned reception; Showers; Bike storage",
+            ["1 breakout area", "Minimum term 12 months"],
+        ),
+        (
+            "Conran Building",
+            "Located directly on the river, fit out underway due to complete Summer 2026",
+            "Located directly on the river, fit out underway due to complete Summer 2026; Located directly on the "
+            "river, fit out underway due to complete Summer 2026; 4 meeting rooms; 1 tea point; 36 current desks; "
+            "views overlooking the river; minimum term 36 months; Staffed reception; Dedicated reception desk; "
+            "Panoramic river views; Fully accessible (DDA compliant); Secure bicycle storage; Modern shower "
+            "facilities; Pet-friendly policy",
+            ["36 current desks", "Staffed reception"],
+        ),
+        (
+            "95 Southwark Street",
+            "New fitout, bright floors. Conveniently located. ",
+            "New fitout, bright floors. Conveniently located. ; New fitout, bright floors. Conveniently located. ; "
+            "2 meeting rooms; 2 phone booths; Minimum term 36 months; Short-Form All Inclusive Lease; Showers; Bike "
+            "storage; Pet-friendly",
+            ["Short-Form All Inclusive Lease", "Pet-friendly"],
+        ),
+        (
+            "The Rochester, Rochester Mews",
+            "Fully fitted, shared landscaped garden, onsite cafe. Currently undergoing works to create a split unit.",
+            "Fully fitted, shared landscaped garden, onsite cafe. Currently undergoing works to create a split unit. "
+            "; Fully fitted, shared landscaped garden, onsite cafe. Currently undergoing works to create a split "
+            "unit.",
+            [],
+        ),
+    ]
+
+    def test_no_duplicate_survives_and_no_new_information_is_lost(self):
+        for name, row_features, unit_features, expected_new_fragments in self.CASES:
+            with self.subTest(name=name):
+                row = ListingRow(building=name, floor_unit="1st", special_features=row_features)
+                units = _brochure_units([{"building": name, "floor_unit": "1st", "special_features": unit_features}])
+
+                new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+                combined = new_row.special_features
+
+                # The row's own blurb survives EXACTLY once, not twice.
+                self.assertEqual(
+                    combined.lower().count(row_features.strip().lower()), 1,
+                    f"{name}: blurb should appear exactly once, got: {combined!r}",
+                )
+                for fragment in expected_new_fragments:
+                    self.assertIn(fragment, combined, f"{name}: missing new info {fragment!r} in {combined!r}")
+
+    def test_pure_duplication_with_no_new_content_collapses_to_one_copy(self):
+        # The Rochester - a pure duplicate with NOTHING new at all.
+        name, row_features, unit_features, _ = self.CASES[-1]
+        row = ListingRow(building=name, floor_unit="1st", special_features=row_features)
+        units = _brochure_units([{"building": name, "floor_unit": "1st", "special_features": unit_features}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.special_features, row_features)
+        self.assertEqual(fields, [])
+        self.assertIs(new_row, row)
+
+    def test_prime_west_end_location_reported_shape_dedups_the_opening_sentence(self):
+        # The exact reported shape: row_features is Kitt's own spreadsheet
+        # cell (just the opening description sentence); unit_features is
+        # Gemini's own fresh extraction, restating that same sentence as a
+        # PREFIX before its own genuinely new structured facts.
+        row_features = "Prime West End location. Impressive views across London."
+        unit_features = (
+            "Prime West End location. Impressive views across London.; Min. Term 36 months; 5 meeting rooms"
+        )
+        row = ListingRow(building="X", floor_unit="1st", special_features=row_features)
+        units = _brochure_units([{"building": "X", "floor_unit": "1st", "special_features": unit_features}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        combined = new_row.special_features
+
+        self.assertEqual(combined.lower().count(row_features.lower()), 1)
+        self.assertIn("Min. Term 36 months", combined)
+        self.assertIn("5 meeting rooms", combined)
+
+    def test_partial_overlap_between_tiers_keeps_all_distinct_content_from_both(self):
+        # A shared item, identically phrased, alongside OTHER genuinely
+        # different facts on each side - the fix must drop only the exact
+        # repeated item, never anything else, from either side.
+        row_features = "Bike storage; Great natural light"
+        unit_features = "Bike storage; 5 meeting rooms; Manned reception"
+        row = ListingRow(building="X", floor_unit="1st", special_features=row_features)
+        units = _brochure_units([{"building": "X", "floor_unit": "1st", "special_features": unit_features}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        combined = new_row.special_features
+
+        self.assertEqual(combined.lower().count("bike storage"), 1)
+        self.assertIn("Great natural light", combined)
+        self.assertIn("5 meeting rooms", combined)
+        self.assertIn("Manned reception", combined)
+
+
+class FullPipelineExtractionToMergePlanTests(unittest.TestCase):
+    """
+    extraction -> brochure enrichment -> ListingRow -> build_merge_plan,
+    end to end, for three of the real cases above - proves the combine-
+    layer fix (RealWorldSelfDuplicationRegressionTests) and the merge-
+    layer safeguards (master_merge.SpecialFeaturesMergeTests/
+    SpecialFeaturesAutoMergePermissivenessTests) work TOGETHER correctly
+    as one pipeline, not just each in isolation.
+    """
+
+    def test_138_cheapside_1st_enriches_clean_and_auto_applies(self):
+        # The combine-layer fix alone already prevents the duplicate from
+        # ever being produced, so this genuinely new information (a clean,
+        # non-duplicated enrichment) is safe to auto-apply - no review
+        # needed for THIS specific real case, once fixed at the root.
+        import pandas as pd
+
+        import master_merge
+
+        row_features = "High end new fit out with sit stand desks"
+        unit_features = (
+            "High end new fit out with sit stand desks; High end new fit out with sit stand desks; Min term 36 "
+            "months; 2x teapoints; 6x meeting rooms; 4x phone booths; 100x current sit/stand desks; Short-Form "
+            "All-Inclusive Lease; Distinctive hallmark 1950s façade; Plentiful windows offering natural light and "
+            "views of St. Paul's Cathedral; Manned reception; Secure bike racks; End-of-trip facilities; DDA "
+            "compliant"
+        )
+        row = ListingRow(building="138 Cheapside", provider="UNION", floor_unit="1st", special_features=row_features)
+        units = _brochure_units(
+            [{"building": "138 Cheapside", "floor_unit": "1st", "special_features": unit_features}],
+        )
+        enriched_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertEqual(enriched_row.special_features.lower().count(row_features.lower()), 1)
+
+        master_df = pd.DataFrame(
+            [ListingRow(building="138 Cheapside", provider="UNION", floor_unit="1st", special_features=row_features).model_dump()]
+        )
+        plan = master_merge.build_merge_plan([enriched_row], master_df)
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+
+        self.assertNotIn("special_features", matched.risky_fields)
+        self.assertNotIn("High end new fit out with sit stand desks; High end", matched.diffs["special_features"][1])
+
+    def test_thirty_lighterman_real_loss_stays_a_review_decision(self):
+        import pandas as pd
+
+        import master_merge
+
+        old_val = (
+            "Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; minimum term 24 months; legal "
+            "structure: co-lease; excellent natural light; Thirty Lighterman offers a fresh alternative to the "
+            "traditional office. With flexible spaces and room to make it your own, it's designed to support "
+            "collaboration, creativity, and growth as your needs evolve.; private outdoor spaces; high-spec showers"
+        )
+        # The genuinely malformed extraction actually observed - a real
+        # extraction-quality issue (not a combine-layer duplicate this
+        # session's own fix addresses at the source), so this simulates
+        # what reaches build_merge_plan when extraction itself is bad.
+        new_val = (
+            "Penthouse suite, private terrace; Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; "
+            "minimum term 24 months; excellent natural light; private outdoor spaces; high-spec showers"
+        )
+        master_df = pd.DataFrame(
+            [ListingRow(building="Thirty Lighterman", provider="UNION", special_features=old_val).model_dump()]
+        )
+        new_row = ListingRow(building="Thirty Lighterman", provider="UNION", special_features=new_val)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+
+        self.assertIn("special_features", matched.risky_fields)
+        # Master's own richer value is never silently discarded - it's
+        # still sitting right there as the "Current" side of the diff,
+        # completely untouched, waiting for a reviewer's own decision.
+        self.assertEqual(matched.diffs["special_features"][0], old_val)
+
+        # A reviewer can still explicitly approve the real extraction.
+        merged = master_merge.apply_merge(master_df.to_dict("records"), {0: {"special_features": new_val}}, [])
+        self.assertEqual(merged[0].special_features, new_val)
+
+    def test_the_rochester_pure_duplicate_enriches_to_a_no_op(self):
+        import pandas as pd
+
+        import master_merge
+
+        blurb = "Fully fitted, shared landscaped garden, onsite cafe. Currently undergoing works to create a split unit."
+        row = ListingRow(building="The Rochester", provider="UNION", floor_unit="1st", special_features=blurb)
+        units = _brochure_units(
+            [{"building": "The Rochester", "floor_unit": "1st", "special_features": f"{blurb} ; {blurb}"}],
+        )
+        enriched_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertEqual(enriched_row.special_features, blurb)
+
+        master_df = pd.DataFrame(
+            [ListingRow(building="The Rochester", provider="UNION", floor_unit="1st", special_features=blurb).model_dump()]
+        )
+        plan = master_merge.build_merge_plan([enriched_row], master_df)
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+
+        self.assertNotIn("special_features", matched.diffs)
+        self.assertNotIn("special_features", matched.risky_fields)
+
+
 class BuildingAndUnitFieldFallbackTests(unittest.TestCase):
     """
     Regression tests for the widened field scope - address_1/postcode/

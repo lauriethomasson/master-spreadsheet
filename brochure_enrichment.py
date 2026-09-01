@@ -2874,6 +2874,46 @@ def _coerced_unit_value(field: str, value):
     return None
 
 
+_SPECIAL_FEATURES_ITEM_SPLIT_RE = re.compile(r"[;\n]+")
+
+
+def _special_features_items(text: str) -> list:
+    """
+    `text` split on ";"/newline ONLY (matching master_merge._detail_items'
+    own baseline split for this field, WITHOUT that pair's own extra
+    comma-splitting - see _apply_units_to_row's own combine loop comment
+    for why comma-splitting doesn't belong here).
+
+    A `text` with NO ";"/newline at all (a single item) is returned
+    completely UNSTRIPPED, byte-for-byte - unlike master_merge.
+    _split_list_items, which strips every item unconditionally for its own
+    different purpose (building a fresh merged value from possibly-
+    differently-formatted sources). This matters here specifically because
+    a single-item tier's text is written straight into the combined
+    special_features value verbatim when it's the first (kept) occurrence
+    - a row's own value that happens to have stray leading/trailing
+    whitespace around it must survive completely unchanged when nothing
+    about it is actually being replaced, the same "never touch a value
+    that isn't genuinely different" guarantee every other read-only
+    comparison in this codebase already gives (see master_merge.
+    _values_equal's own docstring for the same principle).
+
+    A `text` that DOES genuinely split into 2+ items has each of those
+    items stripped, same as master_merge._split_list_items - confirmed
+    necessary, not merely cosmetic: leaving the whitespace immediately
+    surrounding each ";" delimiter untouched would otherwise leave a
+    stray double space at every internal join point once items are
+    reassembled ("Manned reception;  showers;  bike storage").
+
+    A too-short fragment (an empty trailing segment from a trailing ";")
+    is dropped, same threshold as master_merge._detail_items.
+    """
+    parts = _SPECIAL_FEATURES_ITEM_SPLIT_RE.split(text)
+    if len(parts) == 1:
+        return [text] if len(text.strip()) >= 3 else []
+    return [p.strip() for p in parts if len(p.strip()) >= 3]
+
+
 def _apply_units_to_row(row: ListingRow, units):
     """
     (row_or_new_row, enriched_fields) - the pure "given already-fetched
@@ -2907,10 +2947,14 @@ def _apply_units_to_row(row: ListingRow, units):
     row's own pre-existing value (even a non-descriptive one like a bare
     status marker) is never silently discarded either, since this combine
     is attempted regardless of whether that value was blank to begin with.
-    No deduplication between tiers (a unit's own text may legitimately
-    restate a building-wide detail Gemini already saw) - deliberately not
-    attempted here; a bad dedup rule risks stripping something real, a
-    worse failure mode than an occasional repeated phrase.
+    Deduplication ACROSS tiers is item-level and exact-normalized-match
+    only (see the combine loop's own comment below) - a unit's own text
+    may still legitimately restate a building-wide detail Gemini already
+    saw in DIFFERENT wording, which this never touches; only a literal,
+    byte-identical-once-normalized repeated item is ever dropped. This
+    replaced an earlier, narrower whole-TIER-only dedup once a real,
+    reproducible failure showed that guard alone wasn't enough - see the
+    combine loop's own comment for the confirmed real cases.
 
     1. DOCUMENT-level (PROPERTY_LEVEL_FIELDS - contacts, special_features's
        property_features fallback - see units.property_features/units.
@@ -3019,18 +3063,69 @@ def _apply_units_to_row(row: ListingRow, units):
         if not (isinstance(property_features, str) and not _is_blank(property_features)):
             property_features = None
 
-        kept_features = []
-        kept_keys = set()
+        # ITEM-level dedup (see _special_features_items above - the SAME
+        # semicolon/newline split master_merge._detail_items/_split_list_
+        # items already use as their OWN baseline split for this field,
+        # WITHOUT that pair's own extra comma-splitting - see below for
+        # why, and WITHOUT their own item-stripping - see below too), not
+        # merely whole-tier equality:
+        # confirmed real, reproducible failure this closes - a genuine
+        # "4 Moorgate" 2nd/4th/5th floor row (and many other real
+        # buildings: 138 Cheapside, 108/120 Cannon Street, 44 Paul Street,
+        # 26 Finsbury Square, Albion Mills, Conran Building, 95 Southwark
+        # Street, The Rochester, among others) whose OWN row_features is a
+        # short descriptive blurb, and whose brochure's own Gemini-
+        # extracted unit_features RESTATES THAT SAME BLURB AS A PREFIX
+        # before its own genuinely new facts ("<blurb>; 30 current desks;
+        # ..."), is a DIFFERENT whole-tier string from row_features alone
+        # ("<blurb>") - the prior whole-tier-only dedup below never caught
+        # this, silently producing "<blurb>; <blurb>; 30 current desks; ..."
+        # onto every affected row. Splitting each tier into its own items
+        # FIRST, then deduping across all tiers by exact normalize_key
+        # equality (never a fuzzy/reworded match - see master_merge.
+        # _has_suspicious_duplicate_items' own docstring for why only exact
+        # duplication is safe evidence here), keeps the real new items
+        # ("30 current desks" etc.) while dropping only the literal
+        # repeated blurb - still fully covers the original "verbatim-
+        # duplicated whole tier" case (The Sevens) this dedup already
+        # existed for, since that's just the special case of every item in
+        # a tier being a duplicate. Item-level, not fuzzy - a unit's own
+        # text still legitimately restates a building-wide detail Gemini
+        # already saw in different WORDING (only a BYTE-IDENTICAL-once-
+        # normalized item is ever dropped), so this never risks stripping
+        # a genuinely different fact the way a looser dedup rule would.
+        # Uses _special_features_items (this module's own semicolon/
+        # newline-only split, UNSTRIPPED - see its own docstring), NOT
+        # master_merge._split_list_items' extra comma-splitting
+        # (_MERGE_COMMA_SPLIT_FIELDS) - that extra split exists purely for
+        # is_detail_loss/merge_compatible_text's own item-SIMILARITY
+        # comparison, a different concern; splitting on comma HERE would
+        # reformat a single descriptive sentence's own internal commas
+        # into semicolons in the combined text merely because it happened
+        # to pass through this loop (e.g. "New fitout, bright floor" ->
+        # "New fitout; bright floor") - a needless cosmetic rewrite with no
+        # bearing on the actual duplicate this exists to catch, which only
+        # ever occurs at a genuine ";"/newline boundary (Gemini restates a
+        # row's own full sentence as one semicolon-delimited item, prefixed
+        # before its own new ones - see this loop's own confirmed real
+        # cases above). Also, unlike _split_list_items, never strips a kept
+        # item's own text - a row's own stray whitespace must survive
+        # completely unchanged (see _special_features_items' own
+        # docstring).
+        kept_items = []
+        kept_item_keys = set()
         for seg in (row_features, unit_features, building_features, property_features):
             if not seg:
                 continue
-            key = normalize_key(seg)
-            if key and key in kept_keys:
-                continue
-            kept_keys.add(key)
-            kept_features.append(seg)
+            for item in (_special_features_items(seg) or [seg]):
+                key = normalize_key(item)
+                if key and key in kept_item_keys:
+                    continue
+                if key:
+                    kept_item_keys.add(key)
+                kept_items.append(item)
 
-        combined = "; ".join(kept_features)
+        combined = "; ".join(kept_items)
         if combined and combined != row.special_features:
             updates["special_features"] = combined
 
