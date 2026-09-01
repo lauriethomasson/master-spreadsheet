@@ -5326,6 +5326,45 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         mock_extract.assert_called_once_with("https://example.com/B2.pdf")
         self.assertEqual(stats["processed_urls"], {"https://example.com/B2.pdf": "ok"})
 
+    def test_partial_fill_among_rows_sharing_one_url_forces_a_refetch(self):
+        # Confirmed real root cause of rows staying blank on special_
+        # features indefinitely (the Fetter Lane/High Holborn case): two
+        # rows SHARE one brochure_link (e.g. several floors of the same
+        # building all pointing at one PDF). _apply_units_to_row does its
+        # OWN per-row matching and can legitimately fill SOME of the
+        # sharing rows while leaving others blank (no confident match for
+        # that specific row) - the url still gets marked "ok" because the
+        # FETCH itself succeeded, not because every row got a value. A
+        # url-only skip on resume (the old behavior) would strand row B
+        # blank forever, indistinguishable from a row correctly left blank
+        # because the document genuinely had nothing for it at all - see
+        # enrich_rows_grouped's own already_processed docstring. Row A's
+        # own prior value must survive completely untouched throughout.
+        row_a = ListingRow(
+            building="A", address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Already filled by a prior run", state_of_space="Cat A",
+            contacts="Jane, jane@x.com", brochure_link="https://example.com/shared.pdf",
+        )
+        row_b = ListingRow(building="B", brochure_link="https://example.com/shared.pdf", special_features=None)
+        already_processed = {"https://example.com/shared.pdf": "ok"}
+
+        def _fake_apply(row, units):
+            if row.building == "B":
+                return row.model_copy(update={"special_features": "Recovered for B"}), ["special_features"]
+            return row, []
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[{"building": "B"}]) as mock_extract, \
+             patch("brochure_enrichment._apply_units_to_row", side_effect=_fake_apply):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                [row_a, row_b], already_processed=already_processed,
+            )
+
+        mock_extract.assert_called_once_with("https://example.com/shared.pdf")
+        self.assertEqual(enriched[0].special_features, "Already filled by a prior run")
+        self.assertEqual(enriched[1].special_features, "Recovered for B")
+        self.assertEqual(stats["processed_urls"], {"https://example.com/shared.pdf": "ok"})
+
     def test_skipped_rows_are_left_completely_unchanged(self):
         rows = self._rows(2)
         rows[0] = rows[0].model_copy(update={"special_features": "Already checked, genuinely nothing more"})
@@ -5496,6 +5535,42 @@ class EnrichRowsFromFloorplansCheckpointTests(unittest.TestCase):
         self.assertIsNone(current[0].special_features)  # skipped - left exactly as before
         self.assertEqual(current[1].special_features, "New")
         self.assertEqual(stats["processed_urls"], {"https://example.com/1.pdf": "ok"})
+
+    def test_partial_fill_among_rows_sharing_one_floorplan_forces_a_refetch(self):
+        # Same shape as enrich_rows_grouped's own equivalent regression
+        # test (see EnrichRowsGroupedResumeTests) for the brochure-link
+        # pass, mirrored here for the floorplan-link pass:
+        # _apply_floorplan_units_to_row does its own per-row matching and
+        # can fill some of several rows sharing one floorplan_link while
+        # leaving others blank - the url still gets marked "ok" for the
+        # document as a whole, so a url-only skip on resume would strand
+        # the still-blank row(s) forever. Row A's own prior value must
+        # survive completely untouched.
+        row_a = ListingRow(
+            building="A", floor_unit="1st", floorplan_link="https://example.com/shared.pdf",
+            special_features="Already filled by a prior run",
+        )
+        row_b = ListingRow(
+            building="B", floor_unit="2nd", floorplan_link="https://example.com/shared.pdf", special_features=None,
+        )
+        already_processed = {"https://example.com/shared.pdf": "ok"}
+
+        def _fake_apply(row, units):
+            if row.building == "B":
+                return row.model_copy(update={"special_features": "Recovered for B"}), ["special_features"]
+            return row, []
+
+        with patch(
+            "brochure_enrichment._extract_floorplan_units", return_value=[{"floor_unit": "2nd"}],
+        ) as mock_extract, patch("brochure_enrichment._apply_floorplan_units_to_row", side_effect=_fake_apply):
+            current, log, stats = brochure_enrichment._enrich_rows_from_floorplans(
+                [row_a, row_b], already_processed=already_processed,
+            )
+
+        mock_extract.assert_called_once_with("https://example.com/shared.pdf")
+        self.assertEqual(current[0].special_features, "Already filled by a prior run")
+        self.assertEqual(current[1].special_features, "Recovered for B")
+        self.assertEqual(stats["processed_urls"], {"https://example.com/shared.pdf": "ok"})
 
     def test_stats_report_considered_ok_and_unavailable_counts(self):
         rows = self._rows(2)

@@ -1147,6 +1147,40 @@ def needs_enrichment(row: ListingRow) -> bool:
     return _is_blank(row.special_features) or bool(row.brochure_link)
 
 
+def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow) -> bool:
+    """
+    True if row is missing a real value for at least one of
+    ENRICHABLE_FIELDS, judged STRICTLY - unlike needs_enrichment, a truthy
+    brochure_link is never itself a reason special_features counts as
+    "still needed" here (contrast needs_enrichment's own final line -
+    that override is deliberate THERE, so the additive special_features
+    combine keeps getting a chance to run even once a row already has
+    real content, but it makes needs_enrichment permanently True for any
+    row with an eligible brochure_link regardless of whether special_
+    features already has a genuine value, which is exactly why it can't
+    ALSO serve as evidence a row's own value is still missing).
+
+    Used only by enrich_rows_grouped's own already_processed resume logic
+    (see its own indices_by_url/sharing_counts comment) to tell apart, for
+    a url ALREADY marked "ok", a document that was checked and genuinely
+    had nothing for ANY row sharing it (every sharing row still fails this
+    check) from one that only matched SOME of them (a sibling row already
+    has a real value here, even though needs_enrichment would still call
+    it "eligible" for another pass) - never used for the per-row
+    application loop itself, which keeps using needs_enrichment/
+    indices_by_url completely unchanged, preserving its own deliberate
+    always-eligible-for-recombine behavior.
+    """
+    for field in ENRICHABLE_FIELDS:
+        if field == "address_1":
+            if _is_placeholder_address(row.address_1, row.building):
+                return True
+            continue
+        if _is_blank(getattr(row, field)):
+            return True
+    return False
+
+
 def eligible_rows_and_brochures(rows: list):
     """
     (eligible_rows, unique_urls) - pure, no network/Gemini call of any kind
@@ -3329,8 +3363,11 @@ def _enrich_rows_from_floorplans(
 
     already_processed/checkpoint_callback/url_checkpoint_callback mirror
     enrich_rows_grouped's own identically-named parameters (see its own
-    docstring): a URL already marked "ok" is never re-fetched, and both
-    callbacks fire after EVERY floor plan (never batched - this worklist is
+    docstring): a URL already marked "ok" is skipped UNLESS at least one
+    (never every) row sharing it is still blank - see this function's own
+    sharing_counts/indices_by_url comment, below, for why a partial-fill
+    outcome must still be re-fetched even though the url itself is "ok".
+    Both callbacks fire after EVERY floor plan (never batched - this worklist is
     already expected to be small/rare, see above, so there's no CHECKPOINT_
     EVERY-style interval to tune) so an interruption partway through this
     pass - which used to lose every row update made so far, since nothing
@@ -3341,7 +3378,6 @@ def _enrich_rows_from_floorplans(
     """
     already_processed = already_processed or {}
     eligible, unique_urls = eligible_rows_and_floorplans(rows)
-    urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
     current = list(rows)
     log = []
     floorplans_read_ok = 0
@@ -3356,13 +3392,54 @@ def _enrich_rows_from_floorplans(
         "unique_floorplans_considered": len(unique_urls), "floorplans_read_ok": 0,
         "floorplans_unavailable": 0, "processed_urls": processed_urls, "document_issues": document_issues,
     }
+
+    # indices_by_url tracks which rows STILL need this floor plan applied
+    # (needs_floorplan_enrichment - a row already filled is never in here);
+    # sharing_counts tracks how many rows with an ELIGIBLE floorplan_link
+    # (_is_eligible_floorplan_url) share this url IN TOTAL, regardless of
+    # whether each one still needs enrichment. The two, compared, are what
+    # tell apart the two different things already_processed[url] == "ok"
+    # can mean once more than one row shares a url (see this function's
+    # own docstring on already_processed - a blank field alone is never
+    # itself evidence a document had nothing to offer):
+    #
+    # - every sharing row is STILL blank (len(indices_by_url[url]) ==
+    #   sharing_counts[url]) - the legitimate "checked this floor plan,
+    #   genuinely nothing there for ANY of them" outcome. Stays skipped on
+    #   resume, exactly as before this fix.
+    # - only SOME sharing rows are still blank (0 < len(...) <
+    #   sharing_counts[url]) - at least one sibling row VISIBLY got a real
+    #   value from this exact document already (see _apply_floorplan_
+    #   units_to_row's own per-row matching), which is direct proof this
+    #   floor plan DOES have real content, just not something that matched
+    #   every row sharing it - the still-blank row(s) were never actually
+    #   resolved, only stranded by a coarse per-URL "ok" that was true for
+    #   the document as a whole but not for them individually. Confirmed
+    #   real case: several floors of the same building all pointing at one
+    #   shared floor plan PDF, where only some floors' own unit boxes on
+    #   it were legible/labeled.
+    #
+    # Raw extracted units are never persisted across runs (only the ok/
+    # unavailable status itself is, via processed_urls/already_processed),
+    # so a full re-fetch is the only way to recover a stranded row's
+    # value - worth the one extra fetch only when a sibling row's own
+    # filled state already proves it's worth paying for.
+    indices_by_url = {}
+    sharing_counts = {}
+    for i, row in enumerate(rows):
+        if not _is_eligible_floorplan_url(row.floorplan_link):
+            continue
+        sharing_counts[row.floorplan_link] = sharing_counts.get(row.floorplan_link, 0) + 1
+        if needs_floorplan_enrichment(row):
+            indices_by_url.setdefault(row.floorplan_link, []).append(i)
+
+    urls_to_fetch = [
+        u for u in unique_urls
+        if already_processed.get(u) != "ok"
+        or 0 < len(indices_by_url.get(u, [])) < sharing_counts.get(u, 0)
+    ]
     if not urls_to_fetch:
         return current, log, stats
-
-    indices_by_url = {}
-    for i, row in enumerate(rows):
-        if needs_floorplan_enrichment(row) and _is_eligible_floorplan_url(row.floorplan_link):
-            indices_by_url.setdefault(row.floorplan_link, []).append(i)
 
     for url in urls_to_fetch:
         sink = {}
@@ -3628,12 +3705,33 @@ def enrich_rows_grouped(
     already_processed ({url: "ok" | "unavailable"}, from a PRIOR call of
     this same function against this same staging file - see storage.
     file_store's own processed_urls persistence) lets a caller RESUME an
-    interrupted run: a URL already marked "ok" here is skipped entirely -
-    never re-fetched, never re-sent to Gemini, full stop - since "blank
-    special_features" alone can never tell a caller whether a brochure was
-    already successfully checked and genuinely had nothing to contribute,
-    or was never checked at all (see this module's own ENRICHABLE_FIELDS
-    docstring on why a blank value is never itself evidence of anything).
+    interrupted run: a URL already marked "ok" here is skipped - never
+    re-fetched, never re-sent to Gemini - PROVIDED every row sharing that
+    url is still blank. Since "blank special_features" alone can never
+    tell a caller whether a brochure was already successfully checked and
+    genuinely had nothing to contribute, or was never checked at all (see
+    this module's own ENRICHABLE_FIELDS docstring on why a blank value is
+    never itself evidence of anything), that same ambiguity applies PER
+    ROW, not just per url, once more than one row shares a brochure_link:
+    _apply_units_to_row does its own per-row matching, and can legitimately
+    fill some of a shared document's rows while leaving others blank (no
+    confident match for that specific row) - the url still gets marked
+    "ok" because the fetch/extraction itself succeeded, so a plain url-only
+    skip would strand those never-actually-resolved rows blank forever,
+    indistinguishable from a row correctly left blank because the document
+    had nothing for it. See sharing_counts/still_blank_counts below (NOT
+    indices_by_url/needs_enrichment, which stay reserved for the per-row
+    application loop - needs_enrichment is deliberately always True for a
+    row with an eligible brochure_link, so it can't also serve as evidence
+    a row's own value is still missing, see _row_has_a_genuinely_blank_
+    enrichable_field's own docstring) - the fetch is only ever redone when
+    at least one (but not every) row sharing the url is still genuinely
+    blank, which is direct, row-level evidence this was a partial match
+    rather than a genuine "nothing here" outcome; a url where every
+    sharing row is still blank keeps the original, correct skip-on-resume
+    behavior unchanged. Confirmed real case: several floors of the same
+    building sharing one brochure_link, where only some floors' own units
+    were legible/labeled in it.
     A URL marked "unavailable" is NOT skipped - retried exactly like a
     never-seen URL, since a fetch/Gemini failure may well have been
     transient; this is bounded by the caller only ever resuming in
@@ -3685,14 +3783,47 @@ def enrich_rows_grouped(
     progress_callback = progress_callback or (lambda done, total, label: None)
     already_processed = already_processed or {}
     eligible, unique_urls = eligible_rows_and_brochures(rows)
-    urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
 
+    # indices_by_url (needs_enrichment-based, UNCHANGED by this fix) drives
+    # the per-row APPLICATION loop below - see needs_enrichment's own
+    # docstring for why it deliberately keeps calling a row "eligible" even
+    # once every field, including special_features, already has a value
+    # (so the additive combine keeps getting a chance to run on every
+    # call). first_label is built alongside it for the same reason it
+    # always was.
+    #
+    # sharing_counts / still_blank_counts are a SEPARATE signal, used only
+    # to decide whether a url ALREADY marked "ok" in already_processed is
+    # worth re-fetching on resume (see that parameter's own docstring
+    # above) - needs_enrichment can't serve this purpose, since it's True
+    # for every row sharing an eligible brochure_link regardless of
+    # whether special_features already has real content, so comparing it
+    # against sharing_counts could never tell a genuine "nothing found for
+    # anyone" apart from "some rows are already filled, others are still
+    # stranded". still_blank_counts instead uses _row_has_a_genuinely_
+    # blank_enrichable_field (see its own docstring) - the plain "is
+    # anything actually still missing" question, with no brochure_link-
+    # based override - which is exactly what distinguishes a row that was
+    # never actually resolved from one that was.
     first_label = {}
     indices_by_url = {}
+    sharing_counts = {}
+    still_blank_counts = {}
     for i, row in enumerate(rows):
-        if needs_enrichment(row) and _is_eligible_brochure_url(row.brochure_link):
+        if not _is_eligible_brochure_url(row.brochure_link):
+            continue
+        sharing_counts[row.brochure_link] = sharing_counts.get(row.brochure_link, 0) + 1
+        if _row_has_a_genuinely_blank_enrichable_field(row):
+            still_blank_counts[row.brochure_link] = still_blank_counts.get(row.brochure_link, 0) + 1
+        if needs_enrichment(row):
             indices_by_url.setdefault(row.brochure_link, []).append(i)
             first_label.setdefault(row.brochure_link, row.building)
+
+    urls_to_fetch = [
+        u for u in unique_urls
+        if already_processed.get(u) != "ok"
+        or 0 < still_blank_counts.get(u, 0) < sharing_counts.get(u, 0)
+    ]
 
     current = list(rows)
     log = []
