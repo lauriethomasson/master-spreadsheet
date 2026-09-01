@@ -4,6 +4,13 @@ google-cloud-storage
 pydantic
 openpyxl
 streamlit==1.61.1
+# Used directly (pages/2_Review_and_Master.py imports pydeck at the top
+# level for the Location review card's own st.pydeck_chart map - see
+# _render_combined_location_row) - pinned explicitly rather than relying
+# on it staying available as an unpinned transitive dependency of
+# streamlit, which only uses it internally via st.map/st.pydeck_chart.
+# Version confirmed present in this repo's own dev environment.
+pydeck==0.9.3
 # Streamlit declares starlette<2,>=0.40.0 (a very wide, unpinned transitive
 # range) but its own bundled GZip middleware wrapper (streamlit/web/server/
 # starlette/starlette_gzip_middleware.py) is only actually compatible with

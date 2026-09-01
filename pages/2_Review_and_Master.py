@@ -241,6 +241,21 @@ _NEW_LOCATION_PIN_COLOR = "#FFA500"
 _LOCATION_PIN_RADIUS_PIXELS = 8
 
 
+def _hex_to_rgba(hex_color: str) -> list:
+    """
+    "#rrggbb" -> [r, g, b, 255] - pydeck's own ScatterplotLayer getFillColor
+    accessor expects each row's color as a plain int [r, g, b, a] list, not
+    a hex string (confirmed against streamlit's own st.map implementation,
+    elements/map.py, which always runs every color through its own
+    to_int_color_tuple before handing off to ITS ScatterplotLayer - the
+    same underlying deck.gl layer this card now builds directly). The hex
+    constants (_CURRENT_LOCATION_PIN_COLOR/_NEW_LOCATION_PIN_COLOR) stay
+    the source of truth for readability; this converts at render time only.
+    """
+    hex_color = hex_color.lstrip("#")
+    return [int(hex_color[i:i + 2], 16) for i in (0, 2, 4)] + [255]
+
+
 def _render_combined_location_row(
     diffs: dict, key_prefix: str, default_checked: bool, is_risky: bool, unverified: bool,
 ) -> dict:
@@ -296,13 +311,15 @@ def _render_combined_location_row(
             st.caption(f"⚠️ {_risky_field_reason('lat', unverified)}")
 
     with map_col:
-        points = [{"lat": float(new_lat), "lng": float(new_lng), "point": "New", "color": _NEW_LOCATION_PIN_COLOR}]
+        points = [
+            {"lat": float(new_lat), "lng": float(new_lng), "point": "New", "color": _hex_to_rgba(_NEW_LOCATION_PIN_COLOR)},
+        ]
         if has_current:
             points.insert(
                 0,
                 {
                     "lat": float(old_lat), "lng": float(old_lng), "point": "Current",
-                    "color": _CURRENT_LOCATION_PIN_COLOR,
+                    "color": _hex_to_rgba(_CURRENT_LOCATION_PIN_COLOR),
                 },
             )
         points_df = pd.DataFrame(points)
@@ -324,8 +341,25 @@ def _render_combined_location_row(
             radius_max_pixels=_LOCATION_PIN_RADIUS_PIXELS,
             pickable=False,
         )
+        # compute_view is pydeck's own "fit every point in view, with
+        # padding" utility - the same one st.map itself is built on -
+        # confirmed correct across every real distance range this card
+        # sees: a single point (no "current" to compare against) lands on
+        # a tight, sensible single-building zoom; two close points (tens
+        # of meters) zoom in tight; two far points (a wrong-geocode jump of
+        # several km) zoom out - never degenerate/off-screen in any case.
         view_state = pydeck.data_utils.compute_view(points_df[["lng", "lat"]].values.tolist())
-        st.pydeck_chart(pydeck.Deck(layers=[layer], initial_view_state=view_state, tooltip=False))
+        # map_style deliberately set explicit - a bare pydeck.Deck() with
+        # no map_style defaults to Carto's DARK-MATTER style (confirmed:
+        # pydeck.Deck(layers=[]).map_style), which doesn't match this
+        # app's light theme or what st.map itself rendered before. LIGHT
+        # resolves to Carto's own "positron" light style - still no API
+        # key needed (map_provider stays "carto", the same no-key setup
+        # st.map already used - see this function's own docstring on why
+        # the Maps Static/JavaScript API was deliberately avoided).
+        st.pydeck_chart(pydeck.Deck(
+            layers=[layer], initial_view_state=view_state, map_style=pydeck.map_styles.LIGHT, tooltip=False,
+        ))
         if has_current:
             distance_m = master_merge.haversine_distance_meters(
                 float(old_lat), float(old_lng), float(new_lat), float(new_lng),

@@ -16,6 +16,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_app_review_latlng_map -v
 """
 
+import importlib.util
 import json
 import os
 import sys
@@ -32,6 +33,17 @@ from schema import ListingRow
 from storage.file_store import save_staging_file
 
 BASE = Path(__file__).resolve().parent.parent
+
+# _hex_to_rgba/_CURRENT_LOCATION_PIN_COLOR/_NEW_LOCATION_PIN_COLOR live on
+# the page module itself - loaded via importlib (the file's own numeric-
+# prefixed name isn't a valid plain `import` target), same idiom already
+# used by tests/test_app_review_risky_field_reason.py for this same page.
+_spec = importlib.util.spec_from_file_location(
+    "review_and_master_page", BASE / "pages" / "2_Review_and_Master.py",
+)
+review_and_master_page = importlib.util.module_from_spec(_spec)
+sys.modules.setdefault("review_and_master_page", review_and_master_page)
+_spec.loader.exec_module(review_and_master_page)
 
 
 class IsolatedCwdTestCase(unittest.TestCase):
@@ -123,10 +135,35 @@ class CombinedLocationRowTests(IsolatedCwdTestCase):
         points = spec["layers"][0]["data"]
 
         self.assertEqual(len(points), 2)
+        # pydeck's own getFillColor accessor needs each row's color as a
+        # plain [r, g, b, a] int list, not a hex string (confirmed against
+        # streamlit's own st.map implementation, which always converts via
+        # its own to_int_color_tuple before handing off to the SAME
+        # underlying deck.gl ScatterplotLayer this card now builds
+        # directly) - see review_and_master_page._hex_to_rgba.
         colors = {tuple(p["color"]) for p in points}
         self.assertEqual(len(colors), 2)  # current and new are visually distinct
+        self.assertEqual(
+            colors,
+            {
+                tuple(review_and_master_page._hex_to_rgba(review_and_master_page._CURRENT_LOCATION_PIN_COLOR)),
+                tuple(review_and_master_page._hex_to_rgba(review_and_master_page._NEW_LOCATION_PIN_COLOR)),
+            },
+        )
         coords = {(p["lat"], p["lng"]) for p in points}
         self.assertEqual(coords, {(51.52, -0.1), (51.5158796, -0.1442492)})
+
+    def test_map_uses_a_light_basemap_style_matching_this_apps_theme(self):
+        # A bare pydeck.Deck() with no map_style defaults to Carto's DARK-
+        # matter style, which doesn't match this app's light theme or what
+        # st.map itself rendered before this fix - confirmed real gap,
+        # never actually visually inspected when the map was first added.
+        at = self._staged_row_with_a_real_latlng_change()
+
+        deck_elements = _deck_gl_elements(at)
+        spec = json.loads(deck_elements[0].proto.json)
+        self.assertIn("positron", spec["mapStyle"])  # Carto's light style
+        self.assertEqual(spec["mapProvider"], "carto")  # still no API key needed
 
     def test_pins_use_pixel_based_radius_not_meter_based_size(self):
         # Confirmed real bug (fixed here): st.map's own `size` is a real-
@@ -186,6 +223,64 @@ class CombinedLocationRowTests(IsolatedCwdTestCase):
         row = master_df.loc[master_df["property_id"] == "row-latlng"].iloc[0]
         self.assertEqual(row["lat"], 51.52)
         self.assertEqual(row["lng"], -0.1)
+
+
+class PinRadiusDistanceIndependenceTests(IsolatedCwdTestCase):
+    """
+    The actual regression test for the confirmed root cause behind BOTH
+    reported symptoms - pins that balloon and nearly merge for a CLOSE
+    pair (e.g. 33 Cavendish Square, 187m apart) AND pins that shrink to
+    invisible for a FAR pair (e.g. a wrong-geocode jump of several km) are
+    the SAME bug (a real-world-meter radius is inherently zoom-dependent
+    on screen), just at opposite ends of the same distance range. Stages
+    two independent rows at very different distances apart in the SAME
+    upload, so both cards render on one page, and confirms both layers
+    report the exact same pixel radius - proving radius no longer depends
+    on how far apart that particular pair of points happens to be.
+    """
+
+    def test_radius_is_identical_for_a_close_pair_and_a_far_outlier_pair(self):
+        master_writer.write_master([
+            ListingRow(
+                building="A", provider="UNION", floor_unit="1st",
+                lat=51.5200000, lng=-0.1000000, property_id="row-close",
+            ),
+            ListingRow(
+                building="B", provider="UNION", floor_unit="1st",
+                lat=51.5074000, lng=-0.1278000, property_id="row-far",
+            ),
+        ])
+        save_staging_file(
+            [
+                # ~187m apart - the originally-reported "balloon/merge" case.
+                ListingRow(
+                    building="A", provider="UNION", floor_unit="1st",
+                    lat=51.5171, lng=-0.1450, geocode_unverified=True,
+                ),
+                # ~6km apart - a wrong-geocode-jump-scale far outlier, the
+                # "vanishing dot" case.
+                ListingRow(
+                    building="B", provider="UNION", floor_unit="1st",
+                    lat=51.5560, lng=-0.2000, geocode_unverified=True,
+                ),
+            ],
+            "radius_independence_test.xlsx", content_hash="radius-independence-test-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        deck_elements = _deck_gl_elements(at)
+        self.assertEqual(len(deck_elements), 2)
+        layers = [json.loads(el.proto.json)["layers"][0] for el in deck_elements]
+
+        radii = {(layer["radiusMinPixels"], layer["radiusMaxPixels"], layer["getRadius"]) for layer in layers}
+        self.assertEqual(len(radii), 1)  # identical regardless of distance apart
+        (min_px, max_px, get_radius), = radii
+        self.assertGreater(min_px, 0)
+        self.assertEqual(min_px, max_px)
+        self.assertEqual(min_px, get_radius)
+        for layer in layers:
+            self.assertEqual(layer["radiusUnits"], "pixels")
 
 
 class SingleCoordinateFieldFallbackTests(IsolatedCwdTestCase):
