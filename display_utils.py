@@ -115,7 +115,15 @@ def render_before_after(old_val, new_val) -> None:
         st.write("—" if new_val in (None, "") else new_val)
 
 
-def render_new_value_input(new_val, kind: str, key: str, multiline: bool = False):
+
+# lat/lng need far more decimal precision than st.number_input's own
+# default rendering gives them - see render_new_value_input's own
+# docstring for why this matters (a reviewer comparing "Current" against
+# "New" needs to actually see what they're approving).
+LATLNG_FIELDS = frozenset({"lat", "lng"})
+
+
+def render_new_value_input(new_val, kind: str, key: str, multiline: bool = False, field: str = None):
     """
     The editable "new value" widget alone for one field's manual review
     row - st.number_input for an int/float field, st.text_area/st.
@@ -134,11 +142,37 @@ def render_new_value_input(new_val, kind: str, key: str, multiline: bool = False
     that truncates rather than wraps, which would defeat the whole point of
     comparing full text at a glance for exactly the fields (special_
     features, contacts) where that matters most.
+
+    field, when it's one of LATLNG_FIELDS, widens the number_input's own
+    displayed precision to 7 decimal places (~1cm) instead of leaving it
+    at st.number_input's HARDCODED "%0.2f" default for any float field
+    with no format given (confirmed by reading streamlit's own source -
+    this is NOT derived from `step`, despite appearances, so raising step
+    alone would never have fixed this). Confirmed real gap this closes: a
+    lat/lng decision card only ever shows once master_merge._is_same_
+    location has already established the underlying coordinates differ by
+    MORE than SAME_LOCATION_METERS (~50m, roughly 0.0004-0.0007 degrees at
+    London's latitude) - genuinely never the same coordinate - yet the old
+    2-decimal display could round two such values to the exact same
+    digits, making a reviewer reasonably (but wrongly) read "Current:
+    -0.1442492" next to "New: -0.14" as no real change at all. Purely a
+    DISPLAY fix - the value st.number_input actually returns when left
+    untouched was always already full-precision regardless of `format`
+    (confirmed via AppTest), so this never changes what a reviewer who
+    accepts without editing ends up applying; it only changes whether they
+    can SEE it to make that decision in the first place. Every other
+    float field (rent_pcm/rent_psf/size_sqft/desks_min/desks_max) keeps
+    its exact existing precision/behavior - deliberately narrow, not a
+    blanket default change for every float field.
     """
     if kind in ("int", "float"):
         default = float(new_val) if new_val is not None else 0.0
+        if field in LATLNG_FIELDS:
+            step, fmt = 0.0000001, "%.7f"
+        else:
+            step, fmt = (1.0 if kind == "int" else 0.01), None
         edited = st.number_input(
-            "New value", value=default, step=(1.0 if kind == "int" else 0.01),
+            "New value", value=default, step=step, format=fmt,
             key=key, label_visibility="collapsed",
         )
         return int(edited) if kind == "int" else edited

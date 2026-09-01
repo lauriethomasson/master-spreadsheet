@@ -343,6 +343,7 @@ def _render_field_rows(
         with after_col:
             value = display_utils.render_new_value_input(
                 new_val, kind, key=f"{key_prefix}_{f}_value", multiline=f in display_utils.WIDE_TEXT_COLUMNS,
+                field=f,
             )
             if after_highlight is not None:
                 st.caption(after_highlight)
@@ -1590,9 +1591,18 @@ def _render_edit_property_form(df: pd.DataFrame, property_id: str, key: str) -> 
             field_key = f"{key}_edit_{property_id}_{field}"
             if kind in ("int", "float"):
                 default = float(current) if current is not None else 0.0
+                # See display_utils.render_new_value_input's own
+                # _LATLNG_FIELDS docstring - same display-precision bug,
+                # same fix, this form's own separate st.number_input call
+                # site. Every other numeric field's precision/behavior is
+                # unaffected.
+                if field in display_utils.LATLNG_FIELDS:
+                    step, fmt = 0.0000001, "%.7f"
+                else:
+                    step, fmt = (1.0 if kind == "int" else 0.01), None
                 edited = st.number_input(
                     title_case_label(field), value=default,
-                    step=(1.0 if kind == "int" else 0.01), key=field_key,
+                    step=step, format=fmt, key=field_key,
                 )
                 new_values[field] = int(edited) if kind == "int" else edited
                 original_for_compare[field] = int(default) if kind == "int" else default

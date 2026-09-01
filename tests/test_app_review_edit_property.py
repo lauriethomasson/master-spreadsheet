@@ -308,6 +308,31 @@ class ZeroingBlankNumericFieldsTests(unittest.TestCase):
         df = master_writer.load_master_as_dataframe()
         self.assertEqual(df.loc[df["property_id"] == "row-A", "lat"].iloc[0], 51.52)
 
+    def test_lat_lng_inputs_render_at_full_precision_unlike_other_numeric_fields(self):
+        # Same display-precision fix as display_utils.render_new_value_
+        # input's own LATLNG_FIELDS (see its docstring) - this form's own
+        # SEPARATE st.number_input call site needed the identical fix.
+        master_writer.write_master([
+            ListingRow(
+                building="28 Gresham Street", provider="Kitt's", floor_unit="1st", property_id="row-A",
+                lat=-0.1442492, rent_psf=55.5,
+            ),
+        ])
+        at = AppTest.from_file(str(BASE / "pages" / "2_Review_and_Master.py"), default_timeout=30)
+        at.run()
+        self._select(at, [self._position_of("row-A")])
+        at.run()
+
+        edit_btn = next(b for b in at.button if b.label == "Edit selected property")
+        edit_btn.click().run()
+        lat_input = next(n for n in at.number_input if n.label == "Lat")
+        rent_input = next(n for n in at.number_input if n.label == "Rent Psf")
+
+        self.assertEqual(lat_input.proto.format, "%.7f")
+        self.assertEqual(lat_input.value, -0.1442492)
+        # A non-lat/lng numeric field must stay completely unaffected.
+        self.assertEqual(rent_input.proto.format, "%0.2f")
+
 
 if __name__ == "__main__":
     unittest.main()
