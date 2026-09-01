@@ -211,6 +211,103 @@ def _char_diff_highlight(old_val: str, new_val: str) -> tuple:
     return "".join(before_parts), "".join(after_parts)
 
 
+# Pin colors for _render_combined_location_row's own embedded map - a
+# neutral grey for the CURRENT point, an amber accent for the PROPOSED new
+# one (the same "needs a careful look" meaning as this page's own ⚠️
+# caption elsewhere). No custom Streamlit theme color is defined anywhere
+# in this app (see .streamlit/config.toml - default theme only), so
+# there's no existing warning color to literally reuse; these are a
+# standard, clearly distinct neutral/amber pair chosen for this purpose.
+_CURRENT_LOCATION_PIN_COLOR = "#808495"
+_NEW_LOCATION_PIN_COLOR = "#FFA500"
+
+# st.map's own per-point circle size, in meters (see its "size" parameter
+# docstring) - large enough to stay visible at the auto-fit zoom level two
+# building-scale points typically land on, small enough not to visually
+# merge two pins that are only tens of meters apart into one blob.
+_LOCATION_PIN_SIZE_METERS = 25
+
+
+def _render_combined_location_row(
+    diffs: dict, key_prefix: str, default_checked: bool, is_risky: bool, unverified: bool,
+) -> dict:
+    """
+    lat+lng's own combined "Location" row: a small embedded map with the
+    current and proposed points as two differently-colored pins (see
+    _CURRENT_LOCATION_PIN_COLOR/_NEW_LOCATION_PIN_COLOR), the distance and
+    compass direction between them (master_merge.haversine_distance_
+    meters/compass_bearing), and the raw coordinates in small print below
+    the map - replacing the two separate Lat/Lng before/after rows
+    _render_field_rows would otherwise render for them. See master_merge.
+    _location_distance_meters' own docstring: "both always judge lat and
+    lng TOGETHER as one location, never independently" - a lat without its
+    own lng (or vice versa) is a broken coordinate, so this is ONE Apply
+    checkbox for the pair, never two independently-checkable ones.
+
+    Only ever called when diffs contains BOTH "lat" and "lng" together
+    (see _render_field_rows' own gating, right before this) - a lone lat
+    or lng (the rare case where its own pair is genuinely still missing)
+    never reaches this function at all, and keeps using the ordinary
+    single-field row instead, completely unaffected by this.
+
+    st.map (built into Streamlit, no new API key/dependency - see this
+    module's own docstring on why the Maps Static/JavaScript API was
+    deliberately avoided) auto-centers and auto-zooms to fit every point
+    in its own dataframe with sensible padding when no explicit zoom is
+    given, which is exactly the "fit both pins, however close together"
+    behavior this needs - a fixed zoom level could crop one pin out of
+    view for two points only tens of meters apart.
+
+    old_lat/old_lng can be blank - a row getting real coordinates for the
+    FIRST time ever, never a replacement (diff_fields' own blank-skip rule
+    still lets a blank-old/non-blank-new pair through as a genuine diff).
+    The map then shows only the new point (there is no "current" to plot
+    or compare against), and the distance/direction/current-coordinate
+    text is skipped entirely rather than computed against nothing.
+    """
+    old_lat, new_lat = diffs["lat"]
+    old_lng, new_lng = diffs["lng"]
+    has_current = not (master_merge._is_blank(old_lat) or master_merge._is_blank(old_lng))
+
+    label_col, map_col, apply_col = st.columns([2, 5, 1])
+    with label_col:
+        st.markdown("**Location**")
+        if is_risky:
+            st.caption(f"⚠️ {_risky_field_reason('lat', unverified)}")
+
+    with map_col:
+        points = [{"lat": float(new_lat), "lng": float(new_lng), "point": "New", "color": _NEW_LOCATION_PIN_COLOR}]
+        if has_current:
+            points.insert(
+                0,
+                {
+                    "lat": float(old_lat), "lng": float(old_lng), "point": "Current",
+                    "color": _CURRENT_LOCATION_PIN_COLOR,
+                },
+            )
+        st.map(
+            pd.DataFrame(points), latitude="lat", longitude="lng", color="color",
+            size=_LOCATION_PIN_SIZE_METERS,
+        )
+        if has_current:
+            distance_m = master_merge.haversine_distance_meters(
+                float(old_lat), float(old_lng), float(new_lat), float(new_lng),
+            )
+            direction = master_merge.compass_bearing(
+                float(old_lat), float(old_lng), float(new_lat), float(new_lng),
+            )
+            st.caption(f"Current: {old_lat}, {old_lng} → New: {new_lat}, {new_lng} ({distance_m:,.0f}m {direction})")
+        else:
+            st.caption(f"New: {new_lat}, {new_lng} — no existing coordinate on file to compare against")
+
+    with apply_col:
+        apply_field = st.checkbox(
+            "Apply", value=default_checked and not is_risky, key=f"{key_prefix}_location_apply",
+        )
+
+    return {"lat": float(new_lat), "lng": float(new_lng)} if apply_field else {}
+
+
 def _render_field_rows(
     diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
     unverified: bool = False, address_conflict: str = None,
@@ -294,12 +391,33 @@ def _render_field_rows(
     individually_rendered = [f for f in diffs if f in risky_fields or not bundle_safe_fields]
     bundled_fields = [f for f in diffs if f not in risky_fields and bundle_safe_fields]
 
-    if individually_rendered:
+    # lat+lng are ALWAYS reviewed as one combined "Location" map row, never
+    # as two separate Lat/Lng before/after rows - see _render_combined_
+    # location_row's own docstring for why. A TARGETED addition: only
+    # fires when both happen to be individually-rendered together (the
+    # ordinary case for any risky/unverified geocode change - both are
+    # always added to or withheld from risky_fields TOGETHER, see
+    # master_merge.build_merge_plan's own GEOCODE_RISK_FIELDS/GEOCODE_
+    # UNVERIFIED_FIELDS clauses), never a change to this function's
+    # general per-field contract for lat/lng individually or any other
+    # field - a lone lat or lng (its own pair genuinely still missing)
+    # falls straight through to the ordinary loop below, unaffected.
+    show_combined_location = "lat" in individually_rendered and "lng" in individually_rendered
+    if show_combined_location:
+        individually_rendered = [f for f in individually_rendered if f not in ("lat", "lng")]
+
+    if individually_rendered or show_combined_location:
         _, current_header_col, new_header_col, _ = st.columns([2, 2, 3, 1])
         with current_header_col:
             st.caption("Current")
         with new_header_col:
             st.caption("New")
+
+    if show_combined_location:
+        location_is_risky = "lat" in risky_fields or "lng" in risky_fields
+        approved.update(
+            _render_combined_location_row(diffs, key_prefix, default_checked, location_is_risky, unverified)
+        )
 
     for f in individually_rendered:
         old_val, new_val = diffs[f]

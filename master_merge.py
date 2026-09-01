@@ -153,6 +153,42 @@ def haversine_distance_meters(lat1, lng1, lat2, lng2) -> float:
     return 2 * _EARTH_RADIUS_METERS * math.asin(math.sqrt(a))
 
 
+# 8-point compass, N first and every 45 degrees clockwise after it -
+# matches compass_bearing's own round(bearing / 45) % 8 index math below.
+_COMPASS_POINTS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+def compass_bearing(lat1, lng1, lat2, lng2) -> str:
+    """
+    The 8-point compass direction (N/NE/E/SE/S/SW/W/NW) FROM (lat1, lng1)
+    TO (lat2, lng2) - standard atan2-based initial (forward) bearing
+    formula, converted from degrees-from-true-north into the nearest of
+    the 8 points rather than left as a raw degree figure, for the Review
+    page's own lat/lng map card (see pages/2_Review_and_Master.py's
+    combined Location row) - a reviewer glancing at a map wants "the new
+    point is NE of the old one", not "047.3 degrees".
+
+    Pure directional bearing, independent of haversine_distance_meters'
+    own distance calculation - the two are always shown together on that
+    card (distance + direction), but are two genuinely separate
+    quantities, not derived from one another.
+
+    Not itself great-circle-accurate over very long distances (initial
+    bearing drifts from the straight compass reading the further apart the
+    two points are, since a great-circle path isn't a straight line on a
+    flat compass) - irrelevant here, since this only ever renders for two
+    points already known to be within an ordinary walkable/drivable London
+    distance (this app's own building-level coordinates), never anywhere
+    close to a distance where that drift would matter.
+    """
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lng2 - lng1)
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    bearing_degrees = (math.degrees(math.atan2(x, y)) + 360) % 360
+    return _COMPASS_POINTS[round(bearing_degrees / 45) % 8]
+
+
 # Two thresholds, both anchored to a real, confirmed failure mode already
 # documented in this project: geocode.py's own docstring records a genuine
 # wrong-building Places API match landing "hundreds of meters to over a

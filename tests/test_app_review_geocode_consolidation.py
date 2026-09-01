@@ -104,18 +104,24 @@ class IvybridgeHouseConsolidatedCardTests(IsolatedCwdTestCase):
 
         caption_text = "".join(c.value for c in at.caption)
         self.assertIn("This address couldn't be independently verified", caption_text)
-        # _render_field_rows shows this caption once per RISKY FIELD (see
-        # its own docstring) - 4 here (address_1/postcode/lat/lng), from
-        # the ONE consolidated card. Without consolidation this would be
-        # up to 6 rows x 4 fields = 24 - the count that matters is "once
-        # per shared field", never "once per row sharing that field".
-        self.assertEqual(caption_text.count("This address couldn't be independently verified"), 4)
+        # _render_field_rows shows this caption once per RISKY FIELD/ROW
+        # (see its own docstring) - 3 here (address_1, postcode, and ONE
+        # combined lat+lng "Location" row - see _render_combined_location_
+        # row, which replaced the separate lat/lng rows this used to be 4
+        # for), from the ONE consolidated card. Without consolidation this
+        # would be up to 6 rows x 3 = 18 - the count that matters is "once
+        # per shared field/row", never "once per row sharing that field".
+        self.assertEqual(caption_text.count("This address couldn't be independently verified"), 3)
 
     def test_approving_the_consolidated_card_applies_to_every_row_in_the_group(self):
         at = self._staged_ivybridge_house()
 
+        # address_1, postcode, and ONE combined "Location" checkbox for
+        # lat+lng together (see _render_combined_location_row) - its own
+        # key still shares this card's key_prefix, so it's included here
+        # exactly like every other field checkbox.
         geo_checkboxes = [c for c in at.checkbox if c.key and c.key.startswith("geo_consolidated_0_")]
-        self.assertEqual(len(geo_checkboxes), 4)  # address_1, postcode, lat, lng
+        self.assertEqual(len(geo_checkboxes), 3)
         for cb in geo_checkboxes:
             cb.set_value(True)
         at.run()
