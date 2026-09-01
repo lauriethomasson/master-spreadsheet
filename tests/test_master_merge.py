@@ -301,6 +301,32 @@ class AddressTrailingPunctuationEqualityTests(unittest.TestCase):
             master_merge._values_equal("33 Cavendish Square", "33 Cavendish Square, London", "address_1")
         )
 
+    def test_en_dash_and_hyphen_range_are_equal(self):
+        # Real reported case: "19-21 Great Portland Street" (hyphen-minus)
+        # vs "19–21 Great Portland Street" (en dash, U+2013) - the exact
+        # same real address, a typographic copy-paste artifact only.
+        self.assertTrue(
+            master_merge._values_equal("19-21 Great Portland Street", "19–21 Great Portland Street", "address_1")
+        )
+
+    def test_en_dash_variant_still_detects_a_genuine_number_change(self):
+        self.assertFalse(
+            master_merge._values_equal("19-21 Great Portland Street", "19 Great Portland Street", "address_1")
+        )
+        self.assertFalse(
+            master_merge._values_equal("19-21 Great Portland Street", "19-23 Great Portland Street", "address_1")
+        )
+
+    def test_em_dash_variant_is_also_tolerated(self):
+        self.assertTrue(
+            master_merge._values_equal("19-21 Great Portland Street", "19—21 Great Portland Street", "address_1")
+        )
+
+    def test_dash_variant_tolerance_is_still_scoped_to_address_1_only(self):
+        self.assertFalse(
+            master_merge._values_equal("19-21 Great Portland Street", "19–21 Great Portland Street", "building")
+        )
+
 
 class MergeFieldChoiceTests(unittest.TestCase):
     def test_all_equal_needs_no_choice(self):
@@ -2231,6 +2257,60 @@ class AddressFormattingFullPipelineTests(unittest.TestCase):
         matched = (plan.matched_changed + plan.matched_unchanged)[0]
         self.assertEqual(matched.diffs.get("address_1"), ("33 Cavendish Square", "33 Cavendish Street"))
 
+    def test_33_cavendish_square_end_to_end_reproduction(self):
+        """
+        Traces the real reported "33 Cavendish Square — same address
+        update shared by 5 properties" UI card to its actual root cause,
+        per this session's own investigation checklist:
+
+        1. address_1 text itself is UNCHANGED (same building, same
+           provider, 5 floors) - confirmed NOT the cause, since it never
+           even reaches diffs (see AddressTrailingPunctuationEqualityTests
+           and the address_1-only tests above).
+        2/3. A small (~10m) lat/lng move - well within SAME_LOCATION_
+           METERS - IS correctly removed from diffs entirely (see
+           _is_same_location), so this alone produces NO decision at all.
+        4/5/6. A genuine (~200m) lat/lng move is correctly RETAINED as a
+           real, reviewable diff - the card the user saw is driven purely
+           by geocode.py's own re-resolved coordinates landing somewhere
+           genuinely different from master's own, not by address TEXT
+           at all - confirmed by diffs containing lat/lng only, never
+           address_1/postcode.
+        """
+        def _five_rows(lat, lng, address_1="33 Cavendish Square", postcode="W1G 0PW"):
+            return [
+                ListingRow(
+                    building="33 Cavendish Square", provider="UNION", floor_unit=f"{i + 1} Floor",
+                    address_1=address_1, postcode=postcode, lat=lat, lng=lng, geocode_unverified=True,
+                )
+                for i in range(5)
+            ]
+
+        master_df = _master_df([r.model_dump() for r in _five_rows(51.5170, -0.1440)])
+
+        # Small, insignificant re-geocode noise (~10m) - must produce NO
+        # decision at all, for ANY of the 5 rows.
+        small_move_rows = _five_rows(51.51705, -0.14395)
+        plan = master_merge.build_merge_plan(small_move_rows, master_df)
+        for m in (plan.matched_changed + plan.matched_unchanged):
+            self.assertEqual(m.diffs, {}, f"expected no diff for a trivial coordinate move, got {m.diffs}")
+            self.assertEqual(m.risky_fields, frozenset())
+
+        # A genuine (~200m) coordinate move - must still produce a real,
+        # reviewable decision, driven by lat/lng ALONE (never address_1),
+        # and correctly consolidated as one shared geocode group.
+        large_move_rows = _five_rows(51.5185, -0.1460)
+        plan = master_merge.build_merge_plan(large_move_rows, master_df)
+        risky_rows = [m for m in (plan.matched_changed + plan.matched_unchanged) if m.risky_fields]
+        self.assertEqual(len(risky_rows), 5)
+        for m in risky_rows:
+            self.assertEqual(set(m.diffs.keys()), {"lat", "lng"})
+            self.assertNotIn("address_1", m.diffs)
+            self.assertEqual(m.risky_fields, frozenset({"lat", "lng"}))
+        groups = master_merge.geocode_consolidation_groups(risky_rows)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(next(iter(groups.values()))), 5)
+
 
 class IsBarePostcodeDistrictTests(unittest.TestCase):
     def test_bare_district_is_recognized(self):
@@ -2686,6 +2766,41 @@ class ItemsSimilarTests(unittest.TestCase):
 
     def test_unrelated_normal_length_items_are_not_similar(self):
         self.assertFalse(master_merge._items_similar("manned reception desk", "bike storage available"))
+
+
+class ItemsSimilarNumericContradictionTests(unittest.TestCase):
+    """
+    _items_similar's own numeric-contradiction veto (see _item_numbers) -
+    two items can share every significant WORD while stating a genuinely
+    different FACT purely via an embedded number, which the plain word-
+    overlap ratio alone can't see (_significant_words never tokenizes
+    digits meaningfully - "5"/"2" are both filtered as too-short).
+    """
+
+    def test_meeting_room_count_change_is_not_similar(self):
+        self.assertFalse(master_merge._items_similar("5 meeting rooms", "2 meeting rooms"))
+
+    def test_term_length_change_is_not_similar(self):
+        self.assertFalse(master_merge._items_similar("36 month term", "24 month term"))
+
+    def test_identical_number_is_still_similar(self):
+        self.assertTrue(master_merge._items_similar("5 meeting rooms", "5 meeting rooms available"))
+
+    def test_partial_number_overlap_still_counts_as_a_contradiction(self):
+        # One number shared (the floor), one genuinely different (the room
+        # count) - still a real changed fact, not a partial match.
+        self.assertFalse(
+            master_merge._items_similar("2 meeting rooms on floor 3", "5 meeting rooms on floor 3")
+        )
+
+    def test_item_with_no_number_at_all_is_unaffected(self):
+        self.assertTrue(master_merge._items_similar("manned reception desk", "manned reception"))
+
+    def test_one_sided_number_is_not_vetoed(self):
+        # Only fires when BOTH items have a number - an item gaining a
+        # number the other side never stated at all isn't a "contradiction"
+        # in the same sense, and is left to the ordinary word-overlap check.
+        self.assertTrue(master_merge._items_similar("meeting rooms available", "5 meeting rooms available"))
 
 
 class IsDetailLossTests(unittest.TestCase):
@@ -4176,6 +4291,132 @@ class SpecialFeaturesMergeTests(unittest.TestCase):
         # The exact-match short-circuit must never make two DIFFERENT short
         # items look similar - only literal restatement is exempted.
         self.assertFalse(master_merge._items_similar("4 mr + 3 pb", "5 mr + 2 pb"))
+
+
+class SpecialFeaturesAutoMergePermissivenessTests(unittest.TestCase):
+    """
+    special_features should AUTO-APPLY by default; a review decision is
+    reserved for a CONCRETE risk signal (meaningful information loss with
+    nothing new offered in its place, self-duplication, or a numeric
+    contradiction) - not merely because the new extraction is longer or
+    adds a lot of material. See _safe_to_auto_merge_detail_loss's own
+    docstring for the exact two-part gate this relies on.
+    """
+
+    def _matched(self, old_val, new_val):
+        master_df = _master_df([{"building": "X", "provider": "UNION", "special_features": old_val}]) if old_val else \
+            _master_df([{"building": "X", "provider": "UNION"}])
+        new_row = ListingRow(building="X", provider="UNION", special_features=new_val)
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        return (plan.matched_changed + plan.matched_unchanged)[0]
+
+    def test_1_enrichment_auto_applies(self):
+        old = "Great natural light and contemporary building with onsite cafe"
+        new = (
+            "Great natural light and contemporary building with onsite cafe; Min. Term 36 months; Lease + MSA; "
+            "Impressive offices with stunning views of the West End, fantastic natural light. The building is very "
+            "contemporary with a double hight reception and commissionaire.; DDA compliant; Manned reception; "
+            "Shower; Cafe; Lift; Bike storage"
+        )
+        matched = self._matched(old, new)
+        self.assertNotIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs["special_features"], (old, new))
+
+    def test_2_exact_duplicate_cleanup_auto_applies(self):
+        old = (
+            "High ceilings and great natural light. Custom fitout available. ; Bike racks; Showers; Natural light; "
+            "High ceilings; Bike racks; Showers; Natural light; High ceilings"
+        )
+        new = "High ceilings and great natural light. Custom fitout available. ; Bike racks; Showers; Natural light; High ceilings"
+        matched = self._matched(old, new)
+        self.assertNotIn("special_features", matched.risky_fields)
+
+    def test_3_information_loss_requires_review(self):
+        old = "Great natural light; 5 meeting rooms; Bike storage"
+        new = "Great natural light; Bike storage"
+        matched = self._matched(old, new)
+        self.assertIn("special_features", matched.risky_fields)
+        # Left verbatim, never silently patched back together - the
+        # reviewer sees the RAW extraction, not a reconciled candidate.
+        self.assertEqual(matched.diffs["special_features"], (old, new))
+
+    def test_item_loss_within_a_comma_joined_segment_still_requires_review(self):
+        # risky_fields' own is_detail_loss call must use the SAME
+        # comma-aware split (field_name="special_features") the auto-merge
+        # loop right above it and _has_suspicious_duplicate_items right
+        # next to it already use - otherwise a fact dropped from INSIDE one
+        # semicolon-delimited item (rather than a whole item disappearing
+        # outright) is invisible to the coarse whole-item comparison the
+        # unsplit check falls back to, and silently auto-applies.
+        old = "Great natural light, spacious meeting rooms"
+        new = "Great natural light"
+        matched = self._matched(old, new)
+        self.assertIn("special_features", matched.risky_fields)
+
+    def test_4_self_duplication_requires_review(self):
+        old = (
+            "Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; minimum term 24 months; legal "
+            "structure: co-lease; excellent natural light; private outdoor spaces; high-spec showers"
+        )
+        new = (
+            "Penthouse suite, private terrace; Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; "
+            "24 month minimum term; co-lease; private outdoor spaces; high-spec showers"
+        )
+        matched = self._matched(old, new)
+        self.assertIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs["special_features"], (old, new))
+
+    def test_5_numeric_contradiction_requires_review(self):
+        old = "5 meeting rooms; 36 month term; Bike storage"
+        new = "2 meeting rooms; 24 month term; Bike storage"
+        matched = self._matched(old, new)
+        self.assertIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs["special_features"], (old, new))
+
+    def test_6_blank_current_auto_applies(self):
+        new = "Minimum term 24 months; Shower; Bike storage; Manned reception"
+        matched = self._matched(None, new)
+        self.assertNotIn("special_features", matched.risky_fields)
+        self.assertEqual(matched.diffs["special_features"], (None, new))
+
+    def test_thirty_lighterman_regression_still_requires_review(self):
+        # The original real failure this whole feature exists for - a
+        # duplicated item AND real information loss (legal structure, the
+        # descriptive paragraph) must never become auto-appliable just
+        # because auto-merge is now more permissive elsewhere.
+        old = (
+            "Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; minimum term 24 months; legal "
+            "structure: co-lease; excellent natural light; Thirty Lighterman offers a fresh alternative to the "
+            "traditional office. With flexible spaces and room to make it your own, it's designed to support "
+            "collaboration, creativity, and growth as your needs evolve.; private outdoor spaces; high-spec showers"
+        )
+        new = (
+            "Penthouse suite, private terrace; Penthouse suite, private terrace; 3 meeting rooms; 1 tea point; "
+            "minimum term 24 months; excellent natural light; private outdoor spaces; high-spec showers"
+        )
+        matched = self._matched(old, new)
+        self.assertIn("special_features", matched.risky_fields)
+
+    def test_reviewer_can_still_explicitly_approve_a_flagged_change(self):
+        old = "Great natural light; 5 meeting rooms; Bike storage"
+        new = "Great natural light; Bike storage"
+        master_records = [ListingRow(building="X", provider="UNION", special_features=old).model_dump()]
+
+        merged = master_merge.apply_merge(master_records, {0: {"special_features": new}}, [])
+
+        self.assertEqual(merged[0].special_features, new)
+
+    def test_existing_replace_with_unrelated_new_content_still_auto_merges(self):
+        # The pre-existing, already-tested shape merge_compatible_text was
+        # built for - an old item entirely replaced by different,
+        # unrelated new content (not a pure subset, no numeric
+        # contradiction) - must remain exactly as auto-mergeable as before
+        # this permissiveness change.
+        matched = self._matched("Private terrace, 10-person boardroom", "Private terrace, newly fitted kitchen")
+        self.assertNotIn("special_features", matched.risky_fields)
+        merged = matched.diffs["special_features"][1]
+        self.assertIn("newly fitted kitchen", merged)
+        self.assertIn("10-person boardroom", merged)
 
 
 class ContactsMergeTests(unittest.TestCase):

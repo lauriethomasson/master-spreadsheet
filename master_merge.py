@@ -786,23 +786,46 @@ ADDRESS_TRAILING_PUNCTUATION_FIELDS = ("address_1",)
 # there is never any left to strip here - the set is punctuation only.
 _ADDRESS_HARMLESS_TRAILING_CHARS = ",.;:"
 
+# Unicode dash-punctuation variants a copy-paste (e.g. via Word/Outlook's
+# own autocorrect, or a source PDF's own typography) routinely substitutes
+# for a plain hyphen-minus within a house-number range - hyphen (U+2010),
+# non-breaking hyphen (U+2011), figure dash (U+2012), EN DASH (U+2013, by
+# far the most common real substitution), em dash (U+2014), horizontal bar
+# (U+2015). Normalized to a plain "-" for COMPARISON only (never written
+# back to any stored value) - address_1 alone, same narrow scope as the
+# trailing-punctuation tolerance above, never a general character-class
+# strip. Confirmed real case: "19-21 Great Portland Street" (hyphen-minus)
+# vs "19–21 Great Portland Street" (en dash) - the exact same real address,
+# semantically identical, previously compared as genuinely different since
+# _normalize_text leaves every character other than whitespace/case
+# untouched. Deliberately a SUBSTITUTION (dash-for-dash), not a strip -
+# "19-21" and "19 21" must never become equal, only two different dash
+# GLYPHS meaning the same thing should.
+_ADDRESS_DASH_VARIANTS_RE = re.compile("[‐‑‒–—―]")
+
 
 def _normalize_address_for_comparison(value) -> str:
     """
-    address_1's own tolerant-comparison form: _normalize_text's case/
-    whitespace folding, PLUS a harmless trailing punctuation mark stripped
-    (see _ADDRESS_HARMLESS_TRAILING_CHARS/ADDRESS_TRAILING_PUNCTUATION_
-    FIELDS' own docstring for the real "33 Cavendish Square," case this
-    exists for). Deliberately NOT a general remove_all_punctuation() - a
-    hyphen inside the string (a real house-number range, "27-30") is left
-    completely untouched, and so is any OTHER mid-string punctuation/
-    content difference; only the trailing mark(s) are stripped, so two
+    address_1's own tolerant-comparison form: every Unicode dash variant
+    folded to a plain hyphen-minus (see _ADDRESS_DASH_VARIANTS_RE's own
+    docstring), then _normalize_text's case/whitespace folding, PLUS a
+    harmless trailing punctuation mark stripped (see _ADDRESS_HARMLESS_
+    TRAILING_CHARS/ADDRESS_TRAILING_PUNCTUATION_FIELDS' own docstring for
+    the real "33 Cavendish Square," case this exists for). Deliberately
+    NOT a general remove_all_punctuation() - a hyphen inside the string (a
+    real house-number range, "27-30") is left completely untouched (only
+    ever substituted for an equivalent dash GLYPH, never removed), and so
+    is any OTHER mid-string punctuation/content difference; only the
+    trailing mark(s) are stripped and dash variants folded, so two
     genuinely different addresses ("33 Cavendish Square" vs "34 Cavendish
-    Square", or vs "33 Cavendish Street", or vs "35-37 Cavendish Square")
-    still compare different exactly as before - only the digits/letters
-    themselves ever decide that, completely unaffected by this.
+    Square", "33 Cavendish Square" vs "33 Cavendish Street", "19-21 Great
+    Portland Street" vs "19 Great Portland Street", or vs "19-23 Great
+    Portland Street") still compare different exactly as before - only the
+    digits/letters themselves (and, now, dash GLYPH choice) ever decide
+    that, completely unaffected by this.
     """
-    return _normalize_text(value).rstrip(_ADDRESS_HARMLESS_TRAILING_CHARS)
+    text = _ADDRESS_DASH_VARIANTS_RE.sub("-", str(value))
+    return _normalize_text(text).rstrip(_ADDRESS_HARMLESS_TRAILING_CHARS)
 
 
 # Confirmed real case (Kitt's Availability file): rent_pcm/rent_psf
@@ -934,6 +957,21 @@ def _significant_words(item: str) -> frozenset:
     return frozenset(w for w in words if len(w) > 2 and w not in _STOPWORDS)
 
 
+def _item_numbers(item: str) -> frozenset:
+    """
+    Every digit sequence in `item`, as a set of number strings - used only
+    by _items_similar's own numeric-contradiction veto. A PARTIAL overlap
+    (one number shared, another genuinely different - e.g. "5 meeting
+    rooms on floor 3" vs "2 meeting rooms on floor 3") still makes the two
+    sets unequal, so it's still treated as a contradiction by that check's
+    own `numbers_a != numbers_b` comparison - deliberately not "completely
+    disjoint" specifically, since a real changed fact routinely sits
+    alongside an unrelated, unchanged number in the same item, and
+    partial-overlap-as-safe would miss exactly that shape.
+    """
+    return frozenset(re.findall(r"\d+", item))
+
+
 def _items_similar(item_a: str, item_b: str) -> bool:
     """
     True if item_a and item_b look like the same underlying fact, tolerating
@@ -968,9 +1006,28 @@ def _items_similar(item_a: str, item_b: str) -> bool:
     genuine detail-loss detection - two items that are actually different,
     however short, still correctly fall through to the significant-words
     comparison (or fail it) exactly as before.
+
+    A NUMERIC CONTRADICTION vetoes similarity outright, checked before the
+    significant-words comparison below - two items can share every
+    significant WORD while stating a genuinely different FACT purely via
+    an embedded number ("5 meeting rooms" vs "2 meeting rooms", "36 month
+    term" vs "24 month term") - _significant_words itself only tokenizes
+    letters, so the word-overlap ratio alone reads these as a 100% match
+    ("meeting"/"rooms" shared, the number itself never compared at all),
+    exactly the shape a genuine changed FACT (not a reworded one) takes.
+    Only fires when BOTH items contain at least one number and those
+    number sets genuinely differ - an item with no number at all, or two
+    items agreeing on every number they each state, are both unaffected
+    (see _item_numbers's own docstring for why a PARTIAL number overlap -
+    e.g. one shared floor number alongside one genuinely different room
+    count - still counts as a contradiction, not a partial match).
     """
     if " ".join(item_a.lower().split()) == " ".join(item_b.lower().split()):
         return True
+
+    numbers_a, numbers_b = _item_numbers(item_a), _item_numbers(item_b)
+    if numbers_a and numbers_b and numbers_a != numbers_b:
+        return False
 
     words_a, words_b = _significant_words(item_a), _significant_words(item_b)
     if not words_a or not words_b:
@@ -1019,6 +1076,69 @@ def is_detail_loss(old_val, new_val, field_name: str = None) -> bool:
         return False
 
     return any(not any(_items_similar(old_item, new_item) for new_item in new_items) for old_item in old_items)
+
+
+def _safe_to_auto_merge_detail_loss(old_val, new_val, field_name: str = None) -> bool:
+    """
+    True when is_detail_loss(old_val, new_val) is safe for build_merge_
+    plan's own auto-merge loop to resolve via merge_compatible_text,
+    rather than needing a manual review decision - a NARROWER question
+    than is_detail_loss itself: not every old-item-goes-unrestated shape
+    is safe to silently patch back together, even though every one of
+    them is real evidence worth flagging for review on its own.
+
+    False (never safe, must go to manual review even though merge_
+    compatible_text COULD technically reassemble something) when either:
+
+    1. new_val's own items are a pure EXACT-match SUBSET of old_val's (see
+       _detail_items/normalize_key) - old_val had something new_val simply
+       dropped, with NOTHING new offered in its place at all. Confirmed
+       real want: "Great natural light; 5 meeting rooms; Bike storage" ->
+       "Great natural light; Bike storage" must be a review decision, not
+       silently re-patched back to "...; Bike storage; 5 meeting rooms" -
+       a pure loss with zero new information is exactly the shape a
+       reviewer needs to see and decide on, not have quietly reconciled
+       for them.
+    2. A NUMERIC CONTRADICTION exists between an old item and a new item
+       that otherwise shares enough words to be the "same" topic (see
+       _item_numbers/_items_similar's own numeric veto) - "5 meeting
+       rooms" -> "2 meeting rooms" is a genuinely CHANGED fact, not two
+       independent facts safe to concatenate; silently keeping both
+       ("2 meeting rooms; ...; 5 meeting rooms") would be actively
+       misleading, worse than either value alone.
+
+    Still True (safe to auto-merge) for the ordinary, already-established
+    case merge_compatible_text exists for: an old item entirely REPLACED
+    by a genuinely different, unrelated new item (e.g. "10-person
+    boardroom" -> "newly fitted kitchen", sharing no words and no
+    numbers) - new_val is not a pure subset there (it offers real new
+    content), and there's no numeric contradiction to find, so this stays
+    exactly as permissive as it always was for that real, already-tested
+    shape.
+    """
+    old_items = _detail_items(str(old_val), field_name)
+    new_items = _detail_items(str(new_val), field_name)
+
+    old_keys = {normalize_key(i) for i in old_items if normalize_key(i)}
+    if old_keys and all((normalize_key(i) in old_keys) for i in new_items if normalize_key(i)):
+        return False
+
+    for old_item in old_items:
+        old_numbers = _item_numbers(old_item)
+        if not old_numbers:
+            continue
+        for new_item in new_items:
+            new_numbers = _item_numbers(new_item)
+            if not new_numbers or new_numbers == old_numbers:
+                continue
+            words_a, words_b = _significant_words(old_item), _significant_words(new_item)
+            if not words_a or not words_b:
+                continue
+            overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+            if overlap >= ITEM_SIMILARITY_THRESHOLD:
+                return False
+
+    return True
 
 
 def _has_suspicious_duplicate_items(text, field_name: str = None) -> bool:
@@ -2823,13 +2943,22 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 # nobody ever reviewing it.
                 if _has_suspicious_duplicate_items(new_val, f):
                     continue
-                if is_detail_loss(old_val, new_val, field_name=f):
+                # A pure, nothing-added loss or a genuine numeric
+                # contradiction (see _safe_to_auto_merge_detail_loss's own
+                # docstring) is a review decision, never something to
+                # silently patch back together - only the ordinary
+                # "old item replaced by different, unrelated new content"
+                # shape merge_compatible_text was actually built for stays
+                # auto-mergeable.
+                if is_detail_loss(old_val, new_val, field_name=f) and _safe_to_auto_merge_detail_loss(
+                    old_val, new_val, field_name=f
+                ):
                     diffs[f] = (old_val, merge_compatible_text(old_val, new_val, field_name=f))
 
             risky_fields = frozenset(
                 f for f in diffs
                 if f in DETAIL_LOSS_MERGE_FIELDS and (
-                    is_detail_loss(*diffs[f])
+                    is_detail_loss(*diffs[f], field_name=f)
                     or is_richness_regression(*diffs[f])
                     or _has_suspicious_duplicate_items(diffs[f][1], f)
                 )
