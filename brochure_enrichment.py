@@ -1184,7 +1184,7 @@ def needs_enrichment(row: ListingRow) -> bool:
     return _is_blank(row.special_features) or bool(row.brochure_link)
 
 
-def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow) -> bool:
+def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow, special_features_matched: bool = False) -> bool:
     """
     True if row is missing a real value for at least one of
     ENRICHABLE_FIELDS, judged STRICTLY - unlike needs_enrichment, a truthy
@@ -1209,24 +1209,26 @@ def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow) -> bool:
     always-eligible-for-recombine behavior.
 
     special_features is checked differently from every other field here,
-    using row.special_features_matched (see that field's own schema.py
-    docstring) rather than a plain blank check on row.special_features
-    itself - a confirmed real gap a plain blank check can't close: a row's
-    special_features can be non-blank (short boilerplate carried over from
-    the original source extraction, never actually brochure-sourced) while
-    STILL never having received a genuine unit-/building-/property-level
-    combine. A plain blank check would call such a row "not genuinely
-    blank" - exactly wrong for THIS function's own purpose, since it's
-    what let a row like this get silently, permanently skipped on a
-    resumed run once its shared brochure URL was already marked "ok" by an
-    earlier pass, even though the combine that would have actually
-    resolved it never once ran. special_features_matched is the evidence
-    needed to ask the real question ("did a genuine combine ever land
-    here", not "is there any text here at all") that this function's own
-    docstring above already explains needs_enrichment's blunt brochure_
-    link-based override can't answer on its own - still gated on an
-    eligible brochure_link existing at all, since a row with nothing to
-    fetch has no way to ever resolve this regardless.
+    using the caller-supplied `special_features_matched` flag (see enrich_
+    rows_grouped's own special_features_matched param docstring - a per-
+    staging-file sidecar record, NOT a ListingRow field, since a row's own
+    text is not reliable evidence of this) rather than a plain blank check
+    on row.special_features itself - a confirmed real gap a plain blank
+    check can't close: a row's special_features can be non-blank (short
+    boilerplate carried over from the original source extraction, never
+    actually brochure-sourced) while STILL never having received a genuine
+    unit-/building-/property-level combine. A plain blank check would call
+    such a row "not genuinely blank" - exactly wrong for THIS function's
+    own purpose, since it's what let a row like this get silently,
+    permanently skipped on a resumed run once its shared brochure URL was
+    already marked "ok" by an earlier pass, even though the combine that
+    would have actually resolved it never once ran. special_features_
+    matched is the evidence needed to ask the real question ("did a
+    genuine combine ever land here", not "is there any text here at all")
+    that this function's own docstring above already explains needs_
+    enrichment's blunt brochure_link-based override can't answer on its
+    own - still gated on an eligible brochure_link existing at all, since a
+    row with nothing to fetch has no way to ever resolve this regardless.
     """
     for field in ENRICHABLE_FIELDS:
         if field == "address_1":
@@ -1234,7 +1236,7 @@ def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow) -> bool:
                 return True
             continue
         if field == "special_features":
-            if row.special_features_matched is not True and bool(row.brochure_link):
+            if not special_features_matched and bool(row.brochure_link):
                 return True
             continue
         if _is_blank(getattr(row, field)):
@@ -3787,7 +3789,7 @@ def enrich_rows_grouped(
     rows: list, progress_callback=None, checkpoint_callback=None, max_workers: int = DEFAULT_MAX_WORKERS,
     already_processed: dict = None, url_checkpoint_callback=None,
     floorplan_already_processed: dict = None, floorplan_checkpoint_callback=None,
-    floorplan_url_checkpoint_callback=None,
+    floorplan_url_checkpoint_callback=None, special_features_matched: dict = None,
 ):
     """
     (rows, log, stats) - like enrich_rows, but processes each DISTINCT
@@ -3935,9 +3937,42 @@ def enrich_rows_grouped(
     the caller's own "how much remains" count blind to it entirely (see
     this function's own returned stats: unique_floorplans_considered/
     floorplans_read_ok/floorplans_unavailable/floorplan_processed_urls).
+
+    special_features_matched ({str(row_index): True}, from a PRIOR call of
+    this same function against this same staging file - see storage.
+    file_store's own persistence of this alongside processed_urls) is the
+    per-staging-file sidecar record of which rows have ever received a
+    genuine unit-/building-/property-level special_features combine (see
+    _row_has_a_genuinely_blank_enrichable_field's own docstring on why a
+    row's own special_features text alone is never reliable evidence of
+    this). Deliberately NOT a ListingRow field - it's pure resume
+    bookkeeping for THIS function's own still_blank_counts check below,
+    never a property fact, so it has no business living in master.xlsx or
+    a staging file's own spreadsheet schema. Keyed by the row's plain
+    positional index within `rows`, stringified (matching how a JSON
+    sidecar naturally round-trips object keys) - safe because this
+    function and _enrich_rows_from_floorplans both build their own
+    returned list as `current = list(rows)` and only ever replace entries
+    IN PLACE by index, never reorder/add/drop a row (see _regeocode_rows_
+    with_newly_backfilled_addresses' own docstring, which relies on this
+    same guarantee for its own index-paired zip), and storage.file_store.
+    update_staging_rows persists that same full ordered list wholesale on
+    every checkpoint - so a row's index stays stable across however many
+    resumed calls this staging file goes through. Defaults to {} (nothing
+    previously matched - identical to every row starting unmatched, the
+    only possible state before this parameter existed).
+
+    stats["special_features_matched"] ({str(row_index): True}) reports
+    every row that received a genuine combine during THIS call only (never
+    includes an entry already true coming in) - same "this call's own new
+    knowledge, merge it yourself" contract as stats["processed_urls"]
+    above, for the same reason: a caller can always tell "what did THIS
+    call itself just learn" apart from "what was already known coming in".
     """
     progress_callback = progress_callback or (lambda done, total, label: None)
     already_processed = already_processed or {}
+    special_features_matched = special_features_matched or {}
+    special_features_matched_this_call = {}
     eligible, unique_urls = eligible_rows_and_brochures(rows)
 
     # indices_by_url (needs_enrichment-based, UNCHANGED by this fix) drives
@@ -3971,7 +4006,8 @@ def enrich_rows_grouped(
         if not _is_eligible_brochure_url(row.brochure_link):
             continue
         sharing_counts[row.brochure_link] = sharing_counts.get(row.brochure_link, 0) + 1
-        if _row_has_a_genuinely_blank_enrichable_field(row):
+        row_matched = bool(special_features_matched.get(str(i)))
+        if _row_has_a_genuinely_blank_enrichable_field(row, special_features_matched=row_matched):
             still_blank_counts[row.brochure_link] = still_blank_counts.get(row.brochure_link, 0) + 1
         if needs_enrichment(row):
             indices_by_url.setdefault(row.brochure_link, []).append(i)
@@ -4012,6 +4048,7 @@ def enrich_rows_grouped(
             "unique_brochures_considered": len(unique_urls), "brochures_read_ok": 0,
             "brochures_unavailable": 0, "rows_eligible": len(eligible), "rows_enriched": len(log),
             "processed_urls": processed_urls,
+            "special_features_matched": special_features_matched_this_call,
             "document_issues": document_issues + floorplan_stats["document_issues"],
             "unique_floorplans_considered": floorplan_stats["unique_floorplans_considered"],
             "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
@@ -4114,24 +4151,26 @@ def enrich_rows_grouped(
                         file=sys.stderr,
                     )
                     new_row, fields = rows[i], []
-                # special_features_matched update (see that field's own
-                # schema.py docstring) - True only when _apply_units_to_row
-                # actually changed special_features THIS call (present in
-                # its own `fields` list, never merely carried the row's own
-                # existing value forward unchanged), folded into the same
-                # model_copy as brochure_link_broken above since both are
-                # per-row diagnostic flags decided at this exact point.
-                # Never set False here (or anywhere else) - see that
-                # field's own docstring for why there's deliberately no
-                # "confirmed nothing here" state the way brochure_link_
-                # broken has one.
                 update = {}
                 if link_broken_update is not None:
                     update["brochure_link_broken"] = link_broken_update
-                if "special_features" in fields:
-                    update["special_features_matched"] = True
                 if update:
                     new_row = new_row.model_copy(update=update)
+                # special_features_matched sidecar record (see enrich_rows_
+                # grouped's own special_features_matched param docstring) -
+                # True only when _apply_units_to_row actually changed
+                # special_features THIS call (present in its own `fields`
+                # list, never merely carried the row's own existing value
+                # forward unchanged). Recorded here, NOT on the row itself
+                # (unlike brochure_link_broken above) - this is per-staging-
+                # file resume bookkeeping, never a spreadsheet column.
+                # Never recorded as False here (or anywhere else) - same
+                # "no confirmed-nothing-here state" reasoning as brochure_
+                # link_broken's own None-vs-False distinction, since a
+                # brochure that matched nothing today may still match once
+                # a sibling row's own matching logic improves.
+                if "special_features" in fields:
+                    special_features_matched_this_call[str(i)] = True
                 current[i] = new_row
                 if fields:
                     if (
@@ -4230,6 +4269,7 @@ def enrich_rows_grouped(
         "rows_eligible": len(eligible),
         "rows_enriched": len(log),
         "processed_urls": processed_urls,
+        "special_features_matched": special_features_matched_this_call,
         "document_issues": document_issues + floorplan_stats["document_issues"],
         "unique_floorplans_considered": floorplan_stats["unique_floorplans_considered"],
         "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
@@ -4299,6 +4339,7 @@ def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriche
 
 def run_brochure_enrichment(
     rows: list, staging_path: str, already_processed: dict, floorplan_already_processed: dict = None,
+    special_features_matched: dict = None,
 ) -> list:
     """
     The Streamlit-aware orchestration shared by BOTH callers that ever run
@@ -4337,8 +4378,19 @@ def run_brochure_enrichment(
     knowledge of BOTH passes, never just whichever one just changed, since
     set_staging_enrichment_progress fully replaces the persisted record on
     every call).
+
+    special_features_matched, when given, is a PRIOR call's own persisted
+    sidecar record (see storage.file_store.set_staging_enrichment_summary's
+    own param of the same name, and brochure_enrichment.enrich_rows_
+    grouped's own param/stats-key docstrings) - threaded straight through
+    to enrich_rows_grouped and merged with this call's own new matches
+    before being persisted again, the exact same "in, merge, persist
+    cumulative" shape as already_processed/processed_urls above. Defaults
+    to {} for the ordinary fresh-run case, identical to every prior
+    behavior before this parameter existed.
     """
     floorplan_already_processed = floorplan_already_processed or {}
+    special_features_matched = special_features_matched or {}
     eligible, unique_urls = eligible_rows_and_brochures(rows)
     urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
 
@@ -4375,6 +4427,7 @@ def run_brochure_enrichment(
         staging_path, already_processed, len(unique_urls),
         floorplan_processed_urls=known_floorplan_processed_urls,
         unique_floorplans_considered=known_unique_floorplans_considered,
+        special_features_matched=special_features_matched,
     )
 
     def on_progress(done, total, label):
@@ -4415,6 +4468,7 @@ def run_brochure_enrichment(
         floorplan_already_processed=floorplan_already_processed,
         floorplan_checkpoint_callback=on_checkpoint,
         floorplan_url_checkpoint_callback=on_floorplan_url_checkpoint,
+        special_features_matched=special_features_matched,
     )
     progress_slot.empty()
 
@@ -4429,12 +4483,14 @@ def run_brochure_enrichment(
 
     cumulative_processed_urls = {**already_processed, **stats["processed_urls"]}
     cumulative_floorplan_processed_urls = {**floorplan_already_processed, **stats["floorplan_processed_urls"]}
+    cumulative_special_features_matched = {**special_features_matched, **stats["special_features_matched"]}
     update_staging_rows(staging_path, enriched_rows)
     set_staging_enrichment_summary(
         staging_path, stats, cumulative_processed_urls,
         floorplan_processed_urls=cumulative_floorplan_processed_urls,
         unique_floorplans_considered=stats["unique_floorplans_considered"],
         document_issues=stats["document_issues"],
+        special_features_matched=cumulative_special_features_matched,
     )
 
     counts = _derive_cumulative_counts(cumulative_processed_urls)

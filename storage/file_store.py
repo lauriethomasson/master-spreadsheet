@@ -181,6 +181,7 @@ def _derive_floorplan_counts(floorplan_processed_urls: dict, unique_floorplans_c
 def set_staging_enrichment_summary(
     path: str, stats: dict, processed_urls: dict,
     floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0, document_issues: list = None,
+    special_features_matched: dict = None,
 ) -> None:
     """
     Persists brochure enrichment's own FINAL summary stats into this
@@ -228,6 +229,17 @@ def set_staging_enrichment_summary(
     reflects everything still genuinely outstanding, with no separate merge
     against a prior run's stale list needed). Defaults to [] so every
     existing caller that predates this stays unaffected.
+
+    special_features_matched ({str(row_index): True}) is the FULL
+    CUMULATIVE sidecar record of which rows have ever received a genuine
+    special_features combine (see brochure_enrichment.enrich_rows_
+    grouped's own special_features_matched param/stats key docstrings) -
+    the SAME kind of resume bookkeeping as processed_urls above, just
+    keyed by row index instead of URL. Deliberately NOT a ListingRow
+    field/spreadsheet column - see schema.py's own removal of that earlier
+    approach - so this meta.json sidecar is its only persisted home.
+    Defaults to {} so every existing caller that predates this stays
+    unaffected.
     """
     meta = _read_meta(path)
     meta["brochure_enrichment"] = {
@@ -239,6 +251,7 @@ def set_staging_enrichment_summary(
         "floorplan_processed_urls": dict(floorplan_processed_urls or {}),
         **_derive_floorplan_counts(floorplan_processed_urls, unique_floorplans_considered),
         "document_issues": list(document_issues or []),
+        "special_features_matched": dict(special_features_matched or {}),
     }
     _write_meta(path, meta)
 
@@ -246,6 +259,7 @@ def set_staging_enrichment_summary(
 def set_staging_enrichment_progress(
     path: str, processed_urls: dict, unique_brochures_considered: int,
     floorplan_processed_urls: dict = None, unique_floorplans_considered: int = 0, document_issues: list = None,
+    special_features_matched: dict = None,
 ) -> None:
     """
     Persists an INTERIM brochure-enrichment marker - status="in_progress"
@@ -288,6 +302,17 @@ def set_staging_enrichment_progress(
     considered - brochures_done AND unique_floorplans_considered -
     floorplans_done are zero, never brochures alone (see pages/2_Review_
     and_Master.py's own "remaining" calculation).
+
+    special_features_matched - same cumulative sidecar record as set_
+    staging_enrichment_summary's own param of the same name (see its own
+    docstring); like document_issues above, only ever written here as
+    whatever the caller already knows going into this attempt, never
+    threaded through the per-URL checkpoint mid-run (see run_brochure_
+    enrichment) - an interruption before the final summary call simply
+    means this run's own new matches, like its own new document_issues,
+    aren't yet reflected here; a subsequent resume just re-derives the
+    same still-missing rows from the row content itself, exactly as
+    conservatively safe as never having recorded them at all.
     """
     meta = _read_meta(path)
     meta["brochure_enrichment"] = {
@@ -297,6 +322,7 @@ def set_staging_enrichment_progress(
         "floorplan_processed_urls": dict(floorplan_processed_urls or {}),
         **_derive_floorplan_counts(floorplan_processed_urls, unique_floorplans_considered),
         "document_issues": list(document_issues or []),
+        "special_features_matched": dict(special_features_matched or {}),
     }
     _write_meta(path, meta)
 

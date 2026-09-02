@@ -94,14 +94,10 @@ DATA_ROW_HEIGHT = 60
 # address_conflict is the same idea once more (see that field's own
 # schema.py docstring) - a raw text column would show the SAME conflict
 # note the Review page's own risky-field caption already surfaces, in a
-# spot no one is looking at it during review. special_features_matched is
-# the same diagnostic-pipeline-metadata idea again (see that field's own
-# schema.py docstring and build_merge_plan's own routing of it into
-# silent_updates) - purely enrich_rows_grouped's own resume bookkeeping,
-# never a fact about the property itself.
+# spot no one is looking at it during review.
 HIDDEN_COLUMNS = [
     "source_file", "property_id", "brochure_link_broken", "brochure_link_is_floorplan", "floorplan_link",
-    "geocode_unverified", "development_name", "address_conflict", "special_features_matched",
+    "geocode_unverified", "development_name", "address_conflict",
 ]
 
 

@@ -64,36 +64,6 @@ class ListingRow(BaseModel):
     # this run can never accidentally clear a master row's own already-
     # confirmed True.
     brochure_link_broken: Optional[bool] = None
-    # Tri-state, never Gemini-set (like brochure_link_broken above) - set
-    # True by brochure_enrichment.py's own enrich_rows_grouped, in the SAME
-    # per-row apply loop as brochure_link_broken above, whenever a genuine
-    # unit-, building-, or property-level brochure combine actually ADDED
-    # something to THIS row's own special_features this call (see
-    # _apply_units_to_row's own return value: "special_features" only
-    # appears in its own `fields` list when the combine genuinely changed
-    # it, never merely carried the row's own pre-existing value forward
-    # unchanged). Never reset back to False once True - the combine itself
-    # is additive/monotonic (see _apply_units_to_row's own docstring, it
-    # only ever appends, never removes), so a row that has genuinely
-    # received brochure content once stays considered resolved on this
-    # question for good, even on a later call whose own units happen not to
-    # add anything further.
-    #
-    # None means "no genuine combine has ever landed here yet" - the honest
-    # default a fresh row starts at, and (same reasoning as brochure_link_
-    # broken above) deliberately NOT the same as an explicit False, which
-    # this field never actually writes anywhere: there's no "confirmed
-    # nothing will ever be found" state the way brochure_link_broken has a
-    # confirmed-dead-link one, since a brochure that matched nothing today
-    # may still match once a sibling row's own matching logic improves (see
-    # _row_has_a_genuinely_blank_enrichable_field's own docstring for
-    # exactly the case this exists to fix: a row whose special_features
-    # already carries short, non-brochure-sourced boilerplate text looks
-    # indistinguishable from a genuinely-enriched one under a plain
-    # blank-check alone, which is exactly what let such a row get silently
-    # skipped on a resumed enrichment run once its shared brochure URL was
-    # already marked "ok" from an earlier pass).
-    special_features_matched: Optional[bool] = None
     submarket: Optional[str] = None
     building: str
     floor_unit: Optional[str] = None

@@ -2209,46 +2209,6 @@ class BuildMergePlanBrochureLinkBrokenTests(unittest.TestCase):
         self.assertIs(merged[0].brochure_link_broken, False)
 
 
-class BuildMergePlanSpecialFeaturesMatchedTests(unittest.TestCase):
-    """
-    ListingRow.special_features_matched - the same diagnostic-pipeline-
-    metadata treatment as brochure_link_broken above (see
-    BuildMergePlanBrochureLinkBrokenTests), applied to a different field.
-    """
-
-    def test_a_genuine_change_is_routed_to_silent_never_to_diffs(self):
-        master_df = _master_df([{"building": "Dead Design House", "special_features_matched": None}])
-        new_row = ListingRow(building="Dead Design House", special_features_matched=True)
-
-        plan = master_merge.build_merge_plan([new_row], master_df)
-
-        matched = (plan.matched_changed + plan.matched_unchanged)[0]
-        self.assertNotIn("special_features_matched", matched.diffs)
-        self.assertEqual(matched.silent_updates.get("special_features_matched"), True)
-
-    def test_a_fresh_row_that_never_recombined_never_disturbs_master(self):
-        # A row that simply wasn't re-enriched this run (special_features_
-        # matched defaults to None) must never accidentally clear master's
-        # own already-confirmed True - diff_fields' own blank-new-value-skip
-        # rule is what gives this for free (None is blank, so this field
-        # never even enters diffs or silent at all here).
-        master_df = _master_df([{"building": "Dead Design House", "special_features_matched": True}])
-        new_row = ListingRow(building="Dead Design House")  # special_features_matched defaults to None
-
-        plan = master_merge.build_merge_plan([new_row], master_df)
-
-        matched = (plan.matched_changed + plan.matched_unchanged)[0]
-        self.assertNotIn("special_features_matched", matched.diffs)
-        self.assertNotIn("special_features_matched", matched.silent_updates)
-
-    def test_applying_the_silent_update_actually_reaches_the_merged_row(self):
-        master_records = [ListingRow(building="Dead Design House", special_features_matched=None).model_dump()]
-
-        merged = master_merge.apply_merge(master_records, {0: {"special_features_matched": True}}, [])
-
-        self.assertIs(merged[0].special_features_matched, True)
-
-
 class AddressFormattingFullPipelineTests(unittest.TestCase):
     """
     Full build_merge_plan pipeline coverage for the address_1 trailing-

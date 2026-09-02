@@ -2360,6 +2360,7 @@ def _render_brochure_enrichment_summary(pending: list, superseded: list = ()) ->
                         brochure_enrichment.run_brochure_enrichment(
                             rows, path, already_processed=stats["processed_urls"],
                             floorplan_already_processed=stats.get("floorplan_processed_urls", {}),
+                            special_features_matched=stats.get("special_features_matched", {}),
                         )
                     st.rerun()
             elif stats:

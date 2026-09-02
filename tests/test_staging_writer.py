@@ -259,22 +259,24 @@ class BrokenBrochureLinkDisplayTests(unittest.TestCase):
         column_letter = ws.cell(row=1, column=col_idx).column_letter
         self.assertTrue(ws.column_dimensions[column_letter].hidden)
 
-    def test_special_features_matched_column_is_hidden_not_shown_as_a_raw_flag(self):
-        # special_features_matched is the same kind of pipeline diagnostics
-        # as brochure_link_broken above (see that field's own schema.py
-        # docstring) - hidden rather than dropped, still written with its
-        # real value.
-        row = ListingRow(building="A", brochure_link="https://example.com/ok.pdf", special_features_matched=True)
+    def test_special_features_matched_never_appears_as_a_column_at_all(self):
+        # special_features_matched WAS a ListingRow field/hidden column
+        # (like brochure_link_broken above) but was deliberately moved out
+        # of the spreadsheet schema entirely - it's now pure per-staging-
+        # file resume bookkeeping, tracked in storage.file_store's own
+        # meta.json sidecar instead (see enrich_rows_grouped's own
+        # special_features_matched param docstring). Proves the removal
+        # actually took by writing a real row through the real writer and
+        # inspecting the real column headers that come back, not just
+        # checking ListingRow.model_fields/HIDDEN_COLUMNS in code.
+        row = ListingRow(building="A", brochure_link="https://example.com/ok.pdf")
         buffer = BytesIO()
         write_rows_to_xlsx([row], buffer)
         buffer.seek(0)
         wb = load_workbook(buffer)
-        ws = wb.active
-        headers = [cell.value for cell in ws[1]]
-        col_idx = headers.index(title_case_label("special_features_matched")) + 1
-        column_letter = ws.cell(row=1, column=col_idx).column_letter
-        self.assertTrue(ws.column_dimensions[column_letter].hidden)
-        self.assertEqual(ws.cell(row=2, column=col_idx).value, True)
+        headers = [cell.value for cell in wb.active[1]]
+        self.assertNotIn(title_case_label("special_features_matched"), headers)
+        self.assertNotIn("special_features_matched", ListingRow.model_fields)
 
     def test_geocode_unverified_column_is_hidden_not_shown_as_a_raw_flag(self):
         # geocode_unverified is diagnostic pipeline metadata (see its own
@@ -520,6 +522,30 @@ class LegacyColumnCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].building, "A")
         self.assertFalse(hasattr(rows[0], "rent_psf_min"))
+
+    def test_a_pre_removal_master_or_staging_file_with_the_old_special_features_matched_column_loads_cleanly(self):
+        # Same general "removed field is dropped harmlessly, not a KeyError/
+        # ValidationError" guarantee as the two tests above, exercised for
+        # the SPECIFIC field this migration removes: an already-existing
+        # master.xlsx/staging file written before special_features_matched
+        # moved out of the spreadsheet schema still has a real "Special
+        # Features Matched" column with real historical True/None values -
+        # confirms loading it now is a complete no-op for that column (see
+        # master_writer.py's own docstring: master.xlsx gets a full atomic
+        # rewrite from the CURRENT schema on every successful merge, so no
+        # one-off migration is needed - the column simply stops being
+        # written the next time any batch is approved).
+        import pandas as pd
+
+        from storage.file_store import dataframe_to_listing_rows
+
+        df = pd.DataFrame([{
+            "building": "210 Euston Road", "provider": "Colliers", "special_features_matched": True,
+        }])
+        rows = dataframe_to_listing_rows(df)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].building, "210 Euston Road")
+        self.assertFalse(hasattr(rows[0], "special_features_matched"))
 
 
 if __name__ == "__main__":

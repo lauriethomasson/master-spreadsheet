@@ -530,6 +530,42 @@ class BrochureEnrichmentProgressTests(IsolatedCwdTestCase):
             stats["processed_urls"], {"https://a.pdf": "ok", "https://b.pdf": "ok", "https://c.pdf": "unavailable"},
         )
 
+    def test_special_features_matched_round_trips_through_both_setters(self):
+        # special_features_matched ({str(row_index): True}) is the same
+        # kind of cumulative per-run sidecar record as processed_urls above
+        # - see brochure_enrichment.enrich_rows_grouped's own param/stats
+        # key docstrings - just persisted here instead of as a ListingRow
+        # field/spreadsheet column (see schema.py's own removal of that
+        # earlier approach).
+        staging_path = file_store.save_staging_file([ListingRow(building="A"), ListingRow(building="B")], "a.xlsx")
+
+        file_store.set_staging_enrichment_progress(
+            staging_path, {"https://a.pdf": "ok"}, 2, special_features_matched={"0": True},
+        )
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+        self.assertEqual(stats["special_features_matched"], {"0": True})
+
+        file_store.set_staging_enrichment_summary(
+            staging_path, {"unique_brochures_considered": 2, "rows_eligible": 2, "rows_enriched": 2},
+            {"https://a.pdf": "ok", "https://b.pdf": "ok"},
+            special_features_matched={"0": True, "1": True},
+        )
+        stats = file_store.get_staging_enrichment_summary(staging_path)
+        self.assertEqual(stats["special_features_matched"], {"0": True, "1": True})
+
+    def test_special_features_matched_defaults_to_empty_dict_when_omitted(self):
+        # Every existing caller that predates this parameter must stay
+        # unaffected - never a missing key, always an empty dict a caller
+        # can .get(..., {}) or index into unconditionally.
+        staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
+
+        file_store.set_staging_enrichment_summary(
+            staging_path, {"unique_brochures_considered": 1, "rows_eligible": 1, "rows_enriched": 1},
+            {"https://a.pdf": "ok"},
+        )
+
+        self.assertEqual(file_store.get_staging_enrichment_summary(staging_path)["special_features_matched"], {})
+
     def test_final_summary_overwrites_an_earlier_progress_marker(self):
         staging_path = file_store.save_staging_file([ListingRow(building="A")], "a.xlsx")
         file_store.set_staging_enrichment_progress(staging_path, {"https://a.pdf": "ok"}, 10)

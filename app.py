@@ -365,7 +365,7 @@ def _rows_dropped_as_duplicate_sheet_extractions(header_mapped_sheets: list) -> 
 
 def _run_automatic_brochure_enrichment(
     rows: list[ListingRow], staging_path: str, already_processed: dict = None,
-    floorplan_already_processed: dict = None, row_count: int = None,
+    floorplan_already_processed: dict = None, special_features_matched: dict = None, row_count: int = None,
 ) -> list[ListingRow]:
     """
     Runs immediately after a FRESH spreadsheet OR email upload's base rows
@@ -383,9 +383,12 @@ def _run_automatic_brochure_enrichment(
     caller's own "reused but incomplete" branch below) - already-"ok"
     brochures/floorplans are never re-fetched/re-sent to Gemini just
     because a re-upload of the identical file happened to land on a NEW
-    staging entry rather than the original one. Both default to {} (nothing
-    to resume) for the ordinary fresh-upload case, identical to every prior
-    behavior before either parameter existed.
+    staging entry rather than the original one. special_features_matched
+    ({str(row_index): True}) is the same PRIOR upload's own persisted
+    special-features-resume sidecar (see brochure_enrichment.
+    enrich_rows_grouped's own param docstring) - all three default to {}
+    (nothing to resume) for the ordinary fresh-upload case, identical to
+    every prior behavior before any of them existed.
 
     row_count, when given (the caller's freshly-extracted row count - never
     passed for the "reused but incomplete" resume case below, since that
@@ -443,6 +446,7 @@ def _run_automatic_brochure_enrichment(
     return brochure_enrichment.run_brochure_enrichment(
         rows, staging_path, already_processed=already_processed or {},
         floorplan_already_processed=floorplan_already_processed or {},
+        special_features_matched=special_features_matched or {},
     )
 
 
@@ -1324,6 +1328,7 @@ with page_setup.setup_page("upload"):
                     # the automatic-enrichment call site further down.
                     resume_already_processed = None
                     resume_floorplan_already_processed = None
+                    resume_special_features_matched = None
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
@@ -1347,6 +1352,9 @@ with page_setup.setup_page("upload"):
                             resume_already_processed = previous_enrichment.get("processed_urls", {})
                             resume_floorplan_already_processed = previous_enrichment.get(
                                 "floorplan_processed_urls", {}
+                            )
+                            resume_special_features_matched = previous_enrichment.get(
+                                "special_features_matched", {}
                             )
                         # A reused result's own fully_occupied_buildings (see
                         # extract_spreadsheet_gemini.extract_sheet_with_
@@ -1678,6 +1686,7 @@ with page_setup.setup_page("upload"):
                             rows = _run_automatic_brochure_enrichment(
                                 rows, staging_path, already_processed=resume_already_processed,
                                 floorplan_already_processed=resume_floorplan_already_processed,
+                                special_features_matched=resume_special_features_matched,
                                 row_count=row_count,
                             )
                             _reattempt_geocoding_for_newly_addressed_rows(rows, pre_enrichment_geocode_state)
