@@ -914,10 +914,34 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        a convention with nothing to do with the building's own real
        identity, which its brochure (Gemini-extracted) never carries at
        all. Same weak-signal, corroborated-by-uniqueness treatment as
-       tiers 2/3 - only row_building's own side is ever stripped (a
-       candidate carrying this kind of suffix itself would be real
-       evidence of an actually distinct name, already caught by tier 1's
-       own exact comparison if genuinely shared).
+       tiers 2/3 - only row_building's own side is stripped here (a
+       candidate carrying this kind of suffix itself is handled
+       separately by tier 3c below, not assumed away).
+    3c. CANDIDATE-SIDE TRAILING-PARENTHETICAL-STRIPPED - the mirror image
+       of 3b, e.g. row_building "210 Euston Road" (no parenthetical at
+       all) vs a brochure's own extracted unit building "210 Euston Road
+       (Fora Enterprise)" - confirmed against a real Colliers brochure
+       whose own Gemini extraction appends the floor's own tenant/
+       operator name in parentheses, the same area-orientation-style
+       convention as tier 3b's MetSpace case but on the OTHER side: here
+       it's the brochure's own text carrying the suffix, not the row's.
+       Tier 3b's own original assumption - that a candidate carrying this
+       kind of suffix is already real evidence of a genuinely distinct
+       name, since a truly shared one would already be caught by tier 1's
+       exact comparison - turns out not to hold: the row's own building
+       text can be the shorter, suffix-free one instead, in which case
+       nothing upstream of this tier ever bridges the gap at all. Same
+       weak-signal, corroborated-by-uniqueness discipline as every tier
+       above - tried against row_building's own UNSTRIPPED key (if
+       row_building itself also carried a parenthetical suffix, tier 3b
+       above already tried stripping it and either matched or didn't;
+       this tier is strictly about the suffix appearing on the candidate
+       side), and only ever accepted when it is the SOLE candidate whose
+       own stripped key lands on row_key - two or more candidates
+       collapsing to the same stripped key (e.g. two different floors of
+       two DIFFERENT buildings that each happen to append a parenthetical
+       to the same base text) stays unresolved, never guessed, identically
+       to every other tier's own ambiguity guard.
     4. BUILDING-VS-ADDRESS (row_building compared against each candidate's
        own address_1, via `candidate_addresses` - a parallel list, one
        entry per candidate_buildings, or None from a caller with no address
@@ -1033,6 +1057,19 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
         ]
         if len(parenthetical_stripped) == 1:
             return parenthetical_stripped
+
+    # 3c. CANDIDATE-SIDE TRAILING-PARENTHETICAL-STRIPPED (see this
+    # function's own docstring, tier 3c) - the mirror of 3b above: strips
+    # the same suffix from each CANDIDATE's own text instead, compared
+    # against row_key unstripped. Any candidate whose raw key already
+    # equalled row_key would already have been returned by tier 1's exact
+    # comparison above, so no extra guard against that is needed here.
+    candidate_parenthetical_stripped = [
+        i for i, c in enumerate(candidate_buildings)
+        if normalize_key(_strip_trailing_parenthetical(c)) == row_key
+    ]
+    if len(candidate_parenthetical_stripped) == 1:
+        return candidate_parenthetical_stripped
 
     row_house_number = leading_house_number(row_building)
 

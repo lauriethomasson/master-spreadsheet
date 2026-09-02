@@ -2879,14 +2879,31 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         indices = brochure_enrichment._building_identity_matches("141 Fenchurch Street", ["Somewhere Else"])
         self.assertEqual(indices, [])
 
-    def test_tier_3b_never_applied_to_the_candidate_side(self):
-        # Only row_building's own side is ever stripped - a candidate
-        # that itself carries a parenthetical suffix the row doesn't must
-        # never be treated as a coincidental match via this tier (it
-        # would already have matched via tier 1's own exact comparison if
-        # the row genuinely stated the same parenthetical too).
+    def test_tier_3c_matches_when_only_the_candidate_side_carries_the_suffix(self):
+        # The mirror of tier 3b (see this test class's own docstring,
+        # tier 3c) - confirmed against a real Colliers brochure whose own
+        # Gemini extraction appended a floor's tenant/operator name in
+        # parentheses to a building text the row's own side never carried
+        # at all: row.building "210 Euston Road" vs the brochure's own
+        # extracted unit building "210 Euston Road (Fora Enterprise)".
+        # Tier 3b's own original assumption (a candidate carrying this
+        # kind of suffix must already be a genuinely distinct name, since
+        # tier 1's exact comparison would already have caught a real
+        # match) turns out not to hold when it's the CANDIDATE, not the
+        # row, that's the one carrying the extra text.
         indices = brochure_enrichment._building_identity_matches(
-            "141 Fenchurch Street", ["141 Fenchurch Street (Monument)"],
+            "210 Euston Road", ["210 Euston Road (Fora Enterprise)"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_tier_3c_ambiguous_match_is_rejected(self):
+        # Two DIFFERENT candidate buildings that both happen to strip to
+        # the same parenthetical-stripped key - same "incorrect
+        # enrichment is worse than a blank field" rejection every other
+        # weak tier already applies, now also enforced in this new
+        # direction.
+        indices = brochure_enrichment._building_identity_matches(
+            "210 Euston Road", ["210 Euston Road (Fora Enterprise)", "210 Euston Road (WeWork)"],
         )
         self.assertEqual(indices, [])
 
