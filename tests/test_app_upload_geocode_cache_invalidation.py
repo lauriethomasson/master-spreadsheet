@@ -33,6 +33,19 @@ Fix: fold geocode.py's own source bytes into both existing mechanisms - no
 new version-tracking system, matching the existing automatic pattern
 already used for extract_spreadsheet_gemini.py/brochure_enrichment.py.
 
+Also covers a third, later gap of the exact same shape: brochure_link_
+resolver.py's own source (finalize_brochure_link lives there, called by
+extract_spreadsheet_gemini.py/extract.py/extract_email.py alike) was never
+folded into either fingerprint either, confirmed against a real report -
+the rule-3 PDF-fallback removal (finalize_brochure_link itself) landed
+without either fingerprint changing, so a byte-identical re-upload of an
+already-staged file kept silently reusing its pre-fix cached brochure_link
+values. See FingerprintCompositionTests/PdfEmailContentHashCompositionTests
+below - both fingerprints now fold in brochure_link_resolver.py's own
+source bytes unconditionally, for every spreadsheet/PDF/email upload
+alike (unlike geocode.py/brochure_enrichment.py, which are only
+conditionally relevant to some paths).
+
 Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_app_upload_geocode_cache_invalidation -v
 """
@@ -117,8 +130,21 @@ class FingerprintCompositionTests(unittest.TestCase):
             + Path(app.extract_spreadsheet_gemini.__file__).read_bytes()
             + Path(app.brochure_enrichment.__file__).read_bytes()
             + Path(geocode.__file__).read_bytes()
+            + Path(app.brochure_link_resolver.__file__).read_bytes()
         ).hexdigest()
         self.assertEqual(app._SPREADSHEET_LOGIC_FINGERPRINT, expected)
+
+    def test_spreadsheet_fingerprint_is_computed_from_brochure_link_resolver_py_bytes_too(self):
+        # Proves brochure_link_resolver.py is genuinely part of the formula
+        # (the real gap this file's docstring describes), not just mentioned
+        # in a comment - mirrors the geocode.py test above.
+        without_brochure_link_resolver = hashlib.sha256(
+            Path(app.extract_spreadsheet.__file__).read_bytes()
+            + Path(app.extract_spreadsheet_gemini.__file__).read_bytes()
+            + Path(app.brochure_enrichment.__file__).read_bytes()
+            + Path(geocode.__file__).read_bytes()
+        ).hexdigest()
+        self.assertNotEqual(app._SPREADSHEET_LOGIC_FINGERPRINT, without_brochure_link_resolver)
 
     def test_a_hash_computed_under_a_different_fingerprint_never_matches_current(self):
         # Simulates "this cached entry was produced by older geocoding
@@ -189,14 +215,26 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
 
     def test_pdf_email_fingerprint_is_computed_from_extract_and_extract_email_bytes(self):
         # Proves _PDF_EMAIL_LOGIC_FINGERPRINT is genuinely a hash of
-        # extract.py's/extract_email.py's own source, not just mentioned in
-        # a comment - mirrors FingerprintCompositionTests' own spreadsheet
-        # counterpart above.
+        # extract.py's/extract_email.py's/brochure_link_resolver.py's own
+        # source, not just mentioned in a comment - mirrors
+        # FingerprintCompositionTests' own spreadsheet counterpart above.
         expected = hashlib.sha256(
             Path(app.extract.__file__).read_bytes()
             + Path(app.extract_email.__file__).read_bytes()
+            + Path(app.brochure_link_resolver.__file__).read_bytes()
         ).hexdigest()
         self.assertEqual(app._PDF_EMAIL_LOGIC_FINGERPRINT, expected)
+
+    def test_pdf_email_fingerprint_is_computed_from_brochure_link_resolver_py_bytes_too(self):
+        # The real gap this file's docstring describes: finalize_brochure_
+        # link (called by both extract.py and extract_email.py) lives in
+        # its own module, whose source must genuinely be part of the
+        # formula, not just mentioned in a comment.
+        without_brochure_link_resolver = hashlib.sha256(
+            Path(app.extract.__file__).read_bytes()
+            + Path(app.extract_email.__file__).read_bytes()
+        ).hexdigest()
+        self.assertNotEqual(app._PDF_EMAIL_LOGIC_FINGERPRINT, without_brochure_link_resolver)
 
     def test_content_hash_is_sensitive_to_the_pdf_email_fingerprint(self):
         # _PDF_EMAIL_LOGIC_FINGERPRINT is a module-level constant computed

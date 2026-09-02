@@ -13,6 +13,7 @@ import streamlit as st
 from openpyxl import load_workbook
 
 import brochure_enrichment
+import brochure_link_resolver
 import extract
 import extract_email
 import extract_spreadsheet
@@ -80,11 +81,23 @@ SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
 # one dependency. Folding geocode.py's own source in here (see also its
 # addition to the PDF/email versioned_content below) closes that gap the
 # same automatic, self-maintaining way as the other three modules.
+#
+# brochure_link_resolver.py is included for the same reason once more, and
+# was found to have the exact same gap: extract_spreadsheet_gemini.py (and,
+# on the PDF/email side below, extract.py/extract_email.py) all call
+# finalize_brochure_link, but that function lives in its own separate
+# module, whose source was never folded into either fingerprint at all - a
+# real fix to finalize_brochure_link itself (the rule-3 PDF-fallback
+# removal) landed without either fingerprint changing, so a byte-identical
+# re-upload of an already-staged file kept silently reusing its pre-fix
+# cached brochure_link values, exactly the same failure shape as the
+# geocode.py gap above.
 _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
     Path(extract_spreadsheet.__file__).read_bytes()
     + Path(extract_spreadsheet_gemini.__file__).read_bytes()
     + Path(brochure_enrichment.__file__).read_bytes()
     + Path(geocode.__file__).read_bytes()
+    + Path(brochure_link_resolver.__file__).read_bytes()
 ).hexdigest()
 
 # extract.py's/extract_email.py's own source, folded into
@@ -99,9 +112,17 @@ _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
 # suppression fix), so a PDF re-uploaded after either fix kept silently
 # reusing its pre-fix cached extraction result - the fix was sitting in the
 # repo but never actually took effect for anything already uploaded once.
+#
+# brochure_link_resolver.py's own source is folded in here too, same as
+# _SPREADSHEET_LOGIC_FINGERPRINT above and for the same confirmed gap: both
+# extract.py and extract_email.py call finalize_brochure_link (unlike
+# geocode.py/brochure_enrichment.py below, which only apply to some PDF/
+# email paths, this one applies to both unconditionally, so it belongs in
+# the fingerprint itself rather than in versioned_content).
 _PDF_EMAIL_LOGIC_FINGERPRINT = hashlib.sha256(
     Path(extract.__file__).read_bytes()
     + Path(extract_email.__file__).read_bytes()
+    + Path(brochure_link_resolver.__file__).read_bytes()
 ).hexdigest()
 
 # The neutral, un-decided option in an ambiguous-sheet decision radio (see
