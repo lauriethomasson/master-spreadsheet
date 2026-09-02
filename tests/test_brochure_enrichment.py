@@ -2907,6 +2907,51 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         )
         self.assertEqual(indices, [])
 
+    def test_tier_3d_matches_when_only_the_candidate_side_carries_a_leading_the(self):
+        # The real Regent's Wharf case (see this test class's own
+        # docstring, tier 3d): a provider's own spreadsheet row named
+        # just "Canal Building"/"Packing House", the same real brochure's
+        # own Gemini-extracted building text carrying a leading "The" the
+        # row's own side never had at all.
+        indices = brochure_enrichment._building_identity_matches(
+            "Canal Building", ["Thorley Works", "The Canal Building", "The Mill", "The Packing House"],
+        )
+        self.assertEqual(indices, [1])
+
+        indices = brochure_enrichment._building_identity_matches(
+            "Packing House", ["Thorley Works", "The Canal Building", "The Mill", "The Packing House"],
+        )
+        self.assertEqual(indices, [3])
+
+    def test_tier_3d_matches_when_only_the_row_side_carries_a_leading_the(self):
+        # The mirror direction - unlike tiers 3b/3c's own deliberate row-
+        # side-only/candidate-side-only split, tier 3d strips both sides
+        # at once, so a row carrying the leading article the candidate
+        # lacks must match too.
+        indices = brochure_enrichment._building_identity_matches("The Mill", ["Mill"])
+        self.assertEqual(indices, [0])
+
+    def test_tier_3d_ambiguous_match_is_rejected(self):
+        # Two candidate ENTRIES sharing the identical leading-article-
+        # stripped key stays ambiguous - same plain len(...) == 1 check
+        # (never _distinct_building_group's own same-building-multiple-
+        # floors allowance) every other weak tier already applies, see
+        # test_tier_3b_two_matching_candidates_stays_ambiguous above for
+        # the identical philosophy. Neither candidate here is "Point"
+        # itself, so tier 1's own exact comparison never intercepts
+        # either of them first.
+        indices = brochure_enrichment._building_identity_matches("Point", ["The Point", "The Point"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3d_does_not_introduce_false_positives_between_two_the_prefixed_buildings(self):
+        # Two genuinely different buildings that both happen to start
+        # with "The" must still resolve independently, not collide with
+        # each other just because they share the leading article.
+        indices = brochure_enrichment._building_identity_matches(
+            "Point", ["The Mill", "The Point"],
+        )
+        self.assertEqual(indices, [1])
+
 
 class MatchBuildingFeatureTests(unittest.TestCase):
     """_match_building_feature - the building-level (level B) counterpart

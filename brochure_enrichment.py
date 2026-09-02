@@ -773,6 +773,33 @@ def _strip_trailing_street_suffix_word(key: str) -> str:
     return key
 
 
+def _strip_leading_the(key: str) -> str:
+    """
+    `key` (an ALREADY normalize_key'd string) with a leading "the " word
+    dropped, when present - e.g. "the canal building" -> "canal building".
+    Confirmed real gap this closes: a real Regent's Wharf brochure's own
+    Gemini-extracted building names ("The Canal Building", "The Packing
+    House") carry a leading definite article the provider's own
+    spreadsheet omits from those same buildings' own row text ("Canal
+    Building", "Packing House") - genuinely the same buildings, but
+    sharing no normalize_key() overlap at all purely because of this one
+    word. normalize_key's own docstring already documents deliberately
+    NOT stripping this by default (a near-miss should surface as "no
+    match" for tier 1's exact comparison to catch, not be silently
+    guessed away) - this stays scoped to its own weak-signal tier below
+    instead, same as every other stripped-variant tier in this function;
+    normalize_key and tier 1 itself are both untouched.
+
+    Never strips when "the" is the ONLY word (e.g. a building genuinely
+    just named "The") - stripping down to an empty key would make this
+    tier match literally any other single-word candidate.
+    """
+    words = key.split()
+    if len(words) > 1 and words[0] == "the":
+        return " ".join(words[1:])
+    return key
+
+
 # A trailing "(...)" segment on a row's own building text - see
 # _strip_trailing_parenthetical's own docstring for the real MetSpace
 # convention this exists for.
@@ -942,6 +969,24 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        two DIFFERENT buildings that each happen to append a parenthetical
        to the same base text) stays unresolved, never guessed, identically
        to every other tier's own ambiguity guard.
+    3d. LEADING-ARTICLE-STRIPPED (see _strip_leading_the) - e.g.
+       row_building "Canal Building"/"Packing House" (a row) vs a real
+       Regent's Wharf brochure's own Gemini-extracted building text "The
+       Canal Building"/"The Packing House" - confirmed against that real
+       document, whose own building_features/units both consistently
+       carry the leading article a provider's own spreadsheet just as
+       consistently omits. normalize_key deliberately never strips a
+       leading "the" by default (see its own docstring) so a genuine
+       near-miss still surfaces as "no match" for tier 1 rather than
+       being silently guessed away there - this tier is where that
+       tolerance actually lives instead, same as every other stripped-
+       variant tier here. Stripped from BOTH sides at once (unlike tiers
+       3b/3c's own deliberate row-side-only/candidate-side-only split) -
+       there's no real-world reason a leading article's omission would
+       only ever happen in one direction, so one symmetric comparison
+       covers either side carrying it. Same weak-signal, corroborated-
+       by-uniqueness discipline as every tier above - only accepted when
+       it's the SOLE candidate sharing the stripped key.
     4. BUILDING-VS-ADDRESS (row_building compared against each candidate's
        own address_1, via `candidate_addresses` - a parallel list, one
        entry per candidate_buildings, or None from a caller with no address
@@ -1070,6 +1115,31 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     ]
     if len(candidate_parenthetical_stripped) == 1:
         return candidate_parenthetical_stripped
+
+    # 3d. LEADING-ARTICLE-STRIPPED (see _strip_leading_the's own docstring
+    # for the real Regent's Wharf case: row_building "Canal Building"/
+    # "Packing House" vs the brochure's own extracted building_features
+    # text "The Canal Building"/"The Packing House"). Stripped from BOTH
+    # sides' own keys here, unlike tiers 3b/3c's own deliberate row-side-
+    # only/candidate-side-only split - a leading article omission has no
+    # real-world reason to only ever happen in one direction the way the
+    # parenthetical tiers' own MetSpace/Colliers provenance did, so one
+    # symmetric comparison covers either side carrying it. Tried on the
+    # ORIGINAL (non-address-suffix-stripped, non-street-suffix-stripped,
+    # non-parenthetical-stripped) key, same as tiers 3b/3c - independent
+    # of those gaps, no real case seen so far needs more than one kind of
+    # stripping at once. Same weak-signal, corroborated-by-uniqueness
+    # treatment as every tier above - only accepted when it's the SOLE
+    # candidate sharing the stripped key; two candidates that both
+    # collapse to the same leading-article-stripped key stays unresolved,
+    # never guessed.
+    row_no_the_key = _strip_leading_the(row_key)
+    leading_article_stripped = [
+        i for i, c in enumerate(candidate_buildings)
+        if _strip_leading_the(normalize_key(c)) == row_no_the_key
+    ]
+    if len(leading_article_stripped) == 1:
+        return leading_article_stripped
 
     row_house_number = leading_house_number(row_building)
 
