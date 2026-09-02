@@ -216,9 +216,34 @@ PLACES_NEW_FIELD_MASK = "places.displayName,places.formattedAddress,places.locat
 
 PLACES_ENABLE_URL = "https://console.cloud.google.com/apis/library/places.googleapis.com"
 
-# Greater London bounding box — reject any Places match outside this as
-# low-confidence, since every source document in this pipeline is London-based.
-LONDON_BBOX = {"lat_min": 51.28, "lat_max": 51.70, "lng_min": -0.51, "lng_max": 0.34}
+# Bounding box for this portfolio's own real footprint — reject any Places
+# match outside this as low-confidence, since every source document in this
+# pipeline is London-based. This used to be a crude ~30x50km rectangle sized
+# to cover the whole of Greater London (lat 51.28-51.70, lng -0.51-0.34) -
+# necessary but not sufficient, since a wrong-but-plausible match to a
+# DIFFERENT real place can still land inside a box that loose. Confirmed
+# real incident: a "Thames Court" (4 Upper Thames Street, EC4V 3BJ, City of
+# London) row resolved via Places Text Search to a same-named building in
+# Staines-upon-Thames, Surrey (~51.43, -0.51) - ~29km away, comfortably
+# inside the old box's southwest corner, and accepted with zero
+# corroboration (see log_geocode_name_only_match's own history for the
+# logging gap that let this go unnoticed).
+#
+# Tightened by computing the actual lat/lng extent of every row in the real
+# production master spreadsheet (716 rows, all with a resolved lat/lng, any
+# geocode_unverified value - deliberately not restricted to the small subset
+# explicitly re-confirmed as geocode_unverified=False, since that excluded
+# entire real, legitimate neighbourhoods this portfolio genuinely covers,
+# e.g. Fulham, Chiswick, Islington, Wapping - see this commit's own message
+# for that investigation): lat 51.4719-51.5667, lng -0.2764 to -0.0134, a
+# ~10.5km x 18km spread. A fixed 3km safety margin was added on every side
+# (0.027* for latitude, 0.043* for longitude - a degree of longitude is
+# shorter than a degree of latitude at this latitude, ~69.3km/degree vs
+# ~111.3km/degree, so the same 3km margin needs a bigger degree delta on
+# the lng axis) to give real future properties near the portfolio's current
+# edge room to still be accepted, without reopening the door to a
+# wrong-but-plausible match dozens of km away like Staines.
+LONDON_BBOX = {"lat_min": 51.445, "lat_max": 51.594, "lng_min": -0.319, "lng_max": 0.030}
 
 
 def _api_key() -> str:
@@ -247,14 +272,17 @@ def within_london_bbox(lat: float, lng: float) -> bool:
 
 # --- Generic UK postcode-district evidence -----------------------------
 #
-# within_london_bbox is a coarse ~30x50km rectangle covering the whole of
-# Greater London - necessary (rejects a match in a different city entirely)
-# but not sufficient to catch a wrong-but-plausible match to a DIFFERENT
-# real place within that same box (confirmed real case: source building
-# text "New Derwent House WC1" resolved via Places Text Search to a
-# same/similarly-named place at "25 Savile Row, London W1S 2ER" - a
-# different postcode AREA, nowhere near WC1, still comfortably inside the
-# bbox). The functions below parse a UK postcode's own "outward code"
+# within_london_bbox is now a tighter ~10.5x18km box fit to this portfolio's
+# own real footprint plus a safety margin (see LONDON_BBOX's own comment for
+# how it's computed) - necessary (rejects a match far outside where this
+# portfolio's real properties actually are, including the Staines/Thames
+# Court incident that motivated tightening it) but still not sufficient to
+# catch a wrong-but-plausible match to a DIFFERENT real place within that
+# same box (confirmed real case: source building text "New Derwent House
+# WC1" resolved via Places Text Search to a same/similarly-named place at
+# "25 Savile Row, London W1S 2ER" - a different postcode AREA, nowhere near
+# WC1, still comfortably inside the bbox). The functions below parse a UK
+# postcode's own "outward code"
 # grammar (1-2 area letters + 1-2 district digits + an optional finer-
 # subdivision letter, e.g. "SE1", "EC1V", "W1S") to pull a location hint out
 # of whatever free text the SOURCE already provided (row.postcode,

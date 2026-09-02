@@ -2051,5 +2051,46 @@ class CallGeocodingApiAddressComponentsTests(unittest.TestCase):
         self.assertEqual(result, {"status": "ZERO_RESULTS"})
 
 
+class LondonBboxTightenedTests(unittest.TestCase):
+    """
+    Regression coverage for LONDON_BBOX's tightening from a crude ~30x50km
+    Greater-London-sized rectangle down to this portfolio's own real
+    lat/lng extent (computed from the real production master spreadsheet,
+    716 rows) plus a 3km safety margin - see LONDON_BBOX's own comment in
+    geocode.py for the full computation. Motivated by a confirmed real
+    incident: "Thames Court" (4 Upper Thames Street, EC4V 3BJ) mis-geocoded
+    via Places Text Search to a same-named building in Staines-upon-Thames,
+    Surrey - ~29km away, comfortably inside the old, looser box.
+    """
+
+    def test_accepts_a_point_at_the_real_extents_northeast_corner(self):
+        # Real computed max: lat 51.5667, lng -0.0134 - just inside that,
+        # well within the added 3km margin either way.
+        self.assertTrue(geocode.within_london_bbox(51.566, -0.014))
+
+    def test_accepts_a_point_at_the_real_extents_southwest_corner(self):
+        # Real computed min: lat 51.4719, lng -0.2764.
+        self.assertTrue(geocode.within_london_bbox(51.472, -0.276))
+
+    def test_accepts_a_point_just_past_the_real_extent_within_the_margin(self):
+        # ~1.5km further southwest than the real min corner - inside the
+        # added 3km margin, so a genuine future property just past the
+        # portfolio's current known edge is still accepted.
+        self.assertTrue(geocode.within_london_bbox(51.459, -0.295))
+
+    def test_rejects_the_real_staines_incident_coordinates(self):
+        # Staines-upon-Thames, Surrey - the real place the "Thames Court"
+        # mismatch resolved to, ~29km from the genuine 4 Upper Thames
+        # Street/EC4V 3BJ building. Comfortably inside the OLD bbox
+        # (lat_min 51.28, lng_min -0.51); must be rejected by the new one.
+        self.assertFalse(geocode.within_london_bbox(51.4326, -0.5145))
+
+    def test_rejects_a_point_well_outside_the_margin_on_every_side(self):
+        self.assertFalse(geocode.within_london_bbox(50.9, -0.1))  # too far south
+        self.assertFalse(geocode.within_london_bbox(52.0, -0.1))  # too far north
+        self.assertFalse(geocode.within_london_bbox(51.5, -0.6))  # too far west
+        self.assertFalse(geocode.within_london_bbox(51.5, 0.2))  # too far east
+
+
 if __name__ == "__main__":
     unittest.main()
