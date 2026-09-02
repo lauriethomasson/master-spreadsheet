@@ -645,8 +645,10 @@ _FLOOR_NUMBER_RE = re.compile(r"\d+")
 # "Lower Ground Floor", "Basement", "Mezzanine", "Reception" etc. are
 # deliberately NOT given an invented numeric mapping here (they still return
 # None, exactly as before) since there's no real confirmed case needing one
-# and a wrong guess (e.g. treating "Ground" as floor 0) risks a false match
-# against a genuinely different numbered floor.
+# and a wrong guess risks a false match against a genuinely different
+# numbered floor. Ground itself is the one exception - see _GROUND_FLOOR_RE
+# below, added once a real confirmed case existed for it specifically
+# (unlike the others, still unmapped).
 _ORDINAL_WORD_TO_NUMBER = {
     "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
     "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
@@ -658,20 +660,44 @@ _ORDINAL_WORD_RE = re.compile(
     r"\b(" + "|".join(_ORDINAL_WORD_TO_NUMBER) + r")\b", re.IGNORECASE
 )
 
+# Ground-floor label variants, checked (on normalize_key'd text) ONLY after
+# both the digit and ordinal-word tiers above find nothing - confirmed real
+# gap: a real Ivybridge House row's own floor_unit "G - Strand" (Gemini's
+# own brochure extraction for the same floor: "Ground Floor") never matched
+# via either existing tier (no digit, no ordinal word), permanently
+# excluding this floor's State Of Space/Special Features from ever being
+# applied, on every re-upload of the same real document. Anchored at the
+# START with a word boundary, so this matches ONLY when "g"/"ground"/
+# "ground floor" is itself a complete leading TOKEN - "G - Strand" and
+# "Ground Floor - Part" both match (the trailing description is simply
+# never examined), but "Gallery Floor"/"Garden Level" never do (there is no
+# word boundary directly after "g" in either). Deliberately does NOT match
+# "Lower Ground"/"LG"/"Basement"/"Mezzanine" - those start with a different
+# leading word/token entirely and remain unmapped, exactly as the comment
+# above still documents for them: Lower Ground is a genuinely DIFFERENT
+# space from Ground, confirmed by the same real Ivybridge House brochure
+# stating both "LG" and "G - Strand" as separate floors - conflating them
+# would be a real, confirmed false match, not a hypothetical risk.
+_GROUND_FLOOR_RE = re.compile(r"^(ground floor|ground|g)\b")
+
 
 def _floor_number(floor_unit):
     """
     The leading digit run in `floor_unit` as an int (e.g. 5 from "5th
-    Floor"), or - when there's no digit at all - a recognized spelled-out
-    numbered-floor ordinal word (e.g. 3 from "Third Floor", case-
-    insensitive; see _ORDINAL_WORD_TO_NUMBER), or None if `floor_unit` is
-    blank or matches neither form (e.g. "Ground Floor", "Reception") -
-    those never participate in this fallback tier, exactly as if it didn't
-    exist for them (falls through to the existing size-based tier, or no
-    match, same as before either form of this existed). The digit form is
-    checked first and wins if present - a label with both a digit and a
-    coincidental word match is not a real case this needs to handle
-    specially.
+    Floor", or 6 from "6th Floor - Part"/"6th Floor West" - the digit
+    search runs anywhere in the text, so a trailing description never
+    blocks it), or - when there's no digit at all - a recognized spelled-
+    out numbered-floor ordinal word (e.g. 3 from "Third Floor", case-
+    insensitive; see _ORDINAL_WORD_TO_NUMBER), or 0 for a Ground-floor
+    label (e.g. "G", "Ground Floor", "G - Strand" - see _GROUND_FLOOR_RE's
+    own docstring for exactly which shapes this does and does NOT match),
+    or None if `floor_unit` is blank or matches none of these forms (e.g.
+    "Lower Ground Floor", "Reception") - those never participate in this
+    fallback tier, exactly as if it didn't exist for them (falls through
+    to the existing size-based tier, or no match, same as before any of
+    these forms existed). Digit, then ordinal word, then Ground are
+    checked in that order and the first match wins - a label matching more
+    than one form at once is not a real case this needs to handle specially.
     """
     if _is_blank(floor_unit):
         return None
@@ -680,7 +706,11 @@ def _floor_number(floor_unit):
     if digit_match:
         return int(digit_match.group())
     word_match = _ORDINAL_WORD_RE.search(text)
-    return _ORDINAL_WORD_TO_NUMBER[word_match.group(1).lower()] if word_match else None
+    if word_match:
+        return _ORDINAL_WORD_TO_NUMBER[word_match.group(1).lower()]
+    if _GROUND_FLOOR_RE.match(normalize_key(text)):
+        return 0
+    return None
 
 
 def _is_blank(value) -> bool:
@@ -4407,6 +4437,73 @@ def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriche
         geocode.geocode_row(enriched)
 
 
+def _propagate_shared_brochure_link_within_building(rows: list) -> list:
+    """
+    `rows` with a blank brochure_link filled in from a SIBLING row (same
+    building+provider, elsewhere in this same batch) whenever exactly ONE
+    distinct non-blank brochure_link exists among that group - never
+    touches a row that already has its own value, and never guesses when
+    the group's own non-blank links disagree.
+
+    Real, confirmed gap this closes: a schedule-of-areas brochure covering
+    several floors of ONE building routinely has its brochure_link
+    genuinely stated (by the source spreadsheet, or found by Gemini) for
+    only ONE of those floors' own rows - a real Henly House upload's own
+    "1st"/"2nd"/"3rd" floor rows all had brochure_link blank while "4th"
+    alone carried the real link, all four genuinely describing the SAME
+    document. needs_enrichment/eligible_rows_and_brochures both key
+    eligibility on a row's OWN brochure_link field directly (see either's
+    own docstring) - a row with nothing there is simply never fetched,
+    matched, or enriched at all, no matter how many times the same
+    content gets re-uploaded, since a blank field is never itself
+    evidence of what a sibling row already knows. This runs BEFORE
+    eligibility is ever computed (see run_brochure_enrichment, the one
+    caller, called at the very start) so every downstream step - fetch,
+    match, apply - simply sees a row that already has the link it should
+    have had from the start, no special-casing needed anywhere else.
+
+    Grouped by (building, provider) - the same two fields _fallback_key's
+    own building/provider tier in master_merge.py already treats as a
+    listing's stable identity - never floor_unit, since the whole point
+    is bridging rows that describe DIFFERENT floors of the SAME building.
+    Two or more DISTINCT non-blank links within one group (a genuine
+    multi-building portfolio brochure's own per-property links, or two
+    genuinely unrelated listings that happen to share a building name/
+    provider) is deliberately never resolved - "incorrect enrichment is
+    worse than a blank field", the same principle every matching tier in
+    this module already applies; that group is left completely
+    untouched, exactly as if this function didn't exist for it.
+
+    Paired by INDEX, never object identity or property_id - the same
+    reasoning as _regeocode_rows_with_newly_backfilled_addresses' own
+    docstring: property_id is still blank at this pending/staging stage,
+    and a changed row is a NEW ListingRow (model_copy), never the same
+    object. Returns a NEW list (rows themselves are never mutated in
+    place) - callers reassign their own `rows` variable, the same
+    contract every other row-list-transforming function in this module
+    already has.
+    """
+    groups_by_key = {}
+    for i, row in enumerate(rows):
+        building_key = normalize_key(row.building)
+        if not building_key:
+            continue
+        groups_by_key.setdefault((building_key, normalize_key(row.provider)), []).append(i)
+
+    updated = list(rows)
+    for indices in groups_by_key.values():
+        if len(indices) < 2:
+            continue
+        distinct_links = {rows[i].brochure_link for i in indices if not _is_blank(rows[i].brochure_link)}
+        if len(distinct_links) != 1:
+            continue
+        shared_link = next(iter(distinct_links))
+        for i in indices:
+            if _is_blank(rows[i].brochure_link):
+                updated[i] = rows[i].model_copy(update={"brochure_link": shared_link})
+    return updated
+
+
 def run_brochure_enrichment(
     rows: list, staging_path: str, already_processed: dict, floorplan_already_processed: dict = None,
     special_features_matched: dict = None,
@@ -4458,9 +4555,20 @@ def run_brochure_enrichment(
     cumulative" shape as already_processed/processed_urls above. Defaults
     to {} for the ordinary fresh-run case, identical to every prior
     behavior before this parameter existed.
+
+    rows is first passed through _propagate_shared_brochure_link_within_
+    building (see its own docstring) - BEFORE eligibility is computed, so
+    a row whose own brochure_link was left blank by extraction, but whose
+    sibling floor in the same building genuinely has one, becomes
+    eligible here too, rather than being silently skipped by every
+    downstream step for good. Running this here (the one shared
+    orchestration both real callers - the automatic post-upload run and
+    "Continue enrichment" - go through) means neither needs its own copy
+    of this logic.
     """
     floorplan_already_processed = floorplan_already_processed or {}
     special_features_matched = special_features_matched or {}
+    rows = _propagate_shared_brochure_link_within_building(rows)
     eligible, unique_urls = eligible_rows_and_brochures(rows)
     urls_to_fetch = [u for u in unique_urls if already_processed.get(u) != "ok"]
 

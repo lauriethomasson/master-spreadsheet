@@ -2209,6 +2209,49 @@ class BuildMergePlanBrochureLinkBrokenTests(unittest.TestCase):
         self.assertIs(merged[0].brochure_link_broken, False)
 
 
+class MatchedRowPropertyIdStabilityTests(unittest.TestCase):
+    """
+    Real, confirmed production incident: comparing two real master
+    snapshots keyed by Building+Floor Unit, 37 rows lost a previously-
+    filled State Of Space value and 16 lost Brochure Link, and in every
+    case the row's own Property Id was DIFFERENT between snapshots - a
+    brand-new row had replaced the old one rather than merging into it.
+    property_id IS already excluded from DIFF_FIELDS (see that constant's
+    own definition), so a genuinely MATCHED row should never have its
+    property_id disturbed at all - this proves that end to end, through
+    the real build_merge_plan -> apply_merge pipeline, confirming the
+    incident's own root cause was a MATCH failure (the row never reached
+    this safe path at all), never a gap in property_id's own protection
+    once a match succeeds.
+    """
+
+    def test_property_id_and_existing_non_blank_fields_survive_a_genuine_match(self):
+        master_df = _master_df([{
+            "building": "Henly House", "provider": "Colliers", "floor_unit": "1st",
+            "postcode": "NW1 3AU", "address_1": "Bolsover St", "property_id": "REAL-OLD-ID",
+            "state_of_space": "Fully Fitted", "brochure_link": "https://example.com/henly.pdf",
+        }])
+        # A fresh re-upload of the SAME listing whose own extraction pass
+        # simply didn't re-find state_of_space/brochure_link this time -
+        # the exact real-world shape (see this class's own docstring).
+        new_row = ListingRow(
+            building="Henly House", provider="Colliers", floor_unit="1st",
+            postcode="NW1 3AU", address_1="Bolsover St", state_of_space=None, brochure_link=None,
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        updates = {matched.master_index: {f: v[1] for f, v in matched.diffs.items()}}
+        merged = master_merge.apply_merge(plan.master_records, updates, [])
+
+        self.assertEqual(merged[0].property_id, "REAL-OLD-ID")
+        self.assertEqual(merged[0].state_of_space, "Fully Fitted")
+        self.assertEqual(merged[0].brochure_link, "https://example.com/henly.pdf")
+
+
 class AddressFormattingFullPipelineTests(unittest.TestCase):
     """
     Full build_merge_plan pipeline coverage for the address_1 trailing-

@@ -2440,13 +2440,45 @@ class MatchUnitTests(unittest.TestCase):
 
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
 
-    def test_floor_number_fallback_does_not_apply_when_row_floor_has_no_digit(self):
-        row = ListingRow(building="A", floor_unit="Ground Floor")
+    def test_floor_number_fallback_does_not_apply_when_row_floor_has_no_digit_or_recognized_word(self):
+        row = ListingRow(building="A", floor_unit="Basement")
         units = [
             {"building": "A", "floor_unit": "1st Floor", "special_features": "One"},
             {"building": "A", "floor_unit": "2nd Floor", "special_features": "Two"},
         ]
 
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
+    def test_ground_floor_label_variant_resolves_against_the_brochures_own_ground_floor_unit(self):
+        # Real confirmed gap: a real Ivybridge House row's own floor_unit
+        # "G - Strand" never matched its own brochure's "Ground Floor"
+        # unit at all (no digit, no ordinal word on either side) - State
+        # Of Space/Special Features stayed permanently blank for this
+        # floor on every re-upload of the same real document.
+        units = [
+            {"building": "Ivybridge House", "floor_unit": "Ground Floor", "state_of_space": "Fully Fitted"},
+            {"building": "Ivybridge House", "floor_unit": "1st Floor", "state_of_space": "CAT A"},
+        ]
+        row = ListingRow(building="Ivybridge House", floor_unit="G - Strand")
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["state_of_space"], "Fully Fitted")
+
+    def test_ground_floor_never_confused_with_lower_ground(self):
+        # The genuinely different real-world pair confirmed in the same
+        # Ivybridge House brochure: "LG"/"Lower Ground" must never match
+        # against a brochure's own separate "Ground Floor" unit.
+        units = [
+            {"building": "Ivybridge House", "floor_unit": "Ground Floor", "state_of_space": "Fully Fitted"},
+            {"building": "Ivybridge House", "floor_unit": "Lower Ground Floor", "state_of_space": "Shell & Core"},
+        ]
+        row = ListingRow(building="Ivybridge House", floor_unit="LG")
+
+        # Neither the exact-text nor the floor-number tier resolves this
+        # (LG has no digit and doesn't match the Ground-floor pattern) -
+        # falls through to no match, same as before Ground floor existed,
+        # rather than guessing between two genuinely different spaces.
         self.assertIsNone(brochure_enrichment._match_unit(row, units))
 
     def test_spelled_out_ordinal_brochure_label_resolves_a_numeral_row(self):
@@ -3032,7 +3064,7 @@ class FloorNumberTests(unittest.TestCase):
         self.assertEqual(brochure_enrichment._floor_number("Floor 5"), 5)
 
     def test_no_digit_returns_none(self):
-        self.assertIsNone(brochure_enrichment._floor_number("Ground Floor"))
+        self.assertIsNone(brochure_enrichment._floor_number("Mezzanine"))
 
     def test_blank_returns_none(self):
         self.assertIsNone(brochure_enrichment._floor_number(None))
@@ -3071,12 +3103,29 @@ class FloorNumberTests(unittest.TestCase):
         # checked first and a differing word match never overrides it.
         self.assertEqual(brochure_enrichment._floor_number("5th Floor (Third Suite)"), 5)
 
-    def test_ground_and_reception_style_labels_still_return_none(self):
+    def test_non_ground_unnumbered_labels_still_return_none(self):
         # Deliberately NOT given an invented numeric mapping - see
-        # _ORDINAL_WORD_TO_NUMBER's own comment on why guessing "Ground" is
-        # floor 0 (or similar) risks a false match against a genuinely
-        # different numbered floor.
-        for label in ("Ground Floor", "Lower Ground Floor", "Basement", "Mezzanine", "Reception"):
+        # _ORDINAL_WORD_TO_NUMBER's own comment on why. Ground itself is
+        # the one exception (see test_ground_floor_variants below) - these
+        # remain unmapped, including Lower Ground specifically, which a
+        # real Ivybridge House brochure confirms is a genuinely DIFFERENT
+        # space from Ground, not the same floor loosely restated.
+        for label in ("Lower Ground Floor", "Lower Ground", "LG", "Basement", "Mezzanine", "Reception"):
+            self.assertIsNone(brochure_enrichment._floor_number(label), msg=f"label={label!r}")
+
+    def test_ground_floor_variants(self):
+        # Real confirmed gap: a real Ivybridge House row's own floor_unit
+        # "G - Strand" never matched its own brochure's "Ground Floor"
+        # unit via any existing tier, permanently excluding that floor
+        # from enrichment on every re-upload of the same real document.
+        for label in ("G", "Ground", "Ground Floor", "ground floor", "G - Strand", "Ground Floor - Part"):
+            self.assertEqual(brochure_enrichment._floor_number(label), 0, msg=f"label={label!r}")
+
+    def test_ground_floor_never_matches_a_word_merely_starting_with_g(self):
+        # Anchored at the START with a word boundary - "g" must be its own
+        # complete leading token, never a false positive against an
+        # unrelated label that merely happens to start with the letter.
+        for label in ("Gallery Floor", "Garden Level", "Grand Hall"):
             self.assertIsNone(brochure_enrichment._floor_number(label), msg=f"label={label!r}")
 
 
@@ -5233,6 +5282,103 @@ class EligibleRowsAndBrochuresTests(unittest.TestCase):
         eligible, urls = brochure_enrichment.eligible_rows_and_brochures(rows)
         self.assertEqual(eligible, [])
         self.assertEqual(urls, [])
+
+
+class PropagateSharedBrochureLinkWithinBuildingTests(unittest.TestCase):
+    """
+    _propagate_shared_brochure_link_within_building - the real, confirmed
+    Henly House gap: a schedule-of-areas brochure covering several floors
+    of ONE building only ever had brochure_link genuinely stated for ONE
+    of those floors' own rows, structurally excluding every sibling floor
+    from brochure enrichment entirely (see eligible_rows_and_brochures/
+    needs_enrichment, both keyed on a row's OWN brochure_link field with
+    no sibling awareness at all).
+    """
+
+    def test_blank_sibling_rows_inherit_the_sole_distinct_link(self):
+        rows = [
+            ListingRow(building="Henly House", floor_unit="4th", provider="Colliers", brochure_link="https://example.com/henly.pdf"),
+            ListingRow(building="Henly House", floor_unit="1st", provider="Colliers", brochure_link=None),
+            ListingRow(building="Henly House", floor_unit="2nd", provider="Colliers", brochure_link=None),
+        ]
+        updated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+        self.assertEqual([r.brochure_link for r in updated], ["https://example.com/henly.pdf"] * 3)
+
+    def test_two_distinct_links_in_one_building_group_is_never_resolved(self):
+        # A genuine multi-listing/portfolio shape (or two unrelated
+        # listings sharing a building name+provider) - never guessed,
+        # every row's own existing value (including blank) is left alone.
+        rows = [
+            ListingRow(building="Point House", floor_unit="1st", provider="Colliers", brochure_link="https://example.com/a.pdf"),
+            ListingRow(building="Point House", floor_unit="2nd", provider="Colliers", brochure_link="https://example.com/b.pdf"),
+            ListingRow(building="Point House", floor_unit="3rd", provider="Colliers", brochure_link=None),
+        ]
+        updated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+        self.assertEqual(
+            [r.brochure_link for r in updated],
+            ["https://example.com/a.pdf", "https://example.com/b.pdf", None],
+        )
+
+    def test_never_overwrites_a_row_that_already_has_its_own_link(self):
+        rows = [
+            ListingRow(building="Henly House", floor_unit="4th", provider="Colliers", brochure_link="https://example.com/henly.pdf"),
+            ListingRow(building="Henly House", floor_unit="1st", provider="Colliers", brochure_link="https://example.com/own-link.pdf"),
+        ]
+        updated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+        self.assertEqual(updated[1].brochure_link, "https://example.com/own-link.pdf")
+
+    def test_different_buildings_never_cross_propagate(self):
+        rows = [
+            ListingRow(building="Henly House", floor_unit="4th", provider="Colliers", brochure_link="https://example.com/henly.pdf"),
+            ListingRow(building="Ivybridge House", floor_unit="LG", provider="Colliers", brochure_link=None),
+        ]
+        updated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+        self.assertIsNone(updated[1].brochure_link)
+
+    def test_same_building_different_provider_never_cross_propagates(self):
+        # Same building name, genuinely different provider/source - not
+        # safe to assume the same listing (mirrors master_merge._fallback_
+        # key's own building+provider identity pairing).
+        rows = [
+            ListingRow(building="Henly House", floor_unit="4th", provider="Colliers", brochure_link="https://example.com/henly.pdf"),
+            ListingRow(building="Henly House", floor_unit="1st", provider="UNION", brochure_link=None),
+        ]
+        updated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+        self.assertIsNone(updated[1].brochure_link)
+
+    def test_no_non_blank_link_at_all_in_the_group_leaves_everything_blank(self):
+        rows = [
+            ListingRow(building="Henly House", floor_unit="4th", provider="Colliers", brochure_link=None),
+            ListingRow(building="Henly House", floor_unit="1st", provider="Colliers", brochure_link=None),
+        ]
+        updated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+        self.assertEqual([r.brochure_link for r in updated], [None, None])
+
+    def test_end_to_end_a_previously_ineligible_sibling_now_gets_enriched(self):
+        # The real fix, proven at the level enrich_rows_grouped itself
+        # operates - mirrors run_brochure_enrichment's own wiring (see its
+        # docstring): propagate first, THEN compute eligibility/enrich.
+        rows = [
+            ListingRow(building="Henly House", floor_unit="4th", provider="Colliers", brochure_link="https://example.com/henly.pdf", special_features=None),
+            ListingRow(building="Henly House", floor_unit="1st", provider="Colliers", brochure_link=None, special_features=None, state_of_space=None),
+        ]
+        propagated = brochure_enrichment._propagate_shared_brochure_link_within_building(rows)
+
+        # Before the fix, this second row would never even be considered:
+        # eligible_rows_and_brochures keys eligibility on brochure_link
+        # alone, and the ORIGINAL (unpropagated) row has none.
+        eligible_before, _ = brochure_enrichment.eligible_rows_and_brochures(rows)
+        self.assertEqual(len(eligible_before), 1)
+        eligible_after, urls_after = brochure_enrichment.eligible_rows_and_brochures(propagated)
+        self.assertEqual(len(eligible_after), 2)
+        self.assertEqual(urls_after, ["https://example.com/henly.pdf"])
+
+        units = [{"building": "Henly House", "floor_unit": None, "state_of_space": "Fully Fitted", "special_features": "Shared feature"}]
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched, _log, _stats = brochure_enrichment.enrich_rows_grouped(propagated)
+
+        self.assertEqual(enriched[1].state_of_space, "Fully Fitted")
+        self.assertEqual(enriched[1].special_features, "Shared feature")
 
 
 class EnrichRowsGroupedTests(EnrichmentTestCase):
