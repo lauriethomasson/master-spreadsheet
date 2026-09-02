@@ -446,6 +446,70 @@ def _run_automatic_brochure_enrichment(
     )
 
 
+def _pre_enrichment_geocode_snapshot(rows: list[ListingRow]) -> list:
+    """
+    Captures, by position (never by object identity - brochure enrichment
+    may replace row objects via model_copy rather than mutate them in
+    place, see brochure_enrichment.py's own established pattern), exactly
+    the three facts _reattempt_geocoding_for_newly_addressed_rows below
+    needs to decide whether a row is a genuine candidate for its fix: was
+    this row's existing location already flagged uncertain, and did it
+    already have BOTH address_1 and postcode before enrichment had a
+    chance to backfill either. Called by the caller strictly BEFORE
+    brochure enrichment runs - _run_automatic_brochure_enrichment's own
+    return value is what "after" gets compared against.
+    """
+    return [(row.geocode_unverified, bool(row.address_1), bool(row.postcode)) for row in rows]
+
+
+def _reattempt_geocoding_for_newly_addressed_rows(rows: list[ListingRow], pre_enrichment_state: list) -> None:
+    """
+    Real, confirmed gap this closes: geocode_rows() runs unconditionally
+    right after extraction, before brochure enrichment ever gets a chance
+    to backfill address_1/postcode from the brochure itself - so a row
+    whose source spreadsheet stated only a bare building name (nothing
+    Tier 1's own Geocoding API lookup could use) falls through to Tier 2's
+    weaker Places name-only search, which has no way to distinguish a
+    same-named but genuinely different real place. Confirmed real
+    incident: a fresh Colliers upload's own "Thames Court" row (4 Upper
+    Thames Street, EC4V 3BJ - no street address of its own in the raw
+    spreadsheet) landed on a same-named building ~29km away in Surrey via
+    Tier 2, correctly flagged geocode_unverified=True, but nothing ever
+    revisited it once its own brochure went on to correctly backfill both
+    address_1 and postcode a few steps later - by then geocoding had
+    already run and moved on for good.
+
+    Deliberately scoped to ONLY a row that (a) already carries geocode_
+    unverified=True (see schema.ListingRow's own docstring for its exact
+    tri-state semantics - True specifically means "this run has real
+    evidence the location IS NOT verified", the one and only state this
+    fix should ever act on) - a trusted row (False) or a row geocoding
+    never even attempted (None) must never be re-geocoded here, avoiding
+    needless churn/API cost on rows that don't need it - and (b) didn't
+    already have BOTH address_1 and postcode before this specific
+    enrichment pass, so this only fires when the pass genuinely just
+    supplied evidence Tier 1 didn't have the first time, never re-running
+    an already-Tier-1-quality lookup for no reason.
+
+    Clears the row's own existing (untrusted) lat/lng before calling
+    geocode_row again - geocode_row's own first check returns immediately
+    without attempting anything further whenever lat/lng are already
+    non-None (the ordinary, correct behavior for a row with a real
+    source-provided coordinate), which would otherwise make this entire
+    re-attempt a silent no-op for exactly the rows it exists to fix.
+    """
+    for row, (was_unverified, had_address_1, had_postcode) in zip(rows, pre_enrichment_state):
+        if was_unverified is not True:
+            continue
+        if had_address_1 and had_postcode:
+            continue
+        if not (row.address_1 and row.postcode):
+            continue
+        row.lat = None
+        row.lng = None
+        geocode.geocode_row(row)
+
+
 def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) -> None:
     """
     A cheap, visible sanity check for Gemini-extracted spreadsheet rows only
@@ -1605,11 +1669,18 @@ with page_setup.setup_page("upload"):
                     # file whose real extraction genuinely succeeded.
                     if (is_spreadsheet_source or is_email_source) and (not reused or resume_already_processed is not None):
                         try:
+                            # See _reattempt_geocoding_for_newly_addressed_
+                            # rows's own docstring - captured strictly
+                            # BEFORE enrichment runs, since that's the only
+                            # point "did this row already have an address"
+                            # can still be answered.
+                            pre_enrichment_geocode_state = _pre_enrichment_geocode_snapshot(rows)
                             rows = _run_automatic_brochure_enrichment(
                                 rows, staging_path, already_processed=resume_already_processed,
                                 floorplan_already_processed=resume_floorplan_already_processed,
                                 row_count=row_count,
                             )
+                            _reattempt_geocoding_for_newly_addressed_rows(rows, pre_enrichment_geocode_state)
                         except Exception as e:
                             st.warning(
                                 f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
