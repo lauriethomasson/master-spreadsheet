@@ -1316,6 +1316,61 @@ class WeakStreetCorroborationTests(unittest.TestCase):
         self.assertIn("contradicts", geocode.FAILURES[0]["reason"])
 
 
+class NameOnlyMatchLoggingTests(unittest.TestCase):
+    """
+    Regression coverage for geocode_row's own THIRD Tier 2 accept path -
+    zero source_hint at all (see NAME_ONLY_MATCHES/log_geocode_name_only_
+    match's own module-level docstring for the real "Thames Court"
+    incident this closes) - previously left no trace anywhere, unlike its
+    two siblings (log_geocode_failure/log_geocode_weak_match).
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+        geocode.WEAK_MATCHES.clear()
+        geocode.NAME_ONLY_MATCHES.clear()
+
+    def test_bare_name_candidate_with_no_source_hint_is_accepted_and_logged_distinctly(self):
+        # No address_1/postcode/development_name at all - genuinely zero
+        # source_hint, the exact shape a real "Henly House"-style row has.
+        row = ListingRow(building="Henly House", provider="Kitt's")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5262, "lng": -0.0873, "address_components": []},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5262)
+        self.assertEqual(row.lng, -0.0873)
+        self.assertIs(row.geocode_unverified, True)
+        self.assertEqual(len(geocode.NAME_ONLY_MATCHES), 1)
+        self.assertIn("no source address_1/postcode/building-token hint", geocode.NAME_ONLY_MATCHES[0]["reason"])
+        # A genuinely DIFFERENT log from the weak_corroboration case - this
+        # incident must never be confused with, or hidden inside, that one.
+        self.assertEqual(geocode.WEAK_MATCHES, [])
+
+    def test_weak_corroboration_accept_still_logs_only_as_weak_not_name_only(self):
+        # Same shape as WeakStreetCorroborationTests above - a genuine
+        # source_hint IS present here, so this must log to WEAK_MATCHES
+        # only, never NAME_ONLY_MATCHES (which is reserved for the zero-
+        # hint case specifically).
+        row = ListingRow(building="44 Paul Street", provider="Kitt's", postcode="EC2A 4LB")
+        components = [
+            {"longText": "44", "types": ["street_number"]},
+            {"longText": "EC2A 4LB", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "lat": 51.5262, "lng": -0.0873, "address_components": components},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(len(geocode.WEAK_MATCHES), 1)
+        self.assertEqual(geocode.NAME_ONLY_MATCHES, [])
+
+
 class HouseNumberConflictFullPipelineTests(unittest.TestCase):
     """
     geocode_row -> master_merge.build_merge_plan, end to end - proves the

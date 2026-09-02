@@ -878,6 +878,37 @@ def log_geocode_weak_match(row: ListingRow, reason: str):
     print(f"[geocode] WEAK MATCH ACCEPTED: {row.building!r} ({row.source_file}) — {reason}", file=sys.stderr)
 
 
+# Real, confirmed gap this closes: geocode_row's own THIRD Tier 2 accept
+# path - zero source_hint at all, so the candidate is accepted on a bare
+# building-name Places match with NOTHING to cross-check it against - had
+# NO logging of its own, unlike its two siblings (log_geocode_failure for
+# a rejected candidate, log_geocode_weak_match for a hint-corroborated-
+# but-only-weakly-so accept). This is the weakest and most dangerous of
+# the three, yet the only one invisible in Cloud Run logs - a real
+# "Thames Court" -> a same-named but genuinely different Surrey building
+# ~29km away incident had to be traced by hand for exactly this reason:
+# searching the logs for "Thames Court" found nothing at all, even though
+# this module clearly logs its other two outcomes. Deliberately a
+# SEPARATE list/function from WEAK_MATCHES/log_geocode_weak_match - a
+# weak_corroboration accept still has a real source_hint to check
+# against (just a weaker-than-usual one); this path has none at all, a
+# meaningfully different (and worse) evidentiary situation worth its own
+# record.
+NAME_ONLY_MATCHES = []
+
+
+def log_geocode_name_only_match(row: ListingRow, reason: str):
+    entry = {
+        "building": row.building,
+        "floor_unit": row.floor_unit,
+        "submarket": row.submarket,
+        "source_file": row.source_file,
+        "reason": reason,
+    }
+    NAME_ONLY_MATCHES.append(entry)
+    print(f"[geocode] NAME-ONLY MATCH ACCEPTED: {row.building!r} ({row.source_file}) — {reason}", file=sys.stderr)
+
+
 def _best_places_result(
     query: str,
     source_hint: dict,
@@ -1458,6 +1489,17 @@ def geocode_row(row: ListingRow) -> ListingRow:
                     f"of its own to verify against the source's own stated street in {row.building!r} - "
                     f"accepted only on its postcode district agreeing with source evidence "
                     f"({_hint_label(source_hint)!r}), not a genuine street match",
+                )
+            elif not source_hint:
+                # See NAME_ONLY_MATCHES's own module-level docstring for
+                # the real "Thames Court" incident this closes - this
+                # branch previously left no trace anywhere.
+                log_geocode_name_only_match(
+                    row,
+                    f"Places candidate at (lat={result['lat']}, lng={result['lng']}) accepted for "
+                    f"{row.building!r} with no source address_1/postcode/building-token hint at all to "
+                    f"cross-check against - a pure building-name-only Places match, indistinguishable "
+                    f"here from a same-named but genuinely different real place",
                 )
 
             if not row.address_1 or not row.postcode:
