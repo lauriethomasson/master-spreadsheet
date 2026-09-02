@@ -5685,11 +5685,17 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         # because the document genuinely had nothing for it at all - see
         # enrich_rows_grouped's own already_processed docstring. Row A's
         # own prior value must survive completely untouched throughout.
+        # special_features_matched=True marks row A as genuinely resolved
+        # by that prior run (see that field's own schema.py docstring) -
+        # the actual evidence still_blank_counts now uses, since a plain
+        # non-blank special_features value alone is no longer sufficient
+        # (see the resume-skip regression tests below).
         row_a = ListingRow(
             building="A", address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
             floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
             special_features="Already filled by a prior run", state_of_space="Cat A",
             contacts="Jane, jane@x.com", brochure_link="https://example.com/shared.pdf",
+            special_features_matched=True,
         )
         row_b = ListingRow(building="B", brochure_link="https://example.com/shared.pdf", special_features=None)
         already_processed = {"https://example.com/shared.pdf": "ok"}
@@ -5709,6 +5715,81 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         self.assertEqual(enriched[0].special_features, "Already filled by a prior run")
         self.assertEqual(enriched[1].special_features, "Recovered for B")
         self.assertEqual(stats["processed_urls"], {"https://example.com/shared.pdf": "ok"})
+
+    def test_short_boilerplate_special_features_with_everything_else_filled_forces_a_refetch(self):
+        # Confirmed real root cause of the "210 Euston Road" shape: a row
+        # can have SOME non-blank special_features text (boilerplate from
+        # the original source extraction, never actually brochure-sourced)
+        # while every other ENRICHABLE_FIELDS value is already filled -
+        # _row_has_a_genuinely_blank_enrichable_field used to treat that as
+        # "nothing left to do here" on the strength of special_features'
+        # plain non-blankness alone, permanently stranding it once its
+        # shared URL was marked "ok" by an already-resolved sibling row.
+        # special_features_matched (see schema.ListingRow's own docstring)
+        # is the fix: still_blank_counts now uses it instead of a blank
+        # check, so this row keeps forcing a refetch until a genuine
+        # combine actually lands.
+        row_a = ListingRow(
+            building="A", address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Genuinely resolved by a prior run", state_of_space="Cat A",
+            contacts="Jane, jane@x.com", brochure_link="https://example.com/shared.pdf",
+            special_features_matched=True,
+        )
+        row_b = ListingRow(
+            building="B", address_1="2 Example Street", postcode="EC1A 1AB", submarket="City",
+            floor_unit="2nd", size_sqft=2000, desks_max=30, rent_pcm=6000, rent_psf=65,
+            special_features="5 meeting rooms; 12 month term", state_of_space="Cat A",
+            contacts="Jane, jane@x.com", brochure_link="https://example.com/shared.pdf",
+            special_features_matched=None,
+        )
+        already_processed = {"https://example.com/shared.pdf": "ok"}
+
+        def _fake_apply(row, units):
+            if row.building == "B":
+                return row.model_copy(update={"special_features": "Recovered for B"}), ["special_features"]
+            return row, []
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=[{"building": "B"}]) as mock_extract, \
+             patch("brochure_enrichment._apply_units_to_row", side_effect=_fake_apply):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                [row_a, row_b], already_processed=already_processed,
+            )
+
+        mock_extract.assert_called_once_with("https://example.com/shared.pdf")
+        self.assertEqual(enriched[0].special_features, "Genuinely resolved by a prior run")
+        self.assertEqual(enriched[1].special_features, "Recovered for B")
+        self.assertIs(enriched[1].special_features_matched, True)
+        self.assertEqual(stats["processed_urls"], {"https://example.com/shared.pdf": "ok"})
+
+    def test_url_where_every_sharing_row_is_already_matched_is_not_refetched(self):
+        # The other side of the fix above - once every row sharing a URL
+        # genuinely has special_features_matched=True, the existing "don't
+        # waste a refetch" optimization must still apply unchanged, even
+        # though special_features' own text is non-blank on both (the same
+        # shape a plain blank check would already have gotten right - this
+        # confirms the new special_features_matched-based check does too).
+        row_a = ListingRow(
+            building="A", address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+            floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+            special_features="Resolved A", state_of_space="Cat A", contacts="Jane, jane@x.com",
+            brochure_link="https://example.com/shared.pdf", special_features_matched=True,
+        )
+        row_b = ListingRow(
+            building="B", address_1="2 Example Street", postcode="EC1A 1AB", submarket="City",
+            floor_unit="2nd", size_sqft=2000, desks_max=30, rent_pcm=6000, rent_psf=65,
+            special_features="Resolved B", state_of_space="Cat A", contacts="Jane, jane@x.com",
+            brochure_link="https://example.com/shared.pdf", special_features_matched=True,
+        )
+        already_processed = {"https://example.com/shared.pdf": "ok"}
+
+        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                [row_a, row_b], already_processed=already_processed,
+            )
+
+        mock_extract.assert_not_called()
+        self.assertEqual(stats["processed_urls"], {})
 
     def test_skipped_rows_are_left_completely_unchanged(self):
         rows = self._rows(2)

@@ -1207,10 +1207,34 @@ def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow) -> bool:
     application loop itself, which keeps using needs_enrichment/
     indices_by_url completely unchanged, preserving its own deliberate
     always-eligible-for-recombine behavior.
+
+    special_features is checked differently from every other field here,
+    using row.special_features_matched (see that field's own schema.py
+    docstring) rather than a plain blank check on row.special_features
+    itself - a confirmed real gap a plain blank check can't close: a row's
+    special_features can be non-blank (short boilerplate carried over from
+    the original source extraction, never actually brochure-sourced) while
+    STILL never having received a genuine unit-/building-/property-level
+    combine. A plain blank check would call such a row "not genuinely
+    blank" - exactly wrong for THIS function's own purpose, since it's
+    what let a row like this get silently, permanently skipped on a
+    resumed run once its shared brochure URL was already marked "ok" by an
+    earlier pass, even though the combine that would have actually
+    resolved it never once ran. special_features_matched is the evidence
+    needed to ask the real question ("did a genuine combine ever land
+    here", not "is there any text here at all") that this function's own
+    docstring above already explains needs_enrichment's blunt brochure_
+    link-based override can't answer on its own - still gated on an
+    eligible brochure_link existing at all, since a row with nothing to
+    fetch has no way to ever resolve this regardless.
     """
     for field in ENRICHABLE_FIELDS:
         if field == "address_1":
             if _is_placeholder_address(row.address_1, row.building):
+                return True
+            continue
+        if field == "special_features":
+            if row.special_features_matched is not True and bool(row.brochure_link):
                 return True
             continue
         if _is_blank(getattr(row, field)):
@@ -3934,9 +3958,11 @@ def enrich_rows_grouped(
     # anyone" apart from "some rows are already filled, others are still
     # stranded". still_blank_counts instead uses _row_has_a_genuinely_
     # blank_enrichable_field (see its own docstring) - the plain "is
-    # anything actually still missing" question, with no brochure_link-
-    # based override - which is exactly what distinguishes a row that was
-    # never actually resolved from one that was.
+    # anything actually still missing" question (special_features's own
+    # check there uses special_features_matched, never a blunt brochure_
+    # link-based override the way needs_enrichment does) - which is
+    # exactly what distinguishes a row that was never actually resolved
+    # from one that was.
     first_label = {}
     indices_by_url = {}
     sharing_counts = {}
@@ -4088,8 +4114,24 @@ def enrich_rows_grouped(
                         file=sys.stderr,
                     )
                     new_row, fields = rows[i], []
+                # special_features_matched update (see that field's own
+                # schema.py docstring) - True only when _apply_units_to_row
+                # actually changed special_features THIS call (present in
+                # its own `fields` list, never merely carried the row's own
+                # existing value forward unchanged), folded into the same
+                # model_copy as brochure_link_broken above since both are
+                # per-row diagnostic flags decided at this exact point.
+                # Never set False here (or anywhere else) - see that
+                # field's own docstring for why there's deliberately no
+                # "confirmed nothing here" state the way brochure_link_
+                # broken has one.
+                update = {}
                 if link_broken_update is not None:
-                    new_row = new_row.model_copy(update={"brochure_link_broken": link_broken_update})
+                    update["brochure_link_broken"] = link_broken_update
+                if "special_features" in fields:
+                    update["special_features_matched"] = True
+                if update:
+                    new_row = new_row.model_copy(update=update)
                 current[i] = new_row
                 if fields:
                     if (

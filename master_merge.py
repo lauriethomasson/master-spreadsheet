@@ -2498,6 +2498,7 @@ def geocode_consolidation_groups(rows: list) -> dict:
 # it here.
 DUPLICATE_CARD_HIDDEN_FIELDS = (
     "brochure_link_broken", "brochure_link_is_floorplan", "lat", "lng", "geocode_unverified", "development_name",
+    "special_features_matched",
 )
 
 
@@ -3035,6 +3036,18 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             # else needed for a fixed-and-reuploaded link to self-heal.
             if "brochure_link_broken" in diffs:
                 silent["brochure_link_broken"] = diffs.pop("brochure_link_broken")[1]
+
+            # special_features_matched (see schema.ListingRow's own
+            # docstring) is the same kind of diagnostic pipeline metadata as
+            # brochure_link_broken immediately above - purely enrich_rows_
+            # grouped's own resume bookkeeping (see _row_has_a_genuinely_
+            # blank_enrichable_field's own docstring), never a property fact
+            # a reviewer should ever be asked to approve. Same blank-new-
+            # value-skip reasoning applies unchanged: a fresh row that never
+            # got a genuine combine this run (None) never clears master's
+            # existing True.
+            if "special_features_matched" in diffs:
+                silent["special_features_matched"] = diffs.pop("special_features_matched")[1]
 
             # geocode_unverified is the same kind of diagnostic pipeline
             # metadata as brochure_link_broken above - never a property
