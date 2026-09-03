@@ -145,6 +145,47 @@ class SingleSuggestionYesNoTests(IsolatedCwdTestCase):
         master_df = master_writer.load_master_as_dataframe()
         self.assertEqual(len(master_df), 2)  # back to two separate properties
 
+    def test_no_caption_shown_before_any_click(self):
+        # The default ("Keep as new property") is already communicated by
+        # the button pair's own primary/secondary styling - an
+        # unconditional caption here was confirmed confusing to reviewers.
+        at = self._stage_single_near_miss()
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertNotIn("Will be added as a new property", caption_text)
+        self.assertNotIn("Will be merged into", caption_text)
+
+    def test_clicking_keep_as_new_shows_the_new_property_caption(self):
+        at = self._stage_single_near_miss()
+        no_button = next(b for b in at.button if b.label == "Keep as new property")
+        no_button.click().run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("✓ Will be added as a new property", caption_text)
+        self.assertNotIn("Will be merged into", caption_text)
+
+    def test_clicking_yes_shows_the_merge_caption_naming_the_master_row(self):
+        at = self._stage_single_near_miss()
+        yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
+        yes_button.click().run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("🔗 Will be merged into Thirty Lighterman — Kitt's as an update", caption_text)
+        self.assertNotIn("Will be added as a new property", caption_text)
+
+    def test_caption_updates_when_switching_back_after_yes(self):
+        at = self._stage_single_near_miss()
+        yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
+        at = yes_button.click().run()
+        no_button = next(b for b in at.button if b.label == "Keep as new property")
+        no_button.click().run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("✓ Will be added as a new property", caption_text)
+        self.assertNotIn("Will be merged into", caption_text)
+
 
 class ZeroDiffAfterLinkingTests(IsolatedCwdTestCase):
     """The new row leaves floor_unit blank (no data this time) while master

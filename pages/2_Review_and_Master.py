@@ -2416,6 +2416,24 @@ def _near_miss_matching_and_differing(old_rec: dict, row_dict: dict) -> tuple:
     return matching, differing
 
 
+def _near_miss_decision_caption(same_property: bool, closest: dict) -> str:
+    """
+    One-line confirmation of the near-miss Yes/No decision's CURRENT
+    outcome - shown directly under the button pair, but only once a
+    reviewer has clicked either button at least once this session (see
+    that call site's own clicked_key comment) - an earlier unconditional
+    version of this caption was confirmed confusing shown before any
+    click at all, when the button pair's own primary/secondary styling
+    already communicates the default. Recomputed fresh on every rerun
+    from `same_property` alone, so a "no-op" click on the already-selected
+    option still re-renders this same confirming text, same as a click
+    that actually changed the state.
+    """
+    if same_property:
+        return f"🔗 Will be merged into {display_utils.row_label(closest)} as an update"
+    return "✓ Will be added as a new property"
+
+
 def _oxford_join(items: list) -> str:
     if not items:
         return ""
@@ -2929,6 +2947,16 @@ def _render_pending_review(pending: list):
                             # never linked unless the reviewer explicitly says so.
                             st.session_state[decision_key] = "new"
                         same_property = st.session_state[decision_key] == "same"
+                        # Tracks whether either button has EVER been clicked
+                        # this session - separate from decision_key itself,
+                        # since decision_key already has a real, meaningful
+                        # default ("new") before any click, which alone can't
+                        # tell "reviewer hasn't looked at this yet" apart from
+                        # "reviewer looked and confirmed the default". Gates
+                        # the confirmation caption below - see its own comment.
+                        clicked_key = f"{key_prefix}_yesno_clicked"
+                        if clicked_key not in st.session_state:
+                            st.session_state[clicked_key] = False
 
                         yes_col, no_col = st.columns(2)
                         with yes_col:
@@ -2937,6 +2965,7 @@ def _render_pending_review(pending: list):
                                 type="primary" if same_property else "secondary",
                             ):
                                 st.session_state[decision_key] = "same"
+                                st.session_state[clicked_key] = True
                                 st.rerun()
                         with no_col:
                             if st.button(
@@ -2944,7 +2973,20 @@ def _render_pending_review(pending: list):
                                 type="primary" if not same_property else "secondary",
                             ):
                                 st.session_state[decision_key] = "new"
+                                st.session_state[clicked_key] = True
                                 st.rerun()
+
+                        # No caption at all until a reviewer has clicked
+                        # either button once this session - the default
+                        # ("Keep as new property") speaks for itself via the
+                        # button pair's own primary/secondary styling, and an
+                        # unconditional caption here was confirmed confusing.
+                        # Once clicked, this stays visible and updates on
+                        # every further click (including a "no-op" click on
+                        # the already-selected option), so a reviewer always
+                        # sees confirmation their decision registered.
+                        if st.session_state[clicked_key]:
+                            st.caption(_near_miss_decision_caption(same_property, closest))
 
                         if same_property:
                             target_index = next(
