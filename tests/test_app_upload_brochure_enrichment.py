@@ -380,14 +380,21 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
     Content-hash dedup (see app.py's own find_previous_upload_by_hash)
     reuses an already-extracted result for a byte-identical re-upload
     rather than re-extracting - but when the matched entry's OWN brochure
-    enrichment was left incomplete, the NEW (re-upload) staging entry now
-    CONTINUES that progress automatically (see app.py's own
-    resume_already_processed) rather than silently freezing at the same
-    partial state forever with no automatic path to ever finish - a real
-    production report confirmed a re-upload used to just sit there
-    unfinished. Already-"ok" brochures are still never re-fetched/re-sent
-    to Gemini just because this landed on a new staging path rather than
-    the original one.
+    enrichment was left incomplete (status="in_progress"), OR finished
+    (status="complete") while still leaving at least one row genuinely
+    blank, the NEW (re-upload) staging entry now CONTINUES that progress
+    automatically (see app.py's own resume_already_processed) rather than
+    silently freezing at the same partial/blank state forever with no
+    automatic path to ever finish - a real production report confirmed a
+    re-upload used to just sit there unfinished (the "in_progress" case),
+    and a SEPARATE real, repeated production report (the real Henly House
+    brochure_link) confirmed a "complete" but still genuinely blank match
+    used to stay frozen FOREVER regardless of how many more times the
+    identical file was re-uploaded, since "complete" alone used to be
+    treated as nothing-left-to-do with no regard for whether the row it
+    touched was ever actually filled. Already-"ok" brochures are still
+    never re-fetched/re-sent to Gemini just because this landed on a new
+    staging path rather than the original one.
 
     Each upload event still stages its OWN file (see save_staging_file's
     own docstring - "reused or freshly extracted alike", a pre-existing,
@@ -474,10 +481,87 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
         stats = get_staging_enrichment_summary(original_path)
         self.assertEqual(stats["status"], "in_progress")
 
-    def test_reuploading_a_complete_match_does_not_re_run_enrichment(self):
+    def test_reuploading_a_complete_and_fully_resolved_match_does_not_re_run_enrichment(self):
         # The counterpart case: nothing to continue when the matched
-        # entry's own enrichment already finished - this must stay a pure
-        # reuse, exactly as before this feature existed.
+        # entry's own enrichment already finished AND genuinely left
+        # nothing blank - this must stay a pure reuse, exactly as before
+        # this feature existed. The unit below deliberately supplies EVERY
+        # ENRICHABLE_FIELDS value (see brochure_enrichment.py) that
+        # _union_style_workbook's own source columns don't already fill
+        # (address_1/postcode/submarket/desks_max/rent_psf/state_of_space/
+        # contacts/special_features) - a row still missing even one of
+        # these would no longer count as "nothing left to do" (see
+        # test_reuploading_a_complete_but_still_blank_match_re_runs_
+        # enrichment below for that real, confirmed production case).
+        file_bytes = _union_style_workbook()
+        # rent_psf=150 - NOT arbitrary: _union_style_workbook's own source
+        # already sets rent_pcm=15000/size_sqft=1200 at extraction, and
+        # _apply_units_to_row's own HIGH_RISK_UNIT_LEVEL_FIELDS tier skips
+        # BOTH rent_pcm/rent_psf entirely whenever the two sides' annual
+        # rent figures disagree (see _rent_values_consistent) - 150 is the
+        # one value consistent with the row's own existing 15000/1200
+        # (15000*12 == 150*1200), confirmed directly (a mismatched value
+        # here left rent_psf permanently blank, defeating this fixture's
+        # own "fully resolved" premise).
+        units = brochure_enrichment._BrochureUnits([{
+            "building": "Building 0", "floor_unit": "0th Floor", "address_1": "1 Example Street",
+            "postcode": "EC1A 1AA", "submarket": "City", "desks_max": 12, "rent_psf": 150,
+            "state_of_space": "Cat A", "special_features": "Done",
+        }])
+        units.contacts = "Jane, jane@x.com"
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload(
+                "Union.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        pending = list_pending_staging_files()
+        original_stats = get_staging_enrichment_summary(pending[0])
+        self.assertEqual(original_stats["status"], "complete")
+        df = load_staging_as_dataframe(pending[0])
+        # Confirms the fixture really did fully resolve, including the one
+        # field that's easy to leave accidentally blank (see rent_psf's
+        # own comment above).
+        self.assertEqual(df.iloc[0]["state_of_space"], "Cat A")
+        self.assertEqual(df.iloc[0]["rent_psf"], 150)
+
+        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+            at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at2.run()
+            at2.file_uploader[0].upload(
+                "Union-reupload.xlsx", file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            at2.run()
+            extract_buttons = [b for b in at2.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at2.exception)
+
+        mock_extract.assert_not_called()
+
+    def test_reuploading_a_complete_but_still_blank_match_re_runs_enrichment(self):
+        # Real, repeated, confirmed production case (the real Henly House
+        # brochure_link): a byte-identical re-upload of a file whose
+        # matched entry's enrichment already finished (status="complete")
+        # used to be treated as nothing-left-to-do PURELY because the
+        # status said "complete" - regardless of whether the row it
+        # touched was ever actually filled. A url can legitimately be
+        # marked "ok" (the fetch/extraction itself succeeded) while
+        # _match_unit still found no confident match for a SPECIFIC row
+        # (see brochure_enrichment._row_has_a_genuinely_blank_enrichable_
+        # field's own docstring) - e.g. a building-identity-matching gap
+        # since fixed in a later deploy than the one the "complete" run
+        # actually ran under. Re-uploading the identical file used to stay
+        # frozen at that blank result FOREVER, no matter how many more
+        # times it was re-uploaded. This row deliberately supplies
+        # nothing beyond special_features (mirroring the real Henly House
+        # shape: address_1/postcode/state_of_space all genuinely blank),
+        # so it must now be re-attempted on the very next re-upload.
         file_bytes = _union_style_workbook()
 
         with patch(
@@ -498,7 +582,13 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
         original_stats = get_staging_enrichment_summary(pending[0])
         self.assertEqual(original_stats["status"], "complete")
 
-        with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
+        with patch(
+            "brochure_enrichment._extract_brochure_units",
+            return_value=[{
+                "building": "Building 0", "floor_unit": "0th Floor",
+                "state_of_space": "Recovered", "special_features": "Done",
+            }],
+        ) as mock_extract:
             at2 = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
             at2.run()
             at2.file_uploader[0].upload(
@@ -509,7 +599,11 @@ class ReuploadWhileIncompleteTests(unittest.TestCase):
             extract_buttons[0].click().run()
             self.assertFalse(at2.exception)
 
-        mock_extract.assert_not_called()
+        mock_extract.assert_called_once()
+        pending_after = list_pending_staging_files()
+        new_path = next(p for p in pending_after if p != pending[0])
+        df = load_staging_as_dataframe(new_path)
+        self.assertEqual(df.iloc[0]["state_of_space"], "Recovered")
 
 
 class FingerprintIncludesBrochureEnrichmentAgainTests(unittest.TestCase):

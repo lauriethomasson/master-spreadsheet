@@ -1366,8 +1366,11 @@ with page_setup.setup_page("upload"):
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
                     fully_occupied_buildings = []
                     # Set below ONLY when previous_staging_path's own
-                    # enrichment was left incomplete - see its own use at
-                    # the automatic-enrichment call site further down.
+                    # enrichment was left incomplete (status="in_progress"),
+                    # OR finished (status="complete") but at least one row
+                    # it touched is still genuinely blank (see the "complete"
+                    # branch's own comment below) - see its own use at the
+                    # automatic-enrichment call site further down.
                     resume_already_processed = None
                     resume_floorplan_already_processed = None
                     resume_special_features_matched = None
@@ -1398,6 +1401,57 @@ with page_setup.setup_page("upload"):
                             resume_special_features_matched = previous_enrichment.get(
                                 "special_features_matched", {}
                             )
+                        elif previous_enrichment and previous_enrichment.get("status") == "complete":
+                            # Confirmed real, repeated production case this
+                            # closes: a prior run finishing (status=
+                            # "complete") only ever means every eligible
+                            # brochure URL was ATTEMPTED once - never a
+                            # promise every row it touched actually got
+                            # filled (see brochure_enrichment.
+                            # _row_has_a_genuinely_blank_enrichable_field's
+                            # own docstring on why a url can be marked "ok"
+                            # while still leaving a genuinely blank row
+                            # behind, e.g. a building-identity-matching gap
+                            # fixed in a LATER deploy than the one this
+                            # "complete" run actually ran under - real
+                            # Henly House case: 22 separate re-uploads of the
+                            # byte-identical source file, address_1/
+                            # postcode/state_of_space still blank every
+                            # single time, confirmed via a real fetch +
+                            # Gemini call that the SAME url/rows genuinely
+                            # DO resolve correctly once _run_automatic_
+                            # brochure_enrichment is actually given the
+                            # chance to run again - it never was, because
+                            # this branch used to leave resume_already_
+                            # processed at None for ANY "complete" status,
+                            # and the call site below only ever calls that
+                            # function at all when reused is False OR
+                            # resume_already_processed is not None. A
+                            # byte-identical re-upload of a "complete" but
+                            # still-genuinely-blank prior run used to stay
+                            # frozen at that result FOREVER, no matter how
+                            # many more times the identical file was
+                            # re-uploaded, regardless of any fix deployed
+                            # since. Scoped to the SAME "genuinely blank"
+                            # question enrich_rows_grouped's own resume
+                            # logic already answers per-URL (see its
+                            # already_processed docstring) - a genuinely
+                            # fully-resolved "complete" run is still never
+                            # re-attempted, only one with real remaining
+                            # gaps.
+                            prior_special_features_matched = previous_enrichment.get("special_features_matched", {})
+                            still_has_a_genuine_gap = any(
+                                brochure_enrichment._row_has_a_genuinely_blank_enrichable_field(
+                                    r, special_features_matched=bool(prior_special_features_matched.get(str(i))),
+                                )
+                                for i, r in enumerate(rows)
+                            )
+                            if still_has_a_genuine_gap:
+                                resume_already_processed = previous_enrichment.get("processed_urls", {})
+                                resume_floorplan_already_processed = previous_enrichment.get(
+                                    "floorplan_processed_urls", {}
+                                )
+                                resume_special_features_matched = prior_special_features_matched
                         # A reused result's own fully_occupied_buildings (see
                         # extract_spreadsheet_gemini.extract_sheet_with_
                         # metadata) lives in the ORIGINAL staging run's own
@@ -1703,12 +1757,17 @@ with page_setup.setup_page("upload"):
                     # Automatic - for a fresh spreadsheet OR email extraction
                     # always, and ALSO for a reused (byte-identical previous
                     # upload) result whose own matched entry's enrichment
-                    # was left incomplete (resume_already_processed is then
-                    # non-None - see its own assignment above), so THIS
-                    # staging entry continues that progress rather than
-                    # staying frozen at it forever. A reused result whose
-                    # match was already complete still skips this entirely -
-                    # nothing left to do. Never for PDF (see brochure_
+                    # was left incomplete OR finished with a genuine
+                    # remaining gap (resume_already_processed is then
+                    # non-None either way - see its own assignment above,
+                    # including the "complete but still genuinely blank"
+                    # branch), so THIS staging entry gets a real chance to
+                    # resolve it rather than staying frozen at that prior
+                    # result forever, no matter how many more times the
+                    # identical file gets re-uploaded. A reused result whose
+                    # match was already complete AND has nothing genuinely
+                    # blank left still skips this entirely - nothing left to
+                    # do. Never for PDF (see brochure_
                     # enrichment.py's own module docstring on why that stays
                     # out of scope - already extracted from the actual
                     # brochure itself). Wrapped in its own try/except, on
