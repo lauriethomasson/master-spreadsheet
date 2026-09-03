@@ -2416,25 +2416,6 @@ def _near_miss_matching_and_differing(old_rec: dict, row_dict: dict) -> tuple:
     return matching, differing
 
 
-def _near_miss_decision_caption(same_property: bool, closest: dict) -> str:
-    """
-    One-line, always-visible confirmation of the near-miss Yes/No decision's
-    CURRENT outcome - shown directly under the button pair regardless of
-    which button (if either) was just clicked. Confirmed real gap this
-    closes: "Add as new instead" is the default state before any click
-    (see decision_key's own "new" default above), so clicking it when it's
-    ALREADY selected changes nothing else on screen - a reviewer sees no
-    feedback at all and can't tell their click registered, even though the
-    row genuinely is (and was already) being treated as new. Recomputed
-    fresh on every rerun from `same_property` alone, so a "no-op" click on
-    the already-selected option still re-renders this same confirming text,
-    same as a click that actually changed the state.
-    """
-    if same_property:
-        return f"🔗 Will be merged into {display_utils.row_label(closest)} as an update"
-    return "✓ Will be added as a new property"
-
-
 def _oxford_join(items: list) -> str:
     if not items:
         return ""
@@ -2959,13 +2940,11 @@ def _render_pending_review(pending: list):
                                 st.rerun()
                         with no_col:
                             if st.button(
-                                "Add as new instead", key=f"{key_prefix}_no",
+                                "Keep as new property", key=f"{key_prefix}_no",
                                 type="primary" if not same_property else "secondary",
                             ):
                                 st.session_state[decision_key] = "new"
                                 st.rerun()
-
-                        st.caption(_near_miss_decision_caption(same_property, closest))
 
                         if same_property:
                             target_index = next(

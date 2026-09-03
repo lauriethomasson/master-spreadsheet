@@ -103,7 +103,7 @@ class SingleSuggestionYesNoTests(IsolatedCwdTestCase):
         at = self._stage_single_near_miss()
         button_labels = {b.label for b in at.button}
         self.assertIn("✓ Yes, same property", button_labels)
-        self.assertIn("Add as new instead", button_labels)
+        self.assertIn("Keep as new property", button_labels)
         self.assertEqual([sb for sb in at.selectbox if sb.key == "near_miss_0_choice"], [])
 
     def test_default_without_touching_anything_adds_as_new(self):
@@ -134,7 +134,7 @@ class SingleSuggestionYesNoTests(IsolatedCwdTestCase):
         at = self._stage_single_near_miss()
         yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
         yes_button.click().run()
-        no_button = next(b for b in at.button if b.label == "Add as new instead")
+        no_button = next(b for b in at.button if b.label == "Keep as new property")
         no_button.click().run()
         self.assertFalse(at.exception)
 
@@ -144,38 +144,6 @@ class SingleSuggestionYesNoTests(IsolatedCwdTestCase):
 
         master_df = master_writer.load_master_as_dataframe()
         self.assertEqual(len(master_df), 2)  # back to two separate properties
-
-    def test_default_shows_a_will_be_added_as_new_confirmation(self):
-        # "Add as new instead" is the default state before any click (see
-        # decision_key's own "new" default) - a reviewer must still see an
-        # explicit, always-visible confirmation of that outcome without
-        # needing to scroll down to the New Properties summary.
-        at = self._stage_single_near_miss()
-        caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("✓ Will be added as a new property", caption_text)
-        self.assertNotIn("Will be merged into", caption_text)
-
-    def test_clicking_yes_shows_a_will_be_merged_confirmation_naming_the_master_row(self):
-        at = self._stage_single_near_miss()
-        yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
-        yes_button.click().run()
-
-        caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("🔗 Will be merged into Thirty Lighterman — Kitt's as an update", caption_text)
-        self.assertNotIn("Will be added as a new property", caption_text)
-
-    def test_clicking_the_already_selected_button_still_shows_its_confirmation(self):
-        # Confirmed real gap this covers: clicking "Add as new instead"
-        # while it's ALREADY the current selection changes nothing else on
-        # screen - the confirmation line is what proves the click still
-        # registered, even on this "no-op" click.
-        at = self._stage_single_near_miss()
-        no_button = next(b for b in at.button if b.label == "Add as new instead")
-        no_button.click().run()
-        self.assertFalse(at.exception)
-
-        caption_text = "".join(c.value for c in at.caption)
-        self.assertIn("✓ Will be added as a new property", caption_text)
 
 
 class ZeroDiffAfterLinkingTests(IsolatedCwdTestCase):
@@ -260,7 +228,7 @@ class MultipleSuggestionsDropdownTests(IsolatedCwdTestCase):
         self.assertEqual(len(selectboxes), 1)
         button_labels = {b.label for b in at.button}
         self.assertNotIn("✓ Yes, same property", button_labels)
-        self.assertNotIn("Add as new instead", button_labels)
+        self.assertNotIn("Keep as new property", button_labels)
 
     def test_summary_and_table_compare_against_the_closest_suggestion(self):
         # closest = suggestions[0] - "Thirty Lighterman" (master_records
