@@ -133,7 +133,7 @@ from brochure_link_resolver import (
     is_gpe_flipbook_link, is_kitt_brochure_preview_link, is_pitch_view_link, looks_like_url, resolve_brochure_link,
 )
 import geocode
-from house_number import leading_house_number
+from house_number import LEADING_HOUSE_NUMBER_RE, house_numbers_conflict, leading_house_number
 from master_merge import _STREET_SUFFIX_EXPANSIONS, normalize_key
 from schema import ListingRow
 from storage.file_store import set_staging_enrichment_progress, set_staging_enrichment_summary, update_staging_rows
@@ -768,7 +768,7 @@ _TRAILING_STREET_SUFFIX_WORDS = frozenset({
     "place", "pl", "court", "ct", "crescent", "cres", "gardens", "gdns",
     "terrace", "ter", "square", "sq", "drive", "dr", "way", "close",
     "walk", "row", "grove", "hill", "rise", "mews", "boulevard", "blvd",
-    "parade",
+    "parade", "yard",
 })
 
 
@@ -834,6 +834,17 @@ def _strip_leading_the(key: str) -> str:
 # _strip_trailing_parenthetical's own docstring for the real MetSpace
 # convention this exists for.
 _TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+# A " - " (space-dash-space) split point in a row's own building text -
+# see _building_identity_matches's own tier 3f docstring for the two real
+# confirmed cases this exists for. Deliberately requires whitespace on
+# BOTH sides of the dash (never a bare hyphen inside a single compound
+# word like "Co-working" or a house-number range like "27-29"), and only
+# ever splits on the FIRST such occurrence (maxsplit=1) - a row_building
+# with more than one " - " (none seen in any real case so far) is left
+# with its second half still attached to the suffix piece, never guessed
+# at further.
+_DASH_SEPARATOR_RE = re.compile(r"\s+-\s+")
 
 
 def _strip_trailing_parenthetical(building):
@@ -1280,7 +1291,107 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
         if parenthetical_content_matches:
             return parenthetical_content_matches
 
+    # 3f. DASH-SEPARATED WRAPPER, EITHER SIDE MAY BE THE REAL NAME (see
+    # _DASH_SEPARATOR_RE's own docstring for the two real confirmed cases
+    # this closes: row_building "Southbank Central - ALTO"/"Southbank
+    # Central - VIVO" vs that brochure's own bare "Alto"/"Vivo" (the
+    # SUFFIX is the real sub-building name, "Southbank Central" a
+    # disposable development wrapper - the dash-separated mirror of tier
+    # 3e's own parenthetical-wrapper case), and row_building "210 Euston
+    # Road - Fora Enterprise" vs that brochure's own bare "210 Euston
+    # Road" (here the PREFIX is the real name, "Fora Enterprise" a
+    # disposable operator/tenant suffix - tier 2's own _strip_building_
+    # address_suffix never catches this, since it only ever strips a
+    # dash-suffix that's itself address-SHAPED, i.e. starts with a house
+    # number; "Fora Enterprise" doesn't). Tries BOTH resulting pieces as
+    # independent candidate identities in one pass, since there's no
+    # reliable way to tell in advance which side (if either) is the real
+    # name - same weak-signal, corroborated-by-uniqueness discipline as
+    # every tier above (see _distinct_building_group): if prefix and
+    # suffix happen to match two DIFFERENT real candidates, that stays
+    # genuinely ambiguous, never guessed between. Never fires at all when
+    # row_building has no " - " separator.
+    dash_parts = _DASH_SEPARATOR_RE.split(row_building, maxsplit=1) if row_building else [row_building]
+    if len(dash_parts) == 2:
+        dash_prefix_key = normalize_key(dash_parts[0])
+        dash_suffix_key = normalize_key(dash_parts[1])
+        dash_side_matches = _distinct_building_group(
+            [
+                i for i, c in enumerate(candidate_buildings)
+                if (dash_prefix_key and normalize_key(c) == dash_prefix_key)
+                or (dash_suffix_key and normalize_key(c) == dash_suffix_key)
+            ],
+            candidate_buildings,
+        )
+        if dash_side_matches:
+            return dash_side_matches
+
+    # 3g. PERIOD-AS-WORD-SEPARATOR - e.g. row_building "TBC London - 224
+    # Tower Bridge Rd" (already reduced to "TBC London" by tier 2's own
+    # _strip_building_address_suffix, its "224 Tower Bridge Rd" suffix
+    # genuinely address-shaped) vs a real brochure's own extracted
+    # building text "TBC.London" - confirmed real, growing branding
+    # convention (a domain-style name used AS the building name).
+    # normalize_key itself simply DROPS "." entirely rather than treating
+    # it as a word boundary (confirmed directly: normalize_key("TBC.
+    # London") -> "tbclondon", never "tbc london"), so tier 1's own exact
+    # comparison - and every tier above needing an EXACT normalize_key
+    # match on at least one side - can never bridge this gap no matter how
+    # much else is stripped first. Deliberately narrow: replaces "." with
+    # a space BEFORE normalize_key runs, on both the row's own address-
+    # suffix-stripped text and each candidate's raw text, tried as an
+    # ADDITIONAL exact comparison - never a change to normalize_key
+    # itself (which countless OTHER real building names rely on treating
+    # "." as pure noise, e.g. an address abbreviation like "St." never
+    # meant to gain a spurious extra token). Same weak-signal,
+    # corroborated-by-uniqueness discipline as every tier above.
+    row_period_base = _strip_building_address_suffix(row_building)
+    row_period_key = normalize_key((row_period_base or "").replace(".", " "))
+    if row_period_key:
+        period_matches = _distinct_building_group(
+            [i for i, c in enumerate(candidate_buildings) if normalize_key((c or "").replace(".", " ")) == row_period_key],
+            candidate_buildings,
+        )
+        if period_matches:
+            return period_matches
+
     row_house_number = leading_house_number(row_building)
+
+    # 3h. HOUSE-NUMBER-RANGE OVERLAP - e.g. row_building "27-29 Gloucester
+    # Place" (a provider's own spreadsheet stating the FULL numbered range
+    # a building spans) vs a real brochure's own extracted building text
+    # "29 Gloucester Place" (Gemini choosing to state just the one number
+    # actually printed on that page) - confirmed real case. Requires BOTH:
+    # the text AFTER each side's own leading house number is byte-
+    # identical once normalize_key'd ("gloucester place" == "gloucester
+    # place" - genuinely the same street/name, not a coincidental number
+    # overlap on a different street), AND the two house-number tokens
+    # don't genuinely conflict (see house_number.house_numbers_conflict -
+    # reused rather than a second, independently-drifting range-overlap
+    # check; "27-29" and "29" overlap, so this is never a conflict, the
+    # same real UK convention that function's own docstring already
+    # documents). Never fires when either side has no leading house
+    # number at all - tier 5 below already covers a row/candidate with no
+    # number of its own, on a different, weaker signal (bare street-name
+    # word overlap), and mixing the two would only weaken both.
+    if row_house_number is not None:
+        row_number_match = LEADING_HOUSE_NUMBER_RE.match(row_building)
+        row_number_remainder_key = normalize_key(row_building[row_number_match.end():])
+        if row_number_remainder_key:
+            range_matches = []
+            for i, c in enumerate(candidate_buildings):
+                c = c or ""
+                candidate_number_match = LEADING_HOUSE_NUMBER_RE.match(c)
+                if candidate_number_match is None:
+                    continue
+                if normalize_key(c[candidate_number_match.end():]) != row_number_remainder_key:
+                    continue
+                if house_numbers_conflict(row_house_number, candidate_number_match.group(1)):
+                    continue
+                range_matches.append(i)
+            range_matches = _distinct_building_group(range_matches, candidate_buildings)
+            if range_matches:
+                return range_matches
 
     if candidate_addresses is not None:
         addr_exact = _distinct_building_group(

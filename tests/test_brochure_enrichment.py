@@ -3080,6 +3080,108 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         )
         self.assertEqual(indices, [0])
 
+    def test_yard_is_a_recognized_trailing_street_suffix_word(self):
+        # Real, confirmed case: row_building "160 Blackfriars Yard" vs a
+        # real Friars Yard brochure's own bare building text "Friars
+        # Yard" and address_1 "160 Blackfriars Road" - tier 4b (address-
+        # suffix-stripped + house-number corroboration) needs "yard"
+        # recognized as a trailing street-type word (same as "road") for
+        # "160 blackfriars yard"/"160 blackfriars road" to both strip down
+        # to the identical "160 blackfriars".
+        indices = brochure_enrichment._building_identity_matches(
+            "160 Blackfriars Yard", ["Friars Yard", "Friars Yard"],
+            ["160 Blackfriars Road", "160 Blackfriars Road"],
+        )
+        self.assertEqual(indices, [0, 1])
+
+    def test_tier_3f_dash_wrapper_suffix_is_the_real_name(self):
+        # Real, confirmed case: row_building "Southbank Central - ALTO"/
+        # "Southbank Central - VIVO" vs that brochure's own bare "Alto"/
+        # "Vivo" - "Southbank Central" is a disposable development
+        # wrapper, the SUFFIX after the dash is the real sub-building name.
+        candidates = ["Vivo", "Vivo", "Alto"]
+        self.assertEqual(
+            brochure_enrichment._building_identity_matches("Southbank Central - ALTO", candidates), [2],
+        )
+        self.assertEqual(
+            brochure_enrichment._building_identity_matches("Southbank Central - VIVO", candidates), [0, 1],
+        )
+
+    def test_tier_3f_dash_wrapper_prefix_is_the_real_name(self):
+        # Real, confirmed case: row_building "210 Euston Road - Fora
+        # Enterprise" vs that brochure's own bare "210 Euston Road" - here
+        # the PREFIX is the real name and "Fora Enterprise" (an
+        # operator/tenant name) is disposable - never caught by tier 2's
+        # own _strip_building_address_suffix, which only strips a dash-
+        # suffix that's itself address-shaped (starts with a house
+        # number); "Fora Enterprise" doesn't.
+        indices = brochure_enrichment._building_identity_matches(
+            "210 Euston Road - Fora Enterprise", ["210 Euston Road", "210 Euston Road"],
+        )
+        self.assertEqual(indices, [0, 1])
+
+    def test_tier_3f_never_fires_without_a_dash_separator(self):
+        indices = brochure_enrichment._building_identity_matches("Plain Building Name", ["Something Else"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3f_stays_unresolved_when_neither_side_matches(self):
+        indices = brochure_enrichment._building_identity_matches("Foo Bar - Baz Qux", ["Something Unrelated"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3g_period_as_word_separator(self):
+        # Real, confirmed case: row_building "TBC London - 224 Tower
+        # Bridge Rd" (reduced to "TBC London" by tier 2's own address-
+        # suffix strip) vs that brochure's own extracted building text
+        # "TBC.London" - normalize_key itself simply drops "." rather than
+        # treating it as a word boundary (normalize_key("TBC.London") ->
+        # "tbclondon", never "tbc london"), so no EXACT-comparison tier
+        # above this one can ever bridge the gap no matter what else gets
+        # stripped first.
+        indices = brochure_enrichment._building_identity_matches(
+            "TBC London - 224 Tower Bridge Rd", ["TBC.London", "TBC.London"],
+        )
+        self.assertEqual(indices, [0, 1])
+
+    def test_tier_3g_never_fires_for_an_unrelated_period_containing_name(self):
+        indices = brochure_enrichment._building_identity_matches("St. Mary Axe House", ["Something Unrelated"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3h_house_number_range_overlaps_a_single_candidate_number(self):
+        # Real, confirmed case: row_building "27-29 Gloucester Place" (a
+        # provider's own spreadsheet stating the full numbered range a
+        # building spans) vs a real brochure's own extracted building text
+        # "29 Gloucester Place" (Gemini stating just the one number
+        # actually printed on that page) - 29 falls within 27-29, so this
+        # is never a genuine conflict (see house_number.house_numbers_
+        # conflict), and the remaining text ("Gloucester Place") matches
+        # exactly on both sides.
+        indices = brochure_enrichment._building_identity_matches(
+            "27-29 Gloucester Place", ["29 Gloucester Place"] * 3,
+        )
+        self.assertEqual(indices, [0, 1, 2])
+
+    def test_tier_3h_rejects_a_genuinely_disjoint_house_number(self):
+        # True-negative guard: a candidate number that does NOT fall
+        # within the row's own range is a genuinely different numbered
+        # building on the same street, never guessed at.
+        indices = brochure_enrichment._building_identity_matches("27-29 Gloucester Place", ["45 Gloucester Place"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3h_never_fires_when_the_remaining_text_differs(self):
+        # Same leading house number, but a genuinely different street -
+        # must never match on the number alone.
+        indices = brochure_enrichment._building_identity_matches("27-29 Gloucester Place", ["27-29 Baker Street"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3h_never_fires_when_row_has_no_leading_house_number(self):
+        # A row with no leading house number of its own at all skips tier
+        # 3h entirely (guarded on row_house_number is not None) - this
+        # candidate still resolves, but via the pre-existing, unrelated
+        # tier 5 (bare street reference), not tier 3h's own house-number-
+        # range-overlap logic.
+        indices = brochure_enrichment._building_identity_matches("Gloucester Place", ["29 Gloucester Place"])
+        self.assertEqual(indices, [0])
+
 
 class MatchBuildingFeatureTests(unittest.TestCase):
     """_match_building_feature - the building-level (level B) counterpart
