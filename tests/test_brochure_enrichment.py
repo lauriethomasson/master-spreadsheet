@@ -2935,6 +2935,57 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         indices = brochure_enrichment._building_identity_matches("141 Fenchurch Street", ["Somewhere Else"])
         self.assertEqual(indices, [])
 
+    def test_real_blackfriars_yard_splitable_descriptive_parenthetical_matches_via_address(self):
+        # Real, confirmed gap: a real UNION row's own building is "160
+        # Blackfriars Yard (splitable)" (splitable meaning the floor CAN be
+        # split into smaller units, not an alternate name for the building
+        # itself), while the real brochure's own Gemini extraction calls the
+        # building "Friars Yard" with address_1 "160 Blackfriars Road" - the
+        # SAME real document's plain "160 Blackfriars Yard" rows (no
+        # parenthetical) already bridge this gap via tier 4b's own address-
+        # based fallback (row_building's trailing "Yard" street-suffix-
+        # stripped against the candidate address's own stripped form, "160
+        # Blackfriars"). The "(splitable)" row used to match NOTHING at all
+        # - not because no tier could bridge the parenthetical itself, but
+        # because leaving "splitable" as row_building's own trailing word
+        # (after normalize_key flattens the parentheses away) silently
+        # pushed "Yard" out of trailing position, breaking tier 4b's own
+        # street-suffix stripping too, even though tier 4b has nothing to do
+        # with parentheses at all.
+        candidates = ["Friars Yard", "Friars Yard"]
+        addresses = ["160 Blackfriars Road", "160 Blackfriars Road"]
+        indices = brochure_enrichment._building_identity_matches(
+            "160 Blackfriars Yard (splitable)", candidates, addresses,
+        )
+        self.assertEqual(indices, [0, 1])
+        # Confirms this now matches identically to the bare (no
+        # parenthetical) row - the descriptive aside makes no difference to
+        # the outcome at all, exactly as a person reading both rows would
+        # expect.
+        self.assertEqual(
+            indices,
+            brochure_enrichment._building_identity_matches("160 Blackfriars Yard", candidates, addresses),
+        )
+
+    def test_a_plausible_name_shaped_parenthetical_is_never_treated_as_descriptive(self):
+        # "(Monument)" is capitalized - a real place/landmark name, not a
+        # lowercase descriptive aside - so this must stay tier 3b's own
+        # weak-signal territory (still matches here, via that tier), never
+        # blindly stripped by the new unconditional tier-0 preprocessing.
+        indices = brochure_enrichment._building_identity_matches(
+            "141 Fenchurch Street (Monument)", ["141 Fenchurch Street"],
+        )
+        self.assertEqual(indices, [0])
+
+    def test_a_name_shaped_parenthetical_is_still_available_as_the_real_name_via_tier_3e(self):
+        # "(The Mill)" is also capitalized/name-shaped - must still reach
+        # tier 3e (the parenthetical's own content AS the real name), not be
+        # stripped away and discarded by the new tier-0 preprocessing.
+        indices = brochure_enrichment._building_identity_matches(
+            "Regents Wharf (The Mill)", ["The Mill", "The Canal Building"],
+        )
+        self.assertEqual(indices, [0])
+
     def test_tier_3c_matches_when_only_the_candidate_side_carries_the_suffix(self):
         # The mirror of tier 3b (see this test class's own docstring,
         # tier 3c) - confirmed against a real Colliers brochure whose own

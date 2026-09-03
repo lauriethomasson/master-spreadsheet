@@ -873,6 +873,63 @@ def _strip_trailing_parenthetical(building):
     return stripped or building
 
 
+def _is_descriptive_parenthetical(inner: str) -> bool:
+    """
+    True when `inner` (a trailing parenthetical's own already-extracted
+    content, e.g. "splitable" from "160 Blackfriars Yard (splitable)" - see
+    _trailing_parenthetical_content) reads as a descriptive note about the
+    unit rather than a plausible alternate building/sub-building/landmark
+    name - i.e. it's written in lowercase, the way a person writes an
+    ordinary descriptive word or phrase ("splitable", "subject to
+    availability"), never the way a real proper noun is written ("Monument",
+    "The Mill", "Fora Enterprise") regardless of how short it is. Digits-led
+    content (e.g. a unit number) is never treated as descriptive either -
+    only actual lowercase-led alphabetic text counts.
+
+    Deliberately a narrow, conservative test - only the FIRST character
+    decides it, so a rare descriptive note that happens to start with a
+    proper noun of its own is never caught here (left for a human to widen
+    this if a real case like that ever surfaces), but every real descriptive
+    case confirmed so far ("splitable") is caught by it.
+    """
+    inner = (inner or "").strip()
+    return bool(inner) and inner[0].isalpha() and inner[0].islower()
+
+
+def _strip_descriptive_trailing_parenthetical(building):
+    """
+    `building` with its own trailing "(...)" segment removed ONLY when that
+    segment's content is descriptive (see _is_descriptive_parenthetical) -
+    i.e. never a plausible alternate building name, so there is no
+    building-identity information to weigh at all, unlike the "(Monument)"/
+    "(The Mill)"-style parentheticals tiers 3b/3c/3e already handle as weak,
+    corroborated-by-uniqueness evidence. Confirmed real gap this closes: a
+    real UNION "160 Blackfriars Yard (splitable)" row (splitable meaning the
+    floor CAN be split into smaller units, not an alternate name for the
+    building) never matched its own real brochure at all - not because no
+    tier could bridge the parenthetical, but because leaving "splitable" as
+    the row building's own trailing word (after normalize_key flattens the
+    parentheses away) pushed the real trailing street-suffix word ("Yard")
+    out of trailing position, which silently broke tier 4b's own address-
+    based fallback match too (that tier needs the street-suffix word at the
+    very end to strip it) - a single-purpose parenthetical-stripping tier
+    could never have fixed this, since the breakage wasn't in a building-vs-
+    building tier at all. Run once, unconditionally, on row_building itself
+    before any tier runs, so every tier downstream (not just the ones that
+    explicitly know about parentheses) sees the same clean text a person
+    would read off this row with the purely descriptive aside removed.
+
+    Returns `building` completely unchanged whenever its own trailing
+    parenthetical (if any) looks like a plausible name instead - that case
+    is left entirely to tiers 3b/3c/3e's own existing weak-signal handling,
+    never touched here.
+    """
+    inner = _trailing_parenthetical_content(building)
+    if inner is None or not _is_descriptive_parenthetical(inner):
+        return building
+    return _strip_trailing_parenthetical(building)
+
+
 def _trailing_parenthetical_content(building):
     """
     The INNER text of `building`'s own trailing "(...)" segment, when
@@ -1154,6 +1211,16 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     Returns [] when row_building has no genuine key at all (blank/
     whitespace-only).
     """
+    # 0. DESCRIPTIVE TRAILING PARENTHETICAL STRIPPED (see
+    # _strip_descriptive_trailing_parenthetical) - run once, unconditionally,
+    # before any tier below, so a purely descriptive aside like "160
+    # Blackfriars Yard (splitable)" never has to be bridged tier-by-tier at
+    # all: it's simply never part of row_building's own working text again.
+    # A parenthetical that instead looks like a plausible name (e.g.
+    # "(Monument)", "(The Mill)") is left completely untouched here - that
+    # case stays exactly tiers 3b/3c/3e's own weak-signal territory below.
+    row_building = _strip_descriptive_trailing_parenthetical(row_building)
+
     row_key = normalize_key(row_building)
     if not row_key:
         return []
