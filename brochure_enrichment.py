@@ -862,6 +862,38 @@ def _strip_trailing_parenthetical(building):
     return stripped or building
 
 
+def _trailing_parenthetical_content(building):
+    """
+    The INNER text of `building`'s own trailing "(...)" segment, when
+    present - e.g. "Regents Wharf (The Mill)" -> "The Mill" - or None when
+    there's no trailing parenthetical at all. The mirror image of
+    _strip_trailing_parenthetical (which DISCARDS this same content and
+    keeps everything before it): confirmed real, distinct case this exists
+    for - a real UNION Regents Wharf portfolio spreadsheet states each row's
+    OWN building as "Regents Wharf (<sub-building>)" ("Regents Wharf (The
+    Mill)", "Regents Wharf (The Canal Building)", "Regents Wharf (Thorley
+    Works)", "Regents Wharf (The Packing House)"), while that SAME real
+    brochure's own Gemini extraction (and every OTHER row referencing the
+    same sub-buildings) uses the bare sub-building name alone ("The Mill",
+    "The Canal Building", ...) - here "Regents Wharf" is a shared
+    DEVELOPMENT/portfolio wrapper, not part of any one sub-building's own
+    identity, and the parenthetical content is the real, distinct name -
+    the OPPOSITE of _strip_trailing_parenthetical's own MetSpace case
+    ("141 Fenchurch Street (Monument)"), where the parenthetical is
+    disposable reader-orientation text and everything BEFORE it is the
+    real name. Returns None (never the bare building text) when there's
+    nothing to extract, so a caller can tell "no parenthetical" apart from
+    "a parenthetical that stripped to nothing" without a second check.
+    """
+    if not building:
+        return None
+    match = _TRAILING_PARENTHETICAL_RE.search(str(building))
+    if not match:
+        return None
+    inner = match.group().strip()[1:-1].strip()
+    return inner or None
+
+
 def _is_placeholder_address(address_1, building) -> bool:
     """
     True when `address_1` is either genuinely blank OR just a duplicate of
@@ -1028,6 +1060,19 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        Wharf brochure's own several floors per building, all sharing the
        identical "The Packing House"/"The Canal Building" text, is the
        expected schedule-of-areas case here too, not an ambiguity).
+    3e. ROW'S OWN TRAILING-PARENTHETICAL CONTENT AS THE REAL NAME (see
+       _trailing_parenthetical_content) - the OPPOSITE of tier 3b: e.g.
+       row_building "Regents Wharf (The Mill)" (a real UNION portfolio
+       spreadsheet's own row text) vs that SAME real brochure's own
+       Gemini-extracted building text "The Mill" - "Regents Wharf" is a
+       shared development/portfolio wrapper with no identity of its own,
+       and the parenthetical's own INNER content is the real, distinct
+       sub-building name, not disposable reader-orientation text the way
+       tier 3b's own MetSpace "(Monument)" case is. Tried against the
+       extracted content's own key and its leading-article-stripped form
+       together (see _strip_leading_the) - never fires when row_building
+       has no trailing parenthetical at all. Same weak-signal,
+       corroborated-by-uniqueness discipline as every tier above.
     4. BUILDING-VS-ADDRESS (row_building compared against each candidate's
        own address_1, via `candidate_addresses` - a parallel list, one
        entry per candidate_buildings, or None from a caller with no address
@@ -1194,6 +1239,46 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     )
     if leading_article_stripped:
         return leading_article_stripped
+
+    # 3e. ROW'S OWN PARENTHETICAL CONTENT AS THE REAL NAME (see
+    # _trailing_parenthetical_content's own docstring for the real, confirmed
+    # UNION Regents Wharf case: row_building "Regents Wharf (The Mill)"/
+    # "Regents Wharf (The Canal Building)"/"Regents Wharf (Thorley Works)"/
+    # "Regents Wharf (The Packing House)" vs that SAME real brochure's own
+    # Gemini-extracted building text for each sub-building, the bare name
+    # alone ("The Mill", "The Canal Building", ...). The exact OPPOSITE of
+    # tier 3b above: there the parenthetical is disposable reader-
+    # orientation text and the part BEFORE it is the real name; here
+    # "Regents Wharf" is a shared development/portfolio wrapper with no
+    # identity of its own, and the parenthetical's own INNER content is
+    # the real, distinct sub-building name. Tried against both the
+    # extracted content's own key AND its leading-article-stripped form
+    # (see tier 3d above) in one pass, since a real portfolio's own
+    # sub-building name routinely carries a leading "The" the wrapped row
+    # text still states in full ("Regents Wharf (The Mill)") while the
+    # brochure's own extraction sometimes omits it - no real case seen so
+    # far needs the reverse (a candidate-side "the" that the row's own
+    # parenthetical content lacks), so this stays one-directional, unlike
+    # tier 3d's own deliberately symmetric strip. Same weak-signal,
+    # corroborated-by-uniqueness discipline as every tier above (see
+    # _distinct_building_group) - only accepted when every candidate
+    # sharing the matched key names the SAME real building; two candidates
+    # colliding here stays unresolved, never guessed. Never fires at all
+    # when row_building has no trailing parenthetical (returns None, which
+    # can never equal any real candidate key).
+    row_parenthetical_content = _trailing_parenthetical_content(row_building)
+    if row_parenthetical_content:
+        content_key = normalize_key(row_parenthetical_content)
+        content_no_the_key = _strip_leading_the(content_key)
+        parenthetical_content_matches = _distinct_building_group(
+            [
+                i for i, c in enumerate(candidate_buildings)
+                if normalize_key(c) == content_key or _strip_leading_the(normalize_key(c)) == content_no_the_key
+            ],
+            candidate_buildings,
+        )
+        if parenthetical_content_matches:
+            return parenthetical_content_matches
 
     row_house_number = leading_house_number(row_building)
 

@@ -2386,6 +2386,29 @@ class MatchUnitTests(unittest.TestCase):
 
         self.assertEqual(matched["size_sqft"], 2005)
 
+    def test_real_regents_wharf_wrapped_building_name_matches_via_parenthetical_content(self):
+        # Real, confirmed production case: a UNION Regents Wharf row states
+        # its own building as "Regents Wharf (The Mill)" - a shared
+        # development wrapper around the real sub-building name - while
+        # that SAME brochure's own Gemini extraction (23+ units across 4
+        # sub-buildings, several floors each) states each unit's building
+        # as the bare sub-building name alone. Before tier 3e existed, NO
+        # building-identity tier ever matched this shape at all, so
+        # State Of Space stayed permanently blank for every Regents Wharf
+        # row regardless of floor_unit - confirming this is a genuine
+        # building-match gap, not a floor-matching one.
+        row = ListingRow(building="Regents Wharf (The Mill)", floor_unit="1st Floor")
+        units = [
+            {"building": "The Mill", "floor_unit": "1st Floor", "state_of_space": "Fully Fitted"},
+            {"building": "The Mill", "floor_unit": "2nd Floor", "state_of_space": "Fully Fitted"},
+            {"building": "The Canal Building", "floor_unit": "1st Floor", "state_of_space": "CAT A"},
+        ]
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["state_of_space"], "Fully Fitted")
+        self.assertEqual(matched["building"], "The Mill")
+
     def test_ambiguous_floor_and_size_returns_none(self):
         row = ListingRow(building="28 Lime Street", floor_unit="Suite Z", size_sqft=9999)
         units = [
@@ -2999,6 +3022,63 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
             "Point", ["The Mill", "The Point"],
         )
         self.assertEqual(indices, [1])
+
+    def test_tier_3e_parenthetical_content_is_the_real_name(self):
+        # Real, confirmed UNION Regents Wharf case: a provider's own
+        # spreadsheet states each row's building as "Regents Wharf
+        # (<sub-building>)" - "Regents Wharf" is a shared development
+        # wrapper with no identity of its own, while that SAME real
+        # brochure's own Gemini extraction (and every sibling row
+        # referencing the same sub-building) uses the bare name alone.
+        # Confirmed real production gap this closes: State Of Space stayed
+        # permanently blank for every "Regents Wharf (...)" row because
+        # _match_unit's own building match returned nothing at all for
+        # this shape - no existing tier (row-side-only or candidate-side-
+        # only trailing-parenthetical-stripped) ever tries treating the
+        # row's own parenthetical CONTENT as the real match target.
+        indices = brochure_enrichment._building_identity_matches(
+            "Regents Wharf (The Mill)", ["Thorley Works", "The Canal Building", "The Mill", "The Packing House"],
+        )
+        self.assertEqual(indices, [2])
+
+    def test_tier_3e_matches_several_floors_of_the_same_sub_building(self):
+        # Same _distinct_building_group allowance every other stripped tier
+        # gets - a real schedule of areas with several floors sharing the
+        # identical bare sub-building name is the expected case, not an
+        # ambiguity.
+        indices = brochure_enrichment._building_identity_matches(
+            "Regents Wharf (The Packing House)", ["The Packing House"] * 7,
+        )
+        self.assertEqual(indices, list(range(7)))
+
+    def test_tier_3e_tolerates_a_leading_the_mismatch_either_way(self):
+        # The row's own parenthetical content routinely still carries the
+        # leading article the brochure's own extraction sometimes omits
+        # (or vice versa) - tolerated via the same _strip_leading_the
+        # comparison tier 3d already uses, tried alongside the exact
+        # comparison in one pass.
+        self.assertEqual(
+            brochure_enrichment._building_identity_matches("Regents Wharf (The Mill)", ["Mill"]),
+            [0],
+        )
+        self.assertEqual(
+            brochure_enrichment._building_identity_matches("Regents Wharf (Mill)", ["The Mill"]),
+            [0],
+        )
+
+    def test_tier_3e_never_fires_when_row_building_has_no_parenthetical(self):
+        indices = brochure_enrichment._building_identity_matches("The Mill", ["Somewhere Else"])
+        self.assertEqual(indices, [])
+
+    def test_tier_3e_does_not_cross_contaminate_different_sub_buildings(self):
+        # Only the ONE candidate genuinely naming the row's own
+        # parenthetical content is ever matched - a different real
+        # sub-building sharing the same portfolio wrapper must never be
+        # confused with it.
+        indices = brochure_enrichment._building_identity_matches(
+            "Regents Wharf (The Mill)", ["The Mill", "The Canal Building"],
+        )
+        self.assertEqual(indices, [0])
 
 
 class MatchBuildingFeatureTests(unittest.TestCase):
