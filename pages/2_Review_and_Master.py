@@ -2655,6 +2655,18 @@ def _render_pending_review(pending: list):
     decision_updates = {}
     silent_by_index = {}  # master_index -> {field: value} - tolerant-formatting fixes, never shown in any diff UI
     new_rows_final = []   # ListingRow objects confirmed as genuinely new
+    # The near-miss UnmatchedRow entries (see the `if near_miss:` block
+    # below) currently decided "add as new" rather than linked to master -
+    # tracked SEPARATELY from new_rows_final (which already holds the
+    # actual ListingRow, with its own fresh property_id, the moment that
+    # decision is made) purely so the "New properties" preview section
+    # further down can show an accurate, complete count/list BEFORE Approve
+    # is clicked - see that section's own comment for the real gap this
+    # closes (that preview used to only ever look at plain_new, silently
+    # never counting/listing a near-miss row decided as new, even though
+    # new_rows_final - and therefore what Approve actually applies - always
+    # included it).
+    near_miss_decided_as_new = []
     removed_indices = set()  # master_index values confirmed no longer available - see _render_let_status_decision
 
     def _apply_silent(m):
@@ -2965,6 +2977,7 @@ def _render_pending_review(pending: list):
                             new_rows_final.append(
                                 u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
                             )
+                            near_miss_decided_as_new.append(u)
                     else:
                         choice_label = st.selectbox(
                             "What should happen with this row?",
@@ -2982,6 +2995,7 @@ def _render_pending_review(pending: list):
                             new_rows_final.append(
                                 u.new_row.model_copy(update={"property_id": str(uuid.uuid4())})
                             )
+                            near_miss_decided_as_new.append(u)
                         else:
                             target_index = next(
                                 idx for idx, rec in enumerate(plan.master_records)
@@ -3026,24 +3040,41 @@ def _render_pending_review(pending: list):
         st.info(f"{n} existing propert{'y' if n == 1 else 'ies'} will be updated automatically.")
 
     # ==== 3. New properties ====
-    if plain_new:
-        n = len(plain_new)
+    # new_properties_preview is plain_new PLUS any near-miss row currently
+    # decided "add as new" (see near_miss_decided_as_new's own comment
+    # above) - both genuinely end up in new_rows_final (what Approve
+    # actually applies), so both belong in this preview's own count/list.
+    # plain_new is deliberately placed FIRST in this concatenation: the
+    # `enumerate` below reuses the exact same index `i` per plain_new row
+    # the location_overrides_by_index/new_rows_final.extend loop further
+    # down also uses, so their alignment (and every plain_new widget's own
+    # "plain_new_{i}" key) is completely unaffected by near-miss rows now
+    # also appearing later in this same combined list.
+    new_properties_preview = plain_new + near_miss_decided_as_new
+    if new_properties_preview:
+        n = len(new_properties_preview)
         st.subheader("📄 New properties")
         st.info(f"{n} new propert{'y' if n == 1 else 'ies'} will be added.")
         # {index into plain_new: location_overrides} - collected while
         # rendering the lookup UI below (inside the expander), applied
         # once building new_rows_final further down (outside it) - see
         # _render_missing_location_lookup's own docstring for what this
-        # dict holds and why it's empty until "✓ Use this location".
+        # dict holds and why it's empty until "✓ Use this location". Never
+        # offered for a near-miss row here - that decision (and its own
+        # new_rows_final entry) was already made and applied earlier, in
+        # the `if near_miss:` block above; this expander is read-only for
+        # those, showing only the same label plain_new gets.
+        plain_new_ids = {id(u) for u in plain_new}
         location_overrides_by_index = {}
         with st.expander("View new properties"):
-            labels = master_merge.new_property_labels([u.new_row for u in plain_new])
-            for i, (label, u) in enumerate(zip(labels, plain_new)):
+            labels = master_merge.new_property_labels([u.new_row for u in new_properties_preview])
+            for i, (label, u) in enumerate(zip(labels, new_properties_preview)):
                 st.write(label)
-                row_dict = u.new_row.model_dump()
-                overrides = _render_missing_location_lookup(row_dict, f"plain_new_{i}")
-                if overrides:
-                    location_overrides_by_index[i] = overrides
+                if id(u) in plain_new_ids:
+                    row_dict = u.new_row.model_dump()
+                    overrides = _render_missing_location_lookup(row_dict, f"plain_new_{i}")
+                    if overrides:
+                        location_overrides_by_index[i] = overrides
         new_rows_final.extend(
             u.new_row.model_copy(update={"property_id": str(uuid.uuid4()), **location_overrides_by_index.get(i, {})})
             for i, u in enumerate(plain_new)

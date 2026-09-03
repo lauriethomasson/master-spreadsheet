@@ -88,6 +88,99 @@ class PlainNewSectionTests(IsolatedCwdTestCase):
         self.assertEqual([e for e in at.expander if e.label == "View new properties"], [])
 
 
+class NewPropertiesPreviewIncludesNearMissTests(IsolatedCwdTestCase):
+    """
+    The "📄 New properties" preview (count + "View new properties"
+    expander) must reflect EVERY row that will actually be added on
+    Approve, not just plain_new - a near-miss row left on (or explicitly
+    set to) its "add as new" decision already lands in new_rows_final (see
+    the `if near_miss:` block), so it must show up here too, confirmed real
+    gap: a near-miss-only upload (no plain_new rows at all) used to show NO
+    "New properties" section whatsoever, even though Approve would still
+    add that row as new.
+    """
+
+    def _stage_near_miss(self):
+        # Same building/provider/address/size as master, floor_unit only on
+        # the new row (master's own left blank) - the exact working near-
+        # miss fixture from tests/test_app_review_near_miss_redesign.py's
+        # own SingleSuggestionYesNoTests, reused here rather than a fuzzy-
+        # spelling variant: a fixture whose master/new floor_unit state two
+        # DIFFERENT floor NUMBERS (e.g. "3rd Floor" vs "5th Floor") is
+        # correctly excluded from suggestions by master_merge._suggest_
+        # similar's own _floor_conflicts guard - confirmed directly
+        # (build_merge_plan returns suggestions=[] for such a pair), not a
+        # near-miss shape this test should rely on.
+        master_writer.write_master([
+            ListingRow(
+                building="Thirty Lighterman", provider="Kitt's", address_1="Thirty Lighterman Wharf",
+                size_sqft=1000.0, property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="Thirty Lighterman", provider="Kitt's", address_1="Thirty Lighterman Wharf",
+                size_sqft=1000.0, floor_unit="Ground Floor",
+            )],
+            "near_miss.xlsx", content_hash="new-properties-preview-near-miss-hash",
+        )
+        return _run_review_page()
+
+    def test_default_near_miss_decision_is_counted_and_listed(self):
+        # "Add as new" is the near-miss decision's own default (see
+        # pages/2_Review_and_Master.py's own decision_key "new" default) -
+        # never touching either button still means this row WILL be added,
+        # so the preview must already reflect it before any click at all.
+        at = self._stage_near_miss()
+        self.assertFalse(at.exception)
+
+        self.assertIn("📄 New properties", [s.value for s in at.subheader])
+        info_text = "".join(i.value for i in at.info)
+        self.assertIn("1 new property will be added.", info_text)
+
+        new_props_expanders = [e for e in at.expander if e.label == "View new properties"]
+        self.assertEqual(len(new_props_expanders), 1)
+        page_text = "".join(m.value for m in at.markdown)
+        self.assertIn("Kitt's", page_text)
+
+    def test_linking_to_master_instead_removes_it_from_the_preview(self):
+        # The mirror case - once a reviewer says "Yes, same property"
+        # instead, this row is no longer heading for new_rows_final at all
+        # (see _render_near_miss_link_diff), so it must also disappear from
+        # this preview, not linger as a phantom "new property".
+        at = self._stage_near_miss()
+        yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
+        at = yes_button.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertNotIn("📄 New properties", [s.value for s in at.subheader])
+        self.assertEqual([e for e in at.expander if e.label == "View new properties"], [])
+
+    def test_combined_count_includes_both_plain_new_and_near_miss_decided_as_new(self):
+        master_writer.write_master([
+            ListingRow(
+                building="Thirty Lighterman", provider="Kitt's", address_1="Thirty Lighterman Wharf",
+                size_sqft=1000.0, property_id=str(uuid.uuid4()),
+            ),
+        ])
+        save_staging_file(
+            [
+                ListingRow(
+                    building="Thirty Lighterman", provider="Kitt's", address_1="Thirty Lighterman Wharf",
+                    size_sqft=1000.0, floor_unit="Ground Floor",
+                ),
+                ListingRow(building="1 Example Street", provider="Test Provider"),
+            ],
+            "mixed.xlsx", content_hash="new-properties-preview-mixed-hash",
+        )
+
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        info_text = "".join(i.value for i in at.info)
+        self.assertIn("2 new properties will be added.", info_text)
+
+
 class NeedsADecisionHeadingTests(IsolatedCwdTestCase):
     HEADING = "⚠️ Needs your decision"
     EXPLAINER_TAIL = "Open each one and decide: is this the same property, or genuinely different?"
