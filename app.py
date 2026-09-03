@@ -1776,6 +1776,38 @@ with page_setup.setup_page("upload"):
                     # ALREADY staged by this point, so an unexpected bug
                     # here must never surface as "extraction failed" for a
                     # file whose real extraction genuinely succeeded.
+                    # --- TEMPORARY DEBUG LOGGING (Henly House investigation
+                    # - remove once resolved). Prints to stderr (Cloud Run
+                    # logs) AND shows directly on-page, so no console access
+                    # is needed to see it from a real upload.
+                    _henly_debug = any("henly" in (r.building or "").lower() for r in rows)
+                    if _henly_debug:
+                        import sys as _sys
+                        _will_call = (
+                            (is_spreadsheet_source or is_email_source)
+                            and (not reused or resume_already_processed is not None)
+                        )
+                        _before_lines = [
+                            f"file={uploaded_file.name!r}",
+                            f"reused={reused}",
+                            f"is_spreadsheet_source={is_spreadsheet_source}",
+                            f"is_email_source={is_email_source}",
+                            f"resume_already_processed={resume_already_processed!r}",
+                            f"resume_floorplan_already_processed={resume_floorplan_already_processed!r}",
+                            f"resume_special_features_matched={resume_special_features_matched!r}",
+                            f"will_call_automatic_brochure_enrichment={_will_call}",
+                        ] + [
+                            f"BEFORE row {i}: building={r.building!r} floor_unit={r.floor_unit!r} "
+                            f"brochure_link={r.brochure_link!r} address_1={r.address_1!r} "
+                            f"postcode={r.postcode!r} state_of_space={r.state_of_space!r}"
+                            for i, r in enumerate(rows) if "henly" in (r.building or "").lower()
+                        ]
+                        _before_text = "\n".join(_before_lines)
+                        print(f"[HENLY-DEBUG]\n{_before_text}", file=_sys.stderr)
+                        st.expander("🔧 Henly House debug — before enrichment (temporary)", expanded=True).code(
+                            _before_text
+                        )
+
                     if (is_spreadsheet_source or is_email_source) and (not reused or resume_already_processed is not None):
                         try:
                             # See _reattempt_geocoding_for_newly_addressed_
@@ -1796,6 +1828,20 @@ with page_setup.setup_page("upload"):
                                 f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
                                 f"({e}) and was skipped for this file — the extraction above is "
                                 "unaffected and already staged."
+                            )
+
+                        # --- TEMPORARY DEBUG LOGGING (Henly House
+                        # investigation - remove once resolved).
+                        if _henly_debug:
+                            _after_text = "\n".join(
+                                f"AFTER row {i}: building={r.building!r} floor_unit={r.floor_unit!r} "
+                                f"address_1={r.address_1!r} postcode={r.postcode!r} "
+                                f"state_of_space={r.state_of_space!r}"
+                                for i, r in enumerate(rows) if "henly" in (r.building or "").lower()
+                            )
+                            print(f"[HENLY-DEBUG]\n{_after_text}", file=_sys.stderr)
+                            st.expander("🔧 Henly House debug — after enrichment (temporary)", expanded=True).code(
+                                _after_text
                             )
 
                     succeeded += 1
