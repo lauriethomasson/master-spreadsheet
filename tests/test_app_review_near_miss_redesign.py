@@ -145,6 +145,38 @@ class SingleSuggestionYesNoTests(IsolatedCwdTestCase):
         master_df = master_writer.load_master_as_dataframe()
         self.assertEqual(len(master_df), 2)  # back to two separate properties
 
+    def test_default_shows_a_will_be_added_as_new_confirmation(self):
+        # "Add as new instead" is the default state before any click (see
+        # decision_key's own "new" default) - a reviewer must still see an
+        # explicit, always-visible confirmation of that outcome without
+        # needing to scroll down to the New Properties summary.
+        at = self._stage_single_near_miss()
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("✓ Will be added as a new property", caption_text)
+        self.assertNotIn("Will be merged into", caption_text)
+
+    def test_clicking_yes_shows_a_will_be_merged_confirmation_naming_the_master_row(self):
+        at = self._stage_single_near_miss()
+        yes_button = next(b for b in at.button if b.label == "✓ Yes, same property")
+        yes_button.click().run()
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("🔗 Will be merged into Thirty Lighterman — Kitt's as an update", caption_text)
+        self.assertNotIn("Will be added as a new property", caption_text)
+
+    def test_clicking_the_already_selected_button_still_shows_its_confirmation(self):
+        # Confirmed real gap this covers: clicking "Add as new instead"
+        # while it's ALREADY the current selection changes nothing else on
+        # screen - the confirmation line is what proves the click still
+        # registered, even on this "no-op" click.
+        at = self._stage_single_near_miss()
+        no_button = next(b for b in at.button if b.label == "Add as new instead")
+        no_button.click().run()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        self.assertIn("✓ Will be added as a new property", caption_text)
+
 
 class ZeroDiffAfterLinkingTests(IsolatedCwdTestCase):
     """The new row leaves floor_unit blank (no data this time) while master
