@@ -1504,6 +1504,53 @@ _COMPASS_ABBREVIATIONS = {
     "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
 }
 
+# Same small, explicit, whole-token-only philosophy as _COMPASS_
+# ABBREVIATIONS above (a separate dict, not folded into it - "g"/"lg" are
+# floor-label abbreviations, not compass directions) - see _floor_unit_
+# key's own docstring. Confirmed real, recurring cases in production
+# master (not a one-off): 8 "G" rows, 13 "Ground" rows, 15 "Ground Floor"
+# rows, 3 "LG" rows, 5 "Lower Ground" rows - e.g. Packing House (Colliers)
+# had one row's own floor_unit as bare "G", a later upload of the same
+# physical listing said "Ground Floor" instead; _floor_unit_key("G") ->
+# "g" and _floor_unit_key("Ground Floor") -> "ground" (the word "Floor"
+# already stripped by _FLOOR_WORD_RE before this point) never matched, so
+# the pair fell into the near-miss review queue instead of auto-merging,
+# and a wrong reviewer click on it created a permanent duplicate row.
+# "lg" -> "lower ground" is the exact same idea, one level down - lower
+# ground floor labels show the identical G/Ground-style variation. Note
+# "lg" expands to a TWO-WORD string, not a single token - still handled
+# correctly by the same per-token join below, since "Lower Ground Floor"
+# itself already reduces to the two separate tokens "lower"/"ground" by
+# this point (via _FLOOR_WORD_RE + normalize_key), neither of which is
+# "lg" itself, so there's no risk of this dict's own expansion recursing
+# into itself.
+#
+# Deliberately still NEVER covers "Basement"/"Mezzanine"/"Reception" -
+# those are genuinely DIFFERENT spaces from Ground, no real case seen
+# needing them, same "start conservative" precedent as every other
+# stripped-variant tier in this module. Gated on _COMPOUND_FLOOR_LABEL_RE
+# below - a compound/multi-floor label (e.g. "Ground & LG") is a
+# genuinely different, combined listing, never equated with a plain
+# single-floor "G"/"Ground Floor" row even though it contains the same
+# words. Confirmed both "G" and "LG" as genuinely DISTINCT real floors of
+# the same building (real Ivybridge House data states both an "LG" row and a
+# "G"-labelled row as separate floors of the same building) - this dict
+# only ever expands a token that's an EXACT, WHOLE match for "g" or "lg";
+# "g" and "lg" are two different tokens, each only ever mapped to its own
+# entry, never confused with one another.
+_GROUND_FLOOR_ABBREVIATIONS = {"g": "ground", "lg": "lower ground"}
+
+# See _GROUND_FLOOR_ABBREVIATIONS's own docstring, final paragraph - a
+# floor_unit containing any of these describes MULTIPLE floors combined
+# into one listing (real examples: "Ground & LG", "G/LG East", "Ground +
+# Lower Ground"), genuinely different from - and never equated with - a
+# plain single-floor "G"/"Ground Floor"/"LG"/"Lower Ground Floor" row,
+# even though it contains the identical words. Checked against the RAW
+# floor_unit text, before any other stripping - a "&"/"+"/"/" or the
+# standalone word "and" only ever makes sense here as a combining
+# conjunction, never as genuine part of one single floor's own label.
+_COMPOUND_FLOOR_LABEL_RE = re.compile(r"[&+/]|\band\b", re.IGNORECASE)
+
 # Generic descriptor words that routinely sit directly next to a building's
 # own name as part of how a source phrases it ("Hallmark House", "Nexus
 # Building") - see _floor_unit_key's own building-prefix/suffix strip.
@@ -1570,7 +1617,19 @@ def _floor_unit_key(building, floor_unit) -> str:
     canonical form - same "N" vs "North" idea Elsley House's own address
     needed ("(N)" -> "n" once normalize_key strips the parentheses around
     it), never applied inside a longer token (a unit code like "N12" is
-    left alone). Scoped to this function alone.
+    left alone). Scoped to this function alone. The same expansion also
+    covers _GROUND_FLOOR_ABBREVIATIONS ("g" -> "ground", "lg" -> "lower
+    ground") - see that dict's own docstring for the real, recurring
+    confirmed cases this closes: a bare "G"/"LG" and "Ground Floor"/
+    "Lower Ground Floor" (which the earlier \\bfloor\\b strip above
+    already reduces to just "Ground"/"Lower Ground") describe the
+    identical real floor, but stayed permanently unmatched without this -
+    UNLESS raw's own text matches _COMPOUND_FLOOR_LABEL_RE ("&"/"+"/"/"/
+    "and" - e.g. "Ground & LG"), in which case ONLY the _GROUND_FLOOR_
+    ABBREVIATIONS half of this expansion is skipped for every token in
+    this floor_unit - _COMPASS_ABBREVIATIONS still applies as normal,
+    since a compound label's own compass-direction tokens (if any) are a
+    separate, unrelated concern this exclusion was never meant to touch.
 
     Finally, if what's left after every strip/expansion above is NOTHING
     BUT a single floor number - optionally with an ordinal suffix ("8th"
@@ -1625,7 +1684,10 @@ def _floor_unit_key(building, floor_unit) -> str:
         if stripped is not None:
             floor_key = stripped
 
-    floor_key = " ".join(_COMPASS_ABBREVIATIONS.get(word, word) for word in floor_key.split())
+    ground_floor_abbreviations = {} if _COMPOUND_FLOOR_LABEL_RE.search(raw) else _GROUND_FLOOR_ABBREVIATIONS
+    floor_key = " ".join(
+        _COMPASS_ABBREVIATIONS.get(word, ground_floor_abbreviations.get(word, word)) for word in floor_key.split()
+    )
 
     number_match = _FLOOR_NUMBER_TOKEN_RE.fullmatch(floor_key)
     return str(int(number_match.group(1))) if number_match else floor_key

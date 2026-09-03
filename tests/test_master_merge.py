@@ -5650,6 +5650,92 @@ class HallmarkStyleFloorUnitMatchingTests(unittest.TestCase):
         self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 3)
         self.assertEqual(len(plan.unmatched), 0)
 
+    def test_g_and_ground_floor_reduce_to_the_same_key(self):
+        # Real confirmed case: Packing House (Colliers) - master already
+        # had one row's own floor_unit as bare "G", a later upload of the
+        # same physical listing said "Ground Floor" instead - these never
+        # matched, so the pair fell into the near-miss review queue and a
+        # wrong reviewer click on it created a permanent duplicate row.
+        self.assertEqual(
+            master_merge._floor_unit_key("Packing House", "G"),
+            master_merge._floor_unit_key("Packing House", "Ground Floor"),
+        )
+        self.assertEqual(master_merge._floor_unit_key("Packing House", "G"), "ground")
+
+    def test_g_and_ground_floor_no_longer_need_a_near_miss_decision(self):
+        master_df = _master_df([
+            {"building": "Packing House", "provider": "Colliers", "floor_unit": "G"},
+        ])
+        new_row = ListingRow(building="Packing House", provider="Colliers", floor_unit="Ground Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_lower_ground_and_lg_stay_distinct_from_g(self):
+        # True-negative guard: "Lower Ground"/"LG" describe a genuinely
+        # DIFFERENT space from "G"/"Ground" (confirmed by real building
+        # data stating both an "LG" row and a separate "G" row for the
+        # same building) - neither must ever collapse onto "ground".
+        self.assertNotEqual(master_merge._floor_unit_key("Packing House", "LG"), "ground")
+        self.assertNotEqual(master_merge._floor_unit_key("Packing House", "Lower Ground Floor"), "ground")
+        self.assertNotEqual(
+            master_merge._floor_unit_key("Packing House", "LG"),
+            master_merge._floor_unit_key("Packing House", "G"),
+        )
+
+        master_df = _master_df([
+            {"building": "Packing House", "provider": "Colliers", "floor_unit": "G"},
+        ])
+        new_row = ListingRow(building="Packing House", provider="Colliers", floor_unit="Lower Ground Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
+    def test_lg_and_lower_ground_floor_reduce_to_the_same_key(self):
+        # Same idea one level down - lower ground floor labels show the
+        # identical G/Ground-style variation.
+        self.assertEqual(
+            master_merge._floor_unit_key("Packing House", "LG"),
+            master_merge._floor_unit_key("Packing House", "Lower Ground Floor"),
+        )
+        self.assertEqual(master_merge._floor_unit_key("Packing House", "LG"), "lower ground")
+
+    def test_lg_and_lower_ground_floor_no_longer_need_a_near_miss_decision(self):
+        master_df = _master_df([
+            {"building": "Packing House", "provider": "Colliers", "floor_unit": "LG"},
+        ])
+        new_row = ListingRow(building="Packing House", provider="Colliers", floor_unit="Lower Ground Floor")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        self.assertEqual(len(plan.unmatched), 0)
+
+    def test_compound_floor_labels_never_fold_into_a_plain_ground_or_lg_key(self):
+        # Real requirement: "Ground & LG", "G/LG East", "Ground + Lower
+        # Ground" each describe a genuinely different, COMBINED listing -
+        # must never be treated as the same floor as a plain single-floor
+        # "G"/"Ground Floor"/"LG"/"Lower Ground Floor" row, even though
+        # they contain the identical words.
+        for compound in ("Ground & LG", "G/LG East", "Ground + Lower Ground", "Ground and LG"):
+            key = master_merge._floor_unit_key("Packing House", compound)
+            self.assertNotEqual(key, "ground", msg=f"floor_unit={compound!r}")
+            self.assertNotEqual(key, "lower ground", msg=f"floor_unit={compound!r}")
+
+        master_df = _master_df([
+            {"building": "Packing House", "provider": "Colliers", "floor_unit": "G"},
+        ])
+        new_row = ListingRow(building="Packing House", provider="Colliers", floor_unit="Ground & LG")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+
     def test_ambiguous_multi_number_floor_unit_is_unaffected(self):
         # "2nd & 4th Floors" has two distinct numbers - genuinely
         # ambiguous which one (if either) is "the" floor, so this must
