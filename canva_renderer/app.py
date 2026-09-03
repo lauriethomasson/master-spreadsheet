@@ -247,6 +247,18 @@ MAX_KITT_PAGES = int(os.environ.get("MAX_KITT_PAGES", "20"))
 # Canva app/design is already warm; still enough for that page's own
 # images to paint (confirmed directly against a real 7-page brochure).
 PAGE_NAV_SETTLE_MS = 1_200
+# How often _wait_for_page_content_to_stabilize re-reads the page's own
+# content fingerprint while polling for it to stop changing - see that
+# function's own docstring for the real reported case this exists for (a
+# content-heavy slide still mid-paint at PAGE_NAV_SETTLE_MS under load).
+PAGE_STABILITY_POLL_INTERVAL_MS = 400
+# Upper bound on the EXTRA time _wait_for_page_content_to_stabilize will
+# ever spend polling, on TOP of PAGE_NAV_SETTLE_MS - a page whose content
+# never settles (a live clock, a subtly animating background) still gets
+# screenshotted once this elapses, same "never block indefinitely"
+# principle PAGE_NAV_SETTLE_MS's own docstring already establishes for the
+# fixed wait it follows.
+PAGE_STABILITY_MAX_EXTRA_WAIT_MS = 2_400
 # Deliberately SEPARATE from NAV_TIMEOUT_MS (see that constant's own
 # docstring on why it was raised to 30s) - a "Next page" click advances
 # an ALREADY-loaded, warm design in place (confirmed: no new navigation/
@@ -678,6 +690,56 @@ async def _page_content_fingerprint(page) -> str:
         return ""
 
 
+async def _wait_for_page_content_to_stabilize(
+    page, initial_fingerprint: str = None, max_extra_wait_ms: int = PAGE_STABILITY_MAX_EXTRA_WAIT_MS,
+) -> None:
+    """
+    Waits, ON TOP OF the fixed PAGE_NAV_SETTLE_MS wait a caller already did,
+    until `page`'s own visible content (see _page_content_fingerprint)
+    stops changing between two consecutive reads - direct evidence the
+    page has actually finished painting, rather than trusting that a fixed
+    amount of time was always enough. Real, confirmed production case this
+    closes: the SAME Canva design (DAGbhpjThxc) produced full building-
+    amenities text in one extraction and only sparse per-unit text (no
+    amenities at all) in another, for the identical document - a bare
+    numbers-table slide paints instantly, but a content-heavy slide (a
+    bullet-list "BUILDING FEATURES"/"OFFICE FEATURES" layout) can still be
+    mid-paint at PAGE_NAV_SETTLE_MS under load, so a screenshot taken then
+    alone can capture only part of that page's own text.
+
+    Polls every PAGE_STABILITY_POLL_INTERVAL_MS, stopping the moment two
+    CONSECUTIVE reads come back identical. Capped at max_extra_wait_ms of
+    EXTRA time (never counting PAGE_NAV_SETTLE_MS itself) - a page whose
+    content never settles (a live clock, a subtly animating background)
+    still gets returned from at the cap, so this can never hang the render
+    indefinitely, same "never block indefinitely" principle PAGE_NAV_
+    SETTLE_MS's own docstring already establishes for the wait before it.
+
+    initial_fingerprint, when given, is a fingerprint the caller ALREADY
+    read (e.g. render_canva_page_async's/render_pitch_page_async's own
+    signature_after, captured immediately after the PAGE_NAV_SETTLE_MS
+    wait to confirm the page advanced at all) - reused as this function's
+    own starting point rather than reading a second, redundant one. When
+    omitted (render_kitt_page_async's own scroll-step loop has no
+    equivalent prior read to reuse), this reads one itself before polling.
+
+    Never raises - _page_content_fingerprint's own "" fallback on any read
+    failure already degrades safely: two "" reads in a row "stabilize"
+    immediately on a page this can't even read, which is correct (nothing
+    further polling could do would help a page whose content isn't
+    readable at all).
+    """
+    previous = initial_fingerprint if initial_fingerprint is not None else await _page_content_fingerprint(page)
+    elapsed_ms = 0
+    while elapsed_ms < max_extra_wait_ms:
+        await page.wait_for_timeout(PAGE_STABILITY_POLL_INTERVAL_MS)
+        elapsed_ms += PAGE_STABILITY_POLL_INTERVAL_MS
+        current = await _page_content_fingerprint(page)
+        if current == previous:
+            return
+        previous = current
+
+
 async def _page_shows_email_gate(page) -> bool:
     """
     True when `page` is currently showing a Pitch "Managed Links"
@@ -991,6 +1053,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], list, int]:
                 # page once the page's own state is confirmed different.
                 signature_after = await _page_advance_signature(page)
                 if _page_has_advanced(signature_before, signature_after):
+                    await _wait_for_page_content_to_stabilize(page, signature_after[1])
                     pages.append(await page.screenshot(type="png"))
                     page_links.append(await _page_link_candidates(page))
                     advanced = True
@@ -1280,6 +1343,7 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
 
                 signature_after = await _page_advance_signature(page)
                 if _page_has_advanced(signature_before, signature_after):
+                    await _wait_for_page_content_to_stabilize(page, signature_after[1])
                     pages.append(await page.screenshot(type="png"))
                     page_links.append(await _page_link_candidates(page))
                     advanced = True
@@ -1526,6 +1590,7 @@ async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
                 break
 
             await page.wait_for_timeout(PAGE_NAV_SETTLE_MS)
+            await _wait_for_page_content_to_stabilize(page)
             pages.append(await page.screenshot(type="png"))
             page_links.append(await _page_link_candidates(page))
 

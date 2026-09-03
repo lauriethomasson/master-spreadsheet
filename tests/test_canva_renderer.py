@@ -293,6 +293,100 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+class WaitForPageContentToStabilizeTests(unittest.TestCase):
+    """
+    Unit-level tests for _wait_for_page_content_to_stabilize - the real,
+    confirmed production case this closes: the SAME Canva design
+    (DAGbhpjThxc) produced full building-amenities text in one extraction
+    and only sparse per-unit text (no amenities at all) in another, for
+    the identical document. A bare numbers-table slide paints instantly,
+    but a content-heavy slide (a bullet-list "BUILDING FEATURES"/"OFFICE
+    FEATURES" layout) can still be mid-paint at the fixed PAGE_NAV_
+    SETTLE_MS wait under load, so a screenshot taken then alone can
+    capture only part of that page's own text.
+    """
+
+    def _page(self, fingerprints):
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        page.evaluate = AsyncMock(side_effect=list(fingerprints))
+        return page
+
+    def test_stops_polling_once_two_consecutive_reads_match(self):
+        # First poll ("v1") differs from the caller-supplied initial
+        # fingerprint ("v0") - content was still changing at the fixed
+        # settle wait, exactly the real reported failure shape. Second
+        # poll ("v1" again) matches the first, direct evidence painting
+        # has genuinely stopped - polling must end there, not keep going
+        # to the cap.
+        page = self._page(["v1", "v1"])
+
+        _run(canva_renderer._wait_for_page_content_to_stabilize(page, "v0"))
+
+        self.assertEqual(page.evaluate.call_count, 2)
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+        page.wait_for_timeout.assert_called_with(canva_renderer.PAGE_STABILITY_POLL_INTERVAL_MS)
+
+    def test_stabilizes_immediately_when_the_first_poll_already_matches(self):
+        page = self._page(["v0"])
+
+        _run(canva_renderer._wait_for_page_content_to_stabilize(page, "v0"))
+
+        self.assertEqual(page.evaluate.call_count, 1)
+        self.assertEqual(page.wait_for_timeout.call_count, 1)
+
+    def test_never_exceeds_the_cap_when_content_keeps_changing(self):
+        # A page whose content never settles (a live clock, a subtly
+        # animating background) must still return - never hang the
+        # render indefinitely - once max_extra_wait_ms elapses, at
+        # PAGE_STABILITY_POLL_INTERVAL_MS per poll. max_extra_wait_ms is
+        # an exact multiple of the poll interval here so the expected
+        # poll count (elapsed_ms reaches the cap exactly, on the last
+        # iteration's own boundary check) is unambiguous.
+        poll_ms = canva_renderer.PAGE_STABILITY_POLL_INTERVAL_MS
+        expected_polls = 3
+        max_extra_wait_ms = poll_ms * expected_polls
+        ever_changing = [f"v{i}" for i in range(expected_polls + 5)]  # never repeats consecutively
+        page = self._page(ever_changing)
+
+        _run(canva_renderer._wait_for_page_content_to_stabilize(
+            page, "v-initial", max_extra_wait_ms=max_extra_wait_ms,
+        ))
+
+        self.assertEqual(page.evaluate.call_count, expected_polls)
+        self.assertEqual(page.wait_for_timeout.call_count, expected_polls)
+
+    def test_no_initial_fingerprint_reads_one_fresh_before_polling(self):
+        # render_kitt_page_async's own scroll-step loop has no prior
+        # signature_after to reuse (unlike render_canva_page_async's/
+        # render_pitch_page_async's own pagination loop) - omitting
+        # initial_fingerprint must read one itself first, THEN poll,
+        # rather than treating the omission as "already stable".
+        page = self._page(["fresh", "fresh"])
+
+        _run(canva_renderer._wait_for_page_content_to_stabilize(page))
+
+        # One evaluate() for the initial read, one more for the single
+        # poll that confirms it (both return "fresh" - stable immediately).
+        self.assertEqual(page.evaluate.call_count, 2)
+        self.assertEqual(page.wait_for_timeout.call_count, 1)
+
+    def test_never_raises_when_the_page_cannot_be_read_at_all(self):
+        # _page_content_fingerprint's own "" fallback on any evaluate()
+        # failure degrades safely here too - two "" reads in a row
+        # (the first poll differs from the real, non-empty initial
+        # fingerprint, but the second matches the first "" and stops
+        # there) is correct: nothing further polling could do would help
+        # a page that isn't readable at all.
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        page.evaluate = AsyncMock(side_effect=Exception("evaluate failed"))
+
+        _run(canva_renderer._wait_for_page_content_to_stabilize(page, "v0"))
+
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+
+
 def _make_async_page(
     final_url="https://www.canva.com/design/x/y/view",
     goto_side_effect=None,
