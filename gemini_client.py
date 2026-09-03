@@ -50,6 +50,70 @@ class ResponseTruncatedError(Exception):
     """
 
 
+class EmptyResponseError(Exception):
+    """
+    Raised when Gemini's final attempt has genuinely no text content to
+    parse at all - response.text is None (no text part whatsoever, e.g. a
+    candidate with only a "thought" part or none at all) or "" (a text part
+    present but empty) - and the response was NOT truncated (see
+    ResponseTruncatedError for that, distinct, case). Confirmed real
+    production case this covers: a large, image-heavy Canva-deck paste-link
+    extraction (22 pages) whose second/final Gemini attempt came back with
+    finish_reason=STOP and an empty text part - not a JSON-formatting
+    mistake RETRY_INSTRUCTION could fix, and not truncation either, so
+    retrying with more output tokens would do nothing.
+
+    Message-building is best-effort (see _describe_empty_response) - a
+    genuine safety/content block names its own real reason (prompt_feedback.
+    block_reason, or a candidate finish_reason like SAFETY/PROHIBITED_
+    CONTENT/RECITATION) when Gemini actually reports one; otherwise this
+    falls back to a plain "Gemini returned an empty response" plus whatever
+    finish_reason WAS given (often just STOP, as in the confirmed Canva case
+    above - Gemini's own API gives no further explanation for an empty-but-
+    STOP response). Either way, this is always a clearer message than the
+    raw json.JSONDecodeError("Expecting value: line 1 column 1 (char 0)")
+    this replaces - same "callers show str(e) directly to the user" reasoning
+    as ResponseTruncatedError's own docstring above.
+    """
+
+
+def _describe_empty_response(response) -> str:
+    """
+    A short, user-facing reason `response` came back with no text to parse,
+    for EmptyResponseError's own message - never a stack trace or raw SDK
+    repr. Checked in order, most specific/confident evidence first:
+
+    1. prompt_feedback.block_reason - the PROMPT itself was rejected before
+       generation ever started (see google.genai.types.BlockedReason) -
+       whenever this is set, no candidate ever gets real content, so this is
+       always the most specific, confident answer available.
+    2. The first candidate's own finish_reason, when it's anything other
+       than STOP/the "unspecified" default/blank (see google.genai.types.
+       FinishReason) - SAFETY/RECITATION/PROHIBITED_CONTENT/etc. all name a
+       real, specific cause for stopping with nothing to show for it, even
+       though generation itself was allowed to start.
+    3. Otherwise (confirmed real case: finish_reason == STOP with an empty
+       text part - the Gemini API's own response gives no further reason a
+       caller can extract) - a plain, honest "empty response" message
+       naming whatever finish_reason WAS reported, rather than claiming a
+       specific cause this function has no real evidence for.
+    """
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(prompt_feedback, "block_reason", None)
+    if block_reason:
+        return f"Gemini blocked this request ({getattr(block_reason, 'name', block_reason)})."
+
+    candidates = getattr(response, "candidates", None) or []
+    finish_reason = candidates[0].finish_reason if candidates else None
+    finish_reason_label = getattr(finish_reason, "name", finish_reason) or "unknown"
+    if finish_reason and finish_reason not in (
+        types.FinishReason.STOP, types.FinishReason.FINISH_REASON_UNSPECIFIED,
+    ):
+        return f"Gemini stopped without returning usable content (finish reason: {finish_reason_label})."
+
+    return f"Gemini returned an empty response (finish reason: {finish_reason_label})."
+
+
 def get_client() -> genai.Client:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -152,29 +216,60 @@ def call_gemini(client: genai.Client, prompt: str, parts: list) -> dict:
             raise
 
         truncated = _is_truncated(response)
-        try:
-            return json.loads(response.text)
-        except json.JSONDecodeError as e:
-            if attempt == 0:
-                if truncated:
+        # response.text read into a local ONCE, then checked for emptiness
+        # BEFORE ever calling json.loads, rather than inside a try/except
+        # around it - response.text (see the google-genai SDK's own
+        # GenerateContentResponse._get_text) can be None (no text part at
+        # all - a candidate with only a "thought" part, or none) just as
+        # easily as "" (a text part present but empty), and json.loads(None)
+        # raises TypeError, never json.JSONDecodeError - the OLD code here
+        # only ever caught the latter, so a None response.text would have
+        # escaped as an uncaught TypeError instead of reaching either retry/
+        # final-error branch below. Handling both shapes uniformly here
+        # closes that gap. A confirmed real production case (a large,
+        # 22-page Canva-deck paste-link extraction) hit exactly this
+        # "empty, not truncated" shape on its final attempt.
+        text = response.text
+        parse_error = None
+        if text:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                parse_error = e
+
+        # Nothing usable this attempt, either an empty response or one that
+        # failed to parse - same retry/give-up shape either way, since
+        # RETRY_INSTRUCTION's own "return only valid JSON" wording is a
+        # reasonable ask of Gemini regardless of which of the two happened.
+        if attempt == 0:
+            if truncated:
+                print(
+                    "[gemini_client] Response was cut off before finishing (MAX_TOKENS) - "
+                    f"retrying with max_output_tokens={RETRY_MAX_OUTPUT_TOKENS}.",
+                    file=sys.stderr,
+                )
+                config = types.GenerateContentConfig(
+                    response_mime_type="application/json", max_output_tokens=RETRY_MAX_OUTPUT_TOKENS,
+                )
+            else:
+                if not text:
                     print(
-                        "[gemini_client] Response was cut off before finishing (MAX_TOKENS) - "
-                        f"retrying with max_output_tokens={RETRY_MAX_OUTPUT_TOKENS}.",
+                        "[gemini_client] Response had no text content to parse - "
+                        f"retrying ({_describe_empty_response(response)}).",
                         file=sys.stderr,
                     )
-                    config = types.GenerateContentConfig(
-                        response_mime_type="application/json", max_output_tokens=RETRY_MAX_OUTPUT_TOKENS,
-                    )
-                else:
-                    current_prompt = prompt + RETRY_INSTRUCTION
-                continue
-            if truncated:
-                raise ResponseTruncatedError(
-                    "This document has too much content for Gemini to return in one response, "
-                    "even after retrying with a higher output limit. Try splitting it into smaller "
-                    "files (e.g. fewer pages/units per upload)."
-                ) from e
-            raise
+                current_prompt = prompt + RETRY_INSTRUCTION
+            continue
+
+        if truncated:
+            raise ResponseTruncatedError(
+                "This document has too much content for Gemini to return in one response, "
+                "even after retrying with a higher output limit. Try splitting it into smaller "
+                "files (e.g. fewer pages/units per upload)."
+            ) from parse_error
+        if not text:
+            raise EmptyResponseError(_describe_empty_response(response))
+        raise parse_error
 
 
 def compute_rent(fields: dict) -> dict:

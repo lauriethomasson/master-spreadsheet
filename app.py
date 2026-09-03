@@ -923,7 +923,28 @@ def _fetch_pasted_link(url: str):
     before, correctly failing the same clean way a generic unreadable
     link would (see this feature's own original scoping note on the
     Pitch renderer not needing to exist yet for this to degrade safely).
+
+    url is scheme-normalized (see brochure_link_resolver._normalize_url)
+    BEFORE either check below, never the raw pasted text - a real,
+    confirmed gap this closes: is_canva_view_link/is_pitch_view_link both
+    require a leading "http(s)://" (see their own _CANVA_VIEW_URL_RE/
+    _PITCH_VIEW_URL_RE), which a link pasted straight from a browser's own
+    address bar (or copied from certain UI elements) routinely omits, e.g.
+    "www.canva.com/design/.../view" - a real, confirmed production report.
+    Without this, such a link silently missed the Canva-renderer branch
+    entirely and fell through to the generic path below, which - unlike
+    finalize_brochure_link's own per-unit extraction path, which already
+    normalizes via resolve_brochure_link - still resolves and fetches a
+    real (if unrendered, JS-shell) response for a bare Canva/Pitch domain,
+    so the fetch doesn't obviously fail; it just never reaches a real
+    browser, so _looks_like_fetchable_document always rejects Canva's own
+    "unsupported client" shell as not being a PDF, and this pasted link
+    quietly fails with no useful diagnostic pointing at the missing scheme
+    as the real cause. Every other url shape (a plain https:// document
+    link, an already-schemed Canva/Pitch link) is completely unaffected -
+    _normalize_url is a no-op whenever a scheme is already present.
     """
+    url = brochure_link_resolver._normalize_url(url)
     if (
         brochure_enrichment.is_canva_view_link(url) or brochure_enrichment.is_pitch_view_link(url)
     ) and brochure_enrichment._canva_renderer_configured():

@@ -45,12 +45,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import gemini_client
 
 
-def _response(text: str, finish_reason=types.FinishReason.STOP):
+def _response(text: str, finish_reason=types.FinishReason.STOP, block_reason=None):
+    """
+    block_reason defaults to None (never a bare MagicMock auto-attribute -
+    plain attribute access on a MagicMock auto-vivifies to another,
+    truthy MagicMock, which _describe_empty_response's own block_reason
+    check would otherwise misread as a real block on every response,
+    including every EXISTING test built against this same helper before
+    prompt_feedback existed here at all).
+    """
     candidate = MagicMock()
     candidate.finish_reason = finish_reason
     response = MagicMock()
     response.text = text
     response.candidates = [candidate]
+    response.prompt_feedback = MagicMock()
+    response.prompt_feedback.block_reason = block_reason
     return response
 
 
@@ -133,6 +143,85 @@ class CallGeminiTests(unittest.TestCase):
         )
 
         with self.assertRaises(json.JSONDecodeError):
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+    def test_empty_text_response_retries_with_the_instruction_wording(self):
+        # Confirmed real production case: a large, 22-page Canva-deck
+        # paste-link extraction whose Gemini response came back with
+        # finish_reason=STOP and an empty text part - not truncated, not
+        # malformed JSON, just genuinely empty. Same retry shape as a
+        # malformed response gets (never the max_output_tokens bump, which
+        # is specifically the truncation retry's own signal).
+        self.client.models.generate_content.side_effect = [
+            _response("", finish_reason=types.FinishReason.STOP),
+            _response('{"a": 1}', finish_reason=types.FinishReason.STOP),
+        ]
+
+        result = gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertEqual(result, {"a": 1})
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+        second_call_prompt = self.client.models.generate_content.call_args_list[1].kwargs["contents"][0]
+        self.assertIn(gemini_client.RETRY_INSTRUCTION, second_call_prompt)
+        second_call_config = self.client.models.generate_content.call_args_list[1].kwargs["config"]
+        self.assertIsNone(second_call_config.max_output_tokens)
+
+    def test_none_text_response_is_treated_the_same_as_empty_string(self):
+        # response.text (see the google-genai SDK's own GenerateContent
+        # Response._get_text) returns None, not "", when there's no text
+        # part at all - json.loads(None) raises TypeError, never
+        # json.JSONDecodeError, so the OLD code (only ever wrapping
+        # json.loads in an except json.JSONDecodeError) would have let a
+        # None response.text escape as an uncaught TypeError instead of
+        # reaching the retry/EmptyResponseError handling below. Must be
+        # handled identically to the "" case throughout.
+        self.client.models.generate_content.return_value = _response(None, finish_reason=types.FinishReason.STOP)
+
+        with self.assertRaises(gemini_client.EmptyResponseError):
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+    def test_still_empty_after_retry_raises_a_clear_error_not_a_bare_json_error(self):
+        self.client.models.generate_content.return_value = _response("", finish_reason=types.FinishReason.STOP)
+
+        with self.assertRaises(gemini_client.EmptyResponseError) as ctx:
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertIn("empty response", str(ctx.exception))
+        self.assertIn("STOP", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, json.JSONDecodeError)
+
+    def test_empty_response_with_a_non_stop_finish_reason_names_it_in_the_error(self):
+        self.client.models.generate_content.return_value = _response(
+            "", finish_reason=types.FinishReason.SAFETY,
+        )
+
+        with self.assertRaises(gemini_client.EmptyResponseError) as ctx:
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertIn("SAFETY", str(ctx.exception))
+
+    def test_empty_response_with_a_prompt_level_block_reason_names_it_in_the_error(self):
+        self.client.models.generate_content.return_value = _response(
+            "", finish_reason=types.FinishReason.STOP, block_reason=types.BlockedReason.SAFETY,
+        )
+
+        with self.assertRaises(gemini_client.EmptyResponseError) as ctx:
+            gemini_client.call_gemini(self.client, "prompt", [])
+
+        self.assertIn("blocked", str(ctx.exception).lower())
+        self.assertIn("SAFETY", str(ctx.exception))
+
+    def test_truncated_and_empty_response_still_raises_response_truncated_error(self):
+        # Truncation takes priority over the plain-empty classification
+        # when both are true - MAX_TOKENS is itself a real, specific
+        # explanation for why text ended up empty (cut off before a single
+        # token of real content came out), so this must still be
+        # ResponseTruncatedError, never EmptyResponseError.
+        self.client.models.generate_content.return_value = _response(
+            "", finish_reason=types.FinishReason.MAX_TOKENS,
+        )
+
+        with self.assertRaises(gemini_client.ResponseTruncatedError):
             gemini_client.call_gemini(self.client, "prompt", [])
 
     def test_quota_exceeded_is_raised_for_a_429(self):

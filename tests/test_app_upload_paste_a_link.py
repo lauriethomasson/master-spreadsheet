@@ -170,6 +170,32 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         finally:
             doc.close()
 
+    def test_scheme_less_canva_url_still_routes_to_the_renderer(self):
+        # Real, confirmed production report: a link pasted without its
+        # leading "https://" (e.g. copied as "www.canva.com/design/.../
+        # view", exactly as a browser's own address bar often displays it)
+        # used to fail is_canva_view_link's own scheme-requiring regex,
+        # silently falling through to the generic _fetch_pdf_bytes path -
+        # which never reaches a real browser, so it can only ever see
+        # Canva's own unrendered JS-shell response and fails as "not a
+        # PDF", with nothing pointing at the missing scheme as the real
+        # cause. _fetch_pasted_link now normalizes the scheme BEFORE
+        # either routing check, so this must still reach the renderer, the
+        # SAME as the fully-schemed link case above.
+        png_pages = [_make_png((1, 0, 0))]
+        page_links = [[]]
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment.fetch_rendered_page_with_links",
+                    return_value=(png_pages, page_links),
+                ) as mock_fetch:
+            result = app._fetch_pasted_link("www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view")
+
+        mock_fetch.assert_called_once_with(
+            "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view",
+        )
+        self.assertIsInstance(result, app._PastedLinkFile)
+
     def test_canva_url_without_the_renderer_configured_falls_through_to_the_generic_path(self):
         # No CANVA_RENDERER_URL set - _canva_renderer_configured() is
         # False, so this must fall through to the plain _fetch_pdf_bytes
