@@ -1415,6 +1415,92 @@ class MergeBatchResultsTests(unittest.TestCase):
             "provider": None, "contacts": None, "fully_occupied_buildings": [], "units": [{"building": "X"}],
         })
 
+    def test_a_units_own_batch_contacts_never_leak_into_a_different_batchs_unit(self):
+        # Real, confirmed bug this guards against: the old code joined every
+        # batch's own document-level contacts into one combined string first,
+        # then applied THAT combined string as the shared fallback for every
+        # unit regardless of which batch it came from - so a unit from batch
+        # A with no contact of its own could end up carrying batch B's own
+        # agent's name too. Each batch here states a DIFFERENT document-level
+        # contact of its own; a unit with none of its own must only ever
+        # inherit its OWN batch's contact, never the other batch's.
+        merged = extract_spreadsheet_gemini._merge_batch_results([
+            {"contacts": "Alice Smith, alice@acme.com",
+             "units": [{"building": "28 Lime Street", "contacts": None}]},
+            {"contacts": "Bob Jones, bob@acme.com",
+             "units": [{"building": "40 Fenchurch Street", "contacts": None}]},
+        ])
+        self.assertEqual(merged["units"][0]["contacts"], "Alice Smith, alice@acme.com")
+        self.assertEqual(merged["units"][1]["contacts"], "Bob Jones, bob@acme.com")
+
+    def test_a_units_own_contact_is_preferred_over_its_own_batchs_default(self):
+        merged = extract_spreadsheet_gemini._merge_batch_results([
+            {"contacts": "Alice Smith, alice@acme.com",
+             "units": [{"building": "28 Lime Street", "contacts": "Carol White, carol@acme.com"}]},
+        ])
+        self.assertEqual(merged["units"][0]["contacts"], "Carol White, carol@acme.com")
+
+
+class PerUnitContactsSingleCallTests(unittest.TestCase):
+    """Same per-unit-preferred/sheet-wide-fallback resolution as
+    extract.py/extract_email.py's own PerUnitContactsTests, exercised here
+    through the single (unbatched) Gemini call path via extract_sheet."""
+
+    def _sheet(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "Office"
+        ws["A2"] = "4th Floor"
+        return ws
+
+    def test_each_unit_with_its_own_contact_gets_a_different_value(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": "Jane Doe, jane@copthall.com",
+            "units": [
+                {"building": "28 Lime Street", "floor_unit": "4th Floor",
+                 "contacts": "Alice Smith, alice@copthall.com"},
+                {"building": "11 Cursitor Street", "floor_unit": "1st Floor",
+                 "contacts": "Bob Jones, bob@copthall.com"},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertEqual(rows[0].contacts, "Alice Smith, alice@copthall.com")
+        self.assertEqual(rows[1].contacts, "Bob Jones, bob@copthall.com")
+
+    def test_a_unit_with_no_contact_of_its_own_falls_back_to_sheet_wide(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": "Jane Doe, jane@copthall.com",
+            "units": [
+                {"building": "28 Lime Street", "floor_unit": "4th Floor",
+                 "contacts": "Alice Smith, alice@copthall.com"},
+                {"building": "11 Cursitor Street", "floor_unit": "1st Floor", "contacts": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertEqual(rows[0].contacts, "Alice Smith, alice@copthall.com")
+        self.assertEqual(rows[1].contacts, "Jane Doe, jane@copthall.com")
+
+    def test_single_contact_sheet_behaves_exactly_as_before(self):
+        raw = {
+            "provider": "Copthall Estates", "contacts": "Jane Doe, jane@copthall.com",
+            "units": [
+                {"building": "28 Lime Street", "floor_unit": "4th Floor"},
+                {"building": "28 Lime Street", "floor_unit": "5th Floor"},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertEqual(rows[0].contacts, "Jane Doe, jane@copthall.com")
+        self.assertEqual(rows[1].contacts, "Jane Doe, jane@copthall.com")
+
 
 class BatchedExtractionEndToEndTests(unittest.TestCase):
     """

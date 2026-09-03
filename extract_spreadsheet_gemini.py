@@ -73,7 +73,9 @@ Extract file-level information:
   Agents"/company-name column). Transcribe the exact spelling/capitalization shown - never
   paraphrase or substitute a spelling you recognize from general knowledge of the brand.
 - contacts: every NAMED individual contact person listed, each as "Name, email, phone" (omit
-  whichever of email/phone isn't given). Join multiple with "; ".
+  whichever of email/phone isn't given). Join multiple with "; ". This is the sheet-wide DEFAULT —
+  used for any unit that has no distinctly-its-own contact of its own (see the per-unit "contacts"
+  field below).
 - fully_occupied_buildings: the exact name (as you'd give it in a unit's own "building" field) of
   every building on THIS sheet whose own mini-table states it has zero current availability (shape
   (b)'s "Fully Occupied" marker row - see below) rather than real unit rows. Do not include a
@@ -123,6 +125,13 @@ Then extract EVERY SEPARATE AVAILABLE UNIT:
 - floorplan_link: the URL of the link specifically labeled "Floorplan"/"Floorplans"/"Floor Plan" (e.g.
   "Download Floorplans (https://...)") for that specific row/building, if one is given - the exact
   link brochure_link above must NEVER use as a substitute. Null if no such link is given.
+- contacts: the contact person(s) for THIS SPECIFIC unit/building, ONLY if the sheet distinguishes
+  one for it — e.g. a building's own block names a different agent right next to that building's
+  own mini-table, distinct from whichever contact(s) are listed elsewhere on the sheet. Same
+  "Name, email, phone" format, same "; "-joined for multiple, as the sheet-level contacts field
+  above. Leave this null (never repeat the sheet-wide contacts here) whenever this unit's own
+  building has no contact distinctly its own — the sheet-level contacts field above is used
+  automatically for any unit left null here, so there is no need to duplicate it.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -145,7 +154,8 @@ Return your answer as a single JSON object with this exact structure:
       "special_features": "..." or null,
       "state_of_space": "..." or null,
       "brochure_link": "..." or null,
-      "floorplan_link": "..." or null
+      "floorplan_link": "..." or null,
+      "contacts": "..." or null
     }
   ]
 }
@@ -373,13 +383,28 @@ def _merge_batch_results(results: list) -> dict:
     rather than requiring every batch to agree or waiting for a specific
     one to answer.
 
-    contacts: every batch's own value (already ";"-joined, per PROMPT's
-    own convention) is split back into individual entries, deduplicated
-    by exact text while preserving first-seen order across batches, then
-    rejoined the same way - a named contact stated in one batch's own
-    section (e.g. one submarket's own agent, sitting in a different part
-    of the sheet from another) is never lost just because a DIFFERENT
-    batch's own text didn't restate them.
+    contacts: a unit's own per-unit "contacts" (see PROMPT) is resolved
+    against ITS OWN batch's document-level contacts FIRST, before batches
+    are ever concatenated - a batch's document-level contacts describes
+    only what that ONE batch's own text stated (typically one submarket's
+    worth of sheet), so it must never be used as the fallback for a unit
+    that came from a DIFFERENT batch. Real, confirmed bug this fixes: the
+    old code joined every batch's own document-level contacts into one
+    combined string first (e.g. "Batch A's agent; Batch B's agent") and
+    then applied that same combined string as the shared fallback for
+    EVERY unit regardless of which batch it came from - so a unit from
+    Batch A with no contact of its own could end up carrying Batch B's
+    agent's name too, or vice versa. Resolving per-unit-against-its-own-
+    batch first, here, means each unit only ever inherits a contact that
+    genuinely applied to its own part of the sheet.
+
+    The top-level "contacts" returned here is still every batch's own
+    value ("; "-joined per PROMPT's own convention), deduplicated by exact
+    text while preserving first-seen order across batches - kept only as
+    a final, whole-sheet-wide fallback for the rare unit whose own batch
+    stated no contacts at all (see extract_sheet_with_metadata's own
+    per-unit resolution, which applies this the same way a single,
+    unbatched call's raw["contacts"] already does).
 
     fully_occupied_buildings/units: straight concatenation, in batch
     order - each batch's own list already names only the buildings/units
@@ -393,10 +418,22 @@ def _merge_batch_results(results: list) -> dict:
     contacts_items = []
     seen = set()
     for r in results:
-        contacts = r.get("contacts")
-        if not contacts:
+        batch_contacts = r.get("contacts")
+        for unit in r.get("units") or []:
+            unit_contacts = unit.get("contacts")
+            if not (isinstance(unit_contacts, str) and unit_contacts.strip()):
+                unit_contacts = batch_contacts
+            # Only ever ADDS a resolved value - never introduces a
+            # "contacts": None key into a unit dict that never had a
+            # contacts field to begin with, which would otherwise change
+            # dict equality for every existing caller/test that never
+            # cared about this field before per-unit contacts existed.
+            if unit_contacts:
+                unit["contacts"] = unit_contacts
+
+        if not batch_contacts:
             continue
-        for item in str(contacts).split(";"):
+        for item in str(batch_contacts).split(";"):
             item = item.strip()
             if item and item not in seen:
                 seen.add(item)
@@ -794,10 +831,13 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
     client = get_client()
     raw = _call_gemini_in_batches(client, text, sheet_label)
 
+    # No "contacts" key here - each unit below always sets its own resolved
+    # value (its own per-unit contacts, or the sheet-wide fallback) onto
+    # itself before the merge; a duplicate key in both dicts would make the
+    # ExtractedFields(**brochure, **unit) call below raise TypeError.
     brochure = {
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),
-        "contacts": raw.get("contacts"),
     }
 
     units = []
@@ -844,6 +884,18 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
         if not unit["brochure_link"] and unit["floorplan_link"]:
             unit["brochure_link"] = unit["floorplan_link"]
             brochure_link_is_floorplan = True
+
+        # Per-unit contacts (see the PROMPT's own per-unit "contacts" field
+        # docstring) PREFERRED over the sheet-wide one. For a batched sheet,
+        # _merge_batch_results has already resolved this against each
+        # unit's own batch-level contacts - this is a no-op for those units
+        # (already a non-blank string, or already the correct fallback) and
+        # only does real work for the single-batch/single-call case, where
+        # raw["contacts"] IS the whole sheet's own document-wide value.
+        unit_contacts = unit.get("contacts")
+        if not (isinstance(unit_contacts, str) and unit_contacts.strip()):
+            unit_contacts = raw.get("contacts")
+        unit["contacts"] = unit_contacts
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)

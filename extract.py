@@ -358,12 +358,14 @@ how many properties or units it covers):
   (e.g. don't write "WORKPLACE+" if the document prints "Workplace+", and don't write "Metspace" if the
   document prints "MetSpace"). Never substitute a spelling you recognize from general knowledge of the
   company's branding elsewhere — use only what this specific document actually shows.
-- contacts: every contact person or generic contact listed in the document (e.g. "Sales" if no named
-  person is given). Format each contact as "Name, email, phone" — omit any of the three pieces that
-  aren't given. If there are multiple contacts, join them with "; ". Contact details often appear on
-  a later/closing page (an agent panel, a "get in touch" page) as well as a cover or intro page — check
-  every page before concluding there are none. Leave null only if the document genuinely names no
-  contact/agent anywhere.
+- contacts: every contact person or generic contact listed in the document as a whole (e.g. "Sales" if
+  no named person is given) — the DOCUMENT-WIDE default, used for a unit that has no contact more
+  specifically its own (see each unit's own "contacts" field below, which takes priority over this one
+  whenever the document distinguishes a different contact for that specific unit/building). Format each
+  contact as "Name, email, phone" — omit any of the three pieces that aren't given. If there are
+  multiple contacts, join them with "; ". Contact details often appear on a later/closing page (an agent
+  panel, a "get in touch" page) as well as a cover or intro page — check every page before concluding
+  there are none. Leave null only if the document genuinely names no contact/agent anywhere.
 - property_features: notable amenities, certifications, or characteristics stated as applying to the
   WHOLE property/development this document describes, not to one specific building or unit within it —
   e.g. general sustainability/accreditation credentials ("WiredScore Platinum", "BREEAM Excellent",
@@ -477,6 +479,13 @@ Also extract for each unit:
   "Fully Managed", "Cat A", "Shell & Core", "Ready to Fit"). A space still being fitted out is
   still a real value here (e.g. "Fitout Underway") — that's not a reason to leave this null.
   Leave null only if the document truly gives no indication of fit-out condition at all.
+- contacts: the contact person(s) for THIS SPECIFIC unit/building, ONLY if the document distinguishes
+  one for it — e.g. a multi-building brochure whose own per-building schedule-of-areas page names a
+  different agent right next to that building's own units, distinct from whichever contact(s) appear
+  elsewhere in the document. Same "Name, email, phone" format, same "; "-joined for multiple, as the
+  document-level contacts field above. Leave this null (never repeat the document-wide contacts here)
+  whenever this unit's own building has no contact distinctly its own — the document-level contacts
+  field above is used automatically for any unit left null here, so there is no need to duplicate it.
 
 After the units, also extract building_features: an array of {"building", "features"} objects — one
 entry for each DISTINCT building name (matching a "building" value used above) that has its own
@@ -515,7 +524,8 @@ Return your answer as a single JSON object with this exact structure:
       "brochure_link": "..." or null,
       "floorplan_link": "..." or null,
       "special_features": "..." or null,
-      "state_of_space": "..." or null
+      "state_of_space": "..." or null,
+      "contacts": "..." or null
     }
   ]
 }
@@ -855,10 +865,13 @@ def _rows_from_raw(raw: dict, filename: str) -> tuple[list[ListingRow], list]:
     before it's discarded, purely so extract_from_png_pages's own caller can
     still group rows by originating page after the fact.
     """
+    # No "contacts" key here - each unit below always sets its own resolved
+    # value (its own per-unit contacts, or the document-wide fallback) onto
+    # itself before the merge; a duplicate key in both dicts would make the
+    # ExtractedFields(**brochure, **unit) call below raise TypeError.
     brochure = {
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),
-        "contacts": raw.get("contacts"),
         "development_name": raw.get("development_name"),
     }
 
@@ -909,6 +922,25 @@ def _rows_from_raw(raw: dict, filename: str) -> tuple[list[ListingRow], list]:
             )
             if isinstance(seg, str) and seg.strip()
         ) or None
+
+        # Per-unit contacts (see the PROMPT's own per-unit "contacts" field
+        # docstring) PREFERRED over the document-wide one, never combined
+        # with it - unlike special_features above, a unit's own distinct
+        # contact and the document-wide default describe the SAME kind of
+        # fact (who to contact), so showing both would read as two
+        # different, possibly conflicting answers to "who do I call" rather
+        # than one clear one. Confirmed real gap this closes: a real multi-
+        # building Colliers deck names a genuinely DIFFERENT agent on
+        # different buildings' own pages, which used to be flattened into
+        # one shared value (raw["contacts"]) applied identically to every
+        # row regardless of which building it actually described. Falls
+        # back to the document-wide value (unchanged from before this
+        # existed) whenever this unit's own "contacts" is blank - the
+        # overwhelmingly common single-contact-document case.
+        unit_contacts = unit.get("contacts")
+        if not (isinstance(unit_contacts, str) and unit_contacts.strip()):
+            unit_contacts = raw.get("contacts")
+        unit["contacts"] = unit_contacts
 
         page_index = unit.get(PAGE_INDEX_KEY)
         if not isinstance(page_index, int):

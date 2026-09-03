@@ -1113,5 +1113,61 @@ class BuildingAndPropertyFeaturesMergeTests(unittest.TestCase):
         self.assertEqual(rows[0].special_features, "Cat A fit-out")
 
 
+class PerUnitContactsTests(unittest.TestCase):
+    """
+    _rows_from_raw resolves each unit's own "contacts" (see PROMPT's own
+    per-unit contacts field) PREFERRED over the document-wide raw["contacts"]
+    - the document-wide value is used only as a fallback for a unit that
+    states none of its own. Real, confirmed gap this closes: a real multi-
+    building Colliers deck names a genuinely DIFFERENT agent on different
+    buildings' own pages, which used to be flattened into one shared
+    raw["contacts"] value applied identically to every row regardless of
+    which building it actually described.
+    """
+
+    def _extract(self, raw):
+        with patch("extract.extract_raw_units", return_value=raw), patch("extract._attach_per_row_pdf_links"):
+            return extract.extract(Path("doc.pdf"), original_filename="doc.pdf")
+
+    def test_each_unit_with_its_own_contact_gets_a_different_value(self):
+        raw = {
+            "provider": "Colliers", "contacts": "Jane Doe, jane@colliers.com",
+            "units": [
+                {"building": "The Canal Building", "floor_unit": "1st Floor",
+                 "contacts": "Alice Smith, alice@colliers.com"},
+                {"building": "The Mill", "floor_unit": "2nd Floor",
+                 "contacts": "Bob Jones, bob@colliers.com"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].contacts, "Alice Smith, alice@colliers.com")
+        self.assertEqual(rows[1].contacts, "Bob Jones, bob@colliers.com")
+
+    def test_a_unit_with_no_contact_of_its_own_falls_back_to_document_wide(self):
+        raw = {
+            "provider": "Colliers", "contacts": "Jane Doe, jane@colliers.com",
+            "units": [
+                {"building": "The Canal Building", "floor_unit": "1st Floor",
+                 "contacts": "Alice Smith, alice@colliers.com"},
+                {"building": "The Mill", "floor_unit": "2nd Floor", "contacts": None},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].contacts, "Alice Smith, alice@colliers.com")
+        self.assertEqual(rows[1].contacts, "Jane Doe, jane@colliers.com")
+
+    def test_single_contact_document_behaves_exactly_as_before(self):
+        raw = {
+            "provider": "Colliers", "contacts": "Jane Doe, jane@colliers.com",
+            "units": [
+                {"building": "Henly House", "floor_unit": "1st Floor"},
+                {"building": "Henly House", "floor_unit": "4th Floor"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].contacts, "Jane Doe, jane@colliers.com")
+        self.assertEqual(rows[1].contacts, "Jane Doe, jane@colliers.com")
+
+
 if __name__ == "__main__":
     unittest.main()

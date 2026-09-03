@@ -72,5 +72,60 @@ class BrochureLinkFloorplanFallbackTests(unittest.TestCase):
         self.assertIsNone(row.brochure_link_is_floorplan)
 
 
+class PerUnitContactsTests(unittest.TestCase):
+    """
+    extract() resolves each unit's own "contacts" (see PROMPT's own per-unit
+    contacts field) PREFERRED over the email-wide raw["contacts"] - the
+    email-wide value is used only as a fallback for a unit with none of its
+    own. Same pattern/gap as extract.py's own PerUnitContactsTests, entirely
+    separate code path here.
+    """
+
+    def _extract(self, raw):
+        with patch("extract_email.get_client"), \
+             patch("extract_email.load_eml_body", return_value="email body"), \
+             patch("extract_email.call_gemini", return_value=raw):
+            return extract_email.extract(Path("update.eml"))
+
+    def test_each_unit_with_its_own_contact_gets_a_different_value(self):
+        raw = {
+            "provider": "GPE", "contacts": "Jane Doe, jane@gpe.co.uk",
+            "units": [
+                {"building": "2 Leonard Circus", "floor_unit": "3rd Floor",
+                 "contacts": "Alice Smith, alice@gpe.co.uk"},
+                {"building": "15 Hatfields", "floor_unit": "6th Floor",
+                 "contacts": "Bob Jones, bob@gpe.co.uk"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].contacts, "Alice Smith, alice@gpe.co.uk")
+        self.assertEqual(rows[1].contacts, "Bob Jones, bob@gpe.co.uk")
+
+    def test_a_unit_with_no_contact_of_its_own_falls_back_to_email_wide(self):
+        raw = {
+            "provider": "GPE", "contacts": "Jane Doe, jane@gpe.co.uk",
+            "units": [
+                {"building": "2 Leonard Circus", "floor_unit": "3rd Floor",
+                 "contacts": "Alice Smith, alice@gpe.co.uk"},
+                {"building": "15 Hatfields", "floor_unit": "6th Floor", "contacts": None},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].contacts, "Alice Smith, alice@gpe.co.uk")
+        self.assertEqual(rows[1].contacts, "Jane Doe, jane@gpe.co.uk")
+
+    def test_single_contact_email_behaves_exactly_as_before(self):
+        raw = {
+            "provider": "GPE", "contacts": "Jane Doe, jane@gpe.co.uk",
+            "units": [
+                {"building": "2 Leonard Circus", "floor_unit": "3rd Floor"},
+                {"building": "2 Leonard Circus", "floor_unit": "5th Floor"},
+            ],
+        }
+        rows = self._extract(raw)
+        self.assertEqual(rows[0].contacts, "Jane Doe, jane@gpe.co.uk")
+        self.assertEqual(rows[1].contacts, "Jane Doe, jane@gpe.co.uk")
+
+
 if __name__ == "__main__":
     unittest.main()

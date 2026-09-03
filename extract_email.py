@@ -51,7 +51,8 @@ Extract the following email-level information (who sent this, not which property
   knowledge of the company's branding elsewhere — use only what this specific message shows.
 - contacts: every named contact person listed (typically in a "Get in touch"/"Contact" section),
   each as "Name, email, phone" — omit whichever of email/phone isn't given for that person. Join
-  multiple contacts with "; ".
+  multiple contacts with "; ". This is the email-wide DEFAULT — used for any unit that has no
+  distinctly-its-own contact of its own (see the per-unit "contacts" field below).
 
 Then identify EVERY SEPARATE AVAILABLE UNIT (each row/building-block of availability data).
 For each unit, extract its own location fields — do not assume they're shared with other units,
@@ -142,6 +143,13 @@ Also extract for each unit:
   Floorplan" that sits close to this unit's own listing, if one is given — the exact link brochure_link
   above must NEVER use. Leave null if no such link is given for this unit. Same generic-homepage/
   unrelated-listing/unsubscribe exclusions as brochure_link apply here too.
+- contacts: the contact person(s) for THIS SPECIFIC unit/building, ONLY if the email distinguishes
+  one for it — e.g. a submarket or building's own block names a different agent right next to that
+  building's own listing, distinct from whichever contact(s) appear in the shared "Get in touch"/
+  "Contact" section. Same "Name, email, phone" format, same "; "-joined for multiple, as the
+  email-level contacts field above. Leave this null (never repeat the email-wide contacts here)
+  whenever this unit's own building has no contact distinctly its own — the email-level contacts
+  field above is used automatically for any unit left null here, so there is no need to duplicate it.
 
 Return your answer as a single JSON object with this exact structure:
 
@@ -163,7 +171,8 @@ Return your answer as a single JSON object with this exact structure:
       "brochure_link": "..." or null,
       "floorplan_link": "..." or null,
       "special_features": "..." or null,
-      "state_of_space": "..." or null
+      "state_of_space": "..." or null,
+      "contacts": "..." or null
     }
   ]
 }
@@ -220,10 +229,13 @@ def extract(eml_path: Path, original_filename: str = None) -> list[ListingRow]:
     body = load_eml_body(eml_path)
     raw = call_gemini(client, PROMPT, [body])
 
+    # No "contacts" key here - each unit below always sets its own resolved
+    # value (its own per-unit contacts, or the email-wide fallback) onto
+    # itself before the merge; a duplicate key in both dicts would make the
+    # ExtractedFields(**brochure, **unit) call below raise TypeError.
     brochure = {
         "internal_ref": raw.get("provider"),
         "provider": raw.get("provider"),
-        "contacts": raw.get("contacts"),
     }
 
     rows = []
@@ -254,6 +266,16 @@ def extract(eml_path: Path, original_filename: str = None) -> list[ListingRow]:
         if not unit.get("brochure_link") and unit.get("floorplan_link"):
             unit["brochure_link"] = unit["floorplan_link"]
             brochure_link_is_floorplan = True
+
+        # Per-unit contacts (see the PROMPT's own per-unit "contacts" field
+        # docstring) PREFERRED over the email-wide one — falls back to the
+        # email-wide value (raw["contacts"]) whenever this unit's own
+        # "contacts" is blank, the overwhelmingly common single-contact-
+        # email case.
+        unit_contacts = unit.get("contacts")
+        if not (isinstance(unit_contacts, str) and unit_contacts.strip()):
+            unit_contacts = raw.get("contacts")
+        unit["contacts"] = unit_contacts
 
         fields = ExtractedFields(**brochure, **unit).model_dump()
         fields = compute_rent(fields)
