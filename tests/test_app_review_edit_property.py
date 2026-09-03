@@ -170,6 +170,39 @@ class EditPropertyFormTests(unittest.TestCase):
         # The form is gone - editing_property_id was cleared.
         self.assertEqual([e for e in at.expander if "Edit" in e.label], [])
 
+    # Real, confirmed gap: Save/Cancel only ever cleared the edit form
+    # itself (editing_property_id), never the row's own selection checkbox
+    # in the table - unlike "Remove selected"/"Clear selection" nearby,
+    # which both explicitly clear it too (see _clear_row_selection). Left
+    # unfixed, the edited row's checkbox stayed checked even after the edit
+    # was already done and saved, with no reason left to still show it
+    # selected.
+    def test_save_clears_the_rows_own_selection(self):
+        self._write_two_rows()
+        at = self._open_and_select("row-A")
+        self._click_edit(at)
+        self.assertEqual(at.session_state["export_selected_property_ids"], {"row-A"})
+
+        size_input = next(n for n in at.number_input if n.label == "Size Sqft")
+        size_input.set_value(4500.0).run()
+        save_btn = next(b for b in at.button if b.label == "Save")
+        save_btn.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(at.session_state["export_selected_property_ids"], set())
+
+    def test_cancel_clears_the_rows_own_selection(self):
+        self._write_two_rows()
+        at = self._open_and_select("row-A")
+        self._click_edit(at)
+        self.assertEqual(at.session_state["export_selected_property_ids"], {"row-A"})
+
+        cancel_btn = next(b for b in at.button if b.label == "Cancel")
+        cancel_btn.click().run()
+        self.assertFalse(at.exception)
+
+        self.assertEqual(at.session_state["export_selected_property_ids"], set())
+
     # A no-op Save (nothing actually changed) creates no version either.
     def test_saving_with_no_changes_is_a_no_op(self):
         self._write_two_rows()

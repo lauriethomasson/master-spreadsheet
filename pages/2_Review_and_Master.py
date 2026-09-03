@@ -1730,7 +1730,7 @@ def _render_selection_actions(df: pd.DataFrame, filtered_df: pd.DataFrame, selec
     editing_property_id = st.session_state.get(editing_key)
     if editing_property_id:
         if "property_id" in df.columns and editing_property_id in set(df["property_id"]):
-            _render_edit_property_form(df, editing_property_id, key)
+            _render_edit_property_form(df, filtered_df, editing_property_id, key)
         else:
             st.session_state[editing_key] = None
 
@@ -1785,7 +1785,7 @@ def _save_property_edit(df: pd.DataFrame, property_id: str, changed_fields: dict
     return True
 
 
-def _render_edit_property_form(df: pd.DataFrame, property_id: str, key: str) -> None:
+def _render_edit_property_form(df: pd.DataFrame, filtered_df: pd.DataFrame, property_id: str, key: str) -> None:
     """
     A compact, single-property edit form - deliberately NOT a second
     st.data_editor grid. Streamlit 1.60 does have st.dialog, but AppTest has
@@ -1876,6 +1876,7 @@ def _render_edit_property_form(df: pd.DataFrame, property_id: str, key: str) -> 
             cancel_clicked = st.button("Cancel", key=f"{key}_edit_cancel_{property_id}")
 
         if cancel_clicked:
+            _clear_row_selection(df, filtered_df, key)
             st.session_state[editing_key] = None
             st.rerun()
 
@@ -1885,6 +1886,7 @@ def _render_edit_property_form(df: pd.DataFrame, property_id: str, key: str) -> 
                 if new_val != original_for_compare[field]
             }
             if _save_property_edit(df, property_id, changed_fields):
+                _clear_row_selection(df, filtered_df, key)
                 st.session_state[editing_key] = None
                 st.rerun()
             else:
