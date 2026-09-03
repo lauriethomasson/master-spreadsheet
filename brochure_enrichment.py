@@ -938,14 +938,18 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        does not prove identity, since two GENUINELY DIFFERENT buildings that
        happen to share a brand/prefix (e.g. "WeWork - 10 Fenchurch St" and
        "WeWork - 20 Old Broad St" in the same portfolio brochure) strip to
-       the identical key. Only ever accepted when it is the SOLE candidate
-       sharing that stripped key - two or more candidates sharing it is
-       exactly as ambiguous as two or more exact matches would be if this
-       fell back to guessing between them, so it stays unresolved (empty),
-       same "incorrect enrichment is worse than a blank field" philosophy
-       as every other tier in this module. This is what makes the stripped
-       tier only ever a WEAK, corroborated signal - unique-within-this-
-       comparison is the corroboration, never the bare shortened name alone.
+       the identical key. Only ever accepted when every candidate sharing
+       that stripped key names the SAME real building (see
+       _distinct_building_group - several indices for the identical
+       building, e.g. its own several floors, is the expected schedule-of-
+       areas case, not an ambiguity) - two candidates sharing the stripped
+       key but naming DIFFERENT buildings is exactly as ambiguous as two or
+       more exact matches would be if this fell back to guessing between
+       them, so it stays unresolved (empty), same "incorrect enrichment is
+       worse than a blank field" philosophy as every other tier in this
+       module. This is what makes the stripped tier only ever a WEAK,
+       corroborated signal - uniqueness of the underlying building is the
+       corroboration, never the bare shortened name alone.
     3. TRAILING-STREET-SUFFIX-STRIPPED (see _strip_trailing_street_suffix_
        word) - e.g. "35a Westminster Bridge" (a row) vs "35A Westminster
        Bridge Road" (a brochure's own fuller name) - confirmed against a
@@ -954,8 +958,9 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        two genuinely different streets that merely share everything before
        their own street-type word (e.g. "Kings Road" and "Kings Street" in
        the same portfolio brochure both drop to "kings") - only ever
-       accepted when it is the SOLE candidate sharing that key. Tried
-       independently of tier 2, on the ORIGINAL (non-address-suffix-
+       accepted when every candidate sharing that key names the SAME real
+       building (see _distinct_building_group, same discipline as tier 2
+       above). Tried independently of tier 2, on the ORIGINAL (non-address-suffix-
        stripped) keys - the two gaps are unrelated (one is a spreadsheet
        baking a full address onto a building name, the other is one side
        simply omitting a trailing street-type word) and neither building's
@@ -993,12 +998,14 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        row_building itself also carried a parenthetical suffix, tier 3b
        above already tried stripping it and either matched or didn't;
        this tier is strictly about the suffix appearing on the candidate
-       side), and only ever accepted when it is the SOLE candidate whose
-       own stripped key lands on row_key - two or more candidates
-       collapsing to the same stripped key (e.g. two different floors of
-       two DIFFERENT buildings that each happen to append a parenthetical
-       to the same base text) stays unresolved, never guessed, identically
-       to every other tier's own ambiguity guard.
+       side), and only ever accepted when every candidate whose own
+       stripped key lands on row_key names the SAME real building (see
+       _distinct_building_group) - two or more candidates collapsing to
+       the same stripped key but naming DIFFERENT buildings (e.g. two
+       different floors of two DIFFERENT buildings that each happen to
+       append a parenthetical to the same base text) stays unresolved,
+       never guessed, identically to every other tier's own ambiguity
+       guard.
     3d. LEADING-ARTICLE-STRIPPED (see _strip_leading_the) - e.g.
        row_building "Canal Building"/"Packing House" (a row) vs a real
        Regent's Wharf brochure's own Gemini-extracted building text "The
@@ -1016,7 +1023,11 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
        only ever happen in one direction, so one symmetric comparison
        covers either side carrying it. Same weak-signal, corroborated-
        by-uniqueness discipline as every tier above - only accepted when
-       it's the SOLE candidate sharing the stripped key.
+       every candidate sharing the stripped key names the SAME real
+       building (see _distinct_building_group - e.g. a real Regent's
+       Wharf brochure's own several floors per building, all sharing the
+       identical "The Packing House"/"The Canal Building" text, is the
+       expected schedule-of-areas case here too, not an ambiguity).
     4. BUILDING-VS-ADDRESS (row_building compared against each candidate's
        own address_1, via `candidate_addresses` - a parallel list, one
        entry per candidate_buildings, or None from a caller with no address
@@ -1097,19 +1108,25 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
 
     row_stripped_key = normalize_key(_strip_building_address_suffix(row_building))
     if row_stripped_key:
-        stripped = [
-            i for i, c in enumerate(candidate_buildings)
-            if normalize_key(_strip_building_address_suffix(c)) == row_stripped_key
-        ]
-        if len(stripped) == 1:
+        stripped = _distinct_building_group(
+            [
+                i for i, c in enumerate(candidate_buildings)
+                if normalize_key(_strip_building_address_suffix(c)) == row_stripped_key
+            ],
+            candidate_buildings,
+        )
+        if stripped:
             return stripped
 
     row_street_key = _strip_trailing_street_suffix_word(row_key)
-    street_suffix = [
-        i for i, c in enumerate(candidate_buildings)
-        if _strip_trailing_street_suffix_word(normalize_key(c)) == row_street_key
-    ]
-    if len(street_suffix) == 1:
+    street_suffix = _distinct_building_group(
+        [
+            i for i, c in enumerate(candidate_buildings)
+            if _strip_trailing_street_suffix_word(normalize_key(c)) == row_street_key
+        ],
+        candidate_buildings,
+    )
+    if street_suffix:
         return street_suffix
 
     # 3b. TRAILING PARENTHETICAL STRIPPED (see _strip_trailing_
@@ -1127,10 +1144,11 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     # real case seen so far needs more than one of them stripped at once.
     row_parenthetical_key = normalize_key(_strip_trailing_parenthetical(row_building))
     if row_parenthetical_key and row_parenthetical_key != row_key:
-        parenthetical_stripped = [
-            i for i, c in enumerate(candidate_buildings) if normalize_key(c) == row_parenthetical_key
-        ]
-        if len(parenthetical_stripped) == 1:
+        parenthetical_stripped = _distinct_building_group(
+            [i for i, c in enumerate(candidate_buildings) if normalize_key(c) == row_parenthetical_key],
+            candidate_buildings,
+        )
+        if parenthetical_stripped:
             return parenthetical_stripped
 
     # 3c. CANDIDATE-SIDE TRAILING-PARENTHETICAL-STRIPPED (see this
@@ -1139,11 +1157,14 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     # against row_key unstripped. Any candidate whose raw key already
     # equalled row_key would already have been returned by tier 1's exact
     # comparison above, so no extra guard against that is needed here.
-    candidate_parenthetical_stripped = [
-        i for i, c in enumerate(candidate_buildings)
-        if normalize_key(_strip_trailing_parenthetical(c)) == row_key
-    ]
-    if len(candidate_parenthetical_stripped) == 1:
+    candidate_parenthetical_stripped = _distinct_building_group(
+        [
+            i for i, c in enumerate(candidate_buildings)
+            if normalize_key(_strip_trailing_parenthetical(c)) == row_key
+        ],
+        candidate_buildings,
+    )
+    if candidate_parenthetical_stripped:
         return candidate_parenthetical_stripped
 
     # 3d. LEADING-ARTICLE-STRIPPED (see _strip_leading_the's own docstring
@@ -1164,11 +1185,14 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
     # collapse to the same leading-article-stripped key stays unresolved,
     # never guessed.
     row_no_the_key = _strip_leading_the(row_key)
-    leading_article_stripped = [
-        i for i, c in enumerate(candidate_buildings)
-        if _strip_leading_the(normalize_key(c)) == row_no_the_key
-    ]
-    if len(leading_article_stripped) == 1:
+    leading_article_stripped = _distinct_building_group(
+        [
+            i for i, c in enumerate(candidate_buildings)
+            if _strip_leading_the(normalize_key(c)) == row_no_the_key
+        ],
+        candidate_buildings,
+    )
+    if leading_article_stripped:
         return leading_article_stripped
 
     row_house_number = leading_house_number(row_building)
@@ -1298,11 +1322,14 @@ def _row_has_a_genuinely_blank_enrichable_field(row: ListingRow, special_feature
     ALSO serve as evidence a row's own value is still missing).
 
     Used only by enrich_rows_grouped's own already_processed resume logic
-    (see its own indices_by_url/sharing_counts comment) to tell apart, for
-    a url ALREADY marked "ok", a document that was checked and genuinely
-    had nothing for ANY row sharing it (every sharing row still fails this
-    check) from one that only matched SOME of them (a sibling row already
-    has a real value here, even though needs_enrichment would still call
+    (see its own still_blank_counts comment) to tell whether a url ALREADY
+    marked "ok" still has any row genuinely unresolved - whether that's
+    every row sharing it (a document that was checked and genuinely had
+    nothing for anyone, OR one where a matching bug failed every row
+    identically - the two are indistinguishable from here, see enrich_
+    rows_grouped's own already_processed docstring) or only SOME of them
+    (a sibling row already has a real value here, even though needs_
+    enrichment would still call
     it "eligible" for another pass) - never used for the per-row
     application loop itself, which keeps using needs_enrichment/
     indices_by_url completely unchanged, preserving its own deliberate
@@ -3622,9 +3649,11 @@ def _enrich_rows_from_floorplans(
     already_processed/checkpoint_callback/url_checkpoint_callback mirror
     enrich_rows_grouped's own identically-named parameters (see its own
     docstring): a URL already marked "ok" is skipped UNLESS at least one
-    (never every) row sharing it is still blank - see this function's own
-    sharing_counts/indices_by_url comment, below, for why a partial-fill
-    outcome must still be re-fetched even though the url itself is "ok".
+    row sharing it is still blank (including when every sharing row is -
+    see this function's own indices_by_url comment, below, for why an
+    all-still-blank url is NOT reliable evidence "nothing here", and must
+    still be re-fetched exactly like a partial-fill outcome does, even
+    though the url itself is "ok").
     Both callbacks fire after EVERY floor plan (never batched - this worklist is
     already expected to be small/rare, see above, so there's no CHECKPOINT_
     EVERY-style interval to tune) so an interruption partway through this
@@ -3652,49 +3681,41 @@ def _enrich_rows_from_floorplans(
     }
 
     # indices_by_url tracks which rows STILL need this floor plan applied
-    # (needs_floorplan_enrichment - a row already filled is never in here);
-    # sharing_counts tracks how many rows with an ELIGIBLE floorplan_link
-    # (_is_eligible_floorplan_url) share this url IN TOTAL, regardless of
-    # whether each one still needs enrichment. The two, compared, are what
-    # tell apart the two different things already_processed[url] == "ok"
-    # can mean once more than one row shares a url (see this function's
-    # own docstring on already_processed - a blank field alone is never
-    # itself evidence a document had nothing to offer):
-    #
-    # - every sharing row is STILL blank (len(indices_by_url[url]) ==
-    #   sharing_counts[url]) - the legitimate "checked this floor plan,
-    #   genuinely nothing there for ANY of them" outcome. Stays skipped on
-    #   resume, exactly as before this fix.
-    # - only SOME sharing rows are still blank (0 < len(...) <
-    #   sharing_counts[url]) - at least one sibling row VISIBLY got a real
-    #   value from this exact document already (see _apply_floorplan_
-    #   units_to_row's own per-row matching), which is direct proof this
-    #   floor plan DOES have real content, just not something that matched
-    #   every row sharing it - the still-blank row(s) were never actually
-    #   resolved, only stranded by a coarse per-URL "ok" that was true for
-    #   the document as a whole but not for them individually. Confirmed
-    #   real case: several floors of the same building all pointing at one
-    #   shared floor plan PDF, where only some floors' own unit boxes on
-    #   it were legible/labeled.
+    # (needs_floorplan_enrichment - a row already filled is never in here).
+    # A url already marked "ok" is re-fetched whenever ANY row sharing it
+    # is still in here - including when EVERY sharing row still is. A
+    # coarse per-URL "ok" is never itself reliable evidence a document
+    # "genuinely has nothing" for every row sharing it: the same failure
+    # shape (every sharing row still blank) is equally consistent with a
+    # real matching bug silently failing 100% of the time (see brochure_
+    # enrichment.py's own confirmed regentswharf.co.uk case in enrich_
+    # rows_grouped's own already_processed docstring) as it is with a
+    # genuinely empty document - the two are indistinguishable from the
+    # outside, so re-checking is the safer default; the cost is bounded,
+    # since this only ever runs in response to an explicit resume/re-
+    # upload action, never an automatic loop. Confirmed real PARTIAL case
+    # too, unaffected by this: several floors of the same building all
+    # pointing at one shared floor plan PDF, where only some floors' own
+    # unit boxes on it were legible/labeled - at least one sibling row
+    # VISIBLY got a real value from this exact document already (see
+    # _apply_floorplan_units_to_row's own per-row matching), which is
+    # direct proof this floor plan DOES have real content, just not
+    # something that matched every row sharing it.
     #
     # Raw extracted units are never persisted across runs (only the ok/
     # unavailable status itself is, via processed_urls/already_processed),
-    # so a full re-fetch is the only way to recover a stranded row's
-    # value - worth the one extra fetch only when a sibling row's own
-    # filled state already proves it's worth paying for.
+    # so a full re-fetch is the only way to recover a stranded row's value.
     indices_by_url = {}
-    sharing_counts = {}
     for i, row in enumerate(rows):
         if not _is_eligible_floorplan_url(row.floorplan_link):
             continue
-        sharing_counts[row.floorplan_link] = sharing_counts.get(row.floorplan_link, 0) + 1
         if needs_floorplan_enrichment(row):
             indices_by_url.setdefault(row.floorplan_link, []).append(i)
 
     urls_to_fetch = [
         u for u in unique_urls
         if already_processed.get(u) != "ok"
-        or 0 < len(indices_by_url.get(u, [])) < sharing_counts.get(u, 0)
+        or len(indices_by_url.get(u, [])) > 0
     ]
     if not urls_to_fetch:
         return current, log, stats
@@ -3965,31 +3986,42 @@ def enrich_rows_grouped(
     file_store's own processed_urls persistence) lets a caller RESUME an
     interrupted run: a URL already marked "ok" here is skipped - never
     re-fetched, never re-sent to Gemini - PROVIDED every row sharing that
-    url is still blank. Since "blank special_features" alone can never
-    tell a caller whether a brochure was already successfully checked and
-    genuinely had nothing to contribute, or was never checked at all (see
-    this module's own ENRICHABLE_FIELDS docstring on why a blank value is
-    never itself evidence of anything), that same ambiguity applies PER
-    ROW, not just per url, once more than one row shares a brochure_link:
-    _apply_units_to_row does its own per-row matching, and can legitimately
-    fill some of a shared document's rows while leaving others blank (no
-    confident match for that specific row) - the url still gets marked
-    "ok" because the fetch/extraction itself succeeded, so a plain url-only
-    skip would strand those never-actually-resolved rows blank forever,
-    indistinguishable from a row correctly left blank because the document
-    had nothing for it. See sharing_counts/still_blank_counts below (NOT
-    indices_by_url/needs_enrichment, which stay reserved for the per-row
-    application loop - needs_enrichment is deliberately always True for a
-    row with an eligible brochure_link, so it can't also serve as evidence
-    a row's own value is still missing, see _row_has_a_genuinely_blank_
-    enrichable_field's own docstring) - the fetch is only ever redone when
-    at least one (but not every) row sharing the url is still genuinely
-    blank, which is direct, row-level evidence this was a partial match
-    rather than a genuine "nothing here" outcome; a url where every
-    sharing row is still blank keeps the original, correct skip-on-resume
-    behavior unchanged. Confirmed real case: several floors of the same
-    building sharing one brochure_link, where only some floors' own units
-    were legible/labeled in it.
+    url has already been genuinely resolved. Since "blank special_features"
+    alone can never tell a caller whether a brochure was already
+    successfully checked and genuinely had nothing to contribute, or was
+    never checked at all (see this module's own ENRICHABLE_FIELDS docstring
+    on why a blank value is never itself evidence of anything), that same
+    ambiguity applies PER ROW, not just per url, once more than one row
+    shares a brochure_link: _apply_units_to_row does its own per-row
+    matching, and can legitimately fill some of a shared document's rows
+    while leaving others blank (no confident match for that specific row) -
+    the url still gets marked "ok" because the fetch/extraction itself
+    succeeded, so a plain url-only skip would strand those never-actually-
+    resolved rows blank forever, indistinguishable from a row correctly
+    left blank because the document had nothing for it. See sharing_counts/
+    still_blank_counts below (NOT indices_by_url/needs_enrichment, which
+    stay reserved for the per-row application loop - needs_enrichment is
+    deliberately always True for a row with an eligible brochure_link, so
+    it can't also serve as evidence a row's own value is still missing, see
+    _row_has_a_genuinely_blank_enrichable_field's own docstring) - the
+    fetch is redone whenever ANY row sharing the url is still genuinely
+    blank, including when every sharing row is (still_blank_counts ==
+    sharing_counts), NOT only the strictly-partial case. Confirmed real
+    gap the all-still-blank case used to leave open: a real regentswharf.co.uk
+    Colliers brochure whose OWN several floors per building all share one
+    brochure_link, where a (since-fixed) building-identity-matching bug
+    made EVERY floor's own match fail identically - a url where every
+    sharing row happens to be blank is NOT reliable evidence the document
+    "genuinely has nothing here" the way it would be for a document that
+    was actually read correctly; it's equally consistent with a matching
+    bug silently failing 100% of the time. Re-checking an all-blank url on
+    every resume/re-upload is a bounded cost (only ever triggered by an
+    explicit user action, never an automatic loop - see the "unavailable"
+    paragraph below), so treating "still blank" as the one signal worth
+    trusting - regardless of whether it's partial or total - is the safer
+    default. Confirmed real partial case too, unaffected by this change:
+    several floors of the same building sharing one brochure_link, where
+    only some floors' own units were legible/labeled in it.
     A URL marked "unavailable" is NOT skipped - retried exactly like a
     never-seen URL, since a fetch/Gemini failure may well have been
     transient; this is bounded by the caller only ever resuming in
@@ -4083,14 +4115,13 @@ def enrich_rows_grouped(
     # call). first_label is built alongside it for the same reason it
     # always was.
     #
-    # sharing_counts / still_blank_counts are a SEPARATE signal, used only
-    # to decide whether a url ALREADY marked "ok" in already_processed is
-    # worth re-fetching on resume (see that parameter's own docstring
-    # above) - needs_enrichment can't serve this purpose, since it's True
-    # for every row sharing an eligible brochure_link regardless of
-    # whether special_features already has real content, so comparing it
-    # against sharing_counts could never tell a genuine "nothing found for
-    # anyone" apart from "some rows are already filled, others are still
+    # still_blank_counts is a SEPARATE signal, used only to decide whether
+    # a url ALREADY marked "ok" in already_processed is worth re-fetching
+    # on resume (see that parameter's own docstring above) - needs_
+    # enrichment can't serve this purpose, since it's True for every row
+    # sharing an eligible brochure_link regardless of whether special_
+    # features already has real content, so it could never tell a genuine
+    # "nothing found for anyone" apart from "some/all rows are still
     # stranded". still_blank_counts instead uses _row_has_a_genuinely_
     # blank_enrichable_field (see its own docstring) - the plain "is
     # anything actually still missing" question (special_features's own
@@ -4100,12 +4131,10 @@ def enrich_rows_grouped(
     # from one that was.
     first_label = {}
     indices_by_url = {}
-    sharing_counts = {}
     still_blank_counts = {}
     for i, row in enumerate(rows):
         if not _is_eligible_brochure_url(row.brochure_link):
             continue
-        sharing_counts[row.brochure_link] = sharing_counts.get(row.brochure_link, 0) + 1
         row_matched = bool(special_features_matched.get(str(i)))
         if _row_has_a_genuinely_blank_enrichable_field(row, special_features_matched=row_matched):
             still_blank_counts[row.brochure_link] = still_blank_counts.get(row.brochure_link, 0) + 1
@@ -4116,7 +4145,7 @@ def enrich_rows_grouped(
     urls_to_fetch = [
         u for u in unique_urls
         if already_processed.get(u) != "ok"
-        or 0 < still_blank_counts.get(u, 0) < sharing_counts.get(u, 0)
+        or still_blank_counts.get(u, 0) > 0
     ]
 
     current = list(rows)

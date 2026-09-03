@@ -194,14 +194,27 @@ class BrochureEnrichmentSummaryReviewUiTests(unittest.TestCase):
         self.assertIn("6 remaining", continue_buttons[0].label)
 
     def test_clicking_continue_resumes_only_the_remaining_brochures(self):
+        # Row A must already be genuinely, fully resolved (every
+        # ENRICHABLE_FIELDS value present) for its url's "ok" mark to
+        # actually stick on resume - a row still missing a field now
+        # forces a refetch regardless of the url's own "ok" mark (see
+        # brochure_enrichment.py's own EnrichRowsGroupedResumeTests.
+        # test_urls_marked_ok_but_still_genuinely_blank_are_refetched).
         path = save_staging_file(
             [
-                ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None),
+                ListingRow(
+                    building="A", brochure_link="https://example.com/a.pdf",
+                    address_1="1 Example Street", postcode="EC1A 1AA", submarket="City",
+                    floor_unit="1st", size_sqft=1000, desks_max=20, rent_pcm=5000, rent_psf=60,
+                    special_features="Already resolved", state_of_space="Cat A", contacts="Jane, jane@x.com",
+                ),
                 ListingRow(building="B", brochure_link="https://example.com/b.pdf", special_features=None),
             ],
             "Union.xlsx", content_hash="hash-interrupted-3",
         )
-        set_staging_enrichment_progress(path, {"https://example.com/a.pdf": "ok"}, 2)
+        set_staging_enrichment_progress(
+            path, {"https://example.com/a.pdf": "ok"}, 2, special_features_matched={"0": True},
+        )
 
         with patch(
             "brochure_enrichment._extract_brochure_units",

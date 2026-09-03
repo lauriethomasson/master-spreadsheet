@@ -2877,22 +2877,23 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         )
         self.assertEqual(indices, [0])
 
-    def test_tier_3b_two_matching_candidates_stays_ambiguous(self):
-        # Same weak-signal philosophy as tiers 2/3 (a plain len(...) == 1
-        # check, never _distinct_building_group's own same-building-
-        # multiple-floors allowance, which is specific to tier 4's
-        # different, cross-field corroboration mechanism) - a WEAK signal
-        # shared by 2+ candidates is exactly as unsafe to guess from as
-        # tier 2/3's own ambiguous case, even when both candidates happen
-        # to name the same building. Never actually needed for the real
-        # confirmed case this tier exists for (each of the real MetSpace
-        # Fenchurch Street floors has its own SEPARATE single-unit
-        # brochure, never one PDF with multiple floors of the same
-        # building).
+    def test_tier_3b_two_candidates_naming_the_same_building_both_match(self):
+        # Uses _distinct_building_group (same allowance tier 1's own exact
+        # match already has for a real schedule-of-areas brochure with
+        # several units for the SAME building) - two candidates that both
+        # stripped-match AND share the identical raw building text are the
+        # expected multi-floor case, not an ambiguity: every index is
+        # returned, disambiguated further by the caller's own floor/size
+        # narrowing, same as tier 1. (Tier 3b's own stripping is one-sided -
+        # only row_building's side is ever stripped, candidates are compared
+        # as-is - so two candidates sharing this tier's own matching key
+        # necessarily share the identical raw text too; a genuine
+        # different-building collision under one-sided stripping is tier
+        # 3c's own mirror-image case, covered separately below.)
         indices = brochure_enrichment._building_identity_matches(
             "141 Fenchurch Street (Monument)", ["141 Fenchurch Street", "141 Fenchurch Street"],
         )
-        self.assertEqual(indices, [])
+        self.assertEqual(indices, [0, 1])
 
     def test_tier_3b_ambiguous_match_is_rejected(self):
         # Two DIFFERENT buildings that both happen to strip to the same
@@ -2963,17 +2964,32 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         indices = brochure_enrichment._building_identity_matches("The Mill", ["Mill"])
         self.assertEqual(indices, [0])
 
-    def test_tier_3d_ambiguous_match_is_rejected(self):
-        # Two candidate ENTRIES sharing the identical leading-article-
-        # stripped key stays ambiguous - same plain len(...) == 1 check
-        # (never _distinct_building_group's own same-building-multiple-
-        # floors allowance) every other weak tier already applies, see
-        # test_tier_3b_two_matching_candidates_stays_ambiguous above for
-        # the identical philosophy. Neither candidate here is "Point"
-        # itself, so tier 1's own exact comparison never intercepts
-        # either of them first.
+    def test_tier_3d_two_candidates_naming_the_same_building_both_match(self):
+        # Two candidate entries sharing the identical leading-article-
+        # stripped key AND the identical raw text - the real Regent's
+        # Wharf schedule-of-areas shape (several floors, each entry
+        # repeating "The Packing House" verbatim) - are the expected
+        # multi-floor case via _distinct_building_group, not an ambiguity;
+        # see test_tier_3b_two_candidates_naming_the_same_building_both_
+        # match above for the identical philosophy. Neither candidate here
+        # is "Point" itself, so tier 1's own exact comparison never
+        # intercepts either of them first.
         indices = brochure_enrichment._building_identity_matches("Point", ["The Point", "The Point"])
-        self.assertEqual(indices, [])
+        self.assertEqual(indices, [0, 1])
+
+    # No standalone "tier 3d ambiguous match is rejected, different raw
+    # candidates" test exists here, unlike tiers 2/3/3b/3c above - this
+    # tier's own stripping (a single leading "the " token, symmetric on
+    # both sides) has no realistic shape where two DIFFERENT raw building
+    # names collide onto the same stripped key the way an address suffix
+    # or a street-type word can; the only strings that ever collide under
+    # it are "The X" and "X" for the same X, which is precisely two
+    # phrasings of the SAME building, not a genuine ambiguity - see
+    # test_tier_3d_two_candidates_naming_the_same_building_both_match
+    # above. test_tier_3d_does_not_introduce_false_positives_between_two_
+    # the_prefixed_buildings below covers the real risk this tier could
+    # introduce instead: two buildings that both happen to start with
+    # "The" must still resolve independently.
 
     def test_tier_3d_does_not_introduce_false_positives_between_two_the_prefixed_buildings(self):
         # Two genuinely different buildings that both happen to start
@@ -5849,19 +5865,6 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
             for i in range(n)
         ]
 
-    def test_urls_already_marked_ok_are_never_refetched(self):
-        rows = self._rows(3)
-        already_processed = {"https://example.com/B0.pdf": "ok", "https://example.com/B1.pdf": "ok"}
-
-        def _fake(url):
-            return [{"building": url, "floor_unit": None, "special_features": "checked"}]
-
-        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake) as mock_extract:
-            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
-
-        mock_extract.assert_called_once_with("https://example.com/B2.pdf")
-        self.assertEqual(stats["processed_urls"], {"https://example.com/B2.pdf": "ok"})
-
     def test_partial_fill_among_rows_sharing_one_url_forces_a_refetch(self):
         # Confirmed real root cause of rows staying blank on special_
         # features indefinitely (the Fetter Lane/High Holborn case): two
@@ -5991,14 +5994,29 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         self.assertEqual(stats["processed_urls"], {})
 
     def test_skipped_rows_are_left_completely_unchanged(self):
+        # Row 0 must be genuinely, fully resolved (every ENRICHABLE_FIELDS
+        # value present, AND special_features_matched carrying its own
+        # index) for its url to stay skipped on resume - a row missing
+        # even one other field (address_1, state_of_space, ...) is still
+        # "genuinely blank" per _row_has_a_genuinely_blank_enrichable_field
+        # and must now force a refetch, same as an all-blank row does (see
+        # test_urls_marked_ok_but_still_genuinely_blank_are_refetched).
         rows = self._rows(2)
-        rows[0] = rows[0].model_copy(update={"special_features": "Already checked, genuinely nothing more"})
+        rows[0] = rows[0].model_copy(update={
+            "address_1": "1 Example Street", "postcode": "EC1A 1AA", "submarket": "City",
+            "floor_unit": "1st", "size_sqft": 1000, "desks_max": 20, "rent_pcm": 5000, "rent_psf": 60,
+            "special_features": "Already checked, genuinely nothing more", "state_of_space": "Cat A",
+            "contacts": "Jane, jane@x.com",
+        })
         already_processed = {"https://example.com/B0.pdf": "ok"}
+        special_features_matched = {"0": True}
 
         with patch("brochure_enrichment._extract_brochure_units", return_value=[
             {"building": "B1", "floor_unit": None, "special_features": "New"},
         ]):
-            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                rows, already_processed=already_processed, special_features_matched=special_features_matched,
+            )
 
         self.assertIs(enriched[0], rows[0])
         self.assertEqual(enriched[0].special_features, "Already checked, genuinely nothing more")
@@ -6063,11 +6081,25 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         self.assertTrue(row_checkpoints)
 
     def test_everything_already_ok_is_a_no_op_with_correct_totals(self):
+        # Every row must be genuinely, fully resolved (see test_skipped_
+        # rows_are_left_completely_unchanged's own comment) for "already
+        # ok" to be a true no-op - a row still missing a field forces a
+        # refetch regardless of the url's own "ok" mark (see test_urls_
+        # marked_ok_but_still_genuinely_blank_are_refetched below).
         rows = self._rows(2)
+        full_fields = {
+            "address_1": "1 Example Street", "postcode": "EC1A 1AA", "submarket": "City",
+            "floor_unit": "1st", "size_sqft": 1000, "desks_max": 20, "rent_pcm": 5000, "rent_psf": 60,
+            "special_features": "Resolved", "state_of_space": "Cat A", "contacts": "Jane, jane@x.com",
+        }
+        rows = [r.model_copy(update=full_fields) for r in rows]
         already_processed = {r.brochure_link: "ok" for r in rows}
+        special_features_matched = {"0": True, "1": True}
 
         with patch("brochure_enrichment._extract_brochure_units") as mock_extract:
-            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                rows, already_processed=already_processed, special_features_matched=special_features_matched,
+            )
 
         mock_extract.assert_not_called()
         self.assertEqual(stats["unique_brochures_considered"], 2)
@@ -6075,22 +6107,64 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         self.assertEqual(log, [])
 
     def test_resume_after_interruption_processes_only_the_remaining_brochures(self):
-        # Simulates the exact reported scenario: 30 of 126 already checked,
-        # a resume must only touch the other 96 - proven here at smaller
-        # scale (2 of 5 already done).
+        # Simulates the exact reported scenario: 30 of 126 already checked
+        # AND genuinely, fully resolved, a resume must only touch the other
+        # 96 - proven here at smaller scale (2 of 5 already done). B0/B1
+        # must be fully resolved (see test_skipped_rows_are_left_
+        # completely_unchanged's own comment) for their url's "ok" mark to
+        # actually stick - a merely-blank "ok" row no longer counts (see
+        # test_urls_marked_ok_but_still_genuinely_blank_are_refetched).
         rows = self._rows(5)
+        full_fields = {
+            "address_1": "1 Example Street", "postcode": "EC1A 1AA", "submarket": "City",
+            "floor_unit": "1st", "size_sqft": 1000, "desks_max": 20, "rent_pcm": 5000, "rent_psf": 60,
+            "special_features": "Resolved", "state_of_space": "Cat A", "contacts": "Jane, jane@x.com",
+        }
+        rows[0] = rows[0].model_copy(update=full_fields)
+        rows[1] = rows[1].model_copy(update=full_fields)
         already_processed = {
             "https://example.com/B0.pdf": "ok", "https://example.com/B1.pdf": "ok",
         }
+        special_features_matched = {"0": True, "1": True}
 
         with patch("brochure_enrichment._extract_brochure_units", return_value=[
             {"building": "x", "floor_unit": None, "special_features": "f"},
         ]) as mock_extract:
-            _, _, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+            _, _, stats = brochure_enrichment.enrich_rows_grouped(
+                rows, already_processed=already_processed, special_features_matched=special_features_matched,
+            )
 
         self.assertEqual(mock_extract.call_count, 3)
         called_urls = {c.args[0] for c in mock_extract.call_args_list}
         self.assertEqual(called_urls, {"https://example.com/B2.pdf", "https://example.com/B3.pdf", "https://example.com/B4.pdf"})
+        self.assertEqual(len(stats["processed_urls"]), 3)
+
+    def test_urls_marked_ok_but_still_genuinely_blank_are_refetched(self):
+        # The fix confirmed against the real regentswharf.co.uk Colliers
+        # brochure (see enrich_rows_grouped's own already_processed
+        # docstring): a url marked "ok" where EVERY sharing row is still
+        # genuinely blank is no longer treated as reliable evidence the
+        # document "has nothing here" - that shape is equally consistent
+        # with a matching bug that failed every row identically, so it's
+        # retried on every resume/re-upload exactly like a partial-fill
+        # url already was. Renamed/inverted from this class's own former
+        # test_urls_already_marked_ok_are_never_refetched, which asserted
+        # the old (buggy) behavior this fix removes.
+        rows = self._rows(3)
+        already_processed = {"https://example.com/B0.pdf": "ok", "https://example.com/B1.pdf": "ok"}
+
+        def _fake(url):
+            return [{"building": url, "floor_unit": None, "special_features": "checked"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake) as mock_extract:
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows, already_processed=already_processed)
+
+        self.assertEqual(mock_extract.call_count, 3)
+        called_urls = {c.args[0] for c in mock_extract.call_args_list}
+        self.assertEqual(
+            called_urls,
+            {"https://example.com/B0.pdf", "https://example.com/B1.pdf", "https://example.com/B2.pdf"},
+        )
         self.assertEqual(len(stats["processed_urls"]), 3)
 
 
@@ -6145,7 +6219,13 @@ class EnrichRowsFromFloorplansCheckpointTests(unittest.TestCase):
         self.assertEqual(total, 1)
 
     def test_already_ok_floorplan_is_never_refetched(self):
+        # Row 0 must already be genuinely resolved (special_features
+        # non-blank - the only FLOORPLAN_ENRICHABLE_FIELDS entry) for its
+        # url's "ok" mark to actually stick - a row still blank forces a
+        # refetch regardless (see test_urls_marked_ok_but_still_blank_
+        # floorplans_are_refetched below).
         rows = self._rows(2)
+        rows[0] = rows[0].model_copy(update={"special_features": "Already checked, genuinely nothing more"})
         already_processed = {"https://example.com/0.pdf": "ok"}
 
         with patch(
@@ -6157,9 +6237,31 @@ class EnrichRowsFromFloorplansCheckpointTests(unittest.TestCase):
             )
 
         mock_extract.assert_called_once_with("https://example.com/1.pdf")
-        self.assertIsNone(current[0].special_features)  # skipped - left exactly as before
+        self.assertEqual(current[0].special_features, "Already checked, genuinely nothing more")  # skipped - left exactly as before
         self.assertEqual(current[1].special_features, "New")
         self.assertEqual(stats["processed_urls"], {"https://example.com/1.pdf": "ok"})
+
+    def test_urls_marked_ok_but_still_blank_floorplans_are_refetched(self):
+        # The floorplan-pass counterpart of EnrichRowsGroupedResumeTests'
+        # own test_urls_marked_ok_but_still_genuinely_blank_are_refetched:
+        # a url marked "ok" where every sharing row is still genuinely
+        # blank is no longer treated as reliable "nothing here" evidence,
+        # since that shape is equally consistent with a matching bug that
+        # failed every row identically.
+        rows = self._rows(2)
+        already_processed = {"https://example.com/0.pdf": "ok"}
+
+        with patch(
+            "brochure_enrichment._extract_floorplan_units",
+            return_value=[{"floor_unit": None, "special_features": "New"}],
+        ) as mock_extract:
+            current, log, stats = brochure_enrichment._enrich_rows_from_floorplans(
+                rows, already_processed=already_processed,
+            )
+
+        self.assertEqual(mock_extract.call_count, 2)
+        called_urls = {c.args[0] for c in mock_extract.call_args_list}
+        self.assertEqual(called_urls, {"https://example.com/0.pdf", "https://example.com/1.pdf"})
 
     def test_partial_fill_among_rows_sharing_one_floorplan_forces_a_refetch(self):
         # Same shape as enrich_rows_grouped's own equivalent regression
@@ -6268,9 +6370,15 @@ class EnrichRowsGroupedFloorplanParamsTests(EnrichmentTestCase):
         self.assertEqual(stats["floorplan_processed_urls"], {"https://example.com/fp.pdf": "ok"})
 
     def test_floorplan_already_processed_is_never_refetched(self):
+        # The row must already be genuinely resolved (special_features
+        # non-blank) for its floorplan url's "ok" mark to actually stick -
+        # see _enrich_rows_from_floorplans' own test_already_ok_floorplan_
+        # is_never_refetched for why a still-blank row now forces a
+        # refetch regardless of the url's own "ok" mark.
         rows = [
             ListingRow(
-                building="A", floor_unit="1st", floorplan_link="https://example.com/fp.pdf", special_features=None,
+                building="A", floor_unit="1st", floorplan_link="https://example.com/fp.pdf",
+                special_features="Already resolved",
             ),
         ]
         with patch("brochure_enrichment._extract_floorplan_units") as mock_extract:
@@ -6279,7 +6387,7 @@ class EnrichRowsGroupedFloorplanParamsTests(EnrichmentTestCase):
             )
 
         mock_extract.assert_not_called()
-        self.assertIsNone(enriched[0].special_features)
+        self.assertEqual(enriched[0].special_features, "Already resolved")
 
     def test_floorplan_checkpoint_callbacks_fire_separately_from_brochure_ones(self):
         rows = [
