@@ -11,13 +11,13 @@ already-staged result exactly like an extract_spreadsheet.py/
 extract_spreadsheet_gemini.py/brochure_enrichment.py change already does -
 it simply never did.
 
-Also covers a second, later gap of the exact same shape: once email
-uploads started running automatic brochure enrichment too (see app.py's
-own is_email_source), a brochure_enrichment.py change had to start
-invalidating an already-staged EMAIL result the same way it already does
-for a spreadsheet upload - see PdfEmailContentHashCompositionTests below.
-Deliberately never folded in for a PDF upload, which still never runs
-automatic enrichment at all.
+Also covers a second, later gap of the exact same shape: once PDF/email
+uploads started running automatic brochure enrichment too (now
+unconditionally, for every upload type alike - see app.py's own upload-
+flow comment on the extract -> save -> brochure-check -> geocode reorder),
+a brochure_enrichment.py change had to start invalidating an already-
+staged PDF/email result the same way it already does for a spreadsheet
+upload - see PdfEmailContentHashCompositionTests below.
 
 Confirmed against a real report: after landing the geocoding postcode-
 validation fix (see geocode.py's own module docstring - rejecting a Places
@@ -189,29 +189,25 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
     """
     Pure, no upload involved - app._pdf_or_email_content_hash, the PDF/
     email counterpart to _spreadsheet_content_hash above. Confirms
-    brochure_enrichment.py's own source is folded in for an email upload
-    (which now runs automatic brochure enrichment too - see app.py's own
-    is_email_source) but deliberately NOT for a PDF upload (which still
-    never runs it at all - see brochure_enrichment.py's own module
-    docstring), exactly mirroring why _SPREADSHEET_LOGIC_FINGERPRINT
-    already includes it unconditionally for every spreadsheet upload.
+    brochure_enrichment.py's own source is folded in unconditionally, for
+    every PDF/email upload alike - automatic brochure enrichment now runs
+    for every upload type (see app.py's own upload-flow reorder: extract
+    -> save -> brochure-check -> geocode, no more per-source gating at
+    all), exactly mirroring why _SPREADSHEET_LOGIC_FINGERPRINT already
+    includes it unconditionally for every spreadsheet upload. No longer
+    takes a suffix argument at all - the PDF-vs-email distinction this
+    function's own formula used to make (folding brochure_enrichment.py
+    in for email only) no longer exists, so nothing about the result
+    depends on suffix any more either.
     """
 
-    def test_email_hash_is_computed_from_brochure_enrichment_py_bytes_too(self):
-        file_bytes = b"pretend .eml bytes"
+    def test_hash_is_computed_from_brochure_enrichment_py_bytes_too(self):
+        file_bytes = b"pretend .pdf or .eml bytes"
         expected = hashlib.sha256(
             app._PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes + b"\0"
             + Path(geocode.__file__).read_bytes() + b"\0" + Path(app.brochure_enrichment.__file__).read_bytes()
         ).hexdigest()
-        self.assertEqual(app._pdf_or_email_content_hash(".eml", file_bytes), expected)
-
-    def test_pdf_hash_never_includes_brochure_enrichment_py(self):
-        file_bytes = b"pretend .pdf bytes"
-        expected = hashlib.sha256(
-            app._PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes + b"\0"
-            + Path(geocode.__file__).read_bytes()
-        ).hexdigest()
-        self.assertEqual(app._pdf_or_email_content_hash(".pdf", file_bytes), expected)
+        self.assertEqual(app._pdf_or_email_content_hash(file_bytes), expected)
 
     def test_pdf_email_fingerprint_is_computed_from_extract_and_extract_email_bytes(self):
         # Proves _PDF_EMAIL_LOGIC_FINGERPRINT is genuinely a hash of
@@ -253,10 +249,10 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
         # tests confirm a change to either file's own content changes the
         # resulting content_hash.
         file_bytes = b"pretend .pdf bytes"
-        original_hash = app._pdf_or_email_content_hash(".pdf", file_bytes)
+        original_hash = app._pdf_or_email_content_hash(file_bytes)
 
         with patch.object(app, "_PDF_EMAIL_LOGIC_FINGERPRINT", "a-different-fingerprint"):
-            changed_hash = app._pdf_or_email_content_hash(".pdf", file_bytes)
+            changed_hash = app._pdf_or_email_content_hash(file_bytes)
 
         self.assertNotEqual(original_hash, changed_hash)
 
@@ -274,30 +270,20 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
         old_formula_hash = hashlib.sha256(
             "3".encode("utf-8") + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
         ).hexdigest()
-        current_hash = app._pdf_or_email_content_hash(".pdf", file_bytes)
+        current_hash = app._pdf_or_email_content_hash(file_bytes)
         self.assertNotEqual(old_formula_hash, current_hash)
 
-    def test_pdf_and_email_hash_differently_for_the_exact_same_bytes(self):
-        # Since brochure_enrichment.py's bytes are only folded in for one
-        # of the two, the same underlying content must never collide
-        # between a PDF and an email upload.
-        file_bytes = b"identical bytes, different upload type"
-        self.assertNotEqual(
-            app._pdf_or_email_content_hash(".pdf", file_bytes),
-            app._pdf_or_email_content_hash(".eml", file_bytes),
-        )
-
-    def test_same_suffix_and_bytes_hash_identically_every_call(self):
+    def test_same_bytes_hash_identically_every_call(self):
         file_bytes = b"pretend .eml bytes"
         self.assertEqual(
-            app._pdf_or_email_content_hash(".eml", file_bytes),
-            app._pdf_or_email_content_hash(".eml", file_bytes),
+            app._pdf_or_email_content_hash(file_bytes),
+            app._pdf_or_email_content_hash(file_bytes),
         )
 
     def test_different_bytes_hash_differently(self):
         self.assertNotEqual(
-            app._pdf_or_email_content_hash(".eml", b"one email"),
-            app._pdf_or_email_content_hash(".eml", b"a different email"),
+            app._pdf_or_email_content_hash(b"one email"),
+            app._pdf_or_email_content_hash(b"a different email"),
         )
 
 

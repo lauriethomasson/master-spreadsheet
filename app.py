@@ -36,6 +36,7 @@ from storage.file_store import (
     load_staging_as_dataframe,
     save_original_pdf,
     save_staging_file,
+    update_staging_rows,
 )
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
@@ -389,14 +390,30 @@ def _run_automatic_brochure_enrichment(
     floorplan_already_processed: dict = None, special_features_matched: dict = None, row_count: int = None,
 ) -> list[ListingRow]:
     """
-    Runs immediately after a FRESH spreadsheet OR email upload's base rows
-    are already staged at staging_path (see save_staging_file, called by
-    the caller strictly BEFORE this) - automatic, not a separate action the
-    user has to remember to trigger. That ordering is what keeps the base
-    extraction safe even if this crashes, times out, or is interrupted (see
-    brochure_enrichment.py's own module docstring): the rows already exist
-    on disk, byte-identical to what was just extracted, before this ever
-    downloads or sends a single brochure to Gemini.
+    Runs immediately after a FRESH upload's base rows are already staged at
+    staging_path (see save_staging_file, called by the caller strictly
+    BEFORE this) - for EVERY source type now (spreadsheet, email, PDF,
+    pasted link alike, no more per-source gating - see the caller's own
+    comment for why) - automatic, not a separate action the user has to
+    remember to trigger. That ordering is what keeps the base extraction
+    safe even if this crashes, times out, or is interrupted (see brochure_
+    enrichment.py's own module docstring): the rows already exist on disk,
+    byte-identical to what was just extracted, before this ever downloads
+    or sends a single brochure to Gemini.
+
+    Also runs BEFORE geocode_rows now, not after - real, confirmed reason:
+    a row whose source states no street address at all previously went
+    straight to geocode_rows' own Tier 2 name-only guess, with brochure
+    enrichment (backfilling address_1 from the brochure itself) only ever
+    getting a chance afterward, too late to help THAT geocode attempt (the
+    real Colliers "Prospect House" incident this reorder exists for - see
+    the caller's own comment). Checking the brochure first means address_1/
+    postcode themselves are now routinely among the fields this backfills
+    BEFORE geocoding ever runs, not just the other ENRICHABLE_FIELDS - so
+    geocode_rows' own far more reliable Tier 1 (a real address lookup) gets
+    to fire far more often, with a genuinely blank/nothing-eligible row
+    still falling through to Tier 2's existing guess-and-flag behavior
+    completely unchanged.
 
     already_processed/floorplan_already_processed ({url: "ok" |
     "unavailable"}), when given, are a PRIOR upload's own persisted
@@ -469,70 +486,6 @@ def _run_automatic_brochure_enrichment(
         floorplan_already_processed=floorplan_already_processed or {},
         special_features_matched=special_features_matched or {},
     )
-
-
-def _pre_enrichment_geocode_snapshot(rows: list[ListingRow]) -> list:
-    """
-    Captures, by position (never by object identity - brochure enrichment
-    may replace row objects via model_copy rather than mutate them in
-    place, see brochure_enrichment.py's own established pattern), exactly
-    the three facts _reattempt_geocoding_for_newly_addressed_rows below
-    needs to decide whether a row is a genuine candidate for its fix: was
-    this row's existing location already flagged uncertain, and did it
-    already have BOTH address_1 and postcode before enrichment had a
-    chance to backfill either. Called by the caller strictly BEFORE
-    brochure enrichment runs - _run_automatic_brochure_enrichment's own
-    return value is what "after" gets compared against.
-    """
-    return [(row.geocode_unverified, bool(row.address_1), bool(row.postcode)) for row in rows]
-
-
-def _reattempt_geocoding_for_newly_addressed_rows(rows: list[ListingRow], pre_enrichment_state: list) -> None:
-    """
-    Real, confirmed gap this closes: geocode_rows() runs unconditionally
-    right after extraction, before brochure enrichment ever gets a chance
-    to backfill address_1/postcode from the brochure itself - so a row
-    whose source spreadsheet stated only a bare building name (nothing
-    Tier 1's own Geocoding API lookup could use) falls through to Tier 2's
-    weaker Places name-only search, which has no way to distinguish a
-    same-named but genuinely different real place. Confirmed real
-    incident: a fresh Colliers upload's own "Thames Court" row (4 Upper
-    Thames Street, EC4V 3BJ - no street address of its own in the raw
-    spreadsheet) landed on a same-named building ~29km away in Surrey via
-    Tier 2, correctly flagged geocode_unverified=True, but nothing ever
-    revisited it once its own brochure went on to correctly backfill both
-    address_1 and postcode a few steps later - by then geocoding had
-    already run and moved on for good.
-
-    Deliberately scoped to ONLY a row that (a) already carries geocode_
-    unverified=True (see schema.ListingRow's own docstring for its exact
-    tri-state semantics - True specifically means "this run has real
-    evidence the location IS NOT verified", the one and only state this
-    fix should ever act on) - a trusted row (False) or a row geocoding
-    never even attempted (None) must never be re-geocoded here, avoiding
-    needless churn/API cost on rows that don't need it - and (b) didn't
-    already have BOTH address_1 and postcode before this specific
-    enrichment pass, so this only fires when the pass genuinely just
-    supplied evidence Tier 1 didn't have the first time, never re-running
-    an already-Tier-1-quality lookup for no reason.
-
-    Clears the row's own existing (untrusted) lat/lng before calling
-    geocode_row again - geocode_row's own first check returns immediately
-    without attempting anything further whenever lat/lng are already
-    non-None (the ordinary, correct behavior for a row with a real
-    source-provided coordinate), which would otherwise make this entire
-    re-attempt a silent no-op for exactly the rows it exists to fix.
-    """
-    for row, (was_unverified, had_address_1, had_postcode) in zip(rows, pre_enrichment_state):
-        if was_unverified is not True:
-            continue
-        if had_address_1 and had_postcode:
-            continue
-        if not (row.address_1 and row.postcode):
-            continue
-        row.lat = None
-        row.lng = None
-        geocode.geocode_row(row)
 
 
 def _warn_if_extraction_looks_garbled(rows: list[ListingRow], sheet_label: str) -> None:
@@ -716,7 +669,7 @@ def _spreadsheet_content_hash(file_bytes: bytes, decisions: dict) -> str:
     ).hexdigest()
 
 
-def _pdf_or_email_content_hash(suffix: str, file_bytes: bytes) -> str:
+def _pdf_or_email_content_hash(file_bytes: bytes) -> str:
     """
     content_hash for a PDF/email upload - _PDF_EMAIL_LOGIC_FINGERPRINT (a
     hash of extract.py's/extract_email.py's own source - see its own
@@ -727,24 +680,20 @@ def _pdf_or_email_content_hash(suffix: str, file_bytes: bytes) -> str:
     source types, so a geocoding-logic change must invalidate an already-
     staged PDF/email result too.
 
-    brochure_enrichment.py's own source is ALSO folded in, but only for an
-    email upload (suffix == ".eml") - an email upload now runs automatic
-    brochure enrichment too (see app.py's own is_email_source), so a
-    brochure_enrichment.py change must invalidate an already-staged EMAIL
-    result automatically, exactly like it already does for a spreadsheet
+    brochure_enrichment.py's own source is ALSO folded in, unconditionally
+    for every PDF/email upload - automatic brochure enrichment now runs
+    for every upload type, before geocoding even happens (see app.py's own
+    upload flow, the reorder this closes: extract -> save -> brochure-
+    check -> geocode), not gated by source type at all any more, so a
+    brochure_enrichment.py change must invalidate an already-staged
+    PDF/email result too, exactly like it already does for a spreadsheet
     upload (see _SPREADSHEET_LOGIC_FINGERPRINT's own inclusion of it).
-    Deliberately never folded in for a PDF upload, which still never runs
-    automatic enrichment at all (see brochure_enrichment.py's own module
-    docstring) - doing so anyway would only cause needless re-extraction of
-    a PDF on a brochure_enrichment.py change that could never actually
-    affect its result.
     """
     versioned_content = (
         _PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8")
         + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
+        + b"\0" + Path(brochure_enrichment.__file__).read_bytes()
     )
-    if suffix == ".eml":
-        versioned_content += b"\0" + Path(brochure_enrichment.__file__).read_bytes()
     return hashlib.sha256(versioned_content).hexdigest()
 
 
@@ -1257,26 +1206,6 @@ with page_setup.setup_page("upload"):
                     # AND automatic brochure enrichment (fresh extraction
                     # only, see below) need to know this.
                     is_spreadsheet_source = suffix in SPREADSHEET_SUFFIXES
-                    # Automatic brochure enrichment now also runs for an
-                    # email upload (see the row_count/enrichment gates
-                    # below and brochure_enrichment.py's own module
-                    # docstring). A PDF/Canva upload is handled separately
-                    # (see is_pdf_source/pdf_self_link/has_distinct_pdf_
-                    # brochure_link below, computed once rows exist) -
-                    # NOT unconditionally like spreadsheet/email, since a
-                    # plain single-property PDF really is already the
-                    # brochure it would be "enriched" from (circular), but
-                    # a multi-property PDF/Canva deck (e.g. a "Flex &
-                    # Managed Availability" export) can have an individual
-                    # row's own brochure_link point at a genuinely separate,
-                    # more detailed document distinct from the file that was
-                    # actually uploaded - confirmed real case: Henly House's
-                    # row, extracted from such a deck, had its own brochure_
-                    # link pointing at a completely different PDF with the
-                    # real address/state_of_space detail, never fetched at
-                    # all because the upload source was "PDF".
-                    is_email_source = suffix == ".eml"
-                    is_pdf_source = suffix == ".pdf"
 
                     # Hashed before anything else, from the bytes already in
                     # memory - a byte-identical re-upload (same content, any
@@ -1334,7 +1263,7 @@ with page_setup.setup_page("upload"):
                             file_hash.encode("utf-8") + b"\0" + decisions_repr
                         ).hexdigest()
                     else:
-                        content_hash = _pdf_or_email_content_hash(suffix, file_bytes)
+                        content_hash = _pdf_or_email_content_hash(file_bytes)
                         # Same idea as the spreadsheet branch above - the
                         # real bytes alone, no _PDF_EMAIL_LOGIC_FINGERPRINT/
                         # geocode.py fingerprint, so a re-upload of the same
@@ -1387,14 +1316,6 @@ with page_setup.setup_page("upload"):
                     resume_already_processed = None
                     resume_floorplan_already_processed = None
                     resume_special_features_matched = None
-                    # Only ever set (to the persisted synthetic-render URL)
-                    # inside the fresh-extraction PDF/paste-a-link branch
-                    # further below - stays None for a reused result (no
-                    # fresh rows to compare) and for every other source
-                    # type, which is exactly what has_distinct_pdf_
-                    # brochure_link's own "nothing to compare against"
-                    # fallback below expects.
-                    pdf_self_link = None
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
@@ -1612,53 +1533,39 @@ with page_setup.setup_page("upload"):
                             rows = [r for r in rows if id(r) not in dropped_ids]
                             header_mapped_rows = [r for r in header_mapped_rows if id(r) not in dropped_ids]
 
-                        geocode_rows(rows)
-                        # fill_missing_provider applies to EVERY spreadsheet
-                        # row here, header-mapped or Gemini-fallback alike -
-                        # apply_filename_guess=True is scoped by SOURCE TYPE
-                        # (spreadsheet vs PDF/email, see that function's own
-                        # docstring), never by which extraction METHOD this
-                        # particular sheet happened to need internally. A
-                        # spreadsheet that needed the Gemini fallback (e.g.
-                        # a repeating per-building block layout header-
-                        # mapping can't resolve) is still a spreadsheet
-                        # source - it has no column stating a provider
-                        # either way, so the filename is exactly as reliable
-                        # a fallback for it as for a header-mapped sheet.
-                        # Confirmed real gap this closes: a real beem Live
-                        # Flex Availability.xlsx sheet that fell back to
-                        # Gemini extraction (see classify_sheet_for_
-                        # extraction) ended up with a genuinely blank
-                        # provider, even though guess_provider_name(
-                        # uploaded_file.name) resolves to a real, correct
-                        # "beem" - previously only ever applied to
-                        # header_mapped_rows, never gemini_rows, based on
-                        # reasoning that actually belongs to PDF/email (see
-                        # extract.py/extract_email.py's OWN Gemini-decided
-                        # provider case, which fill_missing_address_from_
-                        # building below is correctly still scoped away
-                        # from - a spreadsheet row's blank address_1 is a
-                        # separate, deliberate judgment call this file's own
-                        # docstring already reasons through independently,
-                        # untouched here).
-                        fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=True)
-                        fill_missing_address_from_building(header_mapped_rows, apply_building_fallback=True)
+                        # Captured as POSITIONS into `rows`, not the row
+                        # OBJECTS themselves, specifically because brochure
+                        # enrichment (which now runs BEFORE fill_missing_
+                        # address_from_building needs this, see the shared
+                        # code below) replaces a TOUCHED row with a NEW
+                        # ListingRow via model_copy rather than mutating it
+                        # in place (see brochure_enrichment.py's own
+                        # established pattern) - an object-identity-based
+                        # list captured here would go silently stale for
+                        # exactly the rows enrichment actually changes,
+                        # right before fill_missing_address_from_building
+                        # needs to know which of THOSE (possibly new) row
+                        # objects were header-mapped. Positions stay valid
+                        # across that reassignment because enrichment never
+                        # reorders, adds, or drops a row - only replaces
+                        # entries in place by index (see enrich_rows_
+                        # grouped's own docstring).
+                        header_mapped_ids = {id(r) for r in header_mapped_rows}
+                        header_mapped_indices = [i for i, r in enumerate(rows) if id(r) in header_mapped_ids]
 
-                        # Brochure enrichment deliberately does NOT run here
-                        # any more - it used to (synchronously, per row),
-                        # which meant a real UNION file's 100+ unique
-                        # brochures blocked this ENTIRE upload behind
-                        # sequential Box-fetch-then-Gemini-vision calls, with
-                        # the rows below not yet staged anywhere - an
-                        # interruption mid-enrichment lost the whole
-                        # extraction, not just the enrichment. Extraction now
-                        # stages its rows immediately (see save_staging_file
-                        # below) with no brochure/Gemini call at all;
-                        # enrichment is a separate, explicit, later action
-                        # (see pages/2_Review_and_Master.py and brochure_
-                        # enrichment.enrich_rows_grouped) that reads these
-                        # already-staged rows back and writes the enriched
-                        # result to the same staging file.
+                        # geocode_rows/fill_missing_provider/fill_missing_
+                        # address_from_building all now run LATER, in the
+                        # shared code below every branch (reused/spreadsheet/
+                        # PDF-email) converges - AFTER staging AND AFTER
+                        # brochure enrichment, not here - see that shared
+                        # code's own comment for the real reorder this is
+                        # (extract -> save -> brochure-check -> geocode ->
+                        # fill_missing_*). header_mapped_indices/rows
+                        # themselves are still exactly what that later code
+                        # needs; apply_filename_guess/apply_building_
+                        # fallback are both driven by is_spreadsheet_source
+                        # there, the same True this branch would have
+                        # passed directly.
                         reused = False
                     else:
                         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -1699,7 +1606,6 @@ with page_setup.setup_page("upload"):
                                     # at all, so it's no longer computed
                                     # there.
                                     brochure_url = save_original_pdf(uploaded_file.getvalue(), uploaded_file.name)
-                                    pdf_self_link = brochure_url
                                     rows = extract.extract_from_png_pages(
                                         png_pages, original_filename=uploaded_file.name,
                                         page_links=uploaded_file.page_links,
@@ -1735,13 +1641,19 @@ with page_setup.setup_page("upload"):
                             tmp_path.unlink(missing_ok=True)
                             tmp_path = None
 
-                        geocode_rows(rows)
-                        # Existing extracted provider/address values are
-                        # never overwritten - see fill_missing_provider's own
-                        # docstring for why PDF/email must never get either
-                        # guess applied on top of Gemini's own judgment call.
-                        fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=False)
-                        fill_missing_address_from_building(rows, apply_building_fallback=False)
+                        # geocode_rows/fill_missing_provider/fill_missing_
+                        # address_from_building all now run LATER, in the
+                        # shared code below every branch converges - see
+                        # that shared code's own comment for the real
+                        # reorder this is. header_mapped_indices is set to
+                        # every position here purely so that later shared
+                        # code has SOMETHING to pass fill_missing_address_
+                        # from_building - is_spreadsheet_source is False for
+                        # this branch, so apply_building_fallback is False
+                        # there regardless, making the exact rows passed
+                        # irrelevant (that function's own first line is
+                        # `if not apply_building_fallback: return`).
+                        header_mapped_indices = list(range(len(rows)))
                         reused = False
 
                     # Fixes known spelling/capitalization drift (e.g. Gemini's
@@ -1767,79 +1679,115 @@ with page_setup.setup_page("upload"):
                         source_identity_hash=source_identity_hash,
                     )
 
-                    # A plain single-property PDF really is already the
-                    # brochure it would be "enriched" from (circular), but a
-                    # multi-property PDF/Canva deck can have an individual
-                    # row's own brochure_link point at a genuinely separate,
-                    # more detailed document distinct from the file that was
-                    # actually uploaded (pdf_self_link, set above only for
-                    # the paste-a-link/png_pages branch - None, so every
-                    # non-blank link compares as distinct, for a plain PDF
-                    # upload with no self-reference of its own at all).
-                    # Confirmed real case this exists for: Henly House's
-                    # row, extracted from a multi-property Canva "Flex &
-                    # Managed Availability" deck, had its own brochure_link
-                    # pointing at a completely different PDF with the real
-                    # address/state_of_space detail - never fetched at all
-                    # because the upload source was "PDF", regardless of
-                    # that row's own distinct link.
-                    has_distinct_pdf_brochure_link = is_pdf_source and any(
-                        r.brochure_link and r.brochure_link != pdf_self_link and not r.brochure_link_is_floorplan
-                        for r in rows
-                    )
-
-                    # Computed here (never for a "reused but incomplete"
-                    # resume, which never announced a row count of its own
-                    # either) so _run_automatic_brochure_enrichment below
-                    # can fold it into ITS OWN caption - confirming,
-                    # immediately, that the row count is already real and
-                    # saved, before any further (potentially slow) step
-                    # runs, without a second, separate caption alongside it.
-                    row_count = (
-                        len(rows)
-                        if (is_spreadsheet_source or is_email_source or has_distinct_pdf_brochure_link) and not reused
-                        else None
-                    )
-
-                    # Automatic - for a fresh spreadsheet OR email extraction
-                    # always, for a fresh PDF/Canva extraction only when
-                    # has_distinct_pdf_brochure_link (see above), and ALSO
-                    # for a reused (byte-identical previous upload) result
-                    # whose own matched entry's enrichment was left
-                    # incomplete OR finished with a genuine remaining gap
-                    # (resume_already_processed is then non-None either way
-                    # - see its own assignment above, including the
-                    # "complete but still genuinely blank" branch), so THIS
-                    # staging entry gets a real chance to resolve it rather
-                    # than staying frozen at that prior result forever, no
-                    # matter how many more times the identical file gets
-                    # re-uploaded. A reused result whose match was already
-                    # complete AND has nothing genuinely blank left still
-                    # skips this entirely - nothing left to do. Wrapped in
-                    # its own try/except, on top of enrich_rows_grouped's
-                    # own internal per-brochure exception handling - the
-                    # base extraction above is ALREADY staged by this point,
-                    # so an unexpected bug here must never surface as
-                    # "extraction failed" for a file whose real extraction
-                    # genuinely succeeded.
-                    if (
-                        (is_spreadsheet_source or is_email_source or has_distinct_pdf_brochure_link)
-                        and (not reused or resume_already_processed is not None)
-                    ):
+                    # Automatic brochure enrichment now runs HERE, before
+                    # geocode_rows below, for every upload type alike - no
+                    # more per-source gating (is_spreadsheet_source/is_
+                    # email_source/is_pdf_source all used to matter here;
+                    # none do any more). Real, confirmed reason for the
+                    # reorder: a Colliers "Prospect House" row had no street
+                    # address of its own in the raw source at all - only its
+                    # own brochure genuinely stated one ("148-150 Great
+                    # Portland Street") - but under the OLD order (geocode
+                    # first, brochure-check after, spreadsheet/email only)
+                    # geocode_rows ran with nothing to go on but the bare
+                    # name, landed on a same-named but genuinely different
+                    # building via Tier 2's weak name-only search, and nothing
+                    # downstream ever revisited it. Checking the brochure
+                    # FIRST means geocode_rows below usually has a real
+                    # address to work with already, so its own far more
+                    # reliable Tier 1 (a real Geocoding API address lookup)
+                    # fires instead of Tier 2 ever having to guess at all -
+                    # for a row whose brochure genuinely has nothing address-
+                    # shaped either, Tier 2's existing guess-and-flag
+                    # behavior is completely unchanged, still the correct
+                    # fallback. save_staging_file above is UNCHANGED in
+                    # position relative to extraction - the raw extraction
+                    # is still durably staged before this (or geocoding)
+                    # ever runs, so a crash/interruption here still never
+                    # loses more than "a handful of brochures' worth of
+                    # work" (see _run_automatic_brochure_enrichment's own
+                    # docstring) - only WHERE geocoding sits relative to
+                    # staging changed, not the safety guarantee itself.
+                    #
+                    # This also makes app.py's own former _pre_enrichment_
+                    # geocode_snapshot/_reattempt_geocoding_for_newly_
+                    # addressed_rows (the earlier, narrower "Thames Court"
+                    # fix) unnecessary for a fresh upload - geocoding now
+                    # only ever runs ONCE per fresh upload, already
+                    # positioned after enrichment, so there is nothing left
+                    # to "reattempt" afterward. It turns out that fix was
+                    # ALSO already redundant even under the old order: brochure_
+                    # enrichment.run_brochure_enrichment (the function _run_
+                    # automatic_brochure_enrichment below delegates to, and
+                    # the same one pages/2_Review_and_Master.py's own manual
+                    # "Continue enrichment" button calls directly) already
+                    # calls its own _regeocode_rows_with_newly_backfilled_
+                    # addresses internally, unconditionally, for EVERY
+                    # caller - a more general fix (any row whose address_1
+                    # or postcode was genuinely blank/placeholder and just
+                    # got backfilled, not only one already flagged geocode_
+                    # unverified=True with neither field previously) that
+                    # already covered app.py's own narrower wrapper's entire
+                    # case, confirmed by reading both implementations side by
+                    # side. Removed rather than kept as a second, now-provably-
+                    # redundant re-geocode of the same rows.
+                    #
+                    # Still skipped entirely for a REUSED (byte-identical
+                    # previous upload) result whose own prior enrichment was
+                    # already complete with nothing genuinely blank left -
+                    # nothing left to do, same as before - and a reused
+                    # result never calls geocode_rows here at all (it already
+                    # carries real coordinates from whichever earlier run
+                    # first produced it); when its own prior enrichment WAS
+                    # left incomplete or genuinely gapped (resume_already_
+                    # processed is not None), resuming it here still relies
+                    # on run_brochure_enrichment's own internal re-geocode
+                    # (above) to fix up any row whose address just changed,
+                    # exactly like the fresh path does.
+                    if not reused:
+                        row_count = len(rows)
                         try:
-                            # See _reattempt_geocoding_for_newly_addressed_
-                            # rows's own docstring - captured strictly
-                            # BEFORE enrichment runs, since that's the only
-                            # point "did this row already have an address"
-                            # can still be answered.
-                            pre_enrichment_geocode_state = _pre_enrichment_geocode_snapshot(rows)
+                            rows = _run_automatic_brochure_enrichment(rows, staging_path, row_count=row_count)
+                        except Exception as e:
+                            st.warning(
+                                f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
+                                f"({e}) and was skipped for this file — the extraction above is "
+                                "unaffected and already staged."
+                            )
+                        geocode_rows(rows)
+                        fill_missing_provider(rows, uploaded_file.name, apply_filename_guess=is_spreadsheet_source)
+                        # Re-derived from the (possibly enrichment-replaced,
+                        # see header_mapped_indices' own comment above) rows
+                        # list by POSITION, never the original header_
+                        # mapped_rows object list, which could otherwise
+                        # point at row objects enrichment has since
+                        # discarded in favor of a model_copy replacement.
+                        fill_missing_address_from_building(
+                            [rows[i] for i in header_mapped_indices], apply_building_fallback=is_spreadsheet_source,
+                        )
+                        # save_staging_file above persisted the PRE-geocode
+                        # (and, for a source with no eligible brochure,
+                        # pre-enrichment too) rows - geocode_rows/fill_
+                        # missing_provider/fill_missing_address_from_building
+                        # all mutate `rows` in place from here on (never a
+                        # model_copy replacement, unlike brochure enrichment
+                        # above), but none of that reaches the actual staged
+                        # file on disk without this: the exact same "read
+                        # this staging file back, write the freshest rows to
+                        # the SAME path" update brochure enrichment's own
+                        # run_brochure_enrichment already relies on (see
+                        # update_staging_rows' own docstring) - only the
+                        # .xlsx blob is rewritten, never the .meta.json
+                        # sidecar (content_hash/status/etc, untouched by any
+                        # of this).
+                        update_staging_rows(staging_path, rows)
+                    elif resume_already_processed is not None:
+                        try:
                             rows = _run_automatic_brochure_enrichment(
                                 rows, staging_path, already_processed=resume_already_processed,
                                 floorplan_already_processed=resume_floorplan_already_processed,
                                 special_features_matched=resume_special_features_matched,
-                                row_count=row_count,
                             )
-                            _reattempt_geocoding_for_newly_addressed_rows(rows, pre_enrichment_geocode_state)
                         except Exception as e:
                             st.warning(
                                 f"{uploaded_file.name}: brochure enrichment hit an unexpected error "

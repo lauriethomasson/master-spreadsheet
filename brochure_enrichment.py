@@ -100,16 +100,24 @@ Two entry points, for two different callers:
   dispatched, never from relying on either the cache or a lock to catch a
   race after the fact.
 
-Runs automatically, immediately after a spreadsheet OR email upload's base
-rows are staged (see app.py's own is_spreadsheet_source/is_email_source and
-save_staging_file) - NOT a separate, later, user-triggered action any
-more. The base rows are staged
-FIRST, with zero brochure/Gemini calls, specifically so that if enrichment
-then crashes, times out, or is interrupted, the original extraction already
-exists safely on disk; enrichment only ever REWRITES that same staging file
+Runs automatically, immediately after a FRESH upload's base rows are
+staged (see app.py's own save_staging_file) - for every source type now
+(spreadsheet, email, PDF, pasted link alike, no more per-source gating -
+see app.py's own upload-flow comment) - NOT a separate, later, user-
+triggered action any more. The base rows are staged FIRST, with zero
+brochure/Gemini calls, specifically so that if enrichment then crashes,
+times out, or is interrupted, the original extraction already exists
+safely on disk; enrichment only ever REWRITES that same staging file
 afterward (see storage.file_store.update_staging_rows), incrementally, as
-results come in - never something the base extraction's own success depends
-on.
+results come in - never something the base extraction's own success
+depends on.
+
+Also runs BEFORE geocode_rows now, not after (see app.py's own upload-flow
+comment for the real Prospect House incident this closes) - a row whose
+address_1/postcode this enrichment backfills is now routinely available to
+geocode_rows' own far more reliable Tier 1 lookup, rather than only ever
+reaching geocode.py after its own weaker Tier 2 name-only guess had
+already run and moved on.
 """
 
 import base64
