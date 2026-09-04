@@ -4004,6 +4004,36 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertEqual(new_row.contacts, "Existing Agent, existing@agent.com")
         self.assertEqual(fields, [])
 
+    def test_paste_a_link_row_gets_contacts_from_its_own_resolved_document_not_a_shared_deck(self):
+        # End-to-end companion to extract.py's own PastedLinkContactsNeverFall
+        # BackToTheSharedDeckTests: `row` here is exactly what extract_from_
+        # png_pages now produces for a paste-a-link/multi-property-deck unit
+        # with no per-unit contact of its own (contacts=None, no longer the
+        # shared deck's generic team value) - `units` is the SEPARATE,
+        # individually-resolved document that row's own (validated,
+        # propagated) brochure_link actually points at, real Mainframe-
+        # brochure-shaped (see this session's own confirmed real extraction:
+        # jamie.quinn@colliers.com/alex.kemp@colliers.com, nothing to do with
+        # the shared deck's own "mishon/hechle/chalk" team block, which never
+        # appears anywhere here at all). Proves the fix's whole point: once
+        # contacts starts genuinely blank, _apply_units_to_row's own
+        # already-correct, already-existing blank-gated fill (see
+        # test_contacts_retained_without_requiring_a_floor_match above)
+        # naturally picks up THIS row's own real, distinct document.
+        row = ListingRow(building="Mainframe", floor_unit="3rd Floor", contacts=None)
+        units = _brochure_units(
+            [{"building": "Mainframe", "floor_unit": "3rd Floor", "size_sqft": 4000}],
+            contacts="Jamie Quinn, jamie.quinn@colliers.com; Alex Kemp, alex.kemp@colliers.com",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.contacts, "Jamie Quinn, jamie.quinn@colliers.com; Alex Kemp, alex.kemp@colliers.com")
+        self.assertIn("contacts", fields)
+        self.assertNotIn("mishon", new_row.contacts.lower())
+        self.assertNotIn("hechle", new_row.contacts.lower())
+        self.assertNotIn("chalk", new_row.contacts.lower())
+
     def test_ambiguous_unit_match_stays_conservative_property_wide_still_applies(self):
         # Two floors, neither identifiable from the row's own vague label -
         # _match_unit correctly returns None (no unit-level guess), but the
