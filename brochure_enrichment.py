@@ -3123,10 +3123,112 @@ def _match_unit(row: ListingRow, units: list):
     return None
 
 
+def _ambiguous_building_matches(row: ListingRow, units) -> list:
+    """
+    The building-matched-but-not-narrowed candidate unit dicts for `row` -
+    [] whenever there's 0 or exactly 1 building match (0 means the document
+    simply doesn't describe this row's building at all, not ambiguous, just
+    inapplicable; 1 means _match_unit would already have returned it as a
+    confident match), or when _match_unit DID resolve one despite 2+
+    building matches (floor_unit/size_sqft successfully narrowed it).
+    Returns the actual candidate list (not just a count/bool) specifically
+    so _agreed_value_across_ambiguous_units below has something to check
+    per-field agreement across.
+
+    Factored out from _row_had_ambiguous_match (now a thin bool wrapper
+    around this) and _apply_units_to_row's own tied-agreement fallback
+    (see that function's own docstring on the real schedule-of-areas shape
+    this exists for) - both need exactly this same "which candidates are
+    genuinely tied" computation; duplicating _row_building_match_indices'
+    own call in both places independently would risk the two silently
+    drifting apart on what counts as "ambiguous" over time.
+    """
+    if not units:
+        return []
+    plain_units = [u for u in units if isinstance(u, dict)]
+    match_indices = _row_building_match_indices(
+        row, [u.get("building") for u in plain_units], [u.get("address_1") for u in plain_units],
+    )
+    if len(match_indices) < 2:
+        return []
+    if _match_unit(row, units) is not None:
+        return []
+    return [plain_units[i] for i in match_indices]
+
+
+def _agreed_value_across_ambiguous_units(building_matches: list, field: str) -> str | None:
+    """
+    The one value every candidate in `building_matches` (see
+    _ambiguous_building_matches - 2+ real candidates for row's own
+    building that floor_unit/size_sqft couldn't narrow to a single unit)
+    that HAS a non-blank value for `field` agrees on, BYTE-IDENTICALLY
+    (via normalize_key, never a fuzzy/similarity comparison - same "never
+    guess" discipline as every tier in _building_identity_matches) - or
+    None when there's genuine disagreement (even a single outlier differs),
+    when NONE of the tied candidates state a non-blank value for this field
+    at all (all-blank is not "agreement", it's simply nothing to offer), OR
+    when only ONE candidate states a non-blank value at all. That last case
+    matters: with only one voice, "no disagreement" is trivially true but
+    isn't corroboration - it's just that one candidate's unconfirmed text
+    leaking onto a row it was never actually confirmed to describe (the
+    other tied, equally-plausible candidate(s) simply said nothing). Real
+    safety here comes specifically from independent floors of the SAME
+    document restating the SAME fact - genuine agreement requires at least
+    two non-blank candidates to actually agree.
+
+    Deliberately narrow, only ever called by _apply_units_to_row for
+    state_of_space and special_features specifically - the two fields
+    where byte-identical agreement across genuinely different floors is
+    strong, safe evidence (a schedule-of-areas brochure routinely states
+    the SAME building-wide amenity/fit-out status for several floors of
+    one real building - see this module's own Regent's Wharf/Friars Yard-
+    style cases elsewhere), never size_sqft/desks_max/floor_unit/rent_pcm/
+    rent_psf: numeric fields can coincidentally agree without meaning
+    anything (two different floors both being exactly 5,000 sqft is far
+    more plausible by chance than two different floors having byte-
+    identical descriptive text), and floor_unit is nonsensical here by
+    construction (if two tied candidates' own floor_unit text were
+    identical, _match_unit's own exact-text tier would already have
+    resolved them, so a genuine tie can never also be floor_unit
+    agreement).
+
+    This is what keeps STATUS_EXTRACTED_BUT_AMBIGUOUS's own reviewer-
+    facing wording ("so your data wasn't changed" - see _ISSUE_LABELS)
+    accurate without needing to touch that wording, that status, or _row_
+    had_ambiguous_match's own true/false meaning at all: _apply_units_to_
+    row's caller (enrich_rows_grouped) only ever flags STATUS_EXTRACTED_
+    BUT_AMBIGUOUS via its own `elif document_status == ... and needs_
+    enrichment(new_row):` branch, which sits as the `elif` of that same
+    call's own `if fields:` branch (identical indentation, confirmed
+    directly) - once this function lets state_of_space/special_features
+    actually land in `fields`, that `elif` (and therefore the "nothing
+    changed" wording) is automatically never reached for this row at all.
+    A row this resolves NEITHER field for still correctly falls through to
+    that branch and is still genuinely flagged ambiguous, exactly as
+    before this existed - _row_had_ambiguous_match's own meaning ("the
+    underlying MATCH is still unresolved") stays completely unchanged and
+    correct either way; only whether that fact is still worth surfacing as
+    an issue changes, and only because it's no longer accompanied by a
+    false "nothing changed" claim.
+    """
+    values = []
+    for u in building_matches:
+        if not isinstance(u, dict):
+            continue
+        value = _coerced_unit_value(field, u.get(field))
+        if value is not None and not _is_blank(value):
+            values.append(value)
+    if len(values) < 2:
+        return None
+    if len({normalize_key(v) for v in values}) != 1:
+        return None
+    return values[0]
+
+
 def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
     """
     True when `row`'s own building genuinely identifies 2+ candidate
-    brochure units (see _row_building_match_indices) that _match_unit still
+    brochure units (see _ambiguous_building_matches) that _match_unit still
     couldn't narrow down to exactly one - i.e. this row's blank fields
     stayed blank because of a real, irreducible ambiguity IN THIS DOCUMENT
     (a schedule of areas with several floors, none of which floor_unit/
@@ -3136,6 +3238,14 @@ def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
     _match_unit's own conservative "unresolved tie stays None" behavior is
     completely unaffected by this function existing.
 
+    Deliberately UNCHANGED in meaning even after _agreed_value_across_
+    ambiguous_units started letting _apply_units_to_row fill state_of_
+    space/special_features for some of these rows (see that function's own
+    docstring for why the two facts - "the match is still ambiguous" and
+    "was anything actually filled anyway" - are kept separate rather than
+    conflating this function's own true/false into also meaning "and
+    nothing came of it").
+
     False whenever there's 0 or exactly 1 building match - 0 means the
     document simply doesn't describe this row's building at all (not
     ambiguous, just inapplicable); 1 means _match_unit would have already
@@ -3143,13 +3253,7 @@ def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
     a still-blank field there means the SINGLE matched unit genuinely
     didn't state that field, not that matching itself was ambiguous.
     """
-    if not units:
-        return False
-    plain_units = [u for u in units if isinstance(u, dict)]
-    match_indices = _row_building_match_indices(
-        row, [u.get("building") for u in plain_units], [u.get("address_1") for u in plain_units],
-    )
-    return len(match_indices) >= 2 and _match_unit(row, units) is None
+    return bool(_ambiguous_building_matches(row, units))
 
 
 def _match_building_feature(row: ListingRow, units):
@@ -3574,6 +3678,13 @@ def _apply_units_to_row(row: ListingRow, units):
     """
     updates = {}
     unit = _match_unit(row, units) if units else None
+    # Only ever computed when there's genuinely no single matched unit -
+    # see _ambiguous_building_matches' own docstring. Feeds the state_of_
+    # space/special_features tied-agreement fallback below (Part 2's own
+    # addition) - [] (its own safe default) whenever unit was already
+    # resolved, so every existing code path below that only checks `unit`
+    # itself is completely unaffected by this ever having run.
+    ambiguous_matches = _ambiguous_building_matches(row, units) if units and unit is None else []
 
     if units is not None:
         contacts = getattr(units, "contacts", None)
@@ -3616,7 +3727,19 @@ def _apply_units_to_row(row: ListingRow, units):
         # stated. Exact-match-only still fully covers the confirmed real
         # case (a verbatim-duplicated tier) with none of that risk.
         row_features = row.special_features if isinstance(row.special_features, str) and not _is_blank(row.special_features) else None
-        unit_features = _coerced_unit_value("special_features", unit.get("special_features")) if unit else None
+        if unit:
+            unit_features = _coerced_unit_value("special_features", unit.get("special_features"))
+        elif ambiguous_matches:
+            # Part 2's own tied-agreement fallback (see _agreed_value_
+            # across_ambiguous_units' own docstring) - `unit` itself is
+            # still None (the individual PHYSICAL unit is genuinely
+            # unresolved), but every tied candidate stating a non-blank
+            # special_features value at all says the exact same thing, so
+            # it's safe to feed into this SAME existing multi-source
+            # combine below exactly as if a single unit had matched.
+            unit_features = _agreed_value_across_ambiguous_units(ambiguous_matches, "special_features")
+        else:
+            unit_features = None
         building_features = _match_building_feature(row, units)
         if not (isinstance(building_features, str) and not _is_blank(building_features)):
             building_features = None
@@ -3745,6 +3868,23 @@ def _apply_units_to_row(row: ListingRow, units):
             value = _coerced_unit_value(field, unit.get(field))
             if value is not None:
                 updates[field] = value  # a genuine unit match beats both fallbacks above
+
+    # Part 2's own tied-agreement fallback for state_of_space specifically
+    # (special_features' own equivalent is already folded into the combine
+    # above, via unit_features) - see _agreed_value_across_ambiguous_units'
+    # own docstring for why ONLY these two fields, never size_sqft/
+    # desks_max/floor_unit/rent_pcm/rent_psf. Deliberately a separate,
+    # narrow block rather than folding state_of_space into the UNIT_LEVEL_
+    # FIELDS loop above (which stays exactly as-is, still gated on `unit is
+    # not None` - this file's own "never touch _match_unit's own tiers"
+    # discipline extends to never touching that loop's own single-match
+    # contract either) - `field in HIGH_RISK_UNIT_LEVEL_FIELDS and rent_
+    # conflict` never applies here, since state_of_space was never a rent
+    # field to begin with.
+    if ambiguous_matches and _is_blank(row.state_of_space):
+        agreed_state_of_space = _agreed_value_across_ambiguous_units(ambiguous_matches, "state_of_space")
+        if agreed_state_of_space is not None:
+            updates["state_of_space"] = agreed_state_of_space
 
     if not updates:
         return row, []
