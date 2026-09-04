@@ -45,7 +45,20 @@ import re
 # starting with a digit (there are none in real building/address strings seen
 # so far, but this costs nothing to guard against). Case-insensitive since it
 # runs before any lowercasing.
-LEADING_HOUSE_NUMBER_RE = re.compile(r"^\s*(\d+[a-z]?(?:-\d+[a-z]?)?)\b", re.IGNORECASE)
+#
+# The range separator between the two numbers is captured as its own group
+# (a bare "-", or the word "to" wrapped in whitespace) rather than folded
+# into the number groups - leading_house_number() below rewrites it to a
+# canonical "-" regardless of which form the source used. Confirmed real
+# case: "1 to 5 Adam Street" (Ivybridge House) vs master's own "1-5 Adam
+# Street" - the same range, spelled two common ways - previously produced
+# two DIFFERENT tokens ("1" vs "1-5", since the plain-hyphen pattern doesn't
+# match " to " and LEADING_HOUSE_NUMBER_RE simply stopped at the space),
+# which house_number_changed then flagged as a risky address change even
+# though nothing actually changed.
+LEADING_HOUSE_NUMBER_RE = re.compile(
+    r"^\s*(\d+[a-z]?)(?:(-|\s+to\s+)(\d+[a-z]?))?\b", re.IGNORECASE,
+)
 
 # Spelled-out cardinal numbers, one through nineteen - confirmed real case:
 # master's "19 Wells Street" vs an upload's own "Nineteen Wells St" (same
@@ -144,7 +157,9 @@ def leading_house_number(text):
         return None
     match = LEADING_HOUSE_NUMBER_RE.match(stripped)
     if match:
-        return match.group(1).lower()
+        low, _separator, high = match.groups()
+        token = f"{low}-{high}" if high else low
+        return token.lower()
     return _spelled_out_leading_number(stripped)
 
 

@@ -43,6 +43,21 @@ class LeadingHouseNumberDigitFormTests(unittest.TestCase):
         # finds nothing at all.
         self.assertEqual(leading_house_number("10 Downing Street"), "10")
 
+    def test_word_to_range_normalizes_to_hyphen_form(self):
+        # Confirmed real case: "1 to 5 Adam Street" (Ivybridge House) vs
+        # master's own "1-5 Adam Street" - the same range, written two
+        # common ways - must produce the IDENTICAL token so house_number_
+        # changed treats them as equal, not a risky address change.
+        self.assertEqual(leading_house_number("1 to 5 Adam Street"), "1-5")
+        self.assertEqual(leading_house_number("1 to 5 Adam Street"), leading_house_number("1-5 Adam Street"))
+
+    def test_word_to_range_is_case_insensitive_and_whitespace_tolerant(self):
+        self.assertEqual(leading_house_number("1 To 5 Adam Street"), "1-5")
+        self.assertEqual(leading_house_number("1  to  5 Adam Street"), "1-5")
+
+    def test_word_to_range_with_letter_suffixes(self):
+        self.assertEqual(leading_house_number("27a to 30b Lime Street"), "27a-30b")
+
 
 class SpelledOutNumberTests(unittest.TestCase):
     """The new fallback: a leading spelled-out cardinal number (one through

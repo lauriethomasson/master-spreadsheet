@@ -3433,6 +3433,15 @@ class HouseNumberChangedTests(unittest.TestCase):
         # numbers, and a spelled-out form must never blur that distinction.
         self.assertTrue(master_merge.house_number_changed("19 Wells Street", "Twenty Wells Street"))
 
+    def test_word_to_range_vs_hyphen_range_real_case_is_not_flagged(self):
+        # The confirmed real case: "1 to 5 Adam Street" (Ivybridge House) vs
+        # master's own "1-5 Adam Street" - the same range, written two
+        # common ways - previously flagged as a risky address change because
+        # leading_house_number stopped at the space in the "to" form ("1")
+        # while the hyphen form produced "1-5".
+        self.assertFalse(master_merge.house_number_changed("1 to 5 Adam Street", "1-5 Adam Street"))
+        self.assertFalse(master_merge.house_number_changed("1-5 Adam Street", "1 to 5 Adam Street"))
+
 
 class HouseNumberSilentlyDroppedTests(unittest.TestCase):
     """
