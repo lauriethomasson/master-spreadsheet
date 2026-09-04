@@ -6974,6 +6974,219 @@ class RowHadAmbiguousMatchTests(unittest.TestCase):
         ])
         self.assertFalse(brochure_enrichment._row_had_ambiguous_match(row, units))
 
+    def test_still_true_even_when_part_2_resolves_state_of_space_and_special_features(self):
+        # Deliberate design decision (see _agreed_value_across_ambiguous_
+        # units' own docstring): _row_had_ambiguous_match's own meaning -
+        # "the underlying MATCH is still unresolved" - stays completely
+        # unchanged even for a row Part 2 successfully fills state_of_
+        # space/special_features for via tied agreement. The two facts
+        # ("still ambiguous" and "but something useful still came of it
+        # anyway") are kept separate rather than conflating this function's
+        # own bool into also meaning "and nothing came of it" - locked in
+        # here so a future change can't silently drift this into meaning
+        # something else without a test actually catching it.
+        row = ListingRow(building="Nash House", floor_unit=None, size_sqft=None)
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "state_of_space": "CAT A"},
+            {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500, "state_of_space": "CAT A"},
+        ])
+        self.assertTrue(brochure_enrichment._row_had_ambiguous_match(row, units))
+        # Confirms Part 2 really would resolve something for this exact
+        # row/units - the test above would be vacuous otherwise.
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertEqual(new_row.state_of_space, "CAT A")
+        self.assertIn("state_of_space", fields)
+
+
+class AgreedValueAcrossAmbiguousUnitsTests(unittest.TestCase):
+    """
+    Direct unit tests for _agreed_value_across_ambiguous_units - Part 2's
+    own tied-agreement helper (see its own docstring for the real schedule-
+    of-areas shape it exists for: several floors of one real building
+    sharing identical amenity/status text even though floor_unit/size_sqft
+    couldn't narrow the match to a single physical unit).
+    """
+
+    def test_unanimous_non_blank_agreement_returns_the_shared_value(self):
+        matches = [
+            {"floor_unit": "1st Floor", "state_of_space": "CAT A"},
+            {"floor_unit": "2nd Floor", "state_of_space": "CAT A"},
+            {"floor_unit": "3rd Floor", "state_of_space": "CAT A"},
+        ]
+        self.assertEqual(
+            brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"), "CAT A",
+        )
+
+    def test_a_single_dissenting_candidate_anywhere_blocks_agreement(self):
+        # Even just ONE outlier among many agreeing candidates must block
+        # this entirely - never a majority vote.
+        matches = [
+            {"floor_unit": "1st Floor", "state_of_space": "CAT A"},
+            {"floor_unit": "2nd Floor", "state_of_space": "CAT A"},
+            {"floor_unit": "3rd Floor", "state_of_space": "CAT A"},
+            {"floor_unit": "4th Floor", "state_of_space": "Fully Fitted"},
+        ]
+        self.assertIsNone(brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"))
+
+    def test_agreement_uses_normalize_key_so_trivial_formatting_differences_still_count(self):
+        # "CAT A" vs "Cat A " (trailing space/case difference) DOES count
+        # as agreement - normalize_key is the same exact-after-
+        # canonicalization comparison every other exact-match tier in this
+        # module already uses (e.g. special_features' own item-level combine
+        # dedup), not a new similarity/fuzzy mechanism. Genuinely different
+        # text (see test_a_single_dissenting_candidate_anywhere_blocks_
+        # agreement) still blocks it.
+        matches = [
+            {"state_of_space": "CAT A"},
+            {"state_of_space": "Cat A "},
+        ]
+        self.assertEqual(
+            brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"), "CAT A",
+        )
+
+    def test_all_blank_is_not_agreement(self):
+        matches = [
+            {"floor_unit": "1st Floor", "state_of_space": None},
+            {"floor_unit": "2nd Floor", "state_of_space": None},
+        ]
+        self.assertIsNone(brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"))
+
+    def test_blank_candidates_are_ignored_not_counted_as_dissent(self):
+        # A candidate with nothing stated for this field isn't evidence
+        # AGAINST agreement - only a candidate that states something
+        # genuinely DIFFERENT is.
+        matches = [
+            {"state_of_space": "CAT A"},
+            {"state_of_space": None},
+            {"state_of_space": "CAT A"},
+        ]
+        self.assertEqual(
+            brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"), "CAT A",
+        )
+
+    def test_a_single_non_blank_candidate_among_blanks_is_not_agreement(self):
+        # Real regression this guards (see ThreeLevelEnrichmentTests'
+        # own floorplan-pages test): exactly one tied candidate stating a
+        # value while the other(s) say nothing at all is "no disagreement"
+        # only trivially - it's one candidate's unconfirmed text, not two
+        # independent floors of the same document corroborating each
+        # other. Genuine agreement needs at least two non-blank voices.
+        matches = [
+            {"state_of_space": "CAT A"},
+            {"state_of_space": None},
+        ]
+        self.assertIsNone(brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"))
+
+    def test_works_for_special_features_too(self):
+        matches = [
+            {"special_features": "Roof terrace"},
+            {"special_features": "Roof terrace"},
+        ]
+        self.assertEqual(
+            brochure_enrichment._agreed_value_across_ambiguous_units(matches, "special_features"), "Roof terrace",
+        )
+
+    def test_a_non_dict_entry_is_ignored_not_a_crash(self):
+        # units is raw Gemini JSON, same "one bad entry degrades gracefully"
+        # discipline as _match_unit's own docstring.
+        matches = [{"state_of_space": "CAT A"}, "not a dict", {"state_of_space": "CAT A"}]
+        self.assertEqual(
+            brochure_enrichment._agreed_value_across_ambiguous_units(matches, "state_of_space"), "CAT A",
+        )
+
+
+class ApplyUnitsToRowTiedAgreementTests(unittest.TestCase):
+    """
+    End-to-end (through the real _apply_units_to_row, not just the helper
+    in isolation) coverage for Part 2 - a row with 2+ tied building matches
+    (no floor_unit/size_sqft disambiguator) whose state_of_space and/or
+    special_features every non-blank candidate agrees on gets those fields
+    filled anyway, even though _match_unit itself still returns None for
+    the individual physical unit.
+    """
+
+    def _tied_row(self, **overrides):
+        defaults = dict(building="Nash House", floor_unit=None, size_sqft=None, state_of_space=None)
+        defaults.update(overrides)
+        return ListingRow(**defaults)
+
+    def test_agreeing_state_of_space_is_filled_despite_unresolved_unit_match(self):
+        row = self._tied_row()
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "state_of_space": "CAT A"},
+            {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500, "state_of_space": "CAT A"},
+        ])
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertEqual(new_row.state_of_space, "CAT A")
+        self.assertIn("state_of_space", fields)
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))  # the underlying unit is still unresolved
+
+    def test_agreeing_special_features_flows_into_the_real_combine_not_just_the_unit_level_piece(self):
+        # Tests the COMBINED result (what actually reaches the row), not
+        # just _agreed_value_across_ambiguous_units in isolation - this is
+        # what the required test explicitly asks for, since the combine's
+        # own row/building/property tiers could otherwise mask a bug in
+        # how the tied-agreement value gets wired into unit_features.
+        row = self._tied_row(special_features="Existing note")
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "special_features": "Roof terrace"},
+            {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500, "special_features": "Roof terrace"},
+        ])
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertIn("special_features", fields)
+        self.assertIn("Existing note", new_row.special_features)
+        self.assertIn("Roof terrace", new_row.special_features)
+
+    def test_dissenting_state_of_space_fills_nothing(self):
+        row = self._tied_row()
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "state_of_space": "CAT A"},
+            {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500, "state_of_space": "Fully Fitted"},
+        ])
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertIsNone(new_row.state_of_space)
+        self.assertNotIn("state_of_space", fields)
+
+    def test_all_blank_state_of_space_fills_nothing(self):
+        row = self._tied_row()
+        units = _brochure_units([
+            {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "state_of_space": None},
+            {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500, "state_of_space": None},
+        ])
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertIsNone(new_row.state_of_space)
+        self.assertNotIn("state_of_space", fields)
+
+    def test_numeric_and_floor_unit_fields_stay_unresolved_even_when_they_coincidentally_agree(self):
+        # The explicit scope guard: size_sqft/desks_max/floor_unit/
+        # rent_pcm/rent_psf must NEVER be filled by tied agreement, even
+        # when every tied candidate happens to state the identical value -
+        # only state_of_space/special_features are in scope for Part 2.
+        row = self._tied_row()
+        units = _brochure_units([
+            {
+                "building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "desks_max": 20,
+                "rent_pcm": 5000, "rent_psf": 60, "state_of_space": "CAT A",
+            },
+            {
+                "building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "desks_max": 20,
+                "rent_pcm": 5000, "rent_psf": 60, "state_of_space": "CAT A",
+            },
+        ])
+        # (Both candidates share an identical floor_unit "1st Floor" too -
+        # confirmed this can never actually happen as a genuine TIE in
+        # practice, since _match_unit's own exact-text tier would already
+        # have resolved it; included here purely to prove floor_unit is
+        # never filled by this mechanism even in that impossible shape.)
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+        self.assertIsNone(new_row.size_sqft)
+        self.assertIsNone(new_row.desks_max)
+        self.assertIsNone(new_row.rent_pcm)
+        self.assertIsNone(new_row.rent_psf)
+        self.assertIsNone(new_row.floor_unit)
+        for field in ("size_sqft", "desks_max", "rent_pcm", "rent_psf", "floor_unit"):
+            self.assertNotIn(field, fields)
+
 
 class RowHadRentConflictTests(unittest.TestCase):
     def test_inconsistent_candidate_rent_is_a_conflict(self):
@@ -7203,6 +7416,32 @@ class DocumentStatusIntegrationTests(EnrichmentTestCase):
 
         self.assertIsNone(enriched[0].special_features)
         self.assertEqual(stats["document_issues"][0]["status"], brochure_enrichment.STATUS_EXTRACTED_BUT_AMBIGUOUS)
+
+    def test_ambiguous_unit_match_that_agrees_on_state_of_space_is_not_reported_as_an_issue(self):
+        # Companion to test_ambiguous_unit_match_is_a_distinct_status above
+        # (which must - and does, unchanged - still pass): same tied,
+        # undisambiguated two-floor match, but this time both candidates
+        # agree on state_of_space, so _agreed_value_across_ambiguous_units
+        # fills it. Confirms the real end-to-end pipeline (not just
+        # _apply_units_to_row in isolation) suppresses the ambiguous-status
+        # document_issue once something genuinely lands in `fields`.
+        rows = [ListingRow(
+            building="Nash House", brochure_link="https://example.com/a.pdf",
+            floor_unit=None, size_sqft=None, state_of_space=None,
+        )]
+        with patch("brochure_enrichment.httpx.get", return_value=_response()), \
+             patch("brochure_enrichment.extract.render_pages", return_value=["img"]), \
+             patch(
+                 "brochure_enrichment.extract.render_and_extract",
+                 return_value={"units": [
+                     {"building": "Nash House", "floor_unit": "1st Floor", "size_sqft": 1000, "state_of_space": "CAT A"},
+                     {"building": "Nash House", "floor_unit": "2nd Floor", "size_sqft": 1500, "state_of_space": "CAT A"},
+                 ]},
+             ):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(enriched[0].state_of_space, "CAT A")
+        self.assertEqual(stats["document_issues"], [])
 
     def test_extraction_with_no_useful_data_is_not_reported_as_an_issue(self):
         rows = [ListingRow(building="A", brochure_link="https://example.com/a.pdf", special_features=None)]
