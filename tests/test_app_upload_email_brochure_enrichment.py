@@ -165,9 +165,14 @@ class AutomaticEnrichmentOnEmailExtractTests(unittest.TestCase):
         self.assertIsNone(get_staging_enrichment_summary(list_pending_staging_files()[0]))
 
     def test_pdf_upload_with_no_rows_at_all_still_gets_no_automatic_enrichment(self):
-        # Negative control for the is_email_source gate - a PDF upload with
-        # no rows (so genuinely nothing to compare a brochure_link against)
-        # must still be completely unaffected.
+        # Automatic brochure enrichment now runs unconditionally for every
+        # upload type (see app.py's own upload-flow reorder) - this is a
+        # negative control confirming that alone never forces real network/
+        # Gemini work: a PDF upload with no rows at all (so genuinely
+        # nothing to compare a brochure_link against) must still be
+        # completely unaffected, via eligible_rows_and_brochures' own
+        # existing "nothing eligible" gate inside _run_automatic_brochure_
+        # enrichment, unrelated to source type.
         with patch("extract.extract", return_value=[]) as mock_pdf_extract, \
              patch("brochure_enrichment.httpx.get") as mock_get, \
              patch("brochure_enrichment.extract.render_and_extract") as mock_brochure_extract:
@@ -186,10 +191,10 @@ class AutomaticEnrichmentOnEmailExtractTests(unittest.TestCase):
     def test_pdf_upload_with_every_row_blank_or_matching_the_source_still_gets_no_automatic_enrichment(self):
         # Same negative control, but with real rows this time - one with no
         # brochure_link at all, one whose brochure_link equals the uploaded
-        # file's own name (standing in for "this row has nothing separate
-        # from the file that was actually uploaded"). Neither is a
-        # genuinely distinct document, so this must behave exactly as
-        # before has_distinct_pdf_brochure_link existed - no regression.
+        # file's own name. Neither is an eligible URL to fetch at all (a
+        # bare filename is never http(s)-shaped - see _is_eligible_
+        # brochure_url), so eligible_rows_and_brochures' own existing gate
+        # still correctly finds nothing to do, regardless of source type.
         pdf_rows = [
             ListingRow(building="No Link Building", brochure_link=None),
             ListingRow(building="Self-Referencing Building", brochure_link="Some Brochure.pdf"),
