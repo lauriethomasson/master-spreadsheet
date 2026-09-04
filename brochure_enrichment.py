@@ -3555,7 +3555,12 @@ def _special_features_items(text: str) -> list:
     `text` split on ";"/newline ONLY (matching master_merge._detail_items'
     own baseline split for this field, WITHOUT that pair's own extra
     comma-splitting - see _apply_units_to_row's own combine loop comment
-    for why comma-splitting doesn't belong here).
+    for why comma-splitting doesn't belong here). Reused as-is (not field-
+    specific despite the name) by _apply_units_to_row's own contacts
+    combine below - contacts' own per-person format ("Name, email, phone")
+    needs the exact same semicolon/newline-only split, never comma
+    (master_merge.py's own _MERGE_COMMA_SPLIT_FIELDS already documents
+    contacts as staying out of the extra comma-split for the same reason).
 
     A `text` with NO ";"/newline at all (a single item) is returned
     completely UNSTRIPPED, byte-for-byte - unlike master_merge.
@@ -3695,9 +3700,66 @@ def _apply_units_to_row(row: ListingRow, units):
     ambiguous_matches = _ambiguous_building_matches(row, units) if units and unit is None else []
 
     if units is not None:
-        contacts = getattr(units, "contacts", None)
-        if _is_blank(row.contacts) and isinstance(contacts, str) and not _is_blank(contacts):
-            updates["contacts"] = contacts
+        # Combined, not "fill only if blank" (unlike every other PROPERTY_
+        # LEVEL_FIELDS-adjacent field this function ever just overwrites a
+        # blank for) - same reasoning, same mechanism, and the SAME item-
+        # split/dedup helper (_special_features_items) as special_features'
+        # own combine directly below, deliberately not a second, differently-
+        # tuned one: a row's own original contacts (e.g. from the uploaded
+        # spreadsheet) and this row's own correctly-resolved individual
+        # brochure's contacts (units.contacts - see _extract_brochure_units)
+        # are both genuinely useful, not mutually exclusive - the row's own
+        # value used to silently block the brochure's from ever being seen
+        # at all whenever the row already had SOMEONE listed, even if the
+        # brochure named someone else too (or the same person under a
+        # slightly different normalization, in which case the dedup below
+        # correctly keeps just the one).
+        #
+        # units.contacts here is ALWAYS this row's own correctly-resolved
+        # individual document's own contacts, NEVER a shared multi-property
+        # deck's - see extract._rows_from_raw's own document_wide_contacts_
+        # is_row_own_document docstring for the real, confirmed Colliers-
+        # deck incident this guarantee depends on (a shared deck's own
+        # generic team contact must never reach here as if it were this
+        # row's own genuine document; extract.py's own fix, not this
+        # function's concern, is what keeps that guarantee true - this
+        # combine simply trusts units.contacts is already correctly scoped
+        # by the time it gets here, same as it already trusted the OLD
+        # blank-fill version of this same line to be).
+        #
+        # Order matches special_features' own combine: the row's own
+        # existing value first, then the brochure's, never the reverse -
+        # master_merge.py's own CONTACTS_NEWEST_WINS_FIELDS handling (a
+        # DIFFERENT layer, the matched-row master-merge diff, not this
+        # fresh-upload enrichment pass) is a deliberately separate concern -
+        # see its own docstring for why a departing agent's stale contact
+        # must eventually be replaced outright there, never merged forever.
+        # Nothing about that changes here: this is still the FIRST time
+        # this row's own contacts are ever set (a fresh upload, before any
+        # master-merge has happened), so there is no "old" value to
+        # eventually retire yet, only two sources of the SAME upload to
+        # combine.
+        contacts_document = getattr(units, "contacts", None)
+        if not (isinstance(contacts_document, str) and not _is_blank(contacts_document)):
+            contacts_document = None
+        row_contacts = row.contacts if isinstance(row.contacts, str) and not _is_blank(row.contacts) else None
+
+        kept_contacts_items = []
+        kept_contacts_keys = set()
+        for seg in (row_contacts, contacts_document):
+            if not seg:
+                continue
+            for item in (_special_features_items(seg) or [seg]):
+                key = normalize_key(item)
+                if key and key in kept_contacts_keys:
+                    continue
+                if key:
+                    kept_contacts_keys.add(key)
+                kept_contacts_items.append(item)
+
+        combined_contacts = "; ".join(kept_contacts_items)
+        if combined_contacts and combined_contacts != row.contacts:
+            updates["contacts"] = combined_contacts
 
         # Combines every tier actually present, most-specific-to-least
         # (the row's OWN existing value first, if any, then unit, then

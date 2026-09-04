@@ -1006,6 +1006,67 @@ class ExtractFromPngPagesTests(unittest.TestCase):
         self.assertFalse(hasattr(rows, "page_indices"))
 
 
+class PastedLinkContactsNeverFallBackToTheSharedDeckTests(unittest.TestCase):
+    """
+    Real, confirmed production bug this closes: a shared multi-property
+    Colliers Canva deck (21 real buildings, 13 genuinely different
+    individually-linked brochures) has one generic "team" contact block on
+    its own closing page - raw["contacts"] here. Gemini's own per-unit
+    "contacts" pick came back blank for virtually every building (the deck's
+    own text never names a distinct agent per building), so under the OLD
+    behavior every row fell back to that one shared value regardless of
+    which of the 13 genuinely different documents its own brochure_link
+    would later resolve to - and since brochure_enrichment._apply_units_to_
+    row's own contacts fill only ever applies to a genuinely BLANK field,
+    the correct, later-derived per-row value (from each row's own real,
+    separately-fetched brochure) could never actually land once this wrong
+    value was already baked in here.
+
+    extract_from_png_pages (paste-a-link/Canva-Pitch) must leave contacts
+    genuinely blank for such a unit instead - see _rows_from_raw's own
+    document_wide_contacts_is_row_own_document docstring. extract() (a real,
+    single PDF/email upload, where raw genuinely IS that row's own one
+    document) is a completely different case and must keep falling back to
+    raw["contacts"] exactly as before - see PerUnitContactsTests above,
+    the regression guard for that flow; if any of ITS tests start failing
+    because of this fix, the fix is scoped wrong.
+    """
+
+    _PNG_BYTES = b"\x89PNG\r\n\x1a\n rest of a real PNG"
+
+    def test_a_unit_with_no_contact_of_its_own_stays_blank_not_the_shared_deck_value(self):
+        raw = {
+            "provider": "Colliers",
+            "contacts": "Joseph Mishon, joseph.mishon@colliers.com; Chloe Hechle, chloe.hechle@colliers.com",
+            "units": [
+                {"building": "Mainframe", "floor_unit": "3rd", "brochure_link": None, "contacts": None},
+                {"building": "27-29 Gloucester Place", "floor_unit": "2nd", "brochure_link": None, "contacts": None},
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="deck.pdf")
+
+        self.assertIsNone(rows[0].contacts)
+        self.assertIsNone(rows[1].contacts)
+
+    def test_a_units_own_genuine_per_unit_contact_still_wins_unaffected_by_this_fix(self):
+        raw = {
+            "provider": "Colliers", "contacts": "Shared Team, team@colliers.com",
+            "units": [
+                {
+                    "building": "The Met Building", "floor_unit": "12th", "brochure_link": None,
+                    "contacts": "Joseph Mishon, joseph.mishon@colliers.com",
+                },
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages([self._PNG_BYTES], original_filename="deck.pdf")
+
+        self.assertEqual(rows[0].contacts, "Joseph Mishon, joseph.mishon@colliers.com")
+
+
 class BuildingAndPropertyFeaturesMergeTests(unittest.TestCase):
     """
     _rows_from_raw now folds raw["building_features"]/raw["property_

@@ -780,7 +780,7 @@ def extract_from_png_pages(
     client = get_client()
     images = images_from_png_pages(png_pages, page_links=page_links)
     raw = render_and_extract(images, client=client)
-    rows, page_indices = _rows_from_raw(raw, original_filename)
+    rows, page_indices = _rows_from_raw(raw, original_filename, document_wide_contacts_is_row_own_document=False)
     result = _ExtractedRows(rows)
     result.page_indices = page_indices
     return result
@@ -844,7 +844,9 @@ def _match_building_features(unit_building: str, building_features: list) -> str
     return features if isinstance(features, str) and features.strip() else None
 
 
-def _rows_from_raw(raw: dict, filename: str) -> tuple[list[ListingRow], list]:
+def _rows_from_raw(
+    raw: dict, filename: str, document_wide_contacts_is_row_own_document: bool = True,
+) -> tuple[list[ListingRow], list]:
     """
     The raw Gemini JSON's own "units" (plus document-level provider/
     contacts) turned into (rows, page_indices) - rows shared by extract() (a
@@ -859,6 +861,32 @@ def _rows_from_raw(raw: dict, filename: str) -> tuple[list[ListingRow], list]:
     reaches here, each unit's own "brochure_link" is already whatever
     that source-specific step (or Gemini's own vision-only guess) left
     it as.
+
+    document_wide_contacts_is_row_own_document (default True, extract()'s
+    own case) - whether raw["contacts"] (the document-wide fallback,
+    below) genuinely describes every unit found in `raw`. True for
+    extract(): `raw` there IS the one real document each returned row's
+    own brochure_link already points at (or will, once finalize_
+    brochure_link runs below), so a document-wide contact is a completely
+    valid fallback for a unit with no distinguishable contact of its own.
+
+    False for extract_from_png_pages() specifically: `raw` there is a
+    SHARED multi-property overview deck (a real, confirmed Colliers
+    Canva-deck production case - 21 different real buildings, 13 genuinely
+    different individually-linked brochures, one shared "team" contact
+    block on the deck's own closing page) - each returned row's own
+    brochure_link, once validated/propagated by app.py, points at a
+    DIFFERENT, separately-fetched document that this extraction never even
+    read. Falling back to raw["contacts"] there baked the shared deck's own
+    generic contact onto every unit whose own per-unit "contacts" Gemini
+    left blank - permanently, since brochure_enrichment._apply_units_to_
+    row's own contacts fill is gated on the field still being blank (see
+    its own docstring), so the correct, later-derived per-row value from
+    each row's own real brochure_link could never actually land. Leaving
+    contacts genuinely blank here instead - never guessing at a document
+    this extraction never saw - is what lets that same, already-correct
+    per-row enrichment fill it properly afterward, exactly as it already
+    does for every other field on these same rows.
 
     page_indices is a plain list, same order/length as rows, of each row's
     own raw unit's page_index (or None - either never stated, or already
@@ -940,11 +968,19 @@ def _rows_from_raw(raw: dict, filename: str) -> tuple[list[ListingRow], list]:
         # one shared value (raw["contacts"]) applied identically to every
         # row regardless of which building it actually described. Falls
         # back to the document-wide value (unchanged from before this
-        # existed) whenever this unit's own "contacts" is blank - the
-        # overwhelmingly common single-contact-document case.
+        # existed) whenever this unit's own "contacts" is blank AND
+        # document_wide_contacts_is_row_own_document is True - the
+        # overwhelmingly common single-contact-document case (extract()'s
+        # own callers). See this function's own docstring on
+        # document_wide_contacts_is_row_own_document for why extract_from_
+        # png_pages's own paste-a-link/multi-property-deck case must NOT
+        # fall back here - a real, confirmed production bug this guards
+        # against (a shared deck's own generic team contact silently
+        # winning over every individual building's own real, genuinely
+        # different agent).
         unit_contacts = unit.get("contacts")
         if not (isinstance(unit_contacts, str) and unit_contacts.strip()):
-            unit_contacts = raw.get("contacts")
+            unit_contacts = raw.get("contacts") if document_wide_contacts_is_row_own_document else None
         unit["contacts"] = unit_contacts
 
         page_index = unit.get(PAGE_INDEX_KEY)
