@@ -3995,14 +3995,66 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertIsNone(new_row.contacts)
         self.assertNotIn("contacts", fields)
 
-    def test_existing_contacts_never_overwritten(self):
+    def test_existing_contacts_are_combined_with_the_brochures_own_not_overwritten_or_dropped(self):
+        # Design change (was test_existing_contacts_never_overwritten,
+        # asserting the OLD "fill only if blank" behavior) - contacts now
+        # COMBINES, same mechanism as special_features' own combine
+        # directly below, rather than the brochure's own contacts being
+        # discarded outright whenever the row already had someone listed.
+        # Row's own original entry first, brochure's own genuinely new
+        # entry appended after - see this block's own docstring for why.
         row = ListingRow(building="The Canal Building", contacts="Existing Agent, existing@agent.com")
         units = _brochure_units([], contacts="Different Agent, different@agent.com")
 
         new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
 
-        self.assertEqual(new_row.contacts, "Existing Agent, existing@agent.com")
-        self.assertEqual(fields, [])
+        self.assertEqual(
+            new_row.contacts, "Existing Agent, existing@agent.com; Different Agent, different@agent.com",
+        )
+        self.assertIn("contacts", fields)
+
+    def test_same_person_in_both_sources_is_not_duplicated(self):
+        row = ListingRow(building="The Canal Building", contacts="Jane Smith, jane@agent.com")
+        units = _brochure_units([], contacts="Jane Smith, jane@agent.com")
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.contacts, "Jane Smith, jane@agent.com")
+        self.assertNotIn("contacts", fields)  # combined value == existing value, nothing genuinely changed
+
+    def test_partial_overlap_keeps_the_original_plus_only_the_genuinely_new_person(self):
+        row = ListingRow(building="The Canal Building", contacts="Jane Smith, jane@agent.com; Bob Jones, bob@agent.com")
+        units = _brochure_units([], contacts="Bob Jones, bob@agent.com; Alice Brown, alice@agent.com")
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(
+            new_row.contacts,
+            "Jane Smith, jane@agent.com; Bob Jones, bob@agent.com; Alice Brown, alice@agent.com",
+        )
+        self.assertIn("contacts", fields)
+
+    def test_blank_row_contacts_still_fills_fully_from_the_brochure_via_the_combine_path(self):
+        # Same outcome as the old blank-fill behavior, now reached via the
+        # combine path (row's own side is simply empty, nothing to combine
+        # with) - regression guard that the design change didn't break the
+        # ordinary blank-fill case.
+        row = ListingRow(building="The Canal Building", contacts=None)
+        units = _brochure_units([], contacts="Jane Smith, jane@agent.com")
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.contacts, "Jane Smith, jane@agent.com")
+        self.assertIn("contacts", fields)
+
+    def test_both_blank_stays_blank(self):
+        row = ListingRow(building="The Canal Building", contacts=None)
+        units = _brochure_units([], contacts=None)
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertIsNone(new_row.contacts)
+        self.assertNotIn("contacts", fields)
 
     def test_paste_a_link_row_gets_contacts_from_its_own_resolved_document_not_a_shared_deck(self):
         # End-to-end companion to extract.py's own PastedLinkContactsNeverFall
@@ -4030,6 +4082,42 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(new_row.contacts, "Jamie Quinn, jamie.quinn@colliers.com; Alex Kemp, alex.kemp@colliers.com")
         self.assertIn("contacts", fields)
+        self.assertNotIn("mishon", new_row.contacts.lower())
+        self.assertNotIn("hechle", new_row.contacts.lower())
+        self.assertNotIn("chalk", new_row.contacts.lower())
+
+    def test_combine_never_pulls_in_a_shared_decks_own_contacts_only_the_rows_own_resolved_document(self):
+        # The safety-critical case for the combine change specifically: the
+        # row already has its OWN original contacts (from the uploaded
+        # spreadsheet, exactly like any normal row), and `units` here is -
+        # same as the test directly above - real Mainframe-brochure-shaped
+        # data, this row's own correctly-resolved individual document, NOT
+        # the shared Colliers Canva deck's own generic "mishon/hechle/chalk"
+        # team block (which extract._rows_from_raw's own fix guarantees
+        # never reaches units.contacts for a paste-a-link row in the first
+        # place - see that function's own document_wide_contacts_is_row_
+        # own_document docstring). Combining is only ever safe BECAUSE
+        # units.contacts is already guaranteed correctly-scoped by the time
+        # it gets here - this test proves the combine's own output for
+        # exactly that guaranteed-safe input, and that the deck's own value
+        # (deliberately never present in `units` at all here) has no way to
+        # leak in.
+        row = ListingRow(
+            building="Mainframe", floor_unit="3rd Floor",
+            contacts="Original Uploader, original@spreadsheet.com",
+        )
+        units = _brochure_units(
+            [{"building": "Mainframe", "floor_unit": "3rd Floor", "size_sqft": 4000}],
+            contacts="Jamie Quinn, jamie.quinn@colliers.com; Alex Kemp, alex.kemp@colliers.com",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(
+            new_row.contacts,
+            "Original Uploader, original@spreadsheet.com; "
+            "Jamie Quinn, jamie.quinn@colliers.com; Alex Kemp, alex.kemp@colliers.com",
+        )
         self.assertNotIn("mishon", new_row.contacts.lower())
         self.assertNotIn("hechle", new_row.contacts.lower())
         self.assertNotIn("chalk", new_row.contacts.lower())
