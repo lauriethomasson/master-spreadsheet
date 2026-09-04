@@ -8,12 +8,16 @@ call - nothing mocked) against that row's own brochure_link and
 categorizes WHY state_of_space never got filled, using the exact same real
 helper functions brochure_enrichment.py itself calls:
 
-  1. BUILDING_NOT_MATCHED - _building_identity_matches(row.building, ...)
-     returned zero candidate indices at all. The brochure's own extracted
-     building name(s) never resolved to this row's own `building` text -
-     a real building-identity-matching gap, the class of bug this repo's
-     own tier 3d/3e fixes have already closed two real cases of.
-  2. AMBIGUOUS_NARROWING - _building_identity_matches found 2+ candidates,
+  1. BUILDING_NOT_MATCHED - _row_building_match_indices(row, ...) returned
+     zero candidate indices at all, even after trying row.building itself,
+     a sub-building name embedded in row.floor_unit, and row.address_1 (see
+     that function's own docstring for the real cases each of those three
+     signals closes). The brochure's own extracted building name(s) never
+     resolved to this row's own identity by any of them - a real building-
+     identity-matching gap, the class of bug this repo's own tier 3d/3e/3f
+     fixes (and _row_building_match_indices itself) have already closed
+     several real cases of.
+  2. AMBIGUOUS_NARROWING - _row_building_match_indices found 2+ candidates,
      but _match_unit(row, units) still returned None - floor_unit/
      size_sqft couldn't narrow to exactly one. Genuine document ambiguity
      (or a floor-label mismatch _floor_number doesn't yet bridge), not a
@@ -49,11 +53,11 @@ from collections import Counter
 
 import master_writer
 from brochure_enrichment import (
-    _building_identity_matches,
     _extract_brochure_units,
     _is_blank,
     _is_eligible_brochure_url,
     _match_unit,
+    _row_building_match_indices,
     needs_enrichment,
 )
 from schema import ListingRow
@@ -125,23 +129,34 @@ def _find_affected_rows(df) -> list:
             "provider": _nan_to_none(row.get("provider")),
             "building": _nan_to_none(row.get("building")),
             "floor_unit": _nan_to_none(row.get("floor_unit")),
+            "address_1": _nan_to_none(row.get("address_1")),
             "size_sqft": _nan_to_none(row.get("size_sqft")),
             "brochure_link": brochure_link,
         })
     return affected
 
 
+def _listing_row_for(row: dict) -> ListingRow:
+    # address_1 included (unlike the rest of this script's own fields
+    # before it) specifically because _row_building_match_indices reads it
+    # as a fallback identity signal when row["building"] alone matches
+    # nothing - omitting it here would silently under-report BUILDING_NOT_
+    # MATCHED for exactly the real Northumberland House-shaped case that
+    # fallback exists for.
+    return ListingRow(
+        building=row["building"], floor_unit=row.get("floor_unit"), size_sqft=row.get("size_sqft"),
+        provider=row.get("provider"), brochure_link=row.get("brochure_link"), address_1=row.get("address_1"),
+    )
+
+
 def _categorize(row: dict, units) -> str:
     if units is None:
         return FETCH_FAILED
 
-    listing_row = ListingRow(
-        building=row["building"], floor_unit=row.get("floor_unit"), size_sqft=row.get("size_sqft"),
-        provider=row.get("provider"), brochure_link=row.get("brochure_link"),
-    )
+    listing_row = _listing_row_for(row)
 
-    match_indices = _building_identity_matches(
-        listing_row.building,
+    match_indices = _row_building_match_indices(
+        listing_row,
         [u.get("building") for u in units if isinstance(u, dict)],
         [u.get("address_1") for u in units if isinstance(u, dict)],
     )
@@ -190,10 +205,7 @@ def main():
 
     results = []
     for row in affected:
-        if not needs_enrichment(ListingRow(
-            building=row["building"], floor_unit=row.get("floor_unit"), size_sqft=row.get("size_sqft"),
-            provider=row.get("provider"), brochure_link=row.get("brochure_link"),
-        )) or not _is_eligible_brochure_url(row["brochure_link"]):
+        if not needs_enrichment(_listing_row_for(row)) or not _is_eligible_brochure_url(row["brochure_link"]):
             category = NOT_ELIGIBLE
         else:
             category = _categorize(row, units_by_url.get(row["brochure_link"]))

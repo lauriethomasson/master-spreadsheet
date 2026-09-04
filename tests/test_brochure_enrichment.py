@@ -3233,6 +3233,176 @@ class BuildingIdentityMatchesTests(unittest.TestCase):
         indices = brochure_enrichment._building_identity_matches("Gloucester Place", ["29 Gloucester Place"])
         self.assertEqual(indices, [0])
 
+    def test_tier_3h_bridges_a_spaced_hyphen_range_to_the_bare_hyphen_form(self):
+        # Real, confirmed production case: a Workplace Plus "13-15 Dock
+        # Street" row vs that SAME real brochure's own Gemini-extracted
+        # building text "13 - 15 Dock Street" (spaced-out hyphen) - see
+        # house_number.LEADING_HOUSE_NUMBER_RE's own docstring for the full
+        # provenance. Previously "13 - 15 Dock Street" read as house number
+        # "13" alone with an un-strippable " - 15 Dock Street" remainder,
+        # never bridging to the row's own "Dock Street" remainder.
+        indices = brochure_enrichment._building_identity_matches(
+            "13-15 Dock Street", ["13 - 15 Dock Street"],
+        )
+        self.assertEqual(indices, [0])
+
+
+class FloorUnitWrapperCandidateTests(unittest.TestCase):
+    def test_trailing_parenthetical_is_extracted(self):
+        self.assertEqual(brochure_enrichment._floor_unit_wrapper_candidate("1st (The Mill)"), "The Mill")
+
+    def test_leading_dash_prefix_is_extracted(self):
+        self.assertEqual(brochure_enrichment._floor_unit_wrapper_candidate("Block E - 2nd Floor"), "Block E")
+
+    def test_parenthetical_is_tried_before_a_dash_prefix(self):
+        # Never a real case seen so far, but the priority order is a
+        # deliberate, testable choice, not incidental.
+        self.assertEqual(brochure_enrichment._floor_unit_wrapper_candidate("Block E - 2nd (The Mill)"), "The Mill")
+
+    def test_plain_floor_label_with_neither_shape_returns_none(self):
+        self.assertIsNone(brochure_enrichment._floor_unit_wrapper_candidate("6th Floor"))
+
+    def test_blank_and_none_return_none(self):
+        self.assertIsNone(brochure_enrichment._floor_unit_wrapper_candidate(None))
+        self.assertIsNone(brochure_enrichment._floor_unit_wrapper_candidate(""))
+
+
+class RowBuildingMatchIndicesTests(unittest.TestCase):
+    """
+    Regression coverage for the two real, confirmed BUILDING_NOT_MATCHED
+    clusters report_state_of_space_gap_causes.py surfaced against the real
+    production master (see this repo's own session history) that neither
+    row.building alone nor any existing _building_identity_matches tier
+    could bridge, because the row's own real identity clue lived in a
+    DIFFERENT field entirely.
+    """
+
+    def test_real_regents_wharf_colliers_shape_matches_via_floor_unit_parenthetical(self):
+        # Real, confirmed Colliers "Regent's Wharf" case: row.building is
+        # just "Regent's Wharf", the shared portfolio name with no identity
+        # of its own (shares no vocabulary with the brochure's own
+        # "Thorley Works"/"The Canal Building"/"The Mill"/"The Packing
+        # House" building text at all) - the real per-floor sub-building
+        # name lives in floor_unit instead ("1st (The Mill)"). Contrast a
+        # real UNION row for the SAME building, whose own building field
+        # already states "Regents Wharf (The Mill)" directly and is
+        # already bridged by tier 3e without ever reaching this fallback.
+        units = [
+            {"building": "The Mill", "address_1": "All Saints Street", "floor_unit": "2nd Floor", "size_sqft": 1894},
+            {"building": "The Mill", "address_1": "All Saints Street", "floor_unit": "1st Floor", "size_sqft": 1875},
+            {
+                "building": "The Canal Building", "address_1": "All Saints Street",
+                "floor_unit": "3rd Floor", "size_sqft": 5608,
+            },
+        ]
+        row = ListingRow(building="Regent's Wharf", floor_unit="1st (The Mill)", size_sqft=1875)
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["floor_unit"], "1st Floor")
+        self.assertEqual(matched["size_sqft"], 1875)
+
+    def test_real_morelands_shape_narrows_building_via_floor_unit_dash_prefix(self):
+        # Real, confirmed Workplace Plus "Morelands" case: row.building is
+        # just "Morelands", while the real distinguishing block letter for
+        # one of four real, differently-featured sub-buildings only ever
+        # appears in floor_unit ("Block E - 2nd Floor"). Uses a synthetic
+        # size shape (unlike the real row) where exactly one Block E unit
+        # is within tolerance, so this isolates the building-identification
+        # fix itself from the SEPARATE, genuine floor-narrowing ambiguity
+        # the real production row also happens to have (Ground Floor's own
+        # 1644 sqft sits within the real row's own 2% size tolerance of its
+        # stated 1665 sqft too - a real, irreducible tie _match_unit
+        # correctly still refuses to guess between, unrelated to whether
+        # the building itself was ever found at all).
+        units = [
+            {"building": "Block C", "address_1": "5-23 Old Street", "floor_unit": "2nd Floor", "size_sqft": 1960},
+            {"building": "Block E", "address_1": "5-23 Old Street", "floor_unit": "Ground Floor", "size_sqft": 500},
+            {"building": "Block E", "address_1": "5-23 Old Street", "floor_unit": "2nd Floor", "size_sqft": 1665},
+        ]
+        row = ListingRow(building="Morelands", floor_unit="Block E - 2nd Floor", size_sqft=1665)
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["building"], "Block E")
+        self.assertEqual(matched["floor_unit"], "2nd Floor")
+
+    def test_real_northumberland_house_shape_matches_via_row_address_1_fallback(self):
+        # Real, confirmed Colliers "Northumberland House" case: row.building
+        # states the property's own marketing name, sharing no vocabulary
+        # at all with the brochure's own extracted building text ("107-113
+        # Great Portland Street"), while row.address_1 already states the
+        # bare street ("Great Portland Street") that DOES bridge the gap
+        # via tier 5's own bare-street-reference comparison - a signal
+        # _building_identity_matches never had access to at all before this,
+        # since every prior caller only ever passed row.building.
+        units = [{
+            "building": "107-113 Great Portland Street", "address_1": "107-113 Great Portland Street",
+            "floor_unit": None, "size_sqft": None, "state_of_space": "Fully Fitted",
+        }]
+        row = ListingRow(building="Northumberland House", floor_unit="2nd & 4th Floors", address_1="Great Portland Street")
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["state_of_space"], "Fully Fitted")
+
+    def test_address_1_fallback_is_skipped_when_it_is_just_a_placeholder_copy_of_building(self):
+        # Confirmed real "New Derwent House" shape: address_1 carries no
+        # information beyond building itself (see _is_placeholder_address) -
+        # trying it as a fallback would be pointless, never genuinely
+        # dangerous (a non-informative placeholder can't accidentally match
+        # anything real either), but this locks in the intended skip rather
+        # than relying on it being merely harmless.
+        units = [{"building": "Ivybridge House", "address_1": "1-5 Adam Street", "floor_unit": "4th Floor"}]
+        row = ListingRow(building="New Derwent House", floor_unit="4th", address_1="New Derwent House")
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
+    def test_floor_unit_fallback_is_tried_before_address_1_and_avoids_a_portfolio_wide_address_collision(self):
+        # If row.address_1 were tried FIRST (or the floor_unit fallback
+        # didn't exist at all), a shared portfolio address (here "All
+        # Saints Street", identical across several genuinely DIFFERENT real
+        # sub-buildings) would only ever safely return [] via _distinct_
+        # building_group's own uniqueness guard - never wrongly resolve,
+        # but also never actually identify the one real sub-building this
+        # row means, the way the floor_unit fallback does when tried first.
+        units = [
+            {"building": "The Mill", "address_1": "All Saints Street", "floor_unit": "1st Floor", "size_sqft": 1875},
+            {
+                "building": "The Canal Building", "address_1": "All Saints Street",
+                "floor_unit": "1st Floor", "size_sqft": 5541,
+            },
+        ]
+        row = ListingRow(building="Regent's Wharf", floor_unit="1st (The Mill)", address_1="All Saints Street")
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["building"], "The Mill")
+
+    def test_row_building_match_alone_always_wins_when_it_already_finds_something(self):
+        # Neither fallback is ever even consulted once row.building's own
+        # plain match already found something - confirms the two new
+        # fallbacks are strictly additive, never a change to any existing,
+        # already-working case.
+        units = [{"building": "28 Lime Street", "address_1": "28 Lime Street", "floor_unit": "4th Floor"}]
+        row = ListingRow(
+            building="28 Lime Street", floor_unit="Block Z - Penthouse (Not A Real Sub-Building)",
+            address_1="Somewhere Else Entirely",
+        )
+
+        matched = brochure_enrichment._match_unit(row, units)
+
+        self.assertEqual(matched["building"], "28 Lime Street")
+
+    def test_neither_fallback_finds_anything_stays_unresolved(self):
+        # Confirmed real "Rufus House" shape: no signal on any of the three
+        # tried fields bridges to the brochure's own real "2-4 Rufus
+        # Street" - correctly stays unresolved, not guessed at.
+        units = [{"building": "2-4 Rufus Street", "address_1": "2-4 Rufus Street", "floor_unit": "2nd Floor"}]
+        row = ListingRow(building="Rufus House", floor_unit="2nd Floor", address_1="2-4 Rufus St, London N1 6PE")
+
+        self.assertIsNone(brochure_enrichment._match_unit(row, units))
+
 
 class MatchBuildingFeatureTests(unittest.TestCase):
     """_match_building_feature - the building-level (level B) counterpart

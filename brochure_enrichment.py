@@ -962,6 +962,54 @@ def _trailing_parenthetical_content(building):
     return inner or None
 
 
+def _floor_unit_wrapper_candidate(floor_unit):
+    """
+    A sub-building identity candidate extracted from `floor_unit` itself,
+    when its own text carries one - or None when it doesn't. Only ever
+    consulted by _row_building_match_indices as a FALLBACK, once row.
+    building's own plain _building_identity_matches call has already come
+    back empty - row.building is always tried first and wins outright when
+    it finds anything at all, exactly as before this function existed.
+
+    Two real, confirmed shapes, tried in this order:
+
+    1. A trailing parenthetical (see _trailing_parenthetical_content) -
+       e.g. "1st (The Mill)" -> "The Mill". Confirmed real Colliers
+       "Regent's Wharf" case: row.building is just "Regent's Wharf", the
+       shared portfolio/development name with no identity of its own (it
+       shares no vocabulary at all with the brochure's own extracted
+       "Thorley Works"/"The Canal Building"/"The Mill"/"The Packing House"
+       building text), while each row's own REAL sub-building name lives in
+       floor_unit instead - contrast a real UNION row for the very SAME
+       building, whose own building field already states "Regents Wharf
+       (The Mill)" directly and is already bridged by tier 3e, never
+       reaching this fallback at all.
+    2. A leading dash-separated prefix (see _DASH_SEPARATOR_RE, the same
+       " - " split tier 3f already uses on row.building) - e.g. "Block E -
+       2nd Floor" -> "Block E". Confirmed real Workplace Plus "Morelands"
+       case: row.building is just "Morelands", while the real distinguishing
+       block letter for one of four real, differently-featured
+       sub-buildings the brochure describes only ever appears in floor_unit.
+
+    A floor_unit with neither shape (the common case - most floor_unit text
+    is just a plain floor label) returns None here; the caller's own
+    _building_identity_matches call for whatever THIS returns still has to
+    independently find a confident match on its own exact/weak-corroborated
+    terms - a floor_unit dash-prefix that happens to name nothing real (e.g.
+    "6th Floor" out of "6th Floor - Part") simply finds nothing, the same
+    safe "no match" outcome as if this returned None for it here.
+    """
+    if not floor_unit:
+        return None
+    parenthetical = _trailing_parenthetical_content(floor_unit)
+    if parenthetical:
+        return parenthetical
+    dash_parts = _DASH_SEPARATOR_RE.split(floor_unit, maxsplit=1)
+    if len(dash_parts) == 2 and dash_parts[0].strip():
+        return dash_parts[0]
+    return None
+
+
 def _is_placeholder_address(address_1, building) -> bool:
     """
     True when `address_1` is either genuinely blank OR just a duplicate of
@@ -1528,6 +1576,66 @@ def _building_identity_matches(row_building, candidate_buildings: list, candidat
                 [i for i, c in enumerate(candidate_buildings) if _expanded_street_name_words(c) == row_street_words],
                 candidate_buildings,
             )
+
+    return []
+
+
+def _row_building_match_indices(row: ListingRow, candidate_buildings: list, candidate_addresses: list) -> list:
+    """
+    _building_identity_matches's own result for `row`, tried against
+    progressively less specific identity signals until one finds something.
+    row.building's own text is always tried FIRST and wins outright when it
+    finds anything at all - every case before this function existed only
+    ever tried this, and still does.
+
+    row.building doesn't always carry a row's own real identity clue,
+    though - two further, real, confirmed fallbacks are tried in turn, only
+    when row.building's own match came back completely empty:
+
+    1. row.floor_unit (see _floor_unit_wrapper_candidate) - tried FIRST of
+       the two, since it identifies a specific sub-building directly (the
+       real Regent's Wharf/Morelands cases that function's own docstring
+       covers), stronger, more targeted evidence than row.address_1 below
+       could ever be for a portfolio building shared across several
+       distinct real sub-buildings.
+    2. row.address_1 (skipped when _is_placeholder_address says it carries
+       no real information of its own beyond row.building) - confirmed
+       real Colliers "Northumberland House" case: row.building states the
+       property's own marketing name, sharing no vocabulary at all with
+       the brochure's own extracted building text ("107-113 Great Portland
+       Street"), while row.address_1 already states the bare street
+       ("Great Portland Street") that DOES bridge the gap via tier 5's own
+       bare-street-reference comparison - a signal _building_identity_
+       matches never had access to at all before this, since every prior
+       caller only ever passed row.building.
+
+    Each fallback is a completely independent, ordinary _building_identity_
+    matches call - same exact/weak-corroborated-by-uniqueness discipline as
+    every one of that function's own tiers, never blended with row.
+    building's own text, and never even attempted once an earlier signal
+    already found something. A portfolio address shared across several
+    DISTINCT real sub-buildings (e.g. Regent's Wharf's own several
+    buildings, all sharing "All Saints Street") is safely rejected as
+    ambiguous by _distinct_building_group if row.address_1 fallback #2 ever
+    reached it - which fallback #1 above being tried first, and more
+    specific, means it never needs to for a case like that anyway. Returns
+    [] when none of them find anything, identical to row.building's own
+    plain match already returning [] before this function existed.
+    """
+    match_indices = _building_identity_matches(row.building, candidate_buildings, candidate_addresses)
+    if match_indices:
+        return match_indices
+
+    floor_candidate = _floor_unit_wrapper_candidate(row.floor_unit)
+    if floor_candidate:
+        match_indices = _building_identity_matches(floor_candidate, candidate_buildings, candidate_addresses)
+        if match_indices:
+            return match_indices
+
+    if not _is_placeholder_address(row.address_1, row.building):
+        match_indices = _building_identity_matches(row.address_1, candidate_buildings, candidate_addresses)
+        if match_indices:
+            return match_indices
 
     return []
 
@@ -2933,11 +3041,11 @@ def _match_unit(row: ListingRow, units: list):
     """
     The single brochure unit confidently identified as describing `row`'s
     own property, or None when there isn't one - never a fuzzy/similarity
-    match, only exact building-name matching (see _building_identity_
-    matches - still exact-string, and only weakly, corroborated-by-
-    uniqueness tolerant of a redundant address suffix baked into one side's
-    own building field) and then, in order, an exact floor_unit
-    match, a floor NUMBER match (see
+    match, only exact building-name matching (see _row_building_match_
+    indices/_building_identity_matches - still exact-string, and only
+    weakly, corroborated-by-uniqueness tolerant of a redundant address
+    suffix baked into one side's own building field) and then, in order, an
+    exact floor_unit match, a floor NUMBER match (see
     _floor_number), or a size_sqft match within a small numeric tolerance
     (see _SIZE_MATCH_TOLERANCE_FRACTION).
 
@@ -2981,8 +3089,8 @@ def _match_unit(row: ListingRow, units: list):
     # function's own caller in enrich_rows_grouped for the belt-and-
     # braces try/except around this too).
     units = [u for u in units if isinstance(u, dict)]
-    match_indices = _building_identity_matches(
-        row.building, [u.get("building") for u in units], [u.get("address_1") for u in units],
+    match_indices = _row_building_match_indices(
+        row, [u.get("building") for u in units], [u.get("address_1") for u in units],
     )
     building_matches = [units[i] for i in match_indices]
     if not building_matches:
@@ -3018,7 +3126,7 @@ def _match_unit(row: ListingRow, units: list):
 def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
     """
     True when `row`'s own building genuinely identifies 2+ candidate
-    brochure units (see _building_identity_matches) that _match_unit still
+    brochure units (see _row_building_match_indices) that _match_unit still
     couldn't narrow down to exactly one - i.e. this row's blank fields
     stayed blank because of a real, irreducible ambiguity IN THIS DOCUMENT
     (a schedule of areas with several floors, none of which floor_unit/
@@ -3038,8 +3146,8 @@ def _row_had_ambiguous_match(row: ListingRow, units) -> bool:
     if not units:
         return False
     plain_units = [u for u in units if isinstance(u, dict)]
-    match_indices = _building_identity_matches(
-        row.building, [u.get("building") for u in plain_units], [u.get("address_1") for u in plain_units],
+    match_indices = _row_building_match_indices(
+        row, [u.get("building") for u in plain_units], [u.get("address_1") for u in plain_units],
     )
     return len(match_indices) >= 2 and _match_unit(row, units) is None
 

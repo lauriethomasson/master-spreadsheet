@@ -47,17 +47,27 @@ import re
 # runs before any lowercasing.
 #
 # The range separator between the two numbers is captured as its own group
-# (a bare "-", or the word "to" wrapped in whitespace) rather than folded
-# into the number groups - leading_house_number() below rewrites it to a
-# canonical "-" regardless of which form the source used. Confirmed real
-# case: "1 to 5 Adam Street" (Ivybridge House) vs master's own "1-5 Adam
-# Street" - the same range, spelled two common ways - previously produced
-# two DIFFERENT tokens ("1" vs "1-5", since the plain-hyphen pattern doesn't
-# match " to " and LEADING_HOUSE_NUMBER_RE simply stopped at the space),
-# which house_number_changed then flagged as a risky address change even
-# though nothing actually changed.
+# (a bare "-" with optional surrounding whitespace, or the word "to"
+# wrapped in whitespace) rather than folded into the number groups -
+# leading_house_number() below rewrites it to a canonical "-" regardless of
+# which form the source used. Confirmed real case #1: "1 to 5 Adam Street"
+# (Ivybridge House) vs master's own "1-5 Adam Street" - the same range,
+# spelled two common ways - previously produced two DIFFERENT tokens ("1"
+# vs "1-5", since the plain-hyphen pattern doesn't match " to " and
+# LEADING_HOUSE_NUMBER_RE simply stopped at the space), which house_number_
+# changed then flagged as a risky address change even though nothing
+# actually changed. Confirmed real case #2: a real Workplace Plus "13-15
+# Dock Street" row vs that SAME real brochure's own Gemini-extracted
+# building text "13 - 15 Dock Street" (spaced-out hyphen) - the bare-hyphen
+# form only ever tolerated "13-15" with no surrounding whitespace at all,
+# so this brochure_enrichment.py tier 3h caller (see its own docstring)
+# read "13 - 15 Dock Street" as house number "13" alone, with " - 15 Dock
+# Street" left as an un-strippable remainder that could never equal the
+# row's own "13-15 Dock Street" remainder ("Dock Street") - the SAME range,
+# spelled with extra spacing, silently treated as a completely different
+# street reference.
 LEADING_HOUSE_NUMBER_RE = re.compile(
-    r"^\s*(\d+[a-z]?)(?:(-|\s+to\s+)(\d+[a-z]?))?\b", re.IGNORECASE,
+    r"^\s*(\d+[a-z]?)(?:(\s*-\s*|\s+to\s+)(\d+[a-z]?))?\b", re.IGNORECASE,
 )
 
 # Spelled-out cardinal numbers, one through nineteen - confirmed real case:

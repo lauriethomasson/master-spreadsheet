@@ -55,6 +55,25 @@ class LeadingHouseNumberDigitFormTests(unittest.TestCase):
         self.assertEqual(leading_house_number("1 To 5 Adam Street"), "1-5")
         self.assertEqual(leading_house_number("1  to  5 Adam Street"), "1-5")
 
+    def test_spaced_hyphen_range_normalizes_to_the_same_token_as_the_bare_hyphen_form(self):
+        # Confirmed real case: a real Workplace Plus "13-15 Dock Street" row
+        # vs that SAME real brochure's own Gemini-extracted building text
+        # "13 - 15 Dock Street" (spaced-out hyphen) - the bare-hyphen form
+        # previously only tolerated "13-15" with no surrounding whitespace,
+        # so "13 - 15" read as house number "13" alone with an un-strippable
+        # " - 15 Dock Street" remainder, never bridging to the row's own
+        # "13-15 Dock Street".
+        self.assertEqual(leading_house_number("13 - 15 Dock Street"), "13-15")
+        self.assertEqual(leading_house_number("13 - 15 Dock Street"), leading_house_number("13-15 Dock Street"))
+        self.assertEqual(leading_house_number("13  -  15 Dock Street"), "13-15")
+
+    def test_spaced_hyphen_does_not_swallow_an_unrelated_trailing_word(self):
+        # "56a - West Wing" is NOT a house-number range - "West Wing" isn't
+        # a number, so the optional high-number group must never match, and
+        # this must still resolve to the single low number alone, exactly
+        # as before the spaced-hyphen tolerance existed.
+        self.assertEqual(leading_house_number("56a - West Wing"), "56a")
+
     def test_word_to_range_with_letter_suffixes(self):
         self.assertEqual(leading_house_number("27a to 30b Lime Street"), "27a-30b")
 
