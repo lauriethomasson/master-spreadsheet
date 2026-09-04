@@ -393,7 +393,12 @@ For each unit, extract its own location fields — do not assume they're shared 
 - building: the name of the building this specific unit is in (e.g. "John Stow House", "City Tower").
   ALWAYS populate this for every unit, even when several consecutive units are in the same building and
   it feels redundant to repeat it — never leave building null.
-- address_1: the street address of this specific unit's building (e.g. "18 Bevis Marks")
+- address_1: the street address of this specific unit's building (e.g. "18 Bevis Marks") - ONLY
+  when a real street address is actually stated somewhere for it. Many documents state no street
+  address at all, only a building name and/or a neighbourhood/area label - if that's all this
+  document gives you, leave address_1 null. NEVER put the building's own name here, and NEVER put
+  a neighbourhood/area/district name here (that belongs in submarket below, not here) - a building
+  name or area name is not a street address, even when it's the only location text available.
 - postcode: the UK postcode of this specific unit's building (e.g. "EC3A 7JB")
 - submarket: the general area/district for this specific unit, if stated or clearly inferable
   (e.g. "City of London", "Soho", "West End"). If not stated, infer from the address/postcode

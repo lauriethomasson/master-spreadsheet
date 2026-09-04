@@ -1371,6 +1371,197 @@ class NameOnlyMatchLoggingTests(unittest.TestCase):
         self.assertEqual(geocode.NAME_ONLY_MATCHES, [])
 
 
+class AddressLine1AndPostcodeRouteOnlyTests(unittest.TestCase):
+    """
+    Regression coverage locking in that _address_line1_and_postcode only
+    ever builds address_1 from a genuine street_number/route component -
+    confirmed directly (live-traced against the real Places/Geocoding APIs)
+    NOT the source of a real, confirmed bug where a reviewer saw a
+    neighbourhood name ("Fitzrovia") or a building's own name ("New Derwent
+    House") proposed as address_1 - see _clear_implausible_address_1's own
+    docstring for where that real bug actually lives instead (Gemini's own
+    extraction non-determinism, not this function). Kept here anyway as a
+    direct regression lock on this function's own contract.
+    """
+
+    def test_sublocality_only_components_leave_address_1_blank(self):
+        components = [
+            {"longText": "Fitzrovia", "types": ["sublocality", "sublocality_level_1", "political"]},
+            {"longText": "London", "types": ["postal_town"]},
+        ]
+        address_1, postcode = geocode._address_line1_and_postcode(components)
+        self.assertIsNone(address_1)
+        self.assertIsNone(postcode)
+
+    def test_neighborhood_only_components_leave_address_1_blank(self):
+        components = [{"longText": "Euston", "types": ["neighborhood", "political"]}]
+        address_1, postcode = geocode._address_line1_and_postcode(components)
+        self.assertIsNone(address_1)
+
+    def test_premise_only_components_never_use_the_building_name_as_address_1(self):
+        components = [{"longText": "New Derwent House", "types": ["premise"]}]
+        address_1, postcode = geocode._address_line1_and_postcode(components)
+        self.assertIsNone(address_1)
+
+    def test_a_genuine_route_component_still_produces_address_1(self):
+        # Not a blanket "never fill address_1" regression - a real route
+        # alongside a sublocality still correctly produces one.
+        components = [
+            {"longText": "24", "types": ["street_number"]},
+            {"longText": "Eversholt Street", "types": ["route"]},
+            {"longText": "Kings Cross", "types": ["neighborhood", "political"]},
+            {"longText": "NW1 1AD", "types": ["postal_code"]},
+        ]
+        address_1, postcode = geocode._address_line1_and_postcode(components)
+        self.assertEqual(address_1, "24 Eversholt Street")
+        self.assertEqual(postcode, "NW1 1AD")
+
+
+class ClearImplausibleAddress1Tests(unittest.TestCase):
+    """
+    Regression coverage for the real, confirmed root cause: Gemini's own
+    PDF extraction is not perfectly deterministic - re-running extraction
+    against the IDENTICAL rendered pages of a real Colliers "Flex & Managed
+    Availability" deck (which genuinely states no street address at all for
+    several properties, only a neighbourhood section header) sometimes
+    echoed the building's own name into address_1 instead of correctly
+    leaving it null (live-traced: "Prospect House"/"Mainframe"/"New Derwent
+    House"/"Thames Court", each identical to that row's own building value,
+    on one extraction attempt out of three; correctly None on the other
+    two). A neighbourhood/submarket-name substitution ("Fitzrovia"/
+    "Euston") is the same failure shape, on the other field extract.py's
+    own PROMPT lists right next to address_1.
+    """
+
+    def test_address_1_identical_to_building_is_cleared(self):
+        row = ListingRow(building="New Derwent House", address_1="New Derwent House")
+        geocode._clear_implausible_address_1(row)
+        self.assertIsNone(row.address_1)
+
+    def test_address_1_identical_to_building_case_and_punctuation_insensitive(self):
+        row = ListingRow(building="New Derwent House", address_1="  new derwent house.")
+        geocode._clear_implausible_address_1(row)
+        self.assertIsNone(row.address_1)
+
+    def test_address_1_identical_to_submarket_is_cleared(self):
+        row = ListingRow(building="Prospect House", submarket="Fitzrovia", address_1="Fitzrovia")
+        geocode._clear_implausible_address_1(row)
+        self.assertIsNone(row.address_1)
+
+    def test_a_genuine_address_sharing_a_word_with_building_is_never_cleared(self):
+        # Not a fuzzy/partial-overlap check - a real address that merely
+        # shares a word with building/submarket is a completely different
+        # string and must survive untouched.
+        row = ListingRow(
+            building="Prospect House", submarket="Fitzrovia", address_1="1 Prospect Way",
+        )
+        geocode._clear_implausible_address_1(row)
+        self.assertEqual(row.address_1, "1 Prospect Way")
+
+    def test_blank_address_1_is_left_alone(self):
+        row = ListingRow(building="Prospect House", address_1=None)
+        geocode._clear_implausible_address_1(row)
+        self.assertIsNone(row.address_1)
+
+    def test_blank_submarket_never_matches_a_blank_comparison(self):
+        # address_1 has real text, submarket is blank - must never compare
+        # two blanks and clear a genuine value.
+        row = ListingRow(building="Unrelated Building", submarket=None, address_1="24 Eversholt Street")
+        geocode._clear_implausible_address_1(row)
+        self.assertEqual(row.address_1, "24 Eversholt Street")
+
+
+class GeocodeRowClearsImplausibleAddress1EndToEndTests(unittest.TestCase):
+    """
+    End-to-end regression for the real Prospect House/Mainframe/New
+    Derwent House/Thames Court incident - geocode_row must never trust an
+    implausible pre-existing address_1 verbatim; it must clear it FIRST,
+    then let Tier 2's own real Places lookup have a genuine chance to
+    resolve a real street address instead.
+    """
+
+    def test_building_name_echoed_into_address_1_is_cleared_before_tier2_runs(self):
+        row = ListingRow(building="New Derwent House", submarket="Midtown", address_1="New Derwent House")
+        components = [
+            {"longText": "25", "types": ["street_number"]},
+            {"longText": "Savile Row", "types": ["route"]},
+            {"longText": "W1S 2ER", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.5118, "lng": -0.1414,
+                "address_components": components, "name": "New Derwent House",
+            },
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        # The real street Places actually returned - never the building's
+        # own name surviving untouched.
+        self.assertEqual(row.address_1, "25 Savile Row")
+        self.assertEqual(row.postcode, "W1S 2ER")
+
+    def test_submarket_echoed_into_address_1_is_cleared_before_tier2_runs(self):
+        row = ListingRow(building="Prospect House", submarket="Fitzrovia", address_1="Fitzrovia")
+        components = [
+            {"longText": "10", "types": ["street_number"]},
+            {"longText": "Cleveland Street", "types": ["route"]},
+            {"longText": "W1T 4JE", "types": ["postal_code"]},
+        ]
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.52, "lng": -0.138,
+                "address_components": components, "name": "Prospect House",
+            },
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.address_1, "10 Cleveland Street")
+        self.assertNotEqual(row.address_1, "Fitzrovia")
+
+
+class GeocodeRowsRepresentativeSelectionIgnoresImplausibleAddress1Tests(unittest.TestCase):
+    """
+    geocode_rows picks its group's representative via _completeness, which
+    reads row.address_1 DIRECTLY - before that row has ever been through
+    geocode_row/_clear_implausible_address_1 on its own. Without clearing
+    every row's implausible address_1 up front (see geocode_rows' own
+    comment on this), a member carrying a worthless building-name-echo
+    address_1 would be wrongly PREFERRED as the representative purely for
+    having "something" there, ahead of a genuinely blank sibling with real
+    identifying info elsewhere.
+    """
+
+    def test_a_member_with_a_genuine_postcode_is_preferred_over_one_with_an_implausible_address_1(self):
+        implausible = ListingRow(
+            building="New Derwent House", floor_unit="4th", submarket="Midtown", address_1="New Derwent House",
+        )
+        genuine = ListingRow(
+            building="New Derwent House", floor_unit="3rd", submarket="Midtown",
+            address_1="25 Savile Row", postcode="W1S 2ER",
+        )
+
+        with patch("geocode.geocode_row") as mock_geocode_row:
+            geocode.geocode_rows([implausible, genuine])
+
+        # The genuinely-informative member must be the one sent through
+        # geocode_row FIRST, as the group's own representative - never the
+        # implausible one, which _completeness would otherwise have scored
+        # higher only because address_1 was still non-None at selection
+        # time. (A mocked geocode_row never sets lat/lng, so geocode_rows'
+        # own "representative found nothing" fallback then also calls
+        # geocode_row on the other member too - that second call is
+        # expected here, not what this test is checking.)
+        self.assertEqual(mock_geocode_row.call_args_list[0].args[0], genuine)
+        # And the implausible member's own worthless value must already be
+        # cleared by the time geocode_rows finishes with it, regardless of
+        # which row acted as representative.
+        self.assertIsNone(implausible.address_1)
+
+
 class HouseNumberConflictFullPipelineTests(unittest.TestCase):
     """
     geocode_row -> master_merge.build_merge_plan, end to end - proves the

@@ -1303,7 +1303,62 @@ def _backfill_postcode_via_reverse_geocode(row: ListingRow, source_hint: dict) -
     row.postcode = postcode
 
 
+def _clear_implausible_address_1(row: ListingRow) -> None:
+    """
+    Clears row.address_1 IN PLACE when it's nothing but a disguised copy of
+    row.building or row.submarket - never a genuine street address at all -
+    so every downstream tier (geocode_row's own Tier 1 address+postcode
+    query, Tier 2's "already have an address, skip" guards, geocode_rows'
+    own _completeness scoring used to pick a group's representative) sees
+    a genuinely blank field, exactly as if extraction had correctly left
+    it null, rather than silently trusting whatever's already there (see
+    geocode_row's own `not row.address_1` guards, which - by design, see
+    their own comments - never re-validate an already-present value against
+    anything at all).
+
+    Confirmed real gap this closes: Gemini's own PDF extraction is not
+    perfectly deterministic - re-running extraction against the IDENTICAL
+    rendered pages of a real Colliers "Flex & Managed Availability" deck
+    (which genuinely states no street address at all for several
+    properties, only a neighbourhood section header) sometimes echoed the
+    building's own name into address_1 instead of correctly leaving it
+    null (confirmed live-traced: "Prospect House"/"Mainframe"/"New Derwent
+    House"/"Thames Court", each identical to that same row's own building
+    value, on one extraction attempt; correctly None on two others). A
+    submarket-name substitution (e.g. "Fitzrovia"/"Euston") is the exact
+    same failure shape, just landing on the other location field extract.
+    py's own PROMPT lists right next to address_1 with a similarly-shaped
+    example. Once accepted verbatim, geocode_row's own Tier 1 would happily
+    resolve "Prospect House, UK" or "Fitzrovia, UK" to REAL coordinates
+    (both are genuine, geocodable place names) and geocode_unverified would
+    be left however Tier 1 sets it - never surfacing that address_1 itself,
+    not just the coordinate, needs a second look.
+
+    Reuses normalize_key (case/punctuation/whitespace-tolerant - the same
+    comparison every OTHER identity check in this module already trusts)
+    rather than bare string equality, so "New Derwent House" vs "new
+    derwent house" or a trailing punctuation difference still counts as
+    the same disguised copy. Deliberately an EXACT match only, never a
+    fuzzy/partial-overlap check - a genuine address that happens to share
+    a WORD with the building name ("Prospect House, 1 Prospect Way") is
+    a completely different string and must never be cleared just because
+    it isn't different ENOUGH; only a value that is NOTHING BUT a copy of
+    a field already known to carry no street information of its own
+    counts as implausible here.
+    """
+    if not row.address_1:
+        return
+    address_key = normalize_key(row.address_1)
+    if not address_key:
+        return
+    if address_key == normalize_key(row.building) or (
+        row.submarket and address_key == normalize_key(row.submarket)
+    ):
+        row.address_1 = None
+
+
 def geocode_row(row: ListingRow) -> ListingRow:
+    _clear_implausible_address_1(row)
     # Already has real coordinates (e.g. a provider spreadsheet's own Lat/Lng
     # columns, mapped straight through by extract_spreadsheet.py) - calling
     # out to the API would be a wasted lookup at best, and at worst replaces
@@ -1717,6 +1772,17 @@ def geocode_rows(rows: list) -> list:
     and_Master.py's _risky_field_reason) would only ever show up on
     whichever single row happened to be the representative.
     """
+    # Run BEFORE grouping/representative-selection below (both of which
+    # read row.address_1 directly, never through geocode_row - see
+    # _completeness's own use just below), not merely left to each
+    # member's own eventual geocode_row call - a member carrying an
+    # implausible address_1 (see _clear_implausible_address_1's own
+    # docstring) would otherwise still get PREFERRED as the group's
+    # representative purely for having "something" there, even though
+    # that something is worthless, ahead of a genuinely blank sibling.
+    for row in rows:
+        _clear_implausible_address_1(row)
+
     groups = {}
     ungrouped = []
     for row in rows:
