@@ -1260,10 +1260,23 @@ with page_setup.setup_page("upload"):
                     # Automatic brochure enrichment now also runs for an
                     # email upload (see the row_count/enrichment gates
                     # below and brochure_enrichment.py's own module
-                    # docstring) - deliberately NOT a PDF upload, which is
-                    # already extracted from the actual brochure itself
-                    # (enriching it from itself would be circular).
+                    # docstring). A PDF/Canva upload is handled separately
+                    # (see is_pdf_source/pdf_self_link/has_distinct_pdf_
+                    # brochure_link below, computed once rows exist) -
+                    # NOT unconditionally like spreadsheet/email, since a
+                    # plain single-property PDF really is already the
+                    # brochure it would be "enriched" from (circular), but
+                    # a multi-property PDF/Canva deck (e.g. a "Flex &
+                    # Managed Availability" export) can have an individual
+                    # row's own brochure_link point at a genuinely separate,
+                    # more detailed document distinct from the file that was
+                    # actually uploaded - confirmed real case: Henly House's
+                    # row, extracted from such a deck, had its own brochure_
+                    # link pointing at a completely different PDF with the
+                    # real address/state_of_space detail, never fetched at
+                    # all because the upload source was "PDF".
                     is_email_source = suffix == ".eml"
+                    is_pdf_source = suffix == ".pdf"
 
                     # Hashed before anything else, from the bytes already in
                     # memory - a byte-identical re-upload (same content, any
@@ -1374,6 +1387,14 @@ with page_setup.setup_page("upload"):
                     resume_already_processed = None
                     resume_floorplan_already_processed = None
                     resume_special_features_matched = None
+                    # Only ever set (to the persisted synthetic-render URL)
+                    # inside the fresh-extraction PDF/paste-a-link branch
+                    # further below - stays None for a reused result (no
+                    # fresh rows to compare) and for every other source
+                    # type, which is exactly what has_distinct_pdf_
+                    # brochure_link's own "nothing to compare against"
+                    # fallback below expects.
+                    pdf_self_link = None
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
@@ -1678,6 +1699,7 @@ with page_setup.setup_page("upload"):
                                     # at all, so it's no longer computed
                                     # there.
                                     brochure_url = save_original_pdf(uploaded_file.getvalue(), uploaded_file.name)
+                                    pdf_self_link = brochure_url
                                     rows = extract.extract_from_png_pages(
                                         png_pages, original_filename=uploaded_file.name,
                                         page_links=uploaded_file.page_links,
@@ -1745,6 +1767,27 @@ with page_setup.setup_page("upload"):
                         source_identity_hash=source_identity_hash,
                     )
 
+                    # A plain single-property PDF really is already the
+                    # brochure it would be "enriched" from (circular), but a
+                    # multi-property PDF/Canva deck can have an individual
+                    # row's own brochure_link point at a genuinely separate,
+                    # more detailed document distinct from the file that was
+                    # actually uploaded (pdf_self_link, set above only for
+                    # the paste-a-link/png_pages branch - None, so every
+                    # non-blank link compares as distinct, for a plain PDF
+                    # upload with no self-reference of its own at all).
+                    # Confirmed real case this exists for: Henly House's
+                    # row, extracted from a multi-property Canva "Flex &
+                    # Managed Availability" deck, had its own brochure_link
+                    # pointing at a completely different PDF with the real
+                    # address/state_of_space detail - never fetched at all
+                    # because the upload source was "PDF", regardless of
+                    # that row's own distinct link.
+                    has_distinct_pdf_brochure_link = is_pdf_source and any(
+                        r.brochure_link and r.brochure_link != pdf_self_link and not r.brochure_link_is_floorplan
+                        for r in rows
+                    )
+
                     # Computed here (never for a "reused but incomplete"
                     # resume, which never announced a row count of its own
                     # either) so _run_automatic_brochure_enrichment below
@@ -1752,63 +1795,37 @@ with page_setup.setup_page("upload"):
                     # immediately, that the row count is already real and
                     # saved, before any further (potentially slow) step
                     # runs, without a second, separate caption alongside it.
-                    row_count = len(rows) if (is_spreadsheet_source or is_email_source) and not reused else None
+                    row_count = (
+                        len(rows)
+                        if (is_spreadsheet_source or is_email_source or has_distinct_pdf_brochure_link) and not reused
+                        else None
+                    )
 
                     # Automatic - for a fresh spreadsheet OR email extraction
-                    # always, and ALSO for a reused (byte-identical previous
-                    # upload) result whose own matched entry's enrichment
-                    # was left incomplete OR finished with a genuine
-                    # remaining gap (resume_already_processed is then
-                    # non-None either way - see its own assignment above,
-                    # including the "complete but still genuinely blank"
-                    # branch), so THIS staging entry gets a real chance to
-                    # resolve it rather than staying frozen at that prior
-                    # result forever, no matter how many more times the
-                    # identical file gets re-uploaded. A reused result whose
-                    # match was already complete AND has nothing genuinely
-                    # blank left still skips this entirely - nothing left to
-                    # do. Never for PDF (see brochure_
-                    # enrichment.py's own module docstring on why that stays
-                    # out of scope - already extracted from the actual
-                    # brochure itself). Wrapped in its own try/except, on
-                    # top of enrich_rows_grouped's own internal per-brochure
-                    # exception handling - the base extraction above is
-                    # ALREADY staged by this point, so an unexpected bug
-                    # here must never surface as "extraction failed" for a
-                    # file whose real extraction genuinely succeeded.
-                    # --- TEMPORARY DEBUG LOGGING (Henly House investigation
-                    # - remove once resolved). Prints to stderr (Cloud Run
-                    # logs) AND shows directly on-page, so no console access
-                    # is needed to see it from a real upload.
-                    _henly_debug = any("henly" in (r.building or "").lower() for r in rows)
-                    if _henly_debug:
-                        import sys as _sys
-                        _will_call = (
-                            (is_spreadsheet_source or is_email_source)
-                            and (not reused or resume_already_processed is not None)
-                        )
-                        _before_lines = [
-                            f"file={uploaded_file.name!r}",
-                            f"reused={reused}",
-                            f"is_spreadsheet_source={is_spreadsheet_source}",
-                            f"is_email_source={is_email_source}",
-                            f"resume_already_processed={resume_already_processed!r}",
-                            f"resume_floorplan_already_processed={resume_floorplan_already_processed!r}",
-                            f"resume_special_features_matched={resume_special_features_matched!r}",
-                            f"will_call_automatic_brochure_enrichment={_will_call}",
-                        ] + [
-                            f"BEFORE row {i}: building={r.building!r} floor_unit={r.floor_unit!r} "
-                            f"brochure_link={r.brochure_link!r} address_1={r.address_1!r} "
-                            f"postcode={r.postcode!r} state_of_space={r.state_of_space!r}"
-                            for i, r in enumerate(rows) if "henly" in (r.building or "").lower()
-                        ]
-                        _before_text = "\n".join(_before_lines)
-                        print(f"[HENLY-DEBUG]\n{_before_text}", file=_sys.stderr)
-                        st.expander("🔧 Henly House debug — before enrichment (temporary)", expanded=True).code(
-                            _before_text
-                        )
-
-                    if (is_spreadsheet_source or is_email_source) and (not reused or resume_already_processed is not None):
+                    # always, for a fresh PDF/Canva extraction only when
+                    # has_distinct_pdf_brochure_link (see above), and ALSO
+                    # for a reused (byte-identical previous upload) result
+                    # whose own matched entry's enrichment was left
+                    # incomplete OR finished with a genuine remaining gap
+                    # (resume_already_processed is then non-None either way
+                    # - see its own assignment above, including the
+                    # "complete but still genuinely blank" branch), so THIS
+                    # staging entry gets a real chance to resolve it rather
+                    # than staying frozen at that prior result forever, no
+                    # matter how many more times the identical file gets
+                    # re-uploaded. A reused result whose match was already
+                    # complete AND has nothing genuinely blank left still
+                    # skips this entirely - nothing left to do. Wrapped in
+                    # its own try/except, on top of enrich_rows_grouped's
+                    # own internal per-brochure exception handling - the
+                    # base extraction above is ALREADY staged by this point,
+                    # so an unexpected bug here must never surface as
+                    # "extraction failed" for a file whose real extraction
+                    # genuinely succeeded.
+                    if (
+                        (is_spreadsheet_source or is_email_source or has_distinct_pdf_brochure_link)
+                        and (not reused or resume_already_processed is not None)
+                    ):
                         try:
                             # See _reattempt_geocoding_for_newly_addressed_
                             # rows's own docstring - captured strictly
@@ -1828,20 +1845,6 @@ with page_setup.setup_page("upload"):
                                 f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
                                 f"({e}) and was skipped for this file — the extraction above is "
                                 "unaffected and already staged."
-                            )
-
-                        # --- TEMPORARY DEBUG LOGGING (Henly House
-                        # investigation - remove once resolved).
-                        if _henly_debug:
-                            _after_text = "\n".join(
-                                f"AFTER row {i}: building={r.building!r} floor_unit={r.floor_unit!r} "
-                                f"address_1={r.address_1!r} postcode={r.postcode!r} "
-                                f"state_of_space={r.state_of_space!r}"
-                                for i, r in enumerate(rows) if "henly" in (r.building or "").lower()
-                            )
-                            print(f"[HENLY-DEBUG]\n{_after_text}", file=_sys.stderr)
-                            st.expander("🔧 Henly House debug — after enrichment (temporary)", expanded=True).code(
-                                _after_text
                             )
 
                     succeeded += 1

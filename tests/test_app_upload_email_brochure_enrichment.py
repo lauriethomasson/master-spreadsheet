@@ -42,6 +42,7 @@ from streamlit.testing.v1 import AppTest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import brochure_enrichment
+from schema import ListingRow
 from storage.file_store import (
     get_staging_enrichment_summary,
     list_pending_staging_files,
@@ -163,11 +164,10 @@ class AutomaticEnrichmentOnEmailExtractTests(unittest.TestCase):
         mock_extract.assert_not_called()
         self.assertIsNone(get_staging_enrichment_summary(list_pending_staging_files()[0]))
 
-    def test_pdf_upload_still_never_gets_automatic_enrichment(self):
-        # Negative control for the new is_email_source gate itself - a PDF
-        # upload must still be completely unaffected (see brochure_
-        # enrichment.py's own module docstring: a PDF is already extracted
-        # from the actual brochure, enriching it from itself is circular).
+    def test_pdf_upload_with_no_rows_at_all_still_gets_no_automatic_enrichment(self):
+        # Negative control for the is_email_source gate - a PDF upload with
+        # no rows (so genuinely nothing to compare a brochure_link against)
+        # must still be completely unaffected.
         with patch("extract.extract", return_value=[]) as mock_pdf_extract, \
              patch("brochure_enrichment.httpx.get") as mock_get, \
              patch("brochure_enrichment.extract.render_and_extract") as mock_brochure_extract:
@@ -182,6 +182,76 @@ class AutomaticEnrichmentOnEmailExtractTests(unittest.TestCase):
         mock_pdf_extract.assert_called_once()
         mock_get.assert_not_called()
         mock_brochure_extract.assert_not_called()
+
+    def test_pdf_upload_with_every_row_blank_or_matching_the_source_still_gets_no_automatic_enrichment(self):
+        # Same negative control, but with real rows this time - one with no
+        # brochure_link at all, one whose brochure_link equals the uploaded
+        # file's own name (standing in for "this row has nothing separate
+        # from the file that was actually uploaded"). Neither is a
+        # genuinely distinct document, so this must behave exactly as
+        # before has_distinct_pdf_brochure_link existed - no regression.
+        pdf_rows = [
+            ListingRow(building="No Link Building", brochure_link=None),
+            ListingRow(building="Self-Referencing Building", brochure_link="Some Brochure.pdf"),
+        ]
+        with patch("extract.extract", return_value=pdf_rows) as mock_pdf_extract, \
+             patch("brochure_enrichment.httpx.get") as mock_get, \
+             patch("brochure_enrichment.extract.render_and_extract") as mock_brochure_extract, \
+             patch("geocode.geocode_rows"):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload("Some Brochure.pdf", b"%PDF-1.4 fake", "application/pdf")
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        mock_pdf_extract.assert_called_once()
+        mock_get.assert_not_called()
+        mock_brochure_extract.assert_not_called()
+
+    def test_pdf_upload_with_a_row_pointing_at_a_genuinely_separate_document_triggers_automatic_enrichment(self):
+        # The confirmed real case this exists for: a multi-property PDF/
+        # Canva deck (like this one) whose own upload is "a PDF", but one
+        # row's own brochure_link points at a completely separate,
+        # genuinely different PDF (Henly House's real "c45d78_...pdf") -
+        # never the file that was actually uploaded at all. Previously
+        # never fetched, purely because the upload's source was "PDF" -
+        # regardless of that row's own distinct link.
+        pdf_rows = [
+            ListingRow(
+                building="Henly House", floor_unit="3rd Floor",
+                brochure_link="https://example.com/henly-house-detail.pdf",
+            ),
+        ]
+        brochure_units = {"units": [{
+            "building": "Henly House", "floor_unit": "3rd Floor",
+            "address_1": "1 Henly Way", "postcode": "W1 1AA",
+        }]}
+        with patch("extract.extract", return_value=pdf_rows), \
+             patch("brochure_enrichment.httpx.get", return_value=_pdf_response()) as mock_get, \
+             patch("brochure_enrichment.extract.render_pages", return_value=["fake_image"]), \
+             patch("brochure_enrichment.extract.render_and_extract", return_value=brochure_units) as mock_extract, \
+             patch("geocode.geocode_rows"):
+            at = AppTest.from_file(str(BASE / "app.py"), default_timeout=30)
+            at.run()
+            at.file_uploader[0].upload("Henly Deck.pdf", b"%PDF-1.4 fake", "application/pdf")
+            at.run()
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        brochure_calls = [
+            c for c in mock_get.call_args_list
+            if c.args and c.args[0] == "https://example.com/henly-house-detail.pdf"
+        ]
+        self.assertEqual(len(brochure_calls), 1)
+        mock_extract.assert_called_once()
+
+        pending = list_pending_staging_files()
+        df = load_staging_as_dataframe(pending[0])
+        self.assertEqual(df.iloc[0]["address_1"], "1 Henly Way")
+        self.assertEqual(df.iloc[0]["postcode"], "W1 1AA")
 
 
 class EmailEnrichmentSafeguardsTests(unittest.TestCase):
