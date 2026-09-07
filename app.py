@@ -116,14 +116,33 @@ _SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
 #
 # brochure_link_resolver.py's own source is folded in here too, same as
 # _SPREADSHEET_LOGIC_FINGERPRINT above and for the same confirmed gap: both
-# extract.py and extract_email.py call finalize_brochure_link (unlike
-# geocode.py/brochure_enrichment.py below, which only apply to some PDF/
-# email paths, this one applies to both unconditionally, so it belongs in
-# the fingerprint itself rather than in versioned_content).
+# extract.py and extract_email.py call finalize_brochure_link, and it
+# applies to both unconditionally, so it belongs in the fingerprint itself
+# rather than in versioned_content.
+#
+# brochure_enrichment.py's own source is folded in here too, for the exact
+# same reason _SPREADSHEET_LOGIC_FINGERPRINT above already includes it -
+# automatic brochure enrichment now runs unconditionally for every PDF/
+# email upload too (see _run_automatic_brochure_enrichment/the PDF-email
+# branch below), so a change to its own matching/field rules (e.g. the
+# shared-deck-contamination fix _apply_units_to_row's own is_shared_deck_
+# document param exists for) must invalidate an already-staged PDF/email
+# result too, not silently keep serving rows enriched under the OLD logic.
+# Previously only added to _pdf_or_email_content_hash's own versioned_
+# content below (still functionally identical either way - both end up in
+# the same final content_hash - but stated here explicitly now, alongside
+# extract.py/extract_email.py/brochure_link_resolver.py, the same place
+# _SPREADSHEET_LOGIC_FINGERPRINT already states its own equivalent
+# inclusion, rather than split across two different spots for the two
+# source types). geocode.py is NOT folded in here - left exactly where it
+# already was (_pdf_or_email_content_hash's own versioned_content below) -
+# this fingerprint's own scope is deliberately just brochure enrichment's
+# gap, not a broader reorganization of every dependency's placement.
 _PDF_EMAIL_LOGIC_FINGERPRINT = hashlib.sha256(
     Path(extract.__file__).read_bytes()
     + Path(extract_email.__file__).read_bytes()
     + Path(brochure_link_resolver.__file__).read_bytes()
+    + Path(brochure_enrichment.__file__).read_bytes()
 ).hexdigest()
 
 # The neutral, un-decided option in an ambiguous-sheet decision radio (see
@@ -702,27 +721,24 @@ def _spreadsheet_content_hash(file_bytes: bytes, decisions: dict) -> str:
 def _pdf_or_email_content_hash(file_bytes: bytes) -> str:
     """
     content_hash for a PDF/email upload - _PDF_EMAIL_LOGIC_FINGERPRINT (a
-    hash of extract.py's/extract_email.py's own source - see its own
-    comment) + file_bytes + geocode.py's own source, automatically folded in
-    for the same reason _SPREADSHEET_LOGIC_FINGERPRINT already folds it in
-    for a spreadsheet upload (see that constant's own comment) -
-    geocode_rows() runs unconditionally right after extraction for BOTH
-    source types, so a geocoding-logic change must invalidate an already-
-    staged PDF/email result too.
+    hash of extract.py's/extract_email.py's/brochure_link_resolver.py's/
+    brochure_enrichment.py's own source - see its own comment) + file_bytes
+    + geocode.py's own source, automatically folded in for the same reason
+    _SPREADSHEET_LOGIC_FINGERPRINT already folds it in for a spreadsheet
+    upload (see that constant's own comment) - geocode_rows() runs
+    unconditionally right after extraction for BOTH source types, so a
+    geocoding-logic change must invalidate an already-staged PDF/email
+    result too.
 
-    brochure_enrichment.py's own source is ALSO folded in, unconditionally
-    for every PDF/email upload - automatic brochure enrichment now runs
-    for every upload type, before geocoding even happens (see app.py's own
-    upload flow, the reorder this closes: extract -> save -> brochure-
-    check -> geocode), not gated by source type at all any more, so a
-    brochure_enrichment.py change must invalidate an already-staged
-    PDF/email result too, exactly like it already does for a spreadsheet
-    upload (see _SPREADSHEET_LOGIC_FINGERPRINT's own inclusion of it).
+    brochure_enrichment.py's own source is now folded into _PDF_EMAIL_
+    LOGIC_FINGERPRINT itself instead of being appended separately here (see
+    that constant's own comment for why) - still the exact same
+    unconditional-for-every-PDF/email-upload invalidation this docstring
+    always described, just stated in one place instead of two.
     """
     versioned_content = (
         _PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8")
         + b"\0" + file_bytes + b"\0" + Path(geocode.__file__).read_bytes()
-        + b"\0" + Path(brochure_enrichment.__file__).read_bytes()
     )
     return hashlib.sha256(versioned_content).hexdigest()
 
