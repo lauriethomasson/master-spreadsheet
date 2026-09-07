@@ -3911,7 +3911,7 @@ def _special_features_items(text: str) -> list:
     return [p.strip() for p in parts if len(p.strip()) >= 3]
 
 
-def _apply_units_to_row(row: ListingRow, units):
+def _apply_units_to_row(row: ListingRow, units, is_shared_deck_document: bool = False):
     """
     (row_or_new_row, enriched_fields) - the pure "given already-fetched
     brochure units, does this row get anything from them" step, factored
@@ -3919,6 +3919,27 @@ def _apply_units_to_row(row: ListingRow, units):
     own fetch per row (see that function's own docstring for why: it fetches
     each DISTINCT brochure once, then applies the same result here to every
     row sharing it).
+
+    is_shared_deck_document (see enrich_rows_grouped's own shared_deck_url
+    param docstring), when True, means `units` was read from a document this
+    row's own brochure_link only ended up pointing at because it's the
+    upload's shared, document-level fallback link (see app.py's own
+    _validate_pasted_link_brochure_links) - never a genuinely distinct
+    per-row document. Real, confirmed incident this guards: a shared multi-
+    property Colliers Canva deck's own document-wide contacts/property_
+    features text (see units.contacts/units.property_features below) got
+    applied to 46 rows across many different buildings as if each row's own
+    individual brochure had genuinely stated it. Gates ONLY those two
+    document-wide (PROPERTY_LEVEL_FIELDS) sources - contacts_document and
+    property_features below are simply never populated from `units` in that
+    case, left exactly as blank as a failed/empty fetch would leave them -
+    never the row's own pre-existing contacts/special_features value (still
+    combined in normally), never unit_features/building_features (already
+    safely scoped to this row's own building/unit by _match_unit/_match_
+    building_feature regardless of whether the document itself is shared),
+    and never any BUILDING_LEVEL_FIELDS/UNIT_LEVEL_FIELDS backfill below.
+    Defaults to False - identical to every prior behavior before this
+    parameter existed.
 
     units may be None/[] (nothing to enrich from - a failed or empty fetch)
     - in that case, or if _match_unit finds no confident match, or matching
@@ -4048,17 +4069,23 @@ def _apply_units_to_row(row: ListingRow, units):
         # slightly different normalization, in which case the dedup below
         # correctly keeps just the one).
         #
-        # units.contacts here is ALWAYS this row's own correctly-resolved
-        # individual document's own contacts, NEVER a shared multi-property
-        # deck's - see extract._rows_from_raw's own document_wide_contacts_
-        # is_row_own_document docstring for the real, confirmed Colliers-
-        # deck incident this guarantee depends on (a shared deck's own
-        # generic team contact must never reach here as if it were this
-        # row's own genuine document; extract.py's own fix, not this
-        # function's concern, is what keeps that guarantee true - this
-        # combine simply trusts units.contacts is already correctly scoped
-        # by the time it gets here, same as it already trusted the OLD
-        # blank-fill version of this same line to be).
+        # units.contacts here is meant to be this row's own correctly-
+        # resolved individual document's own contacts, NEVER a shared multi-
+        # property deck's - see extract._rows_from_raw's own document_wide_
+        # contacts_is_row_own_document docstring for the real, confirmed
+        # FIRST Colliers-deck incident this guarantee depends on at the
+        # initial-extraction stage (a shared deck's own generic team contact
+        # must never reach here as if it were this row's own genuine
+        # document). That guarantee held for a genuinely distinct per-row
+        # document, but NOT for a row whose own brochure_link had fallen
+        # back to the upload's shared document-level link itself (see
+        # app.py's own _validate_pasted_link_brochure_links) - a SECOND,
+        # later-stage recurrence of the same contamination, confirmed real
+        # (a Kingsland House row whose own link 403'd and fell back to a
+        # 21-building Colliers deck). is_shared_deck_document above is this
+        # function's own defense for exactly that recurrence: contacts_
+        # document is forced to None in that case, never trusted as this
+        # row's own.
         #
         # Order matches special_features' own combine: the row's own
         # existing value first, then the brochure's, never the reverse -
@@ -4072,7 +4099,12 @@ def _apply_units_to_row(row: ListingRow, units):
         # master-merge has happened), so there is no "old" value to
         # eventually retire yet, only two sources of the SAME upload to
         # combine.
-        contacts_document = getattr(units, "contacts", None)
+        # Never trusted at all when this row's own brochure_link IS the
+        # upload's shared, document-level fallback link (see this
+        # function's own is_shared_deck_document param docstring) - left
+        # exactly as None as a failed/empty fetch would, regardless of what
+        # units.contacts itself says.
+        contacts_document = None if is_shared_deck_document else getattr(units, "contacts", None)
         if not (isinstance(contacts_document, str) and not _is_blank(contacts_document)):
             contacts_document = None
         row_contacts = row.contacts if isinstance(row.contacts, str) and not _is_blank(row.contacts) else None
@@ -4146,7 +4178,13 @@ def _apply_units_to_row(row: ListingRow, units):
         building_features = _match_building_feature(row, units)
         if not (isinstance(building_features, str) and not _is_blank(building_features)):
             building_features = None
-        property_features = getattr(units, "property_features", None)
+        # Same is_shared_deck_document gate as contacts_document above -
+        # property_features is a document/whole-site-wide field (see
+        # extract.py's own PROMPT docstring for property_features - it's
+        # raw Gemini JSON, never a validated ExtractedFields/ListingRow
+        # field of its own), never building-scoped, so it's exactly as
+        # unsafe to trust from a shared deck as contacts is.
+        property_features = None if is_shared_deck_document else getattr(units, "property_features", None)
         if not (isinstance(property_features, str) and not _is_blank(property_features)):
             property_features = None
 
@@ -4848,6 +4886,7 @@ def enrich_rows_grouped(
     already_processed: dict = None, url_checkpoint_callback=None,
     floorplan_already_processed: dict = None, floorplan_checkpoint_callback=None,
     floorplan_url_checkpoint_callback=None, special_features_matched: dict = None,
+    shared_deck_url: str | None = None,
 ):
     """
     (rows, log, stats) - like enrich_rows, but processes each DISTINCT
@@ -4966,6 +5005,19 @@ def enrich_rows_grouped(
     "Continue enrichment"), never an automatic unbounded retry loop.
     Defaults to {} (nothing previously processed - identical to every
     prior behavior before this parameter existed).
+
+    shared_deck_url (see app.py's own _run_automatic_brochure_enrichment
+    param of the same name for the full real-incident context), when given,
+    is this upload's own shared, document-level fallback brochure link - the
+    per-url loop below compares each DISTINCT url it's about to apply
+    against this once per url (never per row), and passes is_shared_deck_
+    document=True into _apply_units_to_row for every row sharing that exact
+    url when it matches, so that row's own document-wide contacts/property_
+    features are never trusted as if they were genuinely its own (see
+    _apply_units_to_row's own is_shared_deck_document param docstring for
+    exactly which fields that gates). Defaults to None - identical to every
+    prior behavior before this parameter existed - and every row not
+    sharing this exact url is completely unaffected regardless.
 
     stats["processed_urls"] ({url: "ok" | "unavailable"}) reports the
     outcome for every URL actually FETCHED during THIS call only (never
@@ -5178,6 +5230,12 @@ def enrich_rows_grouped(
                 brochures_unavailable += 1
                 processed_urls[url] = "unavailable"
 
+            # Computed ONCE per url (see this function's own shared_deck_url
+            # param docstring), never per row - every row in indices_by_url[
+            # url] shares the exact same answer to "is this url itself the
+            # upload's shared, document-level fallback link".
+            is_shared_deck_url = shared_deck_url is not None and url == shared_deck_url
+
             # Falls back to a generic status when the real fetch/render/
             # extract body didn't run for THIS call (a cross-run cache hit
             # - see _StatusCapture's own docstring) rather than leaving
@@ -5222,7 +5280,9 @@ def enrich_rows_grouped(
                 # unchanged, never guessed at from data that couldn't even
                 # be read correctly.
                 try:
-                    new_row, fields = _apply_units_to_row(rows[i], units)
+                    new_row, fields = _apply_units_to_row(
+                        rows[i], units, is_shared_deck_document=is_shared_deck_url,
+                    )
                 except Exception as e:
                     print(
                         f"[brochure_enrichment] Could not apply units from {url!r} to "
@@ -5501,7 +5561,7 @@ def _propagate_shared_brochure_link_within_building(rows: list) -> list:
 
 def run_brochure_enrichment(
     rows: list, staging_path: str, already_processed: dict, floorplan_already_processed: dict = None,
-    special_features_matched: dict = None,
+    special_features_matched: dict = None, shared_deck_url: str | None = None,
 ) -> list:
     """
     The Streamlit-aware orchestration shared by BOTH callers that ever run
@@ -5560,6 +5620,15 @@ def run_brochure_enrichment(
     orchestration both real callers - the automatic post-upload run and
     "Continue enrichment" - go through) means neither needs its own copy
     of this logic.
+
+    shared_deck_url, when given (only ever by app.py's own automatic run
+    for a pasted Canva/Pitch link, never by pages/2_Review_and_Master.py's
+    "Continue enrichment" - see app.py's own _run_automatic_brochure_
+    enrichment param docstring for why that resume caller has no recovered
+    value to pass here), is threaded straight through to enrich_rows_
+    grouped unchanged - see its own param docstring for exactly what this
+    does. Defaults to None, identical to every prior behavior before this
+    parameter existed.
     """
     floorplan_already_processed = floorplan_already_processed or {}
     special_features_matched = special_features_matched or {}
@@ -5642,6 +5711,7 @@ def run_brochure_enrichment(
         floorplan_checkpoint_callback=on_checkpoint,
         floorplan_url_checkpoint_callback=on_floorplan_url_checkpoint,
         special_features_matched=special_features_matched,
+        shared_deck_url=shared_deck_url,
     )
     progress_slot.empty()
 

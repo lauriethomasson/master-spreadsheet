@@ -388,6 +388,7 @@ def _rows_dropped_as_duplicate_sheet_extractions(header_mapped_sheets: list) -> 
 def _run_automatic_brochure_enrichment(
     rows: list[ListingRow], staging_path: str, already_processed: dict = None,
     floorplan_already_processed: dict = None, special_features_matched: dict = None, row_count: int = None,
+    shared_deck_url: str | None = None,
 ) -> list[ListingRow]:
     """
     Runs immediately after a FRESH upload's base rows are already staged at
@@ -462,6 +463,34 @@ def _run_automatic_brochure_enrichment(
     COUNT, only field values, but keeping the caller's own variable
     accurate is one less place a future change could accidentally read the
     stale pre-enrichment list.
+
+    shared_deck_url, when given (only ever for a pasted Canva/Pitch link's
+    own rows - see the caller's own brochure_url), is this upload's own
+    shared document-level fallback link (the SAME url _validate_pasted_
+    link_brochure_links/_propagate_validated_links_within_page already
+    compare each row's brochure_link against - see their own shared_
+    fallback_link param). Threaded straight through to brochure_enrichment.
+    run_brochure_enrichment/enrich_rows_grouped/_apply_units_to_row: a row
+    whose OWN brochure_link genuinely equals this url is the shared,
+    multi-property deck itself, not a distinct per-row document, so this
+    later enrichment pass must not trust that document's own document-wide
+    contacts/property_features as if they were this one row's own (see
+    _apply_units_to_row's own is_shared_deck_document param docstring for
+    the real confirmed incident - 46 Colliers rows sharing one deck's own
+    3-person contacts string - this closes). Confirmed real, narrow gap
+    left open: the "reused but incomplete" resume call below never passes
+    this (a previously-persisted staging entry has no recovered copy of the
+    original upload's own shared_fallback_link to pass here) - accepted
+    rather than solved, meaningfully narrowed by brochure_enrichment.py's
+    own source already being folded into _pdf_or_email_content_hash's own
+    versioned_content (see that function's own docstring - already true
+    before this fix, not something this fix adds): any staging entry from
+    before THIS change to brochure_enrichment.py gets a different
+    content_hash and is never resumed against post-fix code, so only a
+    paste-a-link run interrupted AFTER this fix ships and resumed later
+    would still lack the signal. Defaults to None - identical to every
+    prior behavior for every other source type, and for that resume case -
+    before this parameter existed.
     """
     eligible, unique_urls = brochure_enrichment.eligible_rows_and_brochures(rows)
     eligible_floorplans, unique_floorplan_urls = brochure_enrichment.eligible_rows_and_floorplans(rows)
@@ -485,6 +514,7 @@ def _run_automatic_brochure_enrichment(
         rows, staging_path, already_processed=already_processed or {},
         floorplan_already_processed=floorplan_already_processed or {},
         special_features_matched=special_features_matched or {},
+        shared_deck_url=shared_deck_url,
     )
 
 
@@ -1372,6 +1402,24 @@ with page_setup.setup_page("upload"):
                     resume_already_processed = None
                     resume_floorplan_already_processed = None
                     resume_special_features_matched = None
+                    # Set below ONLY for a pasted-Canva/Pitch-link upload
+                    # (the png_pages branch further down) - this file's own
+                    # shared document-level fallback URL every row's
+                    # brochure_link either started as, or fell back to, once
+                    # _validate_pasted_link_brochure_links ran (see its own
+                    # shared_fallback_link param) - threaded into automatic
+                    # brochure enrichment below so the LATER, separate
+                    # per-row enrichment pass can tell "this row's own
+                    # brochure_link IS the shared multi-property deck itself"
+                    # apart from "this row has its own genuinely distinct
+                    # document" the same way that earlier validation step
+                    # already could. Stays None (identical to every prior
+                    # behavior) for every other source type, and for the
+                    # "reused but incomplete" resume branch below - see
+                    # _run_automatic_brochure_enrichment's own shared_deck_url
+                    # param docstring for why the resume case is an accepted,
+                    # narrow gap rather than something this also solves.
+                    brochure_url = None
 
                     if previous_staging_path:
                         rows = dataframe_to_listing_rows(load_staging_as_dataframe(previous_staging_path))
@@ -1803,7 +1851,9 @@ with page_setup.setup_page("upload"):
                     if not reused:
                         row_count = len(rows)
                         try:
-                            rows = _run_automatic_brochure_enrichment(rows, staging_path, row_count=row_count)
+                            rows = _run_automatic_brochure_enrichment(
+                                rows, staging_path, row_count=row_count, shared_deck_url=brochure_url,
+                            )
                         except Exception as e:
                             st.warning(
                                 f"{uploaded_file.name}: brochure enrichment hit an unexpected error "
