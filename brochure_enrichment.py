@@ -2936,6 +2936,40 @@ def _images_from_fetched_document(data):
         return extract.render_pages(data)
 
 
+def _fetched_data_is_a_real_document(data) -> bool:
+    """
+    True when `data` (exactly what _fetch_pdf_bytes returned, INCLUDING
+    with accept_any_reachable_page=True) is actually something render_
+    pages/render_and_extract can meaningfully read - a real PDF, a real
+    PNG/JPEG, or the Canva/Pitch/GPE/Kitt list[bytes] shape (already-
+    rendered pages from a real browser screenshot - always genuine, never
+    ambiguous).
+
+    Used ONLY by app.py's own _validate_pasted_link_brochure_links, before
+    it calls _brochure_units_from_document_bytes on bytes it already
+    fetched with accept_any_reachable_page=True for its OWN, narrower
+    reachability-only purpose (see _looks_like_fetchable_document's own
+    docstring: that flag deliberately treats ANY reachable response - a
+    real per-unit LISTING WEBPAGE included - as "good enough" for a plain
+    link-is-alive check). A reachable plain webpage is real evidence the
+    LINK works, but never a document to extract a building name from at
+    all - without this guard, _brochure_units_from_document_bytes would
+    hand raw HTML bytes to render_pages/render_and_extract, which either
+    fails cleanly (a genuinely malformed "PDF") or - confirmed directly,
+    the real reason this guard exists - PyMuPDF can sometimes open such
+    bytes as a valid, simply EMPTY document (zero pages), which then
+    reaches Gemini with nothing to send at all, a real, wasted API call
+    for content that was never a document in the first place.
+    """
+    if isinstance(data, list):
+        return True
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if data[:5] == b"%PDF-":
+        return True
+    return any(data[:len(magic)] == magic for magic in _IMAGE_MAGIC_BYTES)
+
+
 @functools.lru_cache(maxsize=64)
 def _extract_brochure_units(url: str):
     """
@@ -2977,7 +3011,41 @@ def _extract_brochure_units(url: str):
     if data is None:
         _record_status(STATUS_FETCH_FAILED, "no document bytes obtained")
         return None
+    return _brochure_units_from_document_bytes(data, url)
 
+
+def _brochure_units_from_document_bytes(data, url: str):
+    """
+    The render-and-Gemini-extract half of _extract_brochure_units's own
+    body, factored out to take already-fetched document bytes/pages
+    directly (see _fetch_pdf_bytes's own return shape) rather than a URL
+    to fetch - `url` is used only for logging/diagnostics below, never
+    fetched again here. _extract_brochure_units(url) itself is just its
+    own fetch step followed by this - see its own docstring for the
+    lru_cache/status-recording contract, which stays entirely there,
+    completely unaffected by this factor-out.
+
+    The ONE real caller with already-fetched bytes in hand for another
+    reason: app.py's own _validate_pasted_link_brochure_links, which
+    already called _fetch_pdf_bytes(row.brochure_link, accept_any_
+    reachable_page=True) once for its own reachability check - calling
+    the cached _extract_brochure_units(url) there too would silently
+    re-fetch the IDENTICAL url a second time (this function's own cache
+    is keyed by url, but nothing populates it before this function is
+    itself called - there's no public API to pre-seed an lru_cache entry
+    without going through a real call), which would both cost a real
+    second network round trip AND break existing tests asserting
+    _fetch_pdf_bytes is called exactly once per pasted link during
+    validation (see tests/test_app_upload_paste_a_link.py's own
+    ValidatePastedLinkBrochureLinksTests). Calling this function directly
+    with the bytes already in hand avoids that entirely - the one
+    accepted trade-off is that _extract_brochure_units's own lru_cache is
+    never populated by validation, so a LATER enrichment pass reading
+    this exact same url still does its own fresh fetch+render+Gemini-
+    extract, rather than getting a free cache hit - no worse than before
+    this feature existed for that later pass, just not free during
+    validation either.
+    """
     try:
         images = _images_from_fetched_document(data)
     except Exception as e:
@@ -3457,6 +3525,257 @@ def _address_conflict_note(file_address, brochure_address):
     return None
 
 
+# --- Cross-check: does a row's OWN brochure/floorplan document actually
+# describe a DIFFERENT real building than the row itself - never an auto-
+# fix, purely a review flag (see schema.ListingRow.brochure_building_
+# mismatch's own docstring) --------------------------------------------
+#
+# Confirmed real incident this exists for: a New Derwent House row's own
+# brochure_link pointed at Ivybridge House's own unrelated brochure - a
+# link picked up while reading a shared multi-property Canva deck (see
+# app.py's own _validate_pasted_link_brochure_links, which only ever
+# confirmed the link was REACHABLE, never that its own content was
+# actually about the row's building). _building_identity_matches' own
+# dozen-plus tiers above already return "no match" for plenty of
+# genuinely CORRECT pairs purely because no tier has been written yet for
+# that specific wording gap - "couldn't confirm" is NOT the same evidence
+# as "confirmed different", so _confident_building_mismatch below only
+# ever fires on confident, POSITIVE evidence of a different building,
+# never merely because every tier above failed to confirm a match.
+
+# Generic building-TYPE words - reused from geocode._GENERIC_BUILDING_
+# WORDS (dozens of unrelated real buildings share a bare type word like
+# "House"/"Building"/"Court" - see that module's own confirmed "Packing
+# House" vs "King's House" case, the identical false-positive risk this
+# reuse closes here: "New Derwent House" and "Ivybridge House" share
+# nothing but "house"), PLUS a few generic real-estate DESCRIPTOR words
+# geocode.py's own list never needed - it only ever compares an ALREADY-
+# CONFIRMED-real Places candidate's own displayName, which never reads
+# merely "Office" or "Workspace" the way a raw Gemini brochure extraction
+# sometimes does (a real risk _confident_building_mismatch's own
+# specificity bar exists to guard against - see its own docstring).
+_GENERIC_DOCUMENT_MISMATCH_WORDS = geocode._GENERIC_BUILDING_WORDS | frozenset({
+    "office", "offices", "workspace", "workspaces", "space", "spaces",
+})
+
+# Minimum normalize_key word count a document's own extracted building name
+# must clear before _confident_building_mismatch will even consider it -
+# see that function's own docstring for why this, combined with the
+# generic-word filter below, is what rules out a bare, vague name ("House"
+# alone, "Workspace") as too weak evidence to build a "different building"
+# claim on.
+_MIN_DOCUMENT_BUILDING_NAME_WORDS = 2
+
+
+def _mismatch_significant_words(text) -> frozenset:
+    """
+    normalize_key(text)'s own word set, minus pure-digit tokens (a shared
+    house number coincidentally appearing in a building NAME field -
+    unlike a genuine address comparison - isn't reliable identity evidence
+    on its own; matches geocode._street_name_words' own digit-drop) and
+    minus _GENERIC_DOCUMENT_MISMATCH_WORDS.
+
+    Used by _confident_building_mismatch's own specificity bar (an empty
+    result means `text` carried no real distinguishing word at all) and
+    its word-overlap check (two names sharing only a generic word, e.g.
+    "House", must never count as "meaningful overlap" - see that
+    function's own docstring for the confirmed real New Derwent House/
+    Ivybridge House case this exists for).
+
+    Unlike geocode._building_name_words, deliberately does NOT fall back
+    to the unfiltered word set when filtering leaves nothing - an
+    all-generic remainder ("Office Building") IS exactly the vague-name
+    signal the specificity bar exists to catch, never an edge case to
+    route around.
+    """
+    words = normalize_key(text).split()
+    return frozenset(w for w in words if w not in _GENERIC_DOCUMENT_MISMATCH_WORDS and not w.isdigit())
+
+
+def _document_address_corroborates_row_address(row_address, document_building_address) -> bool:
+    """
+    True when `document_building_address` (the document's own extracted
+    address for its building) genuinely CORROBORATES `row_address` (the
+    row's own already-stated, real address) - reuses _address_conflict_
+    note (row_address as its own "file_address" side) rather than a
+    second, independently-drifting address comparison, but flips its
+    meaning: _address_conflict_note returning None means EITHER "these
+    genuinely agree" OR "nothing usable to compare at all" (see its own
+    docstring), and only the FIRST of those is real corroboration here -
+    so this additionally requires the document's own address to carry a
+    real house-number-shaped token (leading_house_number) before trusting
+    a None result as agreement, exactly the same guard _address_conflict_
+    note's own docstring already places on itself for the identical
+    reason.
+
+    False (never a signal either way) whenever either address is blank,
+    or the document's own address has nothing number-shaped to compare -
+    see _confident_building_mismatch's own docstring point 4 for why an
+    absent/unusable document address must never itself count as evidence
+    toward a mismatch.
+    """
+    if _is_blank(row_address) or _is_blank(document_building_address):
+        return False
+    if leading_house_number(document_building_address) is None:
+        return False
+    return _address_conflict_note(row_address, document_building_address) is None
+
+
+def _confident_building_mismatch(
+    row_building, document_building_name, row_address=None, document_building_address=None,
+) -> str | None:
+    """
+    A human-readable note (see schema.ListingRow.brochure_building_
+    mismatch's own docstring) when a document's own extracted building
+    name (`document_building_name`) confidently, positively names a
+    DIFFERENT real building than `row_building` - or None whenever that
+    isn't confidently established, which is deliberately the FAR more
+    common outcome (see this section's own module-level comment above:
+    "couldn't confirm" is never treated as "confirmed different").
+
+    ALL FOUR of the following must hold, checked in this order (each one
+    alone is necessary, but NONE is sufficient by itself):
+
+    1. SPECIFICITY BAR - document_building_name is non-blank, its own
+       normalize_key word count is at least _MIN_DOCUMENT_BUILDING_NAME_
+       WORDS, AND at least one of its own words survives _mismatch_
+       significant_words' own generic-word filter. Rules out a vague/
+       generic extracted name ("Office Building", "Workspace", blank/
+       None) - exactly where a false "different building" call is most
+       likely, since a generic name is real evidence of almost nothing.
+
+    2. NO CONFIRMED MATCH - _building_identity_matches(row_building,
+       [document_building_name], [document_building_address] if that's
+       genuinely non-blank else None) returns NO match under any of its
+       dozen-plus tiers (called exactly as-is, never modified). Necessary
+       but NOT sufficient alone - "no tier resolved this yet" is not the
+       same evidence as "confirmed different", which is exactly why every
+       condition below still has to hold too.
+
+    3. ZERO MEANINGFUL WORD OVERLAP - once each side's own _mismatch_
+       significant_words are computed, they share NOTHING in common. This
+       is what separates "probably genuinely a different building" (New
+       Derwent House vs Ivybridge House - zero shared significant words,
+       "house" itself filtered as generic) from "probably just an
+       unmatched wording gap in the SAME building" (e.g. "WeWork - 10
+       Fenchurch St" vs "WeWork - 20 Old Broad St" still shares "wework" -
+       must NOT be flagged on the strength of an unmatched street name
+       alone, since the shared brand word already fails this check).
+       row_building's own significant words must also be non-empty here -
+       a row whose own building text carries no real distinguishing word
+       either has nothing solid enough to call "different" FROM.
+
+    4. NO ADDRESS CORROBORATION - _document_address_corroborates_row_
+       address(row_address, document_building_address) is False. If the
+       document's own address text genuinely corroborates the row's real,
+       already-known address despite the building NAME text disagreeing,
+       that's evidence of a wording gap in the SAME building, not a
+       different one - never flagged. An absent/unusable document address
+       is NOT itself treated as a signal either way (see that function's
+       own docstring) - it simply can't help resolve this either
+       direction.
+
+    Only when all four hold does this return a note naming both
+    buildings; otherwise None, silently - exactly like _building_identity_
+    matches itself stays silent whenever unsure, same "a human catches
+    what this misses, guessing wrong is worse than staying silent"
+    philosophy as every other check in this module. NEVER modifies
+    row_building/brochure_link/any other field - purely advisory, for a
+    human reviewer to confirm or dismiss (see schema.py's own docstring on
+    why this is Optional[str], never a bare bool, and never explicitly
+    False).
+    """
+    if not isinstance(document_building_name, str) or _is_blank(document_building_name):
+        return None
+
+    doc_key = normalize_key(document_building_name)
+    if len(doc_key.split()) < _MIN_DOCUMENT_BUILDING_NAME_WORDS:
+        return None
+
+    doc_significant_words = _mismatch_significant_words(document_building_name)
+    if not doc_significant_words:
+        return None
+
+    candidate_addresses = (
+        [document_building_address] if isinstance(document_building_address, str) and not _is_blank(document_building_address)
+        else None
+    )
+    if _building_identity_matches(row_building, [document_building_name], candidate_addresses):
+        return None
+
+    row_significant_words = _mismatch_significant_words(row_building)
+    if not row_significant_words or (row_significant_words & doc_significant_words):
+        return None
+
+    if _document_address_corroborates_row_address(row_address, document_building_address):
+        return None
+
+    return (
+        f"Brochure appears to be for a different building: document states "
+        f"'{document_building_name}', row states '{row_building}'"
+    )
+
+
+def _document_level_building_name(units):
+    """
+    (name, address) - the single building name (and, if they also agree,
+    address) every unit dict in `units` states for its own "building" -
+    (None, None) when there isn't one: no units at all, every unit's own
+    building blank, or 2+ DISTINCT building names among them.
+
+    That last case matters most: a genuine multi-property portfolio deck
+    spanning several real buildings (e.g. Regent's Wharf's own several
+    real sub-buildings in one document) must NEVER be reduced to any one
+    of them here - picking one to represent "the document's own building"
+    for a mismatch check would be exactly as unsafe a guess as any tier in
+    _building_identity_matches ever makes when several real candidates
+    disagree (see _distinct_building_group's own docstring for the
+    identical discipline applied elsewhere). This is a deliberate scope
+    limit: the confirmed real New Derwent House/Ivybridge House incident
+    this feature exists for was a genuinely SINGLE-building document (the
+    wrongly-linked page's own brochure, not a portfolio spanning both
+    buildings), which is exactly the shape this still catches; a
+    genuinely mixed multi-building document simply isn't safe to reduce to
+    one name, so no mismatch is ever raised against one, on the same
+    "silent is safer than guessing" principle as everywhere else in this
+    module.
+
+    Used by _brochure_building_mismatch_note (both call sites -
+    app.py._validate_pasted_link_brochure_links and this module's own
+    _apply_units_to_row) so the two never derive this differently.
+    """
+    plain_units = [u for u in units if isinstance(u, dict)] if units else []
+    names = [
+        u.get("building") for u in plain_units
+        if isinstance(u.get("building"), str) and not _is_blank(u.get("building"))
+    ]
+    if not names or len({normalize_key(n) for n in names}) != 1:
+        return None, None
+
+    addresses = [
+        u.get("address_1") for u in plain_units
+        if isinstance(u.get("building"), str) and not _is_blank(u.get("building"))
+        and isinstance(u.get("address_1"), str) and not _is_blank(u.get("address_1"))
+    ]
+    address = addresses[0] if addresses and len({normalize_key(a) for a in addresses}) == 1 else None
+    return names[0], address
+
+
+def _brochure_building_mismatch_note(row: ListingRow, units) -> str | None:
+    """
+    _confident_building_mismatch's own note for `row` against `units` (see
+    _extract_brochure_units/_document_level_building_name) - or None,
+    identically, whenever there's nothing confident to flag. Purely a
+    convenience wrapper: the ONLY reason this exists as its own function
+    is so app.py's own _validate_pasted_link_brochure_links and this
+    module's own _apply_units_to_row (below) derive the document's own
+    representative building name/address identically, never two
+    independently-drifting implementations of the same derivation.
+    """
+    document_building_name, document_building_address = _document_level_building_name(units)
+    return _confident_building_mismatch(row.building, document_building_name, row.address_1, document_building_address)
+
+
 def _match_building_value(row: ListingRow, units, field: str):
     """
     The single, unambiguous value for `field` (one of BUILDING_LEVEL_FIELDS
@@ -3698,6 +4017,20 @@ def _apply_units_to_row(row: ListingRow, units):
     # resolved, so every existing code path below that only checks `unit`
     # itself is completely unaffected by this ever having run.
     ambiguous_matches = _ambiguous_building_matches(row, units) if units and unit is None else []
+
+    # Purely additive review flag - see _confident_building_mismatch's own
+    # docstring for exactly what "confident" means here, and schema.
+    # ListingRow.brochure_building_mismatch's own docstring for the field
+    # itself. Deliberately separate from - and never affects - `unit`/
+    # `ambiguous_matches` above or any of this function's own field-
+    # enrichment logic below: this never blocks/changes what gets applied,
+    # only ever adds a note for a human reviewer when the document's own
+    # content confidently names a different real building than row.
+    # building.
+    if units:
+        mismatch_note = _brochure_building_mismatch_note(row, units)
+        if mismatch_note:
+            updates["brochure_building_mismatch"] = mismatch_note
 
     if units is not None:
         # Combined, not "fill only if blank" (unlike every other PROPERTY_
@@ -3959,7 +4292,30 @@ def _apply_units_to_row(row: ListingRow, units):
     if not updates:
         return row, []
 
-    return row.model_copy(update=updates), list(updates.keys())
+    # brochure_building_mismatch (see this function's own top-of-body
+    # comment on _brochure_building_mismatch_note) is deliberately
+    # excluded from the RETURNED enriched_fields list, even though it IS
+    # written onto the returned row below - it's a review flag, never
+    # genuine content enrichment, and several existing callers (enrich_
+    # rows_grouped's own "if fields: ... elif needs_enrichment(new_row):
+    # ..." diagnostic branch, "special_features" in fields, the log
+    # entries built from this same list) all use a non-empty fields list
+    # as their own signal that this row got REAL content from this
+    # document - a signal that must stay exactly as accurate as it was
+    # before this feature existed. A row whose ONLY change is this flag
+    # firing must still read as "nothing was enriched" to every one of
+    # those - confirmed necessary by a real, existing test (Canva Test
+    # EndToEndEnrichmentTests.test_blank_fields_after_successful_canva_
+    # extraction_are_logged_with_a_reason) whose own row's building
+    # ("Unrelated Building") genuinely doesn't match its own document's
+    # ("Metropolitan Wharf") - correctly a confident mismatch by this
+    # feature's own design, but that must never suppress the EXISTING
+    # "document read fine, nothing matched THIS row" diagnostic the same
+    # scenario already triggers. enrich_rows_grouped's own stats counter
+    # (brochure_building_mismatch_flags) reads the returned row's own
+    # field directly instead of this list, for exactly this reason.
+    enriched_fields = [f for f in updates if f != "brochure_building_mismatch"]
+    return row.model_copy(update=updates), enriched_fields
 
 
 # --- Secondary enrichment source: a row's own floorplan_link ---
@@ -4733,6 +5089,12 @@ def enrich_rows_grouped(
     log = []
     brochures_read_ok = 0
     brochures_unavailable = 0
+    # Incremented only when _apply_units_to_row's own call to _confident_
+    # building_mismatch (via _brochure_building_mismatch_note) actually
+    # returns a non-None note for a row below - never once per URL/row
+    # merely checked, see this counter's own stats-dict docstring further
+    # down.
+    brochure_building_mismatch_flags = 0
     processed_urls = {}
     # Additive diagnostics, alongside (never replacing) processed_urls -
     # see this function's own docstring on why processed_urls itself keeps
@@ -4764,6 +5126,13 @@ def enrich_rows_grouped(
             "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
             "floorplans_unavailable": floorplan_stats["floorplans_unavailable"],
             "floorplan_processed_urls": floorplan_stats["processed_urls"],
+            # No brochure fetch happened at all in this early-return branch
+            # (see this branch's own condition above), so there's nothing
+            # _confident_building_mismatch could ever have been run
+            # against - always 0 here, never omitted, so a caller reading
+            # stats["brochure_building_mismatch_flags"] never has to
+            # special-case this branch.
+            "brochure_building_mismatch_flags": 0,
         }
 
     def _fetch_one(url):
@@ -4861,6 +5230,14 @@ def enrich_rows_grouped(
                         file=sys.stderr,
                     )
                     new_row, fields = rows[i], []
+                # Read directly off the row, never off `fields` -
+                # _apply_units_to_row deliberately excludes this flag from
+                # its own returned fields list (see its own docstring on
+                # the final return line) so this counts a genuine NEW
+                # flag firing this call, distinct from a row that already
+                # carried one in from a previous run.
+                if new_row.brochure_building_mismatch and new_row.brochure_building_mismatch != rows[i].brochure_building_mismatch:
+                    brochure_building_mismatch_flags += 1
                 update = {}
                 if link_broken_update is not None:
                     update["brochure_link_broken"] = link_broken_update
@@ -4985,6 +5362,14 @@ def enrich_rows_grouped(
         "floorplans_read_ok": floorplan_stats["floorplans_read_ok"],
         "floorplans_unavailable": floorplan_stats["floorplans_unavailable"],
         "floorplan_processed_urls": floorplan_stats["processed_urls"],
+        # See this variable's own declaration above - incremented only
+        # when _apply_units_to_row's own _confident_building_mismatch
+        # check actually fired for a row, never once per URL/row merely
+        # checked. Floor plans never contribute here - a floor plan unit
+        # carries no "building" field at all (see _extract_floorplan_
+        # units's own docstring), so _confident_building_mismatch is never
+        # even attempted against one.
+        "brochure_building_mismatch_flags": brochure_building_mismatch_flags,
     }
     return current, log, stats
 

@@ -316,6 +316,87 @@ class ValidatePastedLinkBrochureLinksTests(unittest.TestCase):
         self.assertEqual(bad_row.brochure_link, self.SHARED_URL)
 
 
+class ValidatePastedLinkBrochureLinksMismatchTests(unittest.TestCase):
+    """_validate_pasted_link_brochure_links' own content cross-check (see
+    brochure_enrichment._confident_building_mismatch) - the confirmed
+    real gap reachability alone left open: a New Derwent House row's own
+    brochure_link once pointed at Ivybridge House's own unrelated
+    brochure, picked up while reading a shared multi-property Canva deck,
+    and was perfectly "reachable" the whole time. _brochure_units_from_
+    document_bytes (not _extract_brochure_units) is mocked throughout -
+    see that function's own docstring for why this specific call site
+    reuses the bytes the reachability check already fetched rather than
+    the cached url-based wrapper."""
+
+    SHARED_URL = "https://storage.example.com/pasted-deck.pdf"
+
+    def _row(self, building, brochure_link):
+        return ListingRow(building=building, provider="Colliers", brochure_link=brochure_link)
+
+    def test_confirmed_reachable_but_wrong_building_document_sets_the_flag(self):
+        row = self._row("New Derwent House", "https://blob.example.com/wrong.pdf")
+        units = [{"building": "Ivybridge House", "floor_unit": "2nd"}]
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real"), \
+                patch("brochure_enrichment._brochure_units_from_document_bytes", return_value=units) as mock_units:
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_units.assert_called_once_with(b"%PDF-1.4 real", "https://blob.example.com/wrong.pdf")
+        self.assertIsNotNone(row.brochure_building_mismatch)
+        self.assertIn("New Derwent House", row.brochure_building_mismatch)
+        self.assertIn("Ivybridge House", row.brochure_building_mismatch)
+        # Purely a review flag - the link itself is never touched.
+        self.assertEqual(row.brochure_link, "https://blob.example.com/wrong.pdf")
+
+    def test_matching_document_never_sets_the_flag(self):
+        row = self._row("Ivybridge House", "https://blob.example.com/right.pdf")
+        units = [{"building": "Ivybridge House", "floor_unit": "2nd"}]
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real"), \
+                patch("brochure_enrichment._brochure_units_from_document_bytes", return_value=units):
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        self.assertIsNone(row.brochure_building_mismatch)
+        self.assertEqual(row.brochure_link, "https://blob.example.com/right.pdf")
+
+    def test_a_link_that_fails_reachability_never_even_attempts_the_content_check(self):
+        row = self._row("New Derwent House", "https://blob.example.com/dead.pdf")
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=None), \
+                patch("brochure_enrichment._brochure_units_from_document_bytes") as mock_units:
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_units.assert_not_called()
+        self.assertIsNone(row.brochure_building_mismatch)
+        self.assertEqual(row.brochure_link, self.SHARED_URL)
+
+    def test_extraction_failure_never_sets_the_flag_and_does_not_crash(self):
+        row = self._row("New Derwent House", "https://blob.example.com/unreadable.pdf")
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real"), \
+                patch("brochure_enrichment._brochure_units_from_document_bytes", return_value=None):
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        self.assertIsNone(row.brochure_building_mismatch)
+        self.assertEqual(row.brochure_link, "https://blob.example.com/unreadable.pdf")
+
+    def test_fetch_pdf_bytes_is_called_exactly_once_per_row_even_with_the_new_content_check(self):
+        # Regression guard for the exact conflict this feature's own
+        # design had to avoid: calling the cached, url-based _extract_
+        # brochure_units here would have re-fetched this SAME url a
+        # second time internally. _brochure_units_from_document_bytes
+        # (mocked here) never calls _fetch_pdf_bytes at all, so this
+        # stays a single real fetch per row, exactly as before this
+        # feature existed (see test_a_link_that_fetches_as_a_real_
+        # document_is_kept above for the identical pre-existing
+        # assertion this must not break).
+        row = self._row("New Derwent House", "https://blob.example.com/wrong.pdf")
+        units = [{"building": "Ivybridge House", "floor_unit": "2nd"}]
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real") as mock_fetch, \
+                patch("brochure_enrichment._brochure_units_from_document_bytes", return_value=units):
+            app._validate_pasted_link_brochure_links([row], self.SHARED_URL)
+
+        mock_fetch.assert_called_once_with(
+            "https://blob.example.com/wrong.pdf", accept_any_reachable_page=True,
+        )
+
+
 class InvalidLinkTests(unittest.TestCase):
     def setUp(self):
         _clear_pending()

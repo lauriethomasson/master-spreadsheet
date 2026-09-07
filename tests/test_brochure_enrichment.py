@@ -5126,6 +5126,310 @@ class AddressConflictWiringTests(EnrichmentTestCase):
         self.assertEqual(new_row.address_1, "1 John Adam Street")
 
 
+class DocumentLevelBuildingNameTests(unittest.TestCase):
+    """_document_level_building_name - the document-level representative
+    building name/address _confident_building_mismatch is checked
+    against, derived from a document's own raw unit dicts (see
+    _extract_brochure_units). Deliberately returns (None, None) whenever
+    picking ONE representative name wouldn't be safe - see its own
+    docstring."""
+
+    def test_single_unit_returns_its_own_building_and_address(self):
+        units = [{"building": "Ivybridge House", "address_1": "1 to 5 Adam Street"}]
+        name, address = brochure_enrichment._document_level_building_name(units)
+        self.assertEqual(name, "Ivybridge House")
+        self.assertEqual(address, "1 to 5 Adam Street")
+
+    def test_several_units_agreeing_on_building_returns_one_name(self):
+        units = [
+            {"building": "Ivybridge House", "floor_unit": "1st"},
+            {"building": "Ivybridge House", "floor_unit": "2nd"},
+        ]
+        name, address = brochure_enrichment._document_level_building_name(units)
+        self.assertEqual(name, "Ivybridge House")
+        self.assertIsNone(address)
+
+    def test_disagreeing_addresses_across_units_yields_no_representative_address(self):
+        units = [
+            {"building": "Ivybridge House", "address_1": "1 to 5 Adam Street"},
+            {"building": "Ivybridge House", "address_1": "Somewhere Else Entirely"},
+        ]
+        name, address = brochure_enrichment._document_level_building_name(units)
+        self.assertEqual(name, "Ivybridge House")
+        self.assertIsNone(address)
+
+    def test_genuine_multi_building_portfolio_deck_returns_nothing(self):
+        # A real multi-property deck spanning several DIFFERENT real
+        # buildings (e.g. a real Regent's Wharf brochure's own "The
+        # Mill"/"The Canal Building"/"Thorley Works") must never be
+        # reduced to just one of them - deliberately left unresolved,
+        # same "don't guess" discipline as _distinct_building_group
+        # elsewhere in this module.
+        units = [{"building": "The Mill"}, {"building": "The Canal Building"}, {"building": "Thorley Works"}]
+        name, address = brochure_enrichment._document_level_building_name(units)
+        self.assertIsNone(name)
+        self.assertIsNone(address)
+
+    def test_blank_or_missing_building_everywhere_returns_nothing(self):
+        self.assertEqual(brochure_enrichment._document_level_building_name([]), (None, None))
+        self.assertEqual(brochure_enrichment._document_level_building_name(None), (None, None))
+        units = [{"building": None, "floor_unit": "1st"}, {"floor_unit": "2nd"}]
+        self.assertEqual(brochure_enrichment._document_level_building_name(units), (None, None))
+
+
+class ConfidentBuildingMismatchTests(unittest.TestCase):
+    """_confident_building_mismatch - fires ONLY on confident, POSITIVE
+    evidence that a document's own extracted building name is a
+    genuinely DIFFERENT real building than row_building; see this
+    function's own docstring for the four conditions that must ALL hold.
+    Deliberately conservative - "couldn't confirm" must never be treated
+    as "confirmed different", so most of these tests assert None. Every
+    test here is a PURE function call - no row/brochure_link involved at
+    all (see ApplyUnitsToRowBrochureBuildingMismatchTests/
+    ValidatePastedLinkBrochureLinksMismatchTests below for the wiring
+    that actually touches a row)."""
+
+    # --- The confirmed real incident this feature exists for ---
+
+    def test_confirmed_real_new_derwent_house_ivybridge_house_case_flags(self):
+        note = brochure_enrichment._confident_building_mismatch("New Derwent House", "Ivybridge House")
+        self.assertIsNotNone(note)
+        self.assertIn("New Derwent House", note)
+        self.assertIn("Ivybridge House", note)
+
+    # --- Point 1: specificity bar ---
+
+    def test_blank_document_building_name_never_flags(self):
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("New Derwent House", None))
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("New Derwent House", ""))
+
+    def test_single_word_document_building_name_never_flags(self):
+        # A bare, generic single word ("Workspace") carries almost no
+        # distinguishing identity - too weak evidence to build a
+        # "different building" claim on.
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("New Derwent House", "Workspace"))
+
+    def test_all_generic_document_building_name_never_flags(self):
+        # "Office Building" - two words, but BOTH generic real-estate
+        # descriptor/building-type words, carrying no real distinguishing
+        # identity at all once filtered.
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("New Derwent House", "Office Building"))
+
+    def test_row_building_with_no_significant_word_of_its_own_never_flags(self):
+        # row_building itself carries nothing distinguishing (just a
+        # generic type word) - there's nothing solid enough to call
+        # "different" FROM. An extra safety guard beyond the four
+        # documented conditions.
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("Building", "Ivybridge House"))
+
+    # --- Point 2: an existing tier already resolving a match must block this entirely ---
+
+    def test_tier_2_address_suffix_stripped_match_never_flags(self):
+        self.assertIsNone(
+            brochure_enrichment._confident_building_mismatch("Nash House - 13a St George St", "Nash House"),
+        )
+
+    def test_tier_3d_leading_article_stripped_match_never_flags(self):
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("Canal Building", "The Canal Building"))
+
+    def test_tier_4a_exact_address_match_never_flags(self):
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch(
+            "160 Blackfriars Road", "Friars Yard", document_building_address="160 Blackfriars Road",
+        ))
+
+    def test_tier_3h_house_number_range_overlap_match_never_flags(self):
+        self.assertIsNone(
+            brochure_enrichment._confident_building_mismatch("27-29 Gloucester Place", "29 Gloucester Place"),
+        )
+
+    def test_tier_5_bare_street_reference_match_never_flags(self):
+        self.assertIsNone(brochure_enrichment._confident_building_mismatch("Clerkenwell Road", "67 Clerkenwell Road"))
+
+    # --- Point 3: a shared brand/prefix word must never be enough to flag ---
+
+    def test_shared_brand_word_with_different_street_suffix_never_flags(self):
+        # Confirmed real risk this module's own tier 2 docstring names
+        # directly: "WeWork - 10 Fenchurch St" and "WeWork - 20 Old Broad
+        # St" are two DIFFERENT real portfolio buildings that share a
+        # real brand word - must never be flagged purely on the strength
+        # of an unmatched street name, since the shared "WeWork" word
+        # already fails the zero-overlap bar. Deliberately space-
+        # separated here (not " - ") so this isolates the word-overlap
+        # check itself - a dash-separated, address-shaped suffix on
+        # BOTH sides would otherwise already resolve via tier 2's own
+        # address-suffix stripping with just one candidate (see
+        # BuildingIdentityMatchesTests' own tier 2 tests for that
+        # unrelated, already-covered behavior).
+        note = brochure_enrichment._confident_building_mismatch("WeWork 10 Fenchurch St", "WeWork 20 Old Broad St")
+        self.assertIsNone(note)
+
+    # --- Point 4: genuine address corroboration must block a flag ---
+
+    def test_document_address_corroborating_row_address_never_flags(self):
+        # row_building shares no real overlap with document_building_name
+        # at all, and no tier resolves a match either - but the
+        # document's OWN address genuinely corroborates this row's real,
+        # already-known address (a Saint/St spelling difference only,
+        # same tolerance _address_conflict_note already gives this - see
+        # AddressConflictNoteTests' own identical real example), so this
+        # is evidence of a wording gap in the SAME building, not a
+        # different one.
+        note = brochure_enrichment._confident_building_mismatch(
+            "Northumbria House", "Kings Wharf",
+            row_address="26 Saint James's Square", document_building_address="26 St James's Square",
+        )
+        self.assertIsNone(note)
+
+    def test_document_address_that_conflicts_does_not_rescue_a_flag(self):
+        # A genuinely CONFLICTING document address is not corroboration -
+        # the flag still fires on the other evidence (specificity + no
+        # tier match + zero word overlap).
+        note = brochure_enrichment._confident_building_mismatch(
+            "New Derwent House", "Ivybridge House",
+            row_address="69-73 Theobalds Road", document_building_address="1 to 5 Adam Street",
+        )
+        self.assertIsNotNone(note)
+
+    def test_absent_document_address_does_not_block_a_flag(self):
+        # No address text at all on the document's side simply can't
+        # help resolve this either way - never itself treated as a
+        # signal (see _document_address_corroborates_row_address's own
+        # docstring).
+        note = brochure_enrichment._confident_building_mismatch(
+            "New Derwent House", "Ivybridge House", row_address="69-73 Theobalds Road",
+        )
+        self.assertIsNotNone(note)
+
+    def test_absent_row_address_does_not_block_a_flag(self):
+        note = brochure_enrichment._confident_building_mismatch(
+            "New Derwent House", "Ivybridge House", document_building_address="1 to 5 Adam Street",
+        )
+        self.assertIsNotNone(note)
+
+
+class ApplyUnitsToRowBrochureBuildingMismatchTests(unittest.TestCase):
+    """_apply_units_to_row's own wiring of _confident_building_mismatch
+    (via _brochure_building_mismatch_note) - purely additive: only ever
+    sets brochure_building_mismatch, never touches building/brochure_link/
+    any of this function's own existing field-enrichment logic.
+
+    Deliberately excluded from the returned `fields` list itself (see
+    _apply_units_to_row's own final-return docstring comment) - a review
+    flag is not genuine content enrichment, and several existing callers
+    treat a non-empty fields list as proof this row got real content from
+    its document; a row whose ONLY change is this flag firing must still
+    read as "nothing was enriched" to those (confirmed necessary by
+    CanvaEndToEndEnrichmentTests.test_blank_fields_after_successful_canva_
+    extraction_are_logged_with_a_reason, an existing test whose own
+    "Unrelated Building" row vs. its document's own "Metropolitan Wharf"
+    is a real, correct mismatch by this feature's own design, but must
+    never suppress that existing "document read fine, nothing matched
+    THIS row" diagnostic)."""
+
+    def test_confirmed_mismatch_sets_the_flag_but_is_excluded_from_fields(self):
+        row = ListingRow(building="New Derwent House", brochure_link="https://example.com/wrong.pdf")
+        units = _brochure_units([{"building": "Ivybridge House", "floor_unit": "2nd"}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("brochure_building_mismatch", fields)
+        self.assertIsNotNone(new_row.brochure_building_mismatch)
+        self.assertIn("New Derwent House", new_row.brochure_building_mismatch)
+        self.assertIn("Ivybridge House", new_row.brochure_building_mismatch)
+        self.assertEqual(new_row.building, "New Derwent House")
+        self.assertEqual(new_row.brochure_link, "https://example.com/wrong.pdf")
+
+    def test_confirmed_mismatch_alongside_real_document_level_enrichment_still_reports_the_real_field(self):
+        # contacts is a PROPERTY_LEVEL field (see _apply_units_to_row's
+        # own docstring) - applied document-wide regardless of whether
+        # this row's own building matches anything in it, so it's the one
+        # real case where genuine enrichment and a building mismatch can
+        # both happen from the SAME document at once. That real field
+        # still shows up in `fields` normally - only the mismatch flag
+        # itself is ever excluded.
+        row = ListingRow(building="New Derwent House", brochure_link="https://example.com/wrong.pdf", contacts=None)
+        units = _brochure_units(
+            [{"building": "Ivybridge House", "floor_unit": "2nd"}],
+            contacts="Jane Doe, jane@example.com, 555-1234",
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("brochure_building_mismatch", fields)
+        self.assertIn("contacts", fields)
+        self.assertEqual(new_row.contacts, "Jane Doe, jane@example.com, 555-1234")
+        self.assertIsNotNone(new_row.brochure_building_mismatch)
+
+    def test_matched_building_never_sets_the_flag(self):
+        row = ListingRow(building="Ivybridge House", brochure_link="https://example.com/right.pdf")
+        units = _brochure_units([{"building": "Ivybridge House", "floor_unit": "2nd"}])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("brochure_building_mismatch", fields)
+        self.assertIsNone(new_row.brochure_building_mismatch)
+
+    def test_genuine_multi_building_document_never_sets_the_flag(self):
+        # A real multi-property deck spanning several distinct buildings,
+        # none of which happen to match this row - _document_level_
+        # building_name itself already refuses to pick a representative
+        # name for a document like this, so no flag is ever raised, even
+        # though the row's own building genuinely doesn't appear in it.
+        row = ListingRow(building="New Derwent House", brochure_link="https://example.com/portfolio.pdf")
+        units = _brochure_units([
+            {"building": "The Mill", "floor_unit": "1st"},
+            {"building": "The Canal Building", "floor_unit": "2nd"},
+        ])
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("brochure_building_mismatch", fields)
+        self.assertIsNone(new_row.brochure_building_mismatch)
+
+    def test_no_units_never_sets_the_flag_and_does_not_crash(self):
+        row = ListingRow(building="New Derwent House", brochure_link="https://example.com/wrong.pdf")
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, None)
+
+        self.assertNotIn("brochure_building_mismatch", fields)
+        self.assertIsNone(new_row.brochure_building_mismatch)
+
+
+class EnrichRowsGroupedBrochureBuildingMismatchStatsTests(EnrichmentTestCase):
+    """enrich_rows_grouped's own brochure_building_mismatch_flags stats
+    counter - incremented only when _confident_building_mismatch actually
+    fires for a row, never merely because a brochure was checked."""
+
+    def test_counter_increments_only_for_the_row_that_actually_mismatches(self):
+        rows = [
+            ListingRow(building="New Derwent House", brochure_link="https://example.com/wrong.pdf", special_features=None),
+            ListingRow(building="28 Lime Street", brochure_link="https://example.com/right.pdf", special_features=None),
+        ]
+
+        def _fake(url):
+            if "wrong" in url:
+                return [{"building": "Ivybridge House", "floor_unit": None}]
+            return [{"building": "28 Lime Street", "floor_unit": None, "special_features": "Shared feature"}]
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertEqual(stats["brochure_building_mismatch_flags"], 1)
+        mismatched = next(r for r in enriched if r.building == "New Derwent House")
+        self.assertIsNotNone(mismatched.brochure_building_mismatch)
+        self.assertEqual(mismatched.brochure_link, "https://example.com/wrong.pdf")
+        matched = next(r for r in enriched if r.building == "28 Lime Street")
+        self.assertIsNone(matched.brochure_building_mismatch)
+
+    def test_counter_is_zero_and_present_when_nothing_is_eligible_to_fetch(self):
+        rows = [ListingRow(building="No Link Building", brochure_link=None)]
+
+        enriched, log, stats = brochure_enrichment.enrich_rows_grouped(rows)
+
+        self.assertIn("brochure_building_mismatch_flags", stats)
+        self.assertEqual(stats["brochure_building_mismatch_flags"], 0)
+
+
 class RentValuesConsistentTests(unittest.TestCase):
     """
     Direct tests of _rent_values_consistent - the generic, property-agnostic

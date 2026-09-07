@@ -147,6 +147,40 @@ class ListingRow(BaseModel):
     # diff_fields' own blank-skip rule never lets a fresh, unchecked row
     # silently clear a master row's own already-flagged conflict note.
     address_conflict: Optional[str] = None
+    # Human-readable note (never a bare bool - same convention as address_
+    # conflict/geocode_unverified above) set by brochure_enrichment.
+    # _confident_building_mismatch whenever this row's OWN brochure/
+    # floorplan document confidently, POSITIVELY states a DIFFERENT real
+    # building's name than row.building - never merely because the
+    # document's own text didn't happen to match (see that function's own
+    # docstring for exactly what "confident" requires: a specific,
+    # non-generic document-stated name; _building_identity_matches finding
+    # no match under ANY of its dozen-plus tiers; ZERO meaningful word
+    # overlap between the two names once generic building-type words like
+    # "House"/"Building" are filtered out; and no genuine address
+    # corroboration of this row's own real address despite the differing
+    # name text). Confirmed real case this exists for: a New Derwent House
+    # row's own brochure_link pointed at Ivybridge House's own unrelated
+    # brochure, picked up while reading a shared multi-property Canva deck
+    # - nothing before this ever checked that a validated-REACHABLE
+    # document's own CONTENT was actually about the row's own building,
+    # only that the link resolved at all (see app.py's own _validate_
+    # pasted_link_brochure_links).
+    #
+    # Purely a REVIEW FLAG, exactly like address_conflict above - never
+    # auto-corrects/clears brochure_link, floorplan_link, or building
+    # itself, and never blocks an upload/save on its own; a human reviewer
+    # decides what to do once flagged.
+    #
+    # None (never explicitly False) when no mismatch was found OR this
+    # row's own brochure/floorplan was never checked this run (no eligible
+    # link, a fetch/render/extraction failure, or the document's own units
+    # simply didn't clear the confidence bar either way) - same "None
+    # means this run didn't touch the question" convention as address_
+    # conflict/geocode_unverified/brochure_link_broken above, so master_
+    # merge.diff_fields' own blank-skip rule never lets a fresh, unchecked
+    # row silently clear a master row's own already-flagged note.
+    brochure_building_mismatch: Optional[str] = None
     # The overall campus/development's own brand name, distinct from any
     # individual building's own name within it (e.g. "Regent's Wharf"
     # containing "The Canal Building", "Thorley Works", ...) - only when

@@ -914,18 +914,19 @@ def _fetch_pasted_link(url: str):
 
 def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) -> None:
     """
-    Mutates each row's own brochure_link in place - only ever called for
-    a pasted Canva/Pitch link's own rows (see the Extract loop's own
-    png_pages branch). A per-unit link Gemini attributed from a page's
-    real link candidates (see extract.extract_from_png_pages/images_
-    from_png_pages's own page_links param) is trusted by LABEL alone up
-    to this point, never by having actually been fetched - this is where
-    that happens, reusing brochure_enrichment._fetch_pdf_bytes wholesale
-    (the exact same direct-vs-landing-page-scan precedence any other
-    brochure_link fetch already uses) rather than a second, differently-
-    tuned validation. A link that fails - blocked to a plain fetch, a dead
-    link, anything that doesn't even resolve to a live response - loses to
-    the shared document-level fallback link instead of staging a dead one.
+    Mutates each row's own brochure_link (and, when applicable, brochure_
+    building_mismatch) in place - only ever called for a pasted Canva/
+    Pitch link's own rows (see the Extract loop's own png_pages branch). A
+    per-unit link Gemini attributed from a page's real link candidates
+    (see extract.extract_from_png_pages/images_from_png_pages's own
+    page_links param) is trusted by LABEL alone up to this point, never by
+    having actually been fetched - this is where that happens, reusing
+    brochure_enrichment._fetch_pdf_bytes wholesale (the exact same
+    direct-vs-landing-page-scan precedence any other brochure_link fetch
+    already uses) rather than a second, differently-tuned validation. A
+    link that fails - blocked to a plain fetch, a dead link, anything that
+    doesn't even resolve to a live response - loses to the shared
+    document-level fallback link instead of staging a dead one.
 
     accept_any_reachable_page=True (see _looks_like_fetchable_document's
     own docstring) - this call only needs to confirm the link is genuinely
@@ -936,7 +937,8 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
     ever extracted, and confirmed to silently discard a genuine, live
     per-unit link (a real colliers.com listing page) in favor of the
     shared fallback purely for not being a PDF. The bytes themselves are
-    never used below - only whether the fetch returned None at all.
+    never used for THIS check - only whether the fetch returned None at
+    all.
 
     A row whose brochure_link already equals shared_fallback_link (rare
     now that finalize_brochure_link no longer has any PDF-fallback default
@@ -947,12 +949,66 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
     brochure_link_is_floorplan (a floorplan link substituted in because no
     genuine brochure link existed at all) is left alone too - a separate,
     pre-existing mechanism this feature doesn't touch.
+
+    Once a link is confirmed reachable, its own CONTENT is independently
+    cross-checked against this row's own building too (see brochure_
+    enrichment._brochure_building_mismatch_note/_confident_building_
+    mismatch) - the confirmed real gap reachability alone left open: a
+    New Derwent House row's own brochure_link once pointed at Ivybridge
+    House's own unrelated brochure, picked up while reading a shared
+    multi-property Canva deck, and was perfectly "reachable" the whole
+    time. Purely a review flag (brochure_building_mismatch) - never
+    modifies/clears brochure_link itself, and never blocks anything. Reads
+    this check's own units via brochure_enrichment._brochure_units_from_
+    document_bytes, given the exact bytes the reachability fetch above
+    already obtained - deliberately NOT the cached _extract_brochure_
+    units(url) every other caller uses, since that would fetch this exact
+    url a SECOND time (its own lru_cache has nothing in it yet for this
+    url the first time either wrapper is ever called) - a real extra
+    network round trip, and one this function's own existing tests assert
+    doesn't happen (see tests/test_app_upload_paste_a_link.py's own
+    ValidatePastedLinkBrochureLinksTests). The one accepted trade-off:
+    this doesn't populate _extract_brochure_units's own cache, so a later
+    enrichment pass reading this same url still does its own fresh fetch/
+    render/Gemini-extract - no worse than before this feature existed for
+    that later pass, just not free during validation either.
     """
     for row in rows:
         if not row.brochure_link or row.brochure_link == shared_fallback_link or row.brochure_link_is_floorplan:
             continue
-        if brochure_enrichment._fetch_pdf_bytes(row.brochure_link, accept_any_reachable_page=True) is None:
+        data = brochure_enrichment._fetch_pdf_bytes(row.brochure_link, accept_any_reachable_page=True)
+        if data is None:
             row.brochure_link = shared_fallback_link
+            continue
+        # Reachability alone was the confirmed real gap (see this
+        # function's own docstring above) - a link genuinely being live
+        # never proved its own CONTENT was about this row's own building
+        # (the confirmed real New Derwent House/Ivybridge House incident:
+        # a reachable, genuinely-fetchable page whose own content was
+        # someone else's building entirely). Reuses the SAME render/
+        # Gemini-extraction pipeline _extract_brochure_units itself uses
+        # (see _brochure_units_from_document_bytes's own docstring for why
+        # THIS is the one caller that feeds it already-fetched bytes
+        # directly, rather than calling the cached url-based wrapper) -
+        # never a second document-parsing path - and never modifies
+        # brochure_link itself - purely sets a review flag (see schema.
+        # ListingRow.brochure_building_mismatch's own docstring) for a
+        # human to confirm or dismiss.
+        #
+        # _fetched_data_is_a_real_document guards this: accept_any_
+        # reachable_page=True above deliberately lets a genuine per-unit
+        # LISTING WEBPAGE (plain HTML, never a document) through as
+        # "reachable" for its own, narrower purpose - never attempted as
+        # a document to render/Gemini-extract here (see that function's
+        # own docstring for why skipping this guard would risk a real,
+        # wasted Gemini call over content that was never a document at
+        # all).
+        if brochure_enrichment._fetched_data_is_a_real_document(data):
+            units = brochure_enrichment._brochure_units_from_document_bytes(data, row.brochure_link)
+            if units:
+                mismatch_note = brochure_enrichment._brochure_building_mismatch_note(row, units)
+                if mismatch_note:
+                    row.brochure_building_mismatch = mismatch_note
 
 
 def _propagate_validated_links_within_page(rows: list, page_indices: list, shared_fallback_link: str) -> None:
