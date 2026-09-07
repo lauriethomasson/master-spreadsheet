@@ -202,22 +202,36 @@ class PdfEmailContentHashCompositionTests(unittest.TestCase):
     """
 
     def test_hash_is_computed_from_brochure_enrichment_py_bytes_too(self):
+        # brochure_enrichment.py's own bytes are now folded into
+        # _PDF_EMAIL_LOGIC_FINGERPRINT itself (see that constant's own
+        # comment in app.py) rather than appended separately here - still
+        # functionally identical (both end up in the same final
+        # content_hash), just stated in the same place _SPREADSHEET_LOGIC_
+        # FINGERPRINT already does for its own equivalent inclusion. This
+        # test only needs app._PDF_EMAIL_LOGIC_FINGERPRINT itself now, not
+        # a separate append, to prove the dependency is genuinely there -
+        # see test_pdf_email_fingerprint_is_computed_from_extract_and_
+        # extract_email_bytes below for the direct proof of what's inside
+        # that constant.
         file_bytes = b"pretend .pdf or .eml bytes"
         expected = hashlib.sha256(
             app._PDF_EMAIL_LOGIC_FINGERPRINT.encode("utf-8") + b"\0" + file_bytes + b"\0"
-            + Path(geocode.__file__).read_bytes() + b"\0" + Path(app.brochure_enrichment.__file__).read_bytes()
+            + Path(geocode.__file__).read_bytes()
         ).hexdigest()
         self.assertEqual(app._pdf_or_email_content_hash(file_bytes), expected)
 
     def test_pdf_email_fingerprint_is_computed_from_extract_and_extract_email_bytes(self):
         # Proves _PDF_EMAIL_LOGIC_FINGERPRINT is genuinely a hash of
-        # extract.py's/extract_email.py's/brochure_link_resolver.py's own
-        # source, not just mentioned in a comment - mirrors
-        # FingerprintCompositionTests' own spreadsheet counterpart above.
+        # extract.py's/extract_email.py's/brochure_link_resolver.py's/
+        # brochure_enrichment.py's own source, not just mentioned in a
+        # comment - mirrors FingerprintCompositionTests' own spreadsheet
+        # counterpart above (which already includes brochure_enrichment.py
+        # too, for the same "runs unconditionally for every upload" reason).
         expected = hashlib.sha256(
             Path(app.extract.__file__).read_bytes()
             + Path(app.extract_email.__file__).read_bytes()
             + Path(app.brochure_link_resolver.__file__).read_bytes()
+            + Path(app.brochure_enrichment.__file__).read_bytes()
         ).hexdigest()
         self.assertEqual(app._PDF_EMAIL_LOGIC_FINGERPRINT, expected)
 
