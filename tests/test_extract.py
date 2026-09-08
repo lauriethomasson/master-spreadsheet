@@ -1230,5 +1230,225 @@ class PerUnitContactsTests(unittest.TestCase):
         self.assertEqual(rows[1].contacts, "Jane Doe, jane@colliers.com")
 
 
+def _make_multi_page_links_pdf(pages_links: list) -> Path:
+    """
+    A multi-page in-memory PDF - pages_links[i] is a list of URIs to embed
+    as real fitz.LINK_URI annotations on page i (each its own small "Here"
+    caption, same construction idiom as _make_test_pdf, just one page per
+    list entry instead of one row per entry on a single page). Used by
+    RejectUnhintedPdfBrochureLinksTests, where only page MEMBERSHIP of a
+    link matters, never row position within a page.
+    """
+    doc = fitz.open()
+    for uris in pages_links:
+        page = doc.new_page(width=400, height=100)
+        y = 30
+        for uri in uris:
+            page.insert_text((50, y), "Here", fontsize=11)
+            words = page.get_text("words")
+            here_words = [w for w in words if w[4] == "Here" and abs((w[1] + w[3]) / 2 - y) < 8]
+            w = here_words[-1]
+            rect = fitz.Rect(w[0] - 1, w[1] - 1, w[2] + 1, w[3] + 1)
+            page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": uri})
+            y += 20
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    doc.save(str(tmp_path))
+    doc.close()
+    return tmp_path
+
+
+class RejectUnhintedPdfBrochureLinksTests(unittest.TestCase):
+    """
+    _reject_unhinted_pdf_brochure_links - the PDF-upload counterpart to
+    Fix C (app.py's _reject_unhinted_pasted_link_brochure_links, the
+    paste-a-link path). Real confirmed incident this class of bug causes
+    (167 Great Portland Street/Northumberland House, a shared multi-
+    property Colliers deck): Gemini attributing a real, reachable, but
+    WRONG neighbouring unit's link to a row. _attach_per_row_pdf_links'
+    own strict row-position matching (unchanged, not touched by this fix)
+    already guards the common case; this covers the fallback door it
+    deliberately leaves open when its own gates don't clear.
+    """
+
+    def test_a_link_not_among_its_own_pages_real_hrefs_is_rejected(self):
+        # Page 0 genuinely has Northumberland House's own real link; page 1
+        # (167 Great Portland Street's own page) has NO real embedded link
+        # of its own at all. Gemini nonetheless guessed page 0's link for
+        # the page-1 unit - the exact real incident this closes.
+        pdf_path = _make_multi_page_links_pdf([
+            ["https://example.com/northumberland-house.pdf"],
+            [],
+        ])
+        try:
+            units = [{
+                "floor_unit": "2nd & 4th Floors", "page_index": 0,
+                "brochure_link": "https://example.com/northumberland-house.pdf",
+            }, {
+                "floor_unit": "1st", "page_index": 1,
+                "brochure_link": "https://example.com/northumberland-house.pdf",
+            }]
+            extract._reject_unhinted_pdf_brochure_links(pdf_path, units)
+
+            # Page 0's own unit: the link IS genuinely among its own page's
+            # real hrefs - unaffected.
+            self.assertEqual(units[0]["brochure_link"], "https://example.com/northumberland-house.pdf")
+            # Page 1's own unit: that link is NOT among page 1's real hrefs
+            # (page 1 has none at all) - rejected to None, never left as
+            # the wrong neighbour's link.
+            self.assertIsNone(units[1]["brochure_link"])
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_a_link_genuinely_present_on_its_own_page_is_unaffected(self):
+        pdf_path = _make_multi_page_links_pdf([
+            ["https://example.com/own-brochure.pdf"],
+        ])
+        try:
+            units = [{
+                "floor_unit": "1st", "page_index": 0,
+                "brochure_link": "https://example.com/own-brochure.pdf",
+            }]
+            extract._reject_unhinted_pdf_brochure_links(pdf_path, units)
+
+            self.assertEqual(units[0]["brochure_link"], "https://example.com/own-brochure.pdf")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_a_unit_with_no_determinable_page_index_is_left_completely_untouched(self):
+        # "No information, no verdict" - same conservatism as every other
+        # tier in this codebase. Even a link that's genuinely WRONG (not
+        # on any real page here) must be left exactly as-is when there's
+        # no page to check it against at all.
+        pdf_path = _make_multi_page_links_pdf([["https://example.com/real-link.pdf"]])
+        try:
+            units = [
+                {"floor_unit": "1st", "page_index": None, "brochure_link": "https://example.com/unverifiable.pdf"},
+                {"floor_unit": "2nd", "brochure_link": "https://example.com/also-unverifiable.pdf"},  # no key at all
+            ]
+            extract._reject_unhinted_pdf_brochure_links(pdf_path, units)
+
+            self.assertEqual(units[0]["brochure_link"], "https://example.com/unverifiable.pdf")
+            self.assertEqual(units[1]["brochure_link"], "https://example.com/also-unverifiable.pdf")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_a_link_out_of_the_pdfs_real_page_range_is_left_untouched(self):
+        # An unrealistic page_index Gemini nonetheless returned - same "no
+        # information, no verdict" treatment as a missing/None page_index.
+        pdf_path = _make_multi_page_links_pdf([["https://example.com/real-link.pdf"]])
+        try:
+            units = [{"floor_unit": "1st", "page_index": 5, "brochure_link": "https://example.com/whatever.pdf"}]
+            extract._reject_unhinted_pdf_brochure_links(pdf_path, units)
+
+            self.assertEqual(units[0]["brochure_link"], "https://example.com/whatever.pdf")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_a_genuinely_shared_link_across_multiple_pages_is_unaffected(self):
+        # The Regent's Wharf precedent, for a real PDF: a portfolio
+        # document's own combined-brochure link legitimately embedded as a
+        # real href on MORE THAN ONE unit's own page (The Mill/The Packing
+        # House both pointing at the same real combined document). This
+        # check only ever asks "does this page have this link among its
+        # own hrefs," never "is this link exclusive to one page" - so
+        # neither unit should be rejected.
+        shared_link = "https://example.com/regents-wharf-combined-brochure.pdf"
+        pdf_path = _make_multi_page_links_pdf([[shared_link], [shared_link]])
+        try:
+            units = [
+                {"floor_unit": "The Mill", "page_index": 0, "brochure_link": shared_link},
+                {"floor_unit": "The Packing House", "page_index": 1, "brochure_link": shared_link},
+            ]
+            extract._reject_unhinted_pdf_brochure_links(pdf_path, units)
+
+            self.assertEqual(units[0]["brochure_link"], shared_link)
+            self.assertEqual(units[1]["brochure_link"], shared_link)
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_no_units_with_a_determinable_page_index_never_opens_the_pdf_at_all(self):
+        # A nonexistent path must never even be attempted when there's
+        # nothing to verify - same early-exit precedent as _attach_per_row_
+        # pdf_links' own `if not units_by_page: return`.
+        units = [{"floor_unit": "1st", "brochure_link": "https://example.com/whatever.pdf"}]
+        extract._reject_unhinted_pdf_brochure_links(Path("this-file-does-not-exist.pdf"), units)
+        self.assertEqual(units[0]["brochure_link"], "https://example.com/whatever.pdf")
+
+
+class RejectUnhintedPdfBrochureLinksEndToEndTests(unittest.TestCase):
+    """
+    Same real Northumberland House/167 Great Portland Street shape as
+    RejectUnhintedPdfBrochureLinksTests above, but reproduced through the
+    actual extract() pipeline end to end (real PDF, Gemini's raw JSON
+    output stubbed via extract_raw_units) - confirms the fix is genuinely
+    wired into the real upload path, not just correct in isolation, and
+    that _attach_per_row_pdf_links (unpatched, running for real
+    afterward) still composes correctly with it.
+    """
+
+    def test_wrong_neighbouring_units_link_is_rejected_not_silently_applied(self):
+        # Page 0: Northumberland House's own real embedded link. Page 1:
+        # 167 Great Portland Street's own page has NO real link of its own
+        # at all (its own genuine link, in the real incident, actually
+        # lived on a structurally distant part of the document this
+        # simplified page-1 stands in for) - Gemini's raw JSON nonetheless
+        # attributed page 0's link to the page-1 unit.
+        pdf_path = _make_multi_page_links_pdf([
+            ["https://example.com/northumberland-house.pdf"],
+            [],
+        ])
+        try:
+            raw = {
+                "provider": "Colliers", "contacts": None,
+                "units": [
+                    {
+                        "building": "Northumberland House", "floor_unit": "2nd & 4th Floors", "page_index": 0,
+                        "brochure_link": "https://example.com/northumberland-house.pdf",
+                    },
+                    {
+                        "building": "167 Great Portland Street", "floor_unit": "1st", "page_index": 1,
+                        "brochure_link": "https://example.com/northumberland-house.pdf",
+                    },
+                ],
+            }
+            with patch("extract.extract_raw_units", return_value=raw):
+                rows = extract.extract(pdf_path, original_filename="deck.pdf")
+
+            self.assertEqual(rows[0].brochure_link, "https://example.com/northumberland-house.pdf")
+            self.assertIsNone(rows[1].brochure_link)
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_a_genuine_per_row_match_still_wins_over_this_broader_check(self):
+        # _attach_per_row_pdf_links' own strict, unambiguous per-row match
+        # (unpatched here, running for real right after this fix) must
+        # still be able to confidently attach/overwrite - this broader
+        # check having already run first must never block that.
+        pdf_path = _make_test_pdf([
+            ("3rd Floor", 5000, "https://example.com/unit-a"),
+            ("5th Floor", 7500, "https://example.com/unit-b"),
+        ])
+        try:
+            raw = {
+                "provider": None, "contacts": None,
+                "units": [
+                    {"building": "A", "floor_unit": "3rd Floor", "size_sqft": 5000, "page_index": 0,
+                     "brochure_link": None},
+                    {"building": "A", "floor_unit": "5th Floor", "size_sqft": 7500, "page_index": 0,
+                     "brochure_link": None},
+                ],
+            }
+            with patch("extract.extract_raw_units", return_value=raw):
+                rows = extract.extract(pdf_path, original_filename="doc.pdf")
+
+            self.assertEqual(rows[0].brochure_link, "https://example.com/unit-a")
+            self.assertEqual(rows[1].brochure_link, "https://example.com/unit-b")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()

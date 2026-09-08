@@ -340,6 +340,88 @@ def _attach_per_row_pdf_links(pdf_path: Path, units: list) -> None:
         doc.close()
 
 
+def _reject_unhinted_pdf_brochure_links(pdf_path: Path, units: list) -> None:
+    """
+    Nulls out a unit's Gemini-provided "brochure_link" when it does NOT
+    appear among its own page's real embedded href set at all - closes the
+    same class of gap Fix C (app.py's _reject_unhinted_pasted_link_
+    brochure_links) already closed for the paste-a-link path, here for a
+    real PDF upload instead. Real confirmed incident this class of bug
+    causes (167 Great Portland Street/Northumberland House, a shared multi-
+    property Colliers deck): Gemini attributing a real, reachable, but
+    WRONG neighbouring unit's link to a row, which _attach_per_row_pdf_
+    links' own strict row-position matching (below) doesn't fully guard
+    against on its own, since a page that fails ITS OWN gates (ambiguous
+    row match, or too few units/links on the page) leaves whatever raw
+    link Gemini's vision-only JSON guessed completely unverified, all the
+    way through to finalize_brochure_link - which checks only whether a
+    link is admin/floorplan/homepage-shaped, never whether it was ever
+    genuinely associated with this unit's own page at all.
+
+    Deliberately much MORE LENIENT than _attach_per_row_pdf_links' own
+    matching: no MIN_UNITS_FOR_PER_ROW_LINKS/MIN_LINKS_FOR_PER_ROW_LINKS
+    page-level threshold, no row-position/y-tolerance matching, no
+    exactly-one-candidate requirement, no caption-size filter, no brochure/
+    floorplan column x-range narrowing - just "is this specific link
+    string genuinely one of this page's own real embedded hrefs at all,"
+    using the FULL unfiltered _page_uri_links result (not the caption-
+    sized subset _attach_per_row_pdf_links narrows to for its own stricter
+    purpose). A genuine multi-page portfolio PDF where the SAME real href
+    legitimately appears as an embedded link on several different units'
+    own pages is unaffected - this only ever asks whether a page has the
+    link among its own hrefs, never whether the link is exclusive to one
+    page.
+
+    Runs BEFORE _attach_per_row_pdf_links (see extract()), deliberately -
+    reads each unit's own "page_index" without popping it (unlike that
+    function, which consumes it as part of its own page-grouping), so
+    _attach_per_row_pdf_links' own subsequent strict matching still runs
+    completely unchanged afterward and can still confidently OVERWRITE
+    whatever this step left in place with its own unambiguous per-row
+    match - the two compose as "broad reject-if-clearly-wrong first, then
+    narrow confident-attach second," never conflicting, since a confident
+    per-row attach is strictly MORE trustworthy than merely "is this link
+    somewhere on the page" and should always win when it fires.
+
+    Only ever acts on a unit whose own "page_index" is a genuine int
+    within this PDF's real page range - same "no information, no verdict"
+    conservatism as every other tier in this codebase; a unit with no
+    determinable page (None, missing, or out of range) is left completely
+    untouched, exactly as before this function existed.
+    """
+    pages_needed = set()
+    for unit in units:
+        page_index = unit.get(PAGE_INDEX_KEY)
+        if isinstance(page_index, int):
+            pages_needed.add(page_index)
+    if not pages_needed:
+        return
+
+    doc = fitz.open(pdf_path)
+    try:
+        page_hrefs = {}
+        for page_index in pages_needed:
+            if not (0 <= page_index < doc.page_count):
+                continue
+            page_hrefs[page_index] = {link["uri"] for link in _page_uri_links(doc[page_index])}
+
+        for unit in units:
+            page_index = unit.get(PAGE_INDEX_KEY)
+            if not isinstance(page_index, int) or page_index not in page_hrefs:
+                continue
+            link = unit.get("brochure_link")
+            if link and link not in page_hrefs[page_index]:
+                print(
+                    f"[extract] page {page_index}: unit {unit.get('floor_unit')!r}'s Gemini-provided "
+                    f"brochure_link {link!r} isn't among this page's own real embedded links — "
+                    "discarding rather than trusting an unverified attribution.",
+                    file=sys.stderr,
+                )
+                unit["brochure_link"] = None
+    finally:
+        doc.close()
+
+
 PROMPT = """You are extracting structured data from a commercial office property brochure.
 You will be shown the pages of the brochure as images. Read all pages carefully,
 including tables, floor plans, and photo captions.
@@ -730,6 +812,13 @@ def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
     filename = original_filename or pdf_path.name
 
     raw = extract_raw_units(pdf_path)
+
+    # Runs BEFORE _attach_per_row_pdf_links - see _reject_unhinted_pdf_
+    # brochure_links' own docstring for why the order matters (it reads
+    # page_index without consuming it, so the stricter per-row match right
+    # after still runs unchanged and can still confidently overwrite
+    # whatever this leniently-broader check left in place).
+    _reject_unhinted_pdf_brochure_links(pdf_path, raw.get("units", []))
 
     # Runs BEFORE finalize_brochure_link inside _rows_from_raw, and mutates
     # page_index out of each unit dict as it goes - so a unit that gets a
