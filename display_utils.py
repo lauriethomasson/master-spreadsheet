@@ -228,7 +228,13 @@ RANGE_COLUMNS = [
 # that list only controls Excel-native column hiding (visible only if
 # someone downloads and opens the file) - this separate list is what
 # actually governs the live on-screen "View current master" table, so it
-# needs the same fields added here too.
+# needs the same fields added here too. brochure_building_mismatch is the
+# same idea once more (see its own schema.py docstring) - a raw text
+# column would show the SAME mismatch note the Review page's own
+# dedicated brochure-mismatch decision card already surfaces, in a spot
+# no one is looking at it during review; it was confirmed still showing
+# as a plain visible column in two real production exports before this
+# fix (master (32).xlsx, master (33).xlsx).
 ALWAYS_HIDDEN_COLUMNS = [
     "source_file",
     "property_id",
@@ -238,6 +244,7 @@ ALWAYS_HIDDEN_COLUMNS = [
     "geocode_unverified",
     "development_name",
     "address_conflict",
+    "brochure_building_mismatch",
 ]
 
 

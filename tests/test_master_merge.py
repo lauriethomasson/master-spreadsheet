@@ -4037,6 +4037,164 @@ class BuildMergePlanLetStatusTests(unittest.TestCase):
         self.assertEqual(plan.unmatched[0].let_status_fields, frozenset())
 
 
+class BuildMergePlanBrochureMismatchTests(unittest.TestCase):
+    """
+    The confirmed real production incident this exists for: a shared
+    multi-property Colliers Canva deck caused Gemini to occasionally
+    misattribute a NEIGHBORING building's own document link to a row (New
+    Derwent House's rows got Ivybridge House's own brochure_link and real
+    contacts). brochure_enrichment._confident_building_mismatch (merged
+    separately) already sets ListingRow.brochure_building_mismatch - these
+    tests cover what build_merge_plan does with that flag: gate brochure_
+    link/contacts into their own MatchedRow.brochure_mismatch_fields (never
+    auto-applying silently, never merely because the fields changed), and
+    the exact same treatment for a brand-new (no master match) row via
+    UnmatchedRow.brochure_mismatch_fields.
+    """
+
+    def test_matched_row_with_mismatch_and_real_diff_is_gated(self):
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers", "floor_unit": "2nd Floor",
+            "brochure_link": "https://example.com/new-derwent-house.pdf", "contacts": "Old Agent, 020 0000 0000",
+        }])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers", floor_unit="2nd Floor",
+            brochure_link="https://example.com/ivybridge-house.pdf", contacts="Wrong Agent, 020 1111 1111",
+            brochure_building_mismatch=(
+                "Brochure appears to be for a different building: document states 'Ivybridge House', "
+                "row states 'New Derwent House'"
+            ),
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.brochure_mismatch_fields, frozenset({"brochure_link", "contacts"}))
+        # Still a real diff, exactly like let_status_fields/risky_fields -
+        # the safeguard forces manual review, it never makes the change
+        # disappear from diffs entirely.
+        self.assertIn("brochure_link", matched.diffs)
+        self.assertIn("contacts", matched.diffs)
+        self.assertEqual(
+            matched.diffs["brochure_link"],
+            ("https://example.com/new-derwent-house.pdf", "https://example.com/ivybridge-house.pdf"),
+        )
+        # The raw note itself is never left in diffs as its own field - it
+        # would be a meaningless "None -> 'Brochure appears...'" row to a
+        # reviewer (same treatment as address_conflict/geocode_unverified).
+        self.assertNotIn("brochure_building_mismatch", matched.diffs)
+
+    def test_apply_merge_apply_writes_the_new_value(self):
+        master_records = [ListingRow(
+            building="New Derwent House", provider="Colliers",
+            brochure_link="https://example.com/new-derwent-house.pdf", contacts="Old Agent",
+            property_id="p1",
+        ).model_dump()]
+
+        result = master_merge.apply_merge(
+            master_records,
+            {0: {"brochure_link": "https://example.com/ivybridge-house.pdf", "contacts": "Wrong Agent"}},
+            [], frozenset(),
+        )
+
+        self.assertEqual(result[0].brochure_link, "https://example.com/ivybridge-house.pdf")
+        self.assertEqual(result[0].contacts, "Wrong Agent")
+
+    def test_apply_merge_keep_current_preserves_the_old_value(self):
+        # "Keep current" means the reviewer's decision contributes NOTHING
+        # for these fields - apply_merge is never even given an update for
+        # master_index 0, exactly as the page's own "keep" branch does
+        # (see pages/2_Review_and_Master.py's decision_brochure_mismatch
+        # loop - only "apply" ever populates decision_updates).
+        master_records = [ListingRow(
+            building="New Derwent House", provider="Colliers",
+            brochure_link="https://example.com/new-derwent-house.pdf", contacts="Old Agent",
+            property_id="p1",
+        ).model_dump()]
+
+        result = master_merge.apply_merge(master_records, {}, [], frozenset())
+
+        self.assertEqual(result[0].brochure_link, "https://example.com/new-derwent-house.pdf")
+        self.assertEqual(result[0].contacts, "Old Agent")
+
+    def test_matched_row_without_mismatch_flag_auto_applies_unaffected(self):
+        # Regression guard - proves the common (no mismatch) case is
+        # completely untouched: brochure_link/contacts changing on an
+        # ordinary row is NOT gated, NOT added to risky_fields, and stays
+        # in diffs to auto-apply exactly as before this feature existed.
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "Test Provider",
+            "brochure_link": "https://example.com/old.pdf", "contacts": "Old Agent",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="Test Provider",
+            brochure_link="https://example.com/new.pdf", contacts="New Agent",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 1)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.brochure_mismatch_fields, frozenset())
+        self.assertEqual(matched.risky_fields, frozenset())
+        self.assertIn("brochure_link", matched.diffs)
+        self.assertIn("contacts", matched.diffs)
+
+    def test_only_the_field_that_actually_differs_is_gated(self):
+        # brochure_building_mismatch fires on the row as a whole, but only
+        # a field that ACTUALLY differs from master belongs in diffs (see
+        # diff_fields) at all - brochure_mismatch_fields is computed FROM
+        # diffs, so an unchanged contacts value is never gated merely
+        # because the row also carries the mismatch note.
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers",
+            "brochure_link": "https://example.com/new-derwent-house.pdf", "contacts": "Same Agent",
+        }])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers",
+            brochure_link="https://example.com/ivybridge-house.pdf", contacts="Same Agent",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.brochure_mismatch_fields, frozenset({"brochure_link"}))
+        self.assertNotIn("contacts", matched.diffs)
+
+    def test_new_unmatched_property_with_mismatch_is_flagged(self):
+        # Real gap this closes: brochure_building_mismatch is set during
+        # _apply_units_to_row, entirely before/independent of master-
+        # matching - a brand-new property (no master match at all) can
+        # carry a true mismatch flag on its very first upload, exactly
+        # like the matched-row case, just via a different door.
+        master_df = _master_df([{"building": "Somewhere Else", "provider": "Other Provider"}])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers",
+            brochure_link="https://example.com/ivybridge-house.pdf", contacts="Wrong Agent",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.unmatched), 1)
+        self.assertIs(plan.unmatched[0].new_row, new_row)
+        self.assertEqual(plan.unmatched[0].brochure_mismatch_fields, frozenset({"brochure_link", "contacts"}))
+
+    def test_new_unmatched_property_without_mismatch_is_not_flagged(self):
+        master_df = _master_df([{"building": "Somewhere Else", "provider": "Other Provider"}])
+        new_row = ListingRow(
+            building="1 Example Street", provider="Test Provider",
+            brochure_link="https://example.com/ok.pdf", contacts="Some Agent",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(plan.unmatched[0].brochure_mismatch_fields, frozenset())
+
+
 class ApplyMergeRemovalTests(unittest.TestCase):
     """Delete-row support added for the "remove from master entirely"
     decision - confirmed via investigation that no such capability existed

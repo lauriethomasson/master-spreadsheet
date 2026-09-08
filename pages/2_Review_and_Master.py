@@ -1130,6 +1130,88 @@ def _render_let_status_decision(m, key_prefix: str) -> str:
     return "apply"
 
 
+def _render_brochure_mismatch_decision(m, key_prefix: str) -> str:
+    """
+    Prominently shown at the top of the "Needs your decision" section
+    (see _render_pending_review), for a matched row whose OWN diff
+    includes brochure_link and/or contacts AND whose brochure/floorplan
+    carries a confident, confirmed building-name mismatch (see master_
+    merge.MatchedRow.brochure_mismatch_fields, schema.ListingRow.
+    brochure_building_mismatch, brochure_enrichment._confident_building_
+    mismatch) - the real confirmed production incident this exists for: a
+    shared multi-property Colliers Canva deck caused Gemini to
+    misattribute a NEIGHBORING building's own document link/contacts to
+    this row (New Derwent House's rows got Ivybridge House's own
+    brochure_link and real contacts, confirmed sitting in actual approved
+    master data). _confident_building_mismatch already detects this and
+    sets the note shown below; this card is what makes it actually BLOCK
+    brochure_link/contacts from silently auto-applying, exactly like any
+    other ordinary field, the way they did before this existed.
+
+    Modeled on _render_let_status_decision's own warning-then-radio
+    structure (same "positive evidence of a real problem, always needs a
+    human's own look" philosophy) but NOT a call to it directly - the
+    field semantics differ entirely: this is about two SPECIFIC concrete
+    property fields (brochure_link/contacts) on one row, never a free-text
+    signal about the whole property's own let-status, so there's no
+    shared rendering logic to reuse (same "own sibling function, not a
+    parameterized variant" precedent as _render_stale_candidate_decision/
+    _render_new_property_let_status_decision below).
+
+    Only two choices - unlike _render_let_status_decision's three, there
+    is deliberately no "remove property" option here: removing an
+    otherwise-fine, real property from master over a wrong brochure_link/
+    contacts pair would be wildly disproportionate to the actual problem
+    (a reviewer who has some OTHER, unrelated reason to remove this
+    property can still do that via the ordinary "Remove selected" action
+    on the master table itself - see that button's own always-clickable
+    design). Defaults to "keep current" (the opposite default from let-
+    status's own "apply") - a confirmed building mismatch is positive
+    evidence the NEW value is the one to distrust, so silently defaulting
+    to apply here would reproduce the exact New Derwent House incident
+    this whole feature exists to catch; a reviewer who's checked the
+    brochure and disagrees has to say so explicitly.
+
+    Returns "apply" (write every one of m.brochure_mismatch_fields' new
+    values) or "keep" (leave master's existing values for those fields
+    completely untouched) - the caller applies this only to m.brochure_
+    mismatch_fields, never to any of this row's OTHER diffs, which are
+    unrelated facts about the property decided independently (same "other_
+    fields" carve-out _render_let_status_decision's own caller already
+    uses for let_status_fields).
+    """
+    label = display_utils.row_label(m.new_row.model_dump())
+    st.warning(f"**{label}**\n\n⚠️ {m.new_row.brochure_building_mismatch}")
+
+    # Fixed, deterministic order (BROCHURE_MISMATCH_GATED_FIELDS' own
+    # declared order) rather than iterating the frozenset directly - a
+    # frozenset's iteration order isn't guaranteed, which would make this
+    # card's own field order (and therefore its widget keys/on-screen
+    # layout) non-deterministic run to run.
+    for f in master_merge.BROCHURE_MISMATCH_GATED_FIELDS:
+        if f not in m.brochure_mismatch_fields:
+            continue
+        old_val, new_val = m.diffs[f]
+        field_label = display_utils.friendly_field_label(f)
+        before_col, after_col = st.columns(2)
+        with before_col:
+            st.caption(f"**{field_label}** — current")
+            st.write(old_val or "—")
+        with after_col:
+            st.caption(f"**{field_label}** — new (suspect)")
+            st.write(new_val or "—")
+
+    choice = st.radio(
+        "What would you like to do with the brochure_link/contacts update above?",
+        [
+            "Keep current information — ignore this update, leave the existing record unchanged.",
+            "Apply anyway — use the new value(s) despite the mismatch warning.",
+        ],
+        key=f"{key_prefix}_mismatch_decision",
+    )
+    return "keep" if choice.startswith("Keep current information") else "apply"
+
+
 def _render_stale_candidate_decision(rec: dict, provider_label: str, key_prefix: str) -> str:
     """
     Like _render_let_status_decision, for a different signal - see
@@ -1313,6 +1395,65 @@ def _render_new_property_let_status_decision(u, key_prefix: str) -> tuple:
     )
     decision = "skip" if choice.startswith("Don't add") else "add"
     return decision, location_overrides
+
+
+def _render_new_property_brochure_mismatch_decision(u, key_prefix: str) -> dict:
+    """
+    For a genuinely NEW property (no existing master record at all - see
+    master_merge.UnmatchedRow.brochure_mismatch_fields) whose own
+    brochure/floorplan carries a confident, confirmed building-name
+    mismatch (see schema.ListingRow.brochure_building_mismatch) - the same
+    signal _render_brochure_mismatch_decision handles for a MATCHED row,
+    just reached via a different door: brochure_building_mismatch is set
+    during _apply_units_to_row (brochure_enrichment.py), entirely before/
+    independent of master-matching, so a brand-new property can carry a
+    true mismatch flag on its very first upload, exactly like the
+    matched-row case (confirmed: nothing in that code path depends on a
+    master match existing first).
+
+    Unlike the matched-row card, there is no existing master value to
+    "keep" here at all - approving a brand-new row always means adding
+    SOME version of it, never leaving an existing record untouched. So the
+    choice is simpler than that card's apply/keep: add the property WITH
+    the flagged field(s) as extracted despite the warning, or add it
+    WITHOUT them (blanked out, left for a reviewer to fill in by hand once
+    they've checked the real document) - deliberately never a "don't add
+    this property at all" option, for the identical reason _render_
+    brochure_mismatch_decision's own docstring gives for omitting "remove
+    property" there: a wrong brochure_link/contacts pair alone is not a
+    reason to reject an otherwise-perfectly-real property.
+
+    Returns a {field: None} override dict for every field in u.brochure_
+    mismatch_fields when the reviewer chooses to drop them (the default),
+    or {} to add the row exactly as extracted - the caller applies this
+    via model_copy(update=...) alongside the property_id it already
+    assigns, the same pattern _render_new_property_let_status_decision's
+    own location_overrides already uses.
+    """
+    row_dict = u.new_row.model_dump()
+    label = display_utils.row_label(row_dict)
+    st.warning(f"**{label}**\n\n⚠️ {u.new_row.brochure_building_mismatch}")
+
+    # Fixed, deterministic order - see _render_brochure_mismatch_
+    # decision's own identical comment on why this never just iterates
+    # the frozenset directly.
+    for f in master_merge.BROCHURE_MISMATCH_GATED_FIELDS:
+        if f not in u.brochure_mismatch_fields:
+            continue
+        st.caption(f"**{display_utils.friendly_field_label(f)}** — proposed (suspect)")
+        st.write(row_dict.get(f) or "—")
+
+    choice = st.radio(
+        "What would you like to do with the brochure_link/contacts value(s) above?",
+        [
+            "Add without these — add the property, but leave them blank for now.",
+            "Add anyway — add the property with these value(s) despite the mismatch warning.",
+        ],
+        key=f"{key_prefix}_new_mismatch_decision",
+    )
+    if choice.startswith("Add anyway"):
+        return {}
+    return {f: None for f in u.brochure_mismatch_fields}
 
 
 # Search fields for the one master search bar - this used to be two
@@ -2639,6 +2780,17 @@ def _render_pending_review(pending: list):
     # principle as a same-batch collision never being auto-resolved.
     let_status_ids = {id(m) for m in plan.matched_changed if m.let_status_fields}
 
+    # See master_merge.MatchedRow.brochure_mismatch_fields/schema.
+    # ListingRow.brochure_building_mismatch - a confident, confirmed
+    # brochure/floorplan building-name mismatch always forces its own
+    # explicit decision for brochure_link/contacts, same principle as
+    # let_status_ids just above. A row already claimed by let_status_ids
+    # is handled entirely inside the decision_let_status loop below (see
+    # its own comment there) rather than through this separate bucket -
+    # the rare "needs both kinds of decision at once" case is bundled into
+    # ONE row's worth of cards rather than rendering the row twice.
+    brochure_mismatch_ids = {id(m) for m in plan.matched_changed if m.brochure_mismatch_fields}
+
     _render_discard_pending(pending, new_rows)
 
     # auto_updates is populated purely by the safe, already-considered-safe
@@ -2685,6 +2837,7 @@ def _render_pending_review(pending: list):
     # each bucket actually appears on screen.
     auto_matched = []
     decision_let_status = []
+    decision_brochure_mismatch = []
     decision_collision_groups = []
     decision_solo_collision = []  # a collision group that shrank to exactly one non-let-status member - see below
     decision_risky = []
@@ -2697,20 +2850,26 @@ def _render_pending_review(pending: list):
         if id(m) in let_status_ids:
             decision_let_status.append(m)
             continue
+        if id(m) in brochure_mismatch_ids:
+            decision_brochure_mismatch.append(m)
+            continue
         if id(m) in colliding_changed_ids:
             if m.master_index in queued_collision_indices:
                 continue  # this group's peer already queued the whole group
             queued_collision_indices.add(m.master_index)
-            # A collision group's own let-status members (if any) were
-            # already pulled out above - only the remaining, non-let-status
+            # A collision group's own let-status/brochure-mismatch members
+            # (if any) were already pulled out above - only the remaining
             # members are compared against each other as a group. If that
-            # leaves exactly one (a sibling was pulled into its own let-
-            # status decision), there's nothing left to compare it AGAINST
-            # as a group - _render_collision_group expects 2+ members - so
-            # it falls through to the ordinary single-row rendering
-            # instead, still forced into a deliberate accept (default_
-            # checked=False) since it did collide with something.
-            group = [g for g in collision_groups_by_index[m.master_index] if id(g) not in let_status_ids]
+            # leaves exactly one (a sibling was pulled into its own
+            # decision), there's nothing left to compare it AGAINST as a
+            # group - _render_collision_group expects 2+ members - so it
+            # falls through to the ordinary single-row rendering instead,
+            # still forced into a deliberate accept (default_checked=False)
+            # since it did collide with something.
+            group = [
+                g for g in collision_groups_by_index[m.master_index]
+                if id(g) not in let_status_ids and id(g) not in brochure_mismatch_ids
+            ]
             if len(group) >= 2:
                 # Same "does this genuinely need a look" check _render_
                 # collision_group makes internally (see its own auto_accept
@@ -2769,7 +2928,20 @@ def _render_pending_review(pending: list):
     # exactly like a matched row's let_status_fields already does (see
     # let_status_ids above) - never silently added via plain_new.
     decision_new_property_let_status = [u for u in plain_new_candidates if u.let_status_fields]
-    plain_new = [u for u in plain_new_candidates if not u.let_status_fields]
+    # See master_merge.UnmatchedRow.brochure_mismatch_fields - brochure_
+    # building_mismatch is set during _apply_units_to_row, entirely before/
+    # independent of master-matching, so a brand-new property can carry a
+    # true mismatch flag on its very first upload, exactly like the
+    # matched-row case (see brochure_mismatch_ids above), just via a
+    # different door - never silently added via plain_new either. Excludes
+    # anything already claimed by decision_new_property_let_status - that
+    # loop below handles the rare "needs both kinds of decision" row
+    # itself (see its own comment), rather than rendering the same new row
+    # twice under two separate cards.
+    decision_new_property_brochure_mismatch = [
+        u for u in plain_new_candidates if u.brochure_mismatch_fields and not u.let_status_fields
+    ]
+    plain_new = [u for u in plain_new_candidates if not u.let_status_fields and not u.brochure_mismatch_fields]
 
     matched_master_indices = {m.master_index for m in plan.matched_changed} | {
         m.master_index for m in plan.matched_unchanged
@@ -2779,8 +2951,9 @@ def _render_pending_review(pending: list):
     )
 
     any_decisions = bool(
-        decision_let_status or decision_collision_groups or decision_solo_collision or decision_risky
-        or near_miss or plan.unmatched_collisions or stale_indices or decision_new_property_let_status
+        decision_let_status or decision_brochure_mismatch or decision_collision_groups or decision_solo_collision
+        or decision_risky or near_miss or plan.unmatched_collisions or stale_indices
+        or decision_new_property_let_status or decision_new_property_brochure_mismatch
     )
 
     # ==== 1. Needs your decision - every genuinely manual property-level
@@ -2799,25 +2972,46 @@ def _render_pending_review(pending: list):
                 entry["source_file"] = m.new_row.source_file
             # "ignore" - this update contributes nothing for this row at all.
 
+            # A row needing a let-status decision can, rarely, ALSO carry
+            # its own brochure_mismatch_fields (an unrelated diff on
+            # brochure_link/contacts - see brochure_mismatch_ids' own
+            # comment above for why this is bundled here rather than
+            # rendering the row a second time under a separate card).
+            # Skipped entirely when "remove" was just chosen - the property
+            # is leaving master altogether, so there's nothing left to
+            # decide about any of its individual fields.
+            if m.brochure_mismatch_fields and decision != "remove":
+                mismatch_decision = _render_brochure_mismatch_decision(
+                    m, f"let_status_{i}_{m.property_id}_mismatch",
+                )
+                if mismatch_decision == "apply":
+                    entry = decision_updates.setdefault(m.master_index, {})
+                    entry.update(
+                        {f: new_val for f, (old_val, new_val) in m.diffs.items() if f in m.brochure_mismatch_fields}
+                    )
+                    entry["source_file"] = m.new_row.source_file
+                # "keep" - this update contributes nothing for these fields.
+
             # This row's OTHER diffs (every field besides the let-status
-            # field(s) just decided above) are unrelated facts about the
-            # property - never silently bundled into whichever apply/
-            # remove/ignore choice the reviewer just made for the status
-            # question, and decided independently of it. Same "display-only
-            # remaining copy" pattern as the geocode-consolidation fallback
-            # loop below: dataclasses.replace leaves the original MatchedRow
-            # (already used elsewhere - _apply_silent, let_status_ids, etc.)
-            # completely untouched. If "remove" was also chosen above, any
-            # update queued here for the same master_index is moot once
-            # apply_merge runs - removal always takes precedence over a
-            # field-level update for the same row (see apply_merge's own
-            # docstring) - never a conflicting state.
-            other_fields = frozenset(m.diffs) - m.let_status_fields
+            # and brochure-mismatch field(s) already decided above) are
+            # unrelated facts about the property - never silently bundled
+            # into whichever apply/remove/ignore/keep choice the reviewer
+            # just made for those, and decided independently of them. Same
+            # "display-only remaining copy" pattern as the geocode-
+            # consolidation fallback loop below: dataclasses.replace leaves
+            # the original MatchedRow (already used elsewhere - _apply_
+            # silent, let_status_ids, etc.) completely untouched. If
+            # "remove" was also chosen above, any update queued here for
+            # the same master_index is moot once apply_merge runs -
+            # removal always takes precedence over a field-level update
+            # for the same row (see apply_merge's own docstring) - never a
+            # conflicting state.
+            other_fields = frozenset(m.diffs) - m.let_status_fields - m.brochure_mismatch_fields
             if other_fields:
                 remaining = dataclasses.replace(
                     m,
                     diffs={f: v for f, v in m.diffs.items() if f in other_fields},
-                    risky_fields=m.risky_fields - m.let_status_fields,
+                    risky_fields=m.risky_fields - m.let_status_fields - m.brochure_mismatch_fields,
                     kept_as_is_fields=m.kept_as_is_fields & other_fields,
                 )
                 if not remaining.risky_fields and not remaining.kept_as_is_fields:
@@ -2844,12 +3038,67 @@ def _render_pending_review(pending: list):
                     )
             st.divider()
 
+        # See brochure_mismatch_ids' own comment above - excludes any row
+        # already claimed by decision_let_status (handled entirely inside
+        # that loop just above, bundled with its own let-status decision).
+        for i, m in enumerate(decision_brochure_mismatch):
+            decision = _render_brochure_mismatch_decision(m, f"brochure_mismatch_{i}_{m.property_id}")
+            if decision == "apply":
+                entry = decision_updates.setdefault(m.master_index, {})
+                entry.update(
+                    {f: new_val for f, (old_val, new_val) in m.diffs.items() if f in m.brochure_mismatch_fields}
+                )
+                entry["source_file"] = m.new_row.source_file
+            # "keep" - this update contributes nothing for these fields.
+
+            # This row's OTHER diffs (every field besides brochure_link/
+            # contacts just decided above) are unrelated facts about the
+            # property - same "display-only remaining copy" pattern as the
+            # decision_let_status loop above.
+            other_fields = frozenset(m.diffs) - m.brochure_mismatch_fields
+            if other_fields:
+                remaining = dataclasses.replace(
+                    m,
+                    diffs={f: v for f, v in m.diffs.items() if f in other_fields},
+                    risky_fields=m.risky_fields - m.brochure_mismatch_fields,
+                    kept_as_is_fields=m.kept_as_is_fields & other_fields,
+                )
+                if not remaining.risky_fields and not remaining.kept_as_is_fields:
+                    entry = {f: new_val for f, (old_val, new_val) in remaining.diffs.items()}
+                    entry["source_file"] = m.new_row.source_file
+                    auto_updates[m.master_index] = entry
+                elif not remaining.risky_fields:
+                    _render_matched_row(
+                        remaining, f"brochure_mismatch_other_kept_{i}_{m.property_id}", "⚠️ ", True, decision_updates,
+                    )
+                else:
+                    _render_matched_row(
+                        remaining, f"brochure_mismatch_other_{i}_{m.property_id}", "⚠️ ", True, decision_updates,
+                    )
+            st.divider()
+
         for i, u in enumerate(decision_new_property_let_status):
             decision, location_overrides = _render_new_property_let_status_decision(u, f"new_let_status_{i}")
             if decision == "add":
                 update = {"property_id": str(uuid.uuid4()), **location_overrides}
+                # See decision_new_property_brochure_mismatch's own comment
+                # above - a brand-new row can rarely need BOTH kinds of new-
+                # property decision at once; bundled here rather than
+                # rendering the row a second time under a separate card,
+                # only once the reviewer has actually decided to add it at
+                # all (nothing to decide about its fields otherwise).
+                if u.brochure_mismatch_fields:
+                    update.update(
+                        _render_new_property_brochure_mismatch_decision(u, f"new_let_status_{i}_mismatch")
+                    )
                 new_rows_final.append(u.new_row.model_copy(update=update))
             # "skip" - never added to master at all.
+            st.divider()
+
+        for i, u in enumerate(decision_new_property_brochure_mismatch):
+            overrides = _render_new_property_brochure_mismatch_decision(u, f"new_mismatch_{i}")
+            update = {"property_id": str(uuid.uuid4()), **overrides}
+            new_rows_final.append(u.new_row.model_copy(update=update))
             st.divider()
 
         for i, group in enumerate(decision_collision_groups):

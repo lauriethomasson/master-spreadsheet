@@ -150,6 +150,17 @@ class VisibleColumnsAlwaysHiddenTests(unittest.TestCase):
         df = pd.DataFrame([{"building": "The Canal Building", "development_name": "Regent's Wharf"}])
         self.assertNotIn("development_name", display_utils.visible_columns(df))
 
+    def test_brochure_building_mismatch_is_never_shown_on_the_review_grid(self):
+        # The mismatch note has its own dedicated decision card on the
+        # Review page (see pages/2_Review_and_Master.py's _render_
+        # brochure_mismatch_decision) - a raw column here would show the
+        # same note a second time, in a spot no one is looking at it.
+        df = pd.DataFrame([{
+            "building": "New Derwent House",
+            "brochure_building_mismatch": "Brochure appears to be for a different building",
+        }])
+        self.assertNotIn("brochure_building_mismatch", display_utils.visible_columns(df))
+
     def test_an_ordinary_column_is_unaffected(self):
         df = pd.DataFrame([{"building": "A", "brochure_link_broken": True}])
         self.assertIn("building", display_utils.visible_columns(df))

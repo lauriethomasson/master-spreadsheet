@@ -320,6 +320,28 @@ LET_STATUS_KEYWORDS = (
     "let", "leased", "no longer available", "withdrawn", "under offer", "occupied", "u/o",
 )
 
+# brochure_link/contacts - the two fields a confident, confirmed brochure/
+# floorplan building-name mismatch (see schema.ListingRow.brochure_
+# building_mismatch's own docstring, brochure_enrichment._confident_
+# building_mismatch) means might actually belong to a DIFFERENT,
+# neighboring property, not this row at all. Real confirmed production
+# incident this exists for: a shared multi-property Colliers Canva deck
+# caused Gemini to occasionally misattribute a NEIGHBORING building's own
+# brochure_link/contacts to a row (New Derwent House's rows got Ivybridge
+# House's own brochure_link and real contacts). _confident_building_
+# mismatch already DETECTS this and sets brochure_building_mismatch, but
+# on its own that note is purely informational - nothing downstream
+# previously stopped brochure_link/contacts auto-applying on a flagged row
+# exactly like any other ordinary field. Gated the same "positive evidence
+# of a real problem, always needs a human's own look" way address_
+# conflict/GEOCODE_UNVERIFIED_FIELDS already are (see build_merge_plan's
+# own brochure_mismatch_fields computation) - never a silent block (a
+# reviewer decides apply vs. keep current - see pages/2_Review_and_
+# Master.py's own decision card), and NEVER triggered at all when
+# brochure_building_mismatch isn't set - the common case keeps auto-
+# applying brochure_link/contacts exactly as before this existed.
+BROCHURE_MISMATCH_GATED_FIELDS = ("brochure_link", "contacts")
+
 
 def _let_status_pattern(kw: str) -> str:
     """The word-boundary regex pattern for one LET_STATUS_KEYWORDS entry -
@@ -463,6 +485,32 @@ def _new_row_let_status_fields(new_row) -> frozenset:
     property that's already unavailable as over updating one to say so.
     """
     return frozenset(f for f in LET_STATUS_FIELDS if mentions_let_status(getattr(new_row, f)))
+
+
+def _new_row_brochure_mismatch_fields(new_row) -> frozenset:
+    """
+    Mirrors MatchedRow.brochure_mismatch_fields' own computation (see
+    build_merge_plan) for a row with no master record to diff against at
+    all - a genuinely new property has no before/after pair, only its own
+    proposed values, so this just checks whether new_row itself carries a
+    real (non-blank) BROCHURE_MISMATCH_GATED_FIELDS value at all, gated the
+    same way, whenever new_row.brochure_building_mismatch is set. Used to
+    build every UnmatchedRow's own brochure_mismatch_fields (see that
+    dataclass) - same no-master-row precedent as _new_row_let_status_
+    fields just above.
+
+    Real gap this closes: brochure_building_mismatch is set during
+    _apply_units_to_row (brochure_enrichment.py), entirely before/
+    independent of master-matching - so a brand-new property (no existing
+    master record at all) can carry a true mismatch flag on its very first
+    upload, exactly like the matched-row case, just via a different door.
+    Without this, such a row would land silently in plain_new with no
+    decision prompt at all (see pages/2_Review_and_Master.py's own
+    decision_new_property_brochure_mismatch wiring).
+    """
+    if not new_row.brochure_building_mismatch:
+        return frozenset()
+    return frozenset(f for f in BROCHURE_MISMATCH_GATED_FIELDS if not _is_blank(getattr(new_row, f)))
 
 
 # Threshold for _items_similar - a review trigger, not a block, so this is
@@ -2385,6 +2433,11 @@ class MatchedRow:
     # alongside risky_fields ("needs a decision") and the ordinary bundled-
     # safe-changes summary ("will apply automatically").
     kept_as_is_fields: frozenset = field(default_factory=frozenset)
+    # see BROCHURE_MISMATCH_GATED_FIELDS/schema.ListingRow.brochure_
+    # building_mismatch - forces its own dedicated decision (see pages/2_
+    # Review_and_Master.py's own brochure-mismatch decision card), never
+    # folded into risky_fields/let_status_fields' own generic UIs.
+    brochure_mismatch_fields: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -2394,6 +2447,10 @@ class UnmatchedRow:
     # see _new_row_let_status_fields/mentions_let_status - forces manual
     # review for a genuinely new property, same as MatchedRow's own field
     let_status_fields: frozenset = field(default_factory=frozenset)
+    # see _new_row_brochure_mismatch_fields/BROCHURE_MISMATCH_GATED_FIELDS -
+    # forces its own dedicated decision for a genuinely new property, same
+    # as MatchedRow's own brochure_mismatch_fields above.
+    brochure_mismatch_fields: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -2719,7 +2776,12 @@ def consolidate_unmatched_duplicates(plan: MergePlan) -> MergePlan:
                 if id(s) not in seen_ids:
                     seen_ids.add(id(s))
                     suggestions.append(s)
-        merged_rows.append(UnmatchedRow(merged_row, suggestions, _new_row_let_status_fields(merged_row)))
+        merged_rows.append(
+            UnmatchedRow(
+                merged_row, suggestions, _new_row_let_status_fields(merged_row),
+                _new_row_brochure_mismatch_fields(merged_row),
+            )
+        )
 
     new_unmatched = [u for u in plan.unmatched if id(u) not in safe_member_ids] + merged_rows
 
@@ -3130,6 +3192,25 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 silent["address_conflict"] = diffs.pop("address_conflict")[1]
                 diffs.setdefault("address_1", (old_rec.get("address_1"), new_dict.get("address_1")))
 
+            # brochure_building_mismatch (see schema.ListingRow's own
+            # docstring, brochure_enrichment._confident_building_mismatch)
+            # is the same kind of diagnostic pipeline metadata as address_
+            # conflict/geocode_unverified/brochure_link_broken above -
+            # never shown as its own raw diff line (a "None -> 'Brochure
+            # appears to be for a different building...'" row would be
+            # meaningless to a reviewer on its own) - popped out of diffs
+            # and folded silently into the write. Unlike address_conflict's
+            # own address_1-injection trick just above, this doesn't inject
+            # a field into diffs here - it instead GATES brochure_link/
+            # contacts (see BROCHURE_MISMATCH_GATED_FIELDS and brochure_
+            # mismatch_fields below) into their own dedicated decision card
+            # (see pages/2_Review_and_Master.py) whenever this run's new_
+            # dict carries a note, reusing new_dict (not diffs, which this
+            # pop has already mutated) so the check below is unaffected by
+            # ordering.
+            if "brochure_building_mismatch" in diffs:
+                silent["brochure_building_mismatch"] = diffs.pop("brochure_building_mismatch")[1]
+
             # Auto-merge a DETAIL_LOSS_MERGE_FIELDS update BEFORE risky_fields
             # is computed below, whenever it's safe to (see merge_compatible_
             # text's own docstring): is_detail_loss says old_val has a
@@ -3281,14 +3362,27 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])
             )
+            # See BROCHURE_MISMATCH_GATED_FIELDS' own docstring - only ever
+            # non-empty when new_dict.get("brochure_building_mismatch") is
+            # truthy (this run's own _confident_building_mismatch note),
+            # never merely because brochure_link/contacts changed on an
+            # otherwise-ordinary row - the common case is completely
+            # unaffected.
+            brochure_mismatch_fields = frozenset(
+                f for f in diffs
+                if f in BROCHURE_MISMATCH_GATED_FIELDS and new_dict.get("brochure_building_mismatch")
+            )
             matched = MatchedRow(
                 master_idx, old_rec["property_id"], new_row, diffs, tier, silent, risky_fields, let_status_fields,
-                kept_as_is_fields,
+                kept_as_is_fields, brochure_mismatch_fields,
             )
             (matched_changed if diffs else matched_unchanged).append(matched)
         else:
             unmatched.append(
-                UnmatchedRow(new_row, _suggest_similar(new_dict, master_records), _new_row_let_status_fields(new_row))
+                UnmatchedRow(
+                    new_row, _suggest_similar(new_dict, master_records), _new_row_let_status_fields(new_row),
+                    _new_row_brochure_mismatch_fields(new_row),
+                )
             )
 
     # Two incoming rows can independently match the SAME master row via
@@ -3577,7 +3671,7 @@ def _resolve_listing_evidence_conflicts(matched_changed: list, unmatched: list, 
     new_unmatched = list(unmatched) + [
         UnmatchedRow(
             m.new_row, _suggest_similar(m.new_row.model_dump(), master_records),
-            _new_row_let_status_fields(m.new_row),
+            _new_row_let_status_fields(m.new_row), _new_row_brochure_mismatch_fields(m.new_row),
         )
         for m in demoted
     ]
