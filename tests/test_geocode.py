@@ -1831,7 +1831,13 @@ class BareNameCorroborationTests(unittest.TestCase):
     a bare building name with no leading house number and no development_
     name/source_hint of its own to disambiguate the query - the one shape
     with ZERO other corroboration available at all once a Places candidate
-    comes back.
+    comes back. A THIRD confirmed real failure ("New Derwent House" ->
+    "Derwent London", a completely different real place sharing only the
+    brand-ish word "derwent") needed the check strengthened from "at least
+    one shared word" to "a genuine majority (strictly more than half) of
+    source_name_words' own words" - see that test's own comment for why a
+    bare single shared word isn't real evidence two names refer to the same
+    building.
     """
 
     def setUp(self):
@@ -1882,6 +1888,53 @@ class BareNameCorroborationTests(unittest.TestCase):
         self.assertIsNone(row.lng)
         self.assertEqual(len(geocode.FAILURES), 1)
         self.assertIn("shares no words", geocode.FAILURES[0]["reason"])
+
+    def test_new_derwent_house_resolving_to_derwent_london_is_rejected(self):
+        # Confirmed real failure the bare non-empty-intersection rule let
+        # through: source_name_words for "New Derwent House" is {"new",
+        # "derwent"} ("house" filtered) - "Derwent London" shares exactly
+        # one of those two words ("derwent"), a bare majority-less 50%, not
+        # real evidence these name the same building (Derwent London is the
+        # property company's own HQ at 25 Savile Row, not the actual
+        # building at 69-73 Theobalds Road). No postcode/house-number hint
+        # here (no submarket, no address_1) - NAME_CONFLICT is the only
+        # corroboration in play, same shape as the Packing House/Canal
+        # Building cases above.
+        row = ListingRow(building="New Derwent House", provider="beem")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.51, "lng": -0.14, "address_components": [],
+                "name": "Derwent London",
+            },
+        ):
+            geocode.geocode_row(row)
+
+        self.assertIsNone(row.lat)
+        self.assertIsNone(row.lng)
+        self.assertEqual(len(geocode.FAILURES), 1)
+        self.assertIn("not a majority", geocode.FAILURES[0]["reason"])
+
+    def test_new_derwent_house_resolving_to_its_own_full_name_is_still_accepted(self):
+        # The majority rule must not over-reject a genuine multi-word
+        # match - "New Derwent House" resolving to a Places candidate
+        # genuinely named "New Derwent House" shares both significant
+        # words (2 of 2 - a full, not merely majority, match) and is
+        # accepted exactly as before this check existed.
+        row = ListingRow(building="New Derwent House", provider="beem")
+
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={
+                "status": "OK", "lat": 51.52, "lng": -0.12, "address_components": [],
+                "name": "New Derwent House",
+            },
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.52)
+        self.assertEqual(row.lng, -0.12)
 
     def test_bare_name_resolving_to_its_own_genuine_name_is_still_accepted(self):
         # The ordinary, correct case must keep working - "Kent House"
