@@ -4258,6 +4258,104 @@ class BuildMergePlanBrochureMismatchTests(unittest.TestCase):
 
         self.assertEqual(plan.unmatched[0].brochure_mismatch_fields, frozenset())
 
+    def test_special_features_is_gated_same_as_brochure_link_used_to_be(self):
+        # BROCHURE_MISMATCH_GATED_FIELDS originally only covered brochure_
+        # link/contacts - special_features is populated from the exact
+        # same, potentially-mismatched brochure document (see brochure_
+        # enrichment.PROPERTY_LEVEL_FIELDS/UNIT_LEVEL_FIELDS) and must get
+        # the identical review-gate treatment, not silently auto-apply.
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers",
+            "special_features": "Original amenity note",
+        }])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers",
+            special_features="Ivybridge House's own amenity note",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.brochure_mismatch_fields)
+        self.assertIn("special_features", matched.diffs)
+
+    def test_postcode_a_building_level_only_field_is_gated_on_mismatch(self):
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers", "postcode": "EC1A 1AA",
+        }])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers", postcode="EC1A 9ZZ",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("postcode", matched.brochure_mismatch_fields)
+        self.assertIn("postcode", matched.diffs)
+
+    def test_state_of_space_a_unit_level_only_field_is_gated_on_mismatch(self):
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers", "state_of_space": "Cat A",
+        }])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers", state_of_space="Fully Fitted",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertIn("state_of_space", matched.brochure_mismatch_fields)
+        self.assertIn("state_of_space", matched.diffs)
+
+    def test_special_features_postcode_state_of_space_unaffected_without_mismatch(self):
+        # Regression guard for the newly-added fields specifically - proves
+        # the common (no mismatch) case stays completely untouched for
+        # every field this change just added, not only for brochure_link/
+        # contacts (already covered above).
+        master_df = _master_df([{
+            "building": "1 Example Street", "provider": "Test Provider",
+            "special_features": "Old note", "postcode": "EC1A 1AA", "state_of_space": "Cat A",
+        }])
+        new_row = ListingRow(
+            building="1 Example Street", provider="Test Provider",
+            special_features="New note", postcode="EC1A 9ZZ", state_of_space="Fully Fitted",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.brochure_mismatch_fields, frozenset())
+        for f in ("special_features", "postcode", "state_of_space"):
+            self.assertIn(f, matched.diffs)
+
+    def test_address_1_is_never_swept_into_brochure_mismatch_fields(self):
+        # Deliberate exclusion (see BROCHURE_MISMATCH_GATED_FIELDS' own
+        # comment) - address_1 is never directly overwritten by brochure
+        # enrichment at all (a genuine disagreement sets address_conflict
+        # instead, which already has its own older, unconditional gate
+        # completely independent of brochure_building_mismatch - see the
+        # address_conflict clause in build_merge_plan). address_1 must
+        # never land in brochure_mismatch_fields merely because it also
+        # differs on a row that happens to carry brochure_building_
+        # mismatch - that would double-gate the same field two ways and
+        # sweep in an address_1 diff that has nothing to do with the
+        # mismatched brochure at all.
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers", "address_1": "1 Old Address",
+        }])
+        new_row = ListingRow(
+            building="New Derwent House", provider="Colliers", address_1="2 New Address",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertNotIn("address_1", matched.brochure_mismatch_fields)
+
 
 class ApplyMergeRemovalTests(unittest.TestCase):
     """Delete-row support added for the "remove from master entirely"
