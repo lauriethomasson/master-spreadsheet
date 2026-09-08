@@ -1002,17 +1002,34 @@ def _best_places_result(
     never passed for the same candidate) with no development_name or
     source_hint already disambiguating the query - the one shape with
     otherwise ZERO corroboration available: a candidate whose own returned
-    name shares NOT ONE significant word with it is rejected as a
-    NAME_CONFLICT. Confirmed real failures this closes, both live-traced
-    against the real Places API: "Packing House" (Regent's Wharf, King's
-    Cross - no street number stated anywhere in its own brochure) resolved
-    via "Packing House, King's Cross, London, UK" to a genuinely different,
-    unrelated "King's House" (242 Pentonville Road); "Canal Building" (same
-    brochure/campus) resolved via "Canal Building, King's Cross, London,
-    UK" to a candidate sharing no name resemblance at all. Same zero-
-    overlap-only rejection philosophy as source_street_words above, for the
-    same reason - a wrongly-rejected genuine match silently leaves the row
-    completely unmapped, so this only ever fires on a fully disjoint match.
+    name doesn't share a MAJORITY (strictly more than half) of source_
+    name_words' own significant words is rejected as a NAME_CONFLICT.
+    Confirmed real failures this closes, both live-traced against the real
+    Places API: "Packing House" (Regent's Wharf, King's Cross - no street
+    number stated anywhere in its own brochure) resolved via "Packing
+    House, King's Cross, London, UK" to a genuinely different, unrelated
+    "King's House" (242 Pentonville Road) - zero shared words, rejected
+    under either rule; "Canal Building" (same brochure/campus) resolved via
+    "Canal Building, King's Cross, London, UK" to a candidate sharing no
+    name resemblance at all - same. A THIRD confirmed real failure needed
+    the majority rule specifically, not just zero-overlap: "New Derwent
+    House" (source_name_words {"new", "derwent"} once the generic "house"
+    is filtered) resolved via Places to "Derwent London" (candidate_name_
+    words {"derwent", "london"}) - a completely different real place (the
+    property company's own HQ at 25 Savile Row, not the actual building at
+    69-73 Theobalds Road). The two share exactly one word, "derwent" - a
+    bare non-empty-intersection check (the original rule) let this straight
+    through, since sharing one brand-ish word isn't real evidence these
+    name the same building; requiring a genuine majority (here 1 of 2 = 50%,
+    not strictly more than half) correctly rejects it instead. A single-
+    significant-word source is unaffected by this strengthening either way
+    (1 of 1 shared is a majority under both rules, 0 of 1 shared is a
+    conflict under both) - the majority rule only ever changes the outcome
+    once source_name_words has 2+ words. Same "a wrongly-rejected genuine
+    match silently leaves the row completely unmapped" caution as source_
+    street_words above still applies - this only ever fires when the
+    shared fraction is genuinely at or below half, never on a real majority
+    match.
 
     A candidate with no displayName of its own at all makes candidate_name_
     words an EMPTY set - falsy, so the check silently no-ops and the
@@ -1086,9 +1103,27 @@ def _best_places_result(
         if source_name_words:
             candidate_name = place.get("name")
             candidate_name_words = _building_name_words(candidate_name) if candidate_name else frozenset()
-            if candidate_name_words and not (source_name_words & candidate_name_words):
-                last = {**place, "status": "NAME_CONFLICT", "candidate_name": candidate_name}
-                continue
+            if candidate_name_words:
+                shared_name_words = source_name_words & candidate_name_words
+                # Strictly more than half of source_name_words' own words, not
+                # merely "at least one" - see this function's own NAME_CONFLICT
+                # docstring for the confirmed real "New Derwent House" ->
+                # "Derwent London" failure a bare non-empty-intersection check
+                # let straight through (they share exactly one word, "derwent",
+                # out of source's own two - a single shared brand-ish word is
+                # not real evidence these name the same building). Expressed as
+                # integer comparison (2 * overlap <= total) rather than a float
+                # division to sidestep any rounding concern - identical to a
+                # plain non-empty check whenever source_name_words has only one
+                # word (1-of-1 or 0-of-1 either way), so every already-passing
+                # single-word case (e.g. "Packing House" -> "King's House") is
+                # completely unaffected.
+                if len(shared_name_words) * 2 <= len(source_name_words):
+                    last = {
+                        **place, "status": "NAME_CONFLICT", "candidate_name": candidate_name,
+                        "shared_name_words": shared_name_words,
+                    }
+                    continue
         result = {**place, "status": "OK"}
         if weak_corroboration:
             result["weak_corroboration"] = weak_corroboration
@@ -1676,9 +1711,14 @@ def geocode_row(row: ListingRow) -> ListingRow:
             return row
 
         if result["status"] == "NAME_CONFLICT":
+            shared_name_words = result.get("shared_name_words")
+            share_desc = (
+                f"shares only {sorted(shared_name_words)!r} - not a majority of its own significant words"
+                if shared_name_words else "shares no words"
+            )
             log_geocode_failure(
                 row,
-                f"Places candidate's own name ({result.get('candidate_name')!r}) shares no words "
+                f"Places candidate's own name ({result.get('candidate_name')!r}) {share_desc} "
                 f"with the source's own bare building name {row.building!r}, and there was no "
                 "development_name/other source evidence to disambiguate the query either - rejected "
                 "rather than accepted on a completely uncorroborated building-name-only match",
