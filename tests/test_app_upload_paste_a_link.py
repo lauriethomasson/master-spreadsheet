@@ -716,6 +716,211 @@ class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
         self.assertEqual(by_building["27-29 Gloucester Place"], "https://blob.example.com/gloucester.pdf")
         self.assertNotEqual(by_building["27-29 Gloucester Place"], by_building["Kingsland House"])
 
+    def test_167_great_portland_street_never_ends_up_with_northumberlands_own_link(self):
+        # The confirmed real incident, full pipeline: Gemini attributes
+        # Northumberland House's own dedicated-slide link (page 1) to 167
+        # Great Portland Street's unit (page 0) - a genuinely live,
+        # reachable, DIFFERENT building's document, so reachability alone
+        # could never catch it. 167 GPS's own page only ever hinted
+        # Prospect House's real link.
+        url = "https://canva.link/colliers-deck"
+        northumberland_link = (
+            "https://listingsprod.blob.core.windows.net/ourlistings-gbr/"
+            "00a53b33-39c8-41ee-a48b-c3ee9ad792e3/7c38861a-db24-45c2-962f-d39eb3e2ef17"
+        )
+        prospect_house_link = (
+            "https://listingsprod.blob.core.windows.net/ourlistings-gbr/"
+            "8b7165e5-7e6c-4c6e-b59a-89d0d204922b/d6ce0b2a-7240-4c32-8eb9-7223d77f53d5"
+        )
+        png_pages = [_make_png((1, 0, 0)), _make_png((0, 1, 0))]
+        page_links = [
+            [{"href": prospect_house_link, "text": "167 Great Portland Street"}],
+            [{"href": northumberland_link, "text": "Northumberland House"}],
+        ]
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {
+                    "building": "167 Great Portland Street", "floor_unit": "1st", "page_index": 0,
+                    "brochure_link": northumberland_link,
+                },
+                {
+                    "building": "Northumberland House", "floor_unit": "2nd & 4th Floors", "page_index": 1,
+                    "brochure_link": northumberland_link,
+                },
+            ],
+        }
+
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment.fetch_rendered_page_with_links",
+                    return_value=(png_pages, page_links),
+                ), \
+                patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw), \
+                patch("brochure_enrichment._fetch_pdf_bytes", return_value=b"%PDF-1.4 real"), \
+                patch("geocode.geocode_rows"):
+            at = _run_upload_page()
+            _add_link(at, url)
+            self.assertFalse(at.exception)
+
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        from storage.file_store import load_staging_as_dataframe
+
+        staged = list_pending_staging_files()
+        self.assertEqual(len(staged), 1)
+        df = load_staging_as_dataframe(staged[0])
+        by_building = {row["building"]: row["brochure_link"] for _, row in df.iterrows()}
+
+        # Never Northumberland's own link - it was never hinted on 167
+        # GPS's own page at all.
+        self.assertNotEqual(by_building["167 Great Portland Street"], northumberland_link)
+        # Northumberland House's own row keeps its own genuine link -
+        # completely unaffected by the other row's rejection.
+        self.assertEqual(by_building["Northumberland House"], northumberland_link)
+
+
+class RejectUnhintedPastedLinkBrochureLinksTests(unittest.TestCase):
+    """
+    app._reject_unhinted_pasted_link_brochure_links - runs BEFORE
+    _validate_pasted_link_brochure_links. Confirmed real gap this closes:
+    167 Great Portland Street's row ended up with Northumberland House's
+    own dedicated-slide link (a genuinely live, reachable, different
+    building's document) rather than its own page's real hinted link -
+    reachability alone could never catch this, since the wrong link really
+    was live. Uses the real building names/links from that confirmed
+    incident.
+    """
+
+    FALLBACK = "https://storage.example/colliers-deck.pdf"
+    NORTHUMBERLAND_LINK = (
+        "https://listingsprod.blob.core.windows.net/ourlistings-gbr/"
+        "00a53b33-39c8-41ee-a48b-c3ee9ad792e3/7c38861a-db24-45c2-962f-d39eb3e2ef17"
+    )
+    PROSPECT_HOUSE_LINK = (
+        "https://listingsprod.blob.core.windows.net/ourlistings-gbr/"
+        "8b7165e5-7e6c-4c6e-b59a-89d0d204922b/d6ce0b2a-7240-4c32-8eb9-7223d77f53d5"
+    )
+
+    def _row(self, building, floor_unit, brochure_link, brochure_link_is_floorplan=None):
+        return ListingRow(
+            building=building, floor_unit=floor_unit, brochure_link=brochure_link,
+            brochure_link_is_floorplan=brochure_link_is_floorplan,
+        )
+
+    def test_confirmed_real_167_great_portland_street_case_is_rejected(self):
+        # 167 Great Portland Street's own page (page_index 2) only ever
+        # hinted Prospect House's link - Gemini instead attributed
+        # Northumberland House's own link (hinted only on page 5, a
+        # structurally distant, unrelated page) - must be rejected back to
+        # the shared fallback, never silently kept.
+        rows = [self._row("167 Great Portland Street", "1st", self.NORTHUMBERLAND_LINK)]
+        page_indices = [2]
+        page_links = [
+            [], [],
+            [{"href": self.PROSPECT_HOUSE_LINK, "text": "167 Great Portland Street"}],
+            [], [],
+            [{"href": self.NORTHUMBERLAND_LINK, "text": "Northumberland House"}],
+        ]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.FALLBACK)
+
+    def test_link_genuinely_hinted_on_its_own_page_survives(self):
+        rows = [self._row("167 Great Portland Street", "1st", self.PROSPECT_HOUSE_LINK)]
+        page_indices = [2]
+        page_links = [
+            [], [],
+            [{"href": self.PROSPECT_HOUSE_LINK, "text": "167 Great Portland Street"}],
+        ]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.PROSPECT_HOUSE_LINK)
+
+    def test_shared_document_hinted_on_each_of_several_distinct_buildings_own_pages_survives(self):
+        # The real Regent's Wharf shape: one genuine combined document,
+        # correctly re-hinted on each of several distinct sub-buildings'
+        # own separate pages - must never be rejected just because the
+        # SAME link is also used by another building's own page.
+        shared_doc = "https://blob.example.com/regents-wharf-combined-brochure.pdf"
+        rows = [
+            self._row("Regents Wharf (The Mill)", "1st", shared_doc),
+            self._row("Regents Wharf (The Packing House)", "Ground", shared_doc),
+        ]
+        page_indices = [3, 7]
+        page_links = [
+            [], [], [],
+            [{"href": shared_doc, "text": "Download Brochure"}],
+            [], [], [],
+            [{"href": shared_doc, "text": "Download Brochure"}],
+        ]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, shared_doc)
+        self.assertEqual(rows[1].brochure_link, shared_doc)
+
+    def test_no_page_indices_is_a_no_op(self):
+        rows = [self._row("167 Great Portland Street", "1st", self.NORTHUMBERLAND_LINK)]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, None, [[]], self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.NORTHUMBERLAND_LINK)
+
+    def test_no_page_links_is_a_no_op(self):
+        rows = [self._row("167 Great Portland Street", "1st", self.NORTHUMBERLAND_LINK)]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, [2], None, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.NORTHUMBERLAND_LINK)
+
+    def test_page_index_past_what_page_links_covers_is_left_untouched(self):
+        rows = [self._row("167 Great Portland Street", "1st", self.NORTHUMBERLAND_LINK)]
+        page_indices = [9]
+        page_links = [[{"href": self.PROSPECT_HOUSE_LINK, "text": "x"}]]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.NORTHUMBERLAND_LINK)
+
+    def test_row_already_on_the_shared_fallback_is_untouched(self):
+        rows = [self._row("167 Great Portland Street", "1st", self.FALLBACK)]
+        page_indices = [2]
+        page_links = [[], [], [{"href": self.PROSPECT_HOUSE_LINK, "text": "x"}]]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, self.FALLBACK)
+
+    def test_floorplan_substituted_link_is_never_rejected(self):
+        rows = [self._row(
+            "167 Great Portland Street", "1st", "https://blob.example.com/floorplan.pdf",
+            brochure_link_is_floorplan=True,
+        )]
+        page_indices = [2]
+        page_links = [[], [], [{"href": self.PROSPECT_HOUSE_LINK, "text": "x"}]]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, "https://blob.example.com/floorplan.pdf")
+
+    def test_ordinary_single_hinted_link_page_is_unaffected(self):
+        # The common case: one page, one unit, one real hinted link -
+        # completely unaffected by this new constraint.
+        real_link = "https://blob.example.com/some-brochure.pdf"
+        rows = [self._row("1 Example Street", "Ground", real_link)]
+        page_indices = [0]
+        page_links = [[{"href": real_link, "text": "1 Example Street"}]]
+
+        app._reject_unhinted_pasted_link_brochure_links(rows, page_indices, page_links, self.FALLBACK)
+
+        self.assertEqual(rows[0].brochure_link, real_link)
+
 
 class PropagateValidatedLinksWithinPageTests(unittest.TestCase):
     """

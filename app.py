@@ -1057,6 +1057,62 @@ def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) 
                     row.brochure_building_mismatch = mismatch_note
 
 
+def _reject_unhinted_pasted_link_brochure_links(
+    rows: list, page_indices: list, page_links: list, shared_fallback_link: str,
+) -> None:
+    """
+    Mutates each row's own brochure_link in place - runs BEFORE
+    _validate_pasted_link_brochure_links (a cheap, no-network check ahead
+    of that one's own live fetch), on the same rows extract.extract_from_
+    png_pages's own png_pages+page_links branch just produced. Gemini's
+    own per-unit brochure_link pick (see extract.images_from_png_pages's
+    own page_links param) was, up to this point, trusted purely by LABEL -
+    nothing confirmed the link Gemini actually returned was ever one of
+    the real candidates HINTED for that specific unit's own page at all.
+    Confirmed real gap this closes: a large, shared multi-property Colliers
+    deck let Gemini attribute a link it saw HINTED on a structurally
+    distant, unrelated page (Northumberland House's own dedicated slide) to
+    a unit (167 Great Portland Street) whose own page never offered that
+    link at all - both a completely different building's own link AND a
+    genuinely live/reachable one, so _validate_pasted_link_brochure_links'
+    own reachability check alone could never have caught it.
+
+    Rejects (falls back to shared_fallback_link, the exact same "nothing
+    genuine found" outcome as if Gemini had returned nothing for this unit
+    at all - NEVER a different, still-wrong link) any row whose own
+    brochure_link does not appear, byte-for-byte, among page_links[that
+    row's own page_index]'s own hrefs - the SAME real candidates Gemini
+    itself was shown for that exact page. A row with no page_index
+    (couldn't be determined), no page_links data at all, or a page_index
+    past what page_links actually covers is left completely untouched -
+    conservative like every other tier in this feature: never a rejection
+    for lack of INFORMATION to check against, only ever a genuine, provable
+    mismatch. A row whose brochure_link already equals shared_fallback_
+    link, is blank, or is flagged brochure_link_is_floorplan has nothing to
+    check - the same guards _validate_pasted_link_brochure_links already
+    uses, for the identical reasons.
+
+    Deliberately NOT a rejection on "this link is also used by another
+    building's own page" - a genuine multi-building portfolio deck (e.g. a
+    real combined document correctly re-hinted on each of several distinct
+    sub-buildings' own separate pages, the same shape a real Regent's
+    Wharf-style shared document takes) survives this completely unchanged,
+    since this only ever checks whether the link was hinted on THIS row's
+    OWN page, never whether it's exclusive to it.
+    """
+    if not page_indices or not page_links:
+        return
+
+    for row, page_index in zip(rows, page_indices):
+        if not row.brochure_link or row.brochure_link == shared_fallback_link or row.brochure_link_is_floorplan:
+            continue
+        if page_index is None or not (0 <= page_index < len(page_links)):
+            continue
+        hinted_hrefs = {link["href"] for link in page_links[page_index]}
+        if row.brochure_link not in hinted_hrefs:
+            row.brochure_link = shared_fallback_link
+
+
 def _propagate_validated_links_within_page(rows: list, page_indices: list, shared_fallback_link: str) -> None:
     """
     Mutates each row's own brochure_link in place - only ever called right
@@ -1729,6 +1785,23 @@ with page_setup.setup_page("upload"):
                                     rows = extract.extract_from_png_pages(
                                         png_pages, original_filename=uploaded_file.name,
                                         page_links=uploaded_file.page_links,
+                                    )
+                                    # Gemini's own per-unit pick was, up to
+                                    # this point, trusted purely by LABEL -
+                                    # nothing confirmed it was ever one of
+                                    # the real candidates actually HINTED
+                                    # for that unit's own page (see this
+                                    # function's own docstring for the
+                                    # confirmed real 167 Great Portland
+                                    # Street/Northumberland House incident
+                                    # this closes) - runs BEFORE the live
+                                    # reachability fetch below, a cheap
+                                    # check ahead of a network round trip
+                                    # for a link that's about to be
+                                    # rejected anyway.
+                                    _reject_unhinted_pasted_link_brochure_links(
+                                        rows, getattr(rows, "page_indices", None), uploaded_file.page_links,
+                                        brochure_url,
                                     )
                                     # Gemini's own per-unit pick is trusted
                                     # by LABEL alone up to this point, never
