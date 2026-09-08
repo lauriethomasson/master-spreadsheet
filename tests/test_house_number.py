@@ -77,6 +77,35 @@ class LeadingHouseNumberDigitFormTests(unittest.TestCase):
     def test_word_to_range_with_letter_suffixes(self):
         self.assertEqual(leading_house_number("27a to 30b Lime Street"), "27a-30b")
 
+    def test_unicode_dash_variants_normalize_to_the_same_token_as_the_ascii_hyphen_form(self):
+        # Confirmed real case: an Ivybridge House "1 to 5 Adam Street" vs a
+        # Gemini-extracted "1–5 Adam Street" (en dash, not a plain ASCII
+        # hyphen) - visually indistinguishable from "1-5" in ordinary UI
+        # text, but the bare-ASCII-hyphen-only pattern didn't recognize it
+        # as a separator at all, so it stopped at "1" (a bare number) and
+        # house_number_changed then flagged this as a risky address change
+        # even though nothing actually changed. PDF/Gemini text extraction
+        # routinely renders a genuine typographic dash for a number range
+        # (unlike hand-typed text), so every other common dash/minus
+        # codepoint must normalize identically too.
+        ascii_token = leading_house_number("1-5 Adam Street")
+        dash_variants = {
+            "hyphen (U+2010)": "1‐5 Adam Street",
+            "non-breaking hyphen (U+2011)": "1‑5 Adam Street",
+            "figure dash (U+2012)": "1‒5 Adam Street",
+            "en dash (U+2013)": "1–5 Adam Street",
+            "em dash (U+2014)": "1—5 Adam Street",
+            "horizontal bar (U+2015)": "1―5 Adam Street",
+            "minus sign (U+2212)": "1−5 Adam Street",
+        }
+        for name, text in dash_variants.items():
+            with self.subTest(name):
+                self.assertEqual(leading_house_number(text), ascii_token, name)
+                self.assertEqual(leading_house_number(text), "1-5", name)
+
+    def test_unicode_dash_variant_is_whitespace_tolerant_like_the_ascii_hyphen(self):
+        self.assertEqual(leading_house_number("13 – 15 Dock Street"), "13-15")
+
 
 class SpelledOutNumberTests(unittest.TestCase):
     """The new fallback: a leading spelled-out cardinal number (one through

@@ -65,9 +65,20 @@ import re
 # Street" left as an un-strippable remainder that could never equal the
 # row's own "13-15 Dock Street" remainder ("Dock Street") - the SAME range,
 # spelled with extra spacing, silently treated as a completely different
-# street reference.
+# street reference. Confirmed real case #3: an Ivybridge House "1 to 5 Adam
+# Street" vs a Gemini-extracted "1–5 Adam Street" (en dash, not a plain
+# ASCII hyphen) - visually indistinguishable from "1-5" in ordinary UI text,
+# but the bare-hyphen-only pattern didn't recognize it as a separator at
+# all, so it stopped at "1" (a bare number) and house_number_changed then
+# flagged this as a risky address change even though, again, nothing
+# actually changed. PDF/Gemini text extraction routinely renders a genuine
+# typographic dash character for a number range (unlike hand-typed text),
+# so _DASH_CHARS below also tolerates every other common dash/minus
+# codepoint for the identical reason - one canonical token regardless of
+# which dash-like character the source happened to use.
+_DASH_CHARS = "-‐‑‒–—―−"
 LEADING_HOUSE_NUMBER_RE = re.compile(
-    r"^\s*(\d+[a-z]?)(?:(\s*-\s*|\s+to\s+)(\d+[a-z]?))?\b", re.IGNORECASE,
+    rf"^\s*(\d+[a-z]?)(?:(\s*[{_DASH_CHARS}]\s*|\s+to\s+)(\d+[a-z]?))?\b", re.IGNORECASE,
 )
 
 # Spelled-out cardinal numbers, one through nineteen - confirmed real case:
