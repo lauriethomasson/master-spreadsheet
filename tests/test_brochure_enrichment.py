@@ -4122,6 +4122,79 @@ class ThreeLevelEnrichmentTests(unittest.TestCase):
         self.assertNotIn("hechle", new_row.contacts.lower())
         self.assertNotIn("chalk", new_row.contacts.lower())
 
+    def test_is_shared_deck_document_suppresses_contacts_and_property_features_but_not_building_features(self):
+        # The SECOND, later-stage recurrence of the shared-deck contamination
+        # (the real confirmed Kingsland House incident: its own colliers.com
+        # listing page 403'd, _validate_pasted_link_brochure_links fell back
+        # to the shared 21-building Colliers deck's own URL, and THIS later
+        # enrichment pass then read that same shared deck as if it were
+        # Kingsland House's own individual document). units here mirrors the
+        # real shared deck's own shape: document-wide contacts (a multi-
+        # person string), a whole-site property_features blurb, per-unit
+        # contacts blank (contacts is never per-unit anyway - see this
+        # function's own docstring), and a building_features entry that DOES
+        # cover this row's own building (already safely scoped by
+        # _match_building_feature's own exact building-name match, regardless
+        # of whether the source document is shared).
+        row = ListingRow(
+            building="Kingsland House", floor_unit="2nd Floor", contacts=None, special_features=None,
+            brochure_link="https://www.canva.com/design/DAGbhpjThxc/shared-colliers-deck",
+        )
+        units = _brochure_units(
+            [{"building": "Kingsland House", "floor_unit": "2nd Floor", "size_sqft": 3000}],
+            property_features="Whole-site amenities: manned reception, on-site gym, cafe",
+            contacts="Team Mishon, mishon@colliers.com; Team Hechle, hechle@colliers.com; Team Chalk, chalk@colliers.com",
+            building_features=[{"building": "Kingsland House", "features": "Kingsland House's own manned reception"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units, is_shared_deck_document=True)
+
+        # contacts stays blank - the shared deck's own document-wide
+        # contacts are never trusted as this row's own.
+        self.assertIsNone(new_row.contacts)
+        self.assertNotIn("contacts", fields)
+        # property_features (document-wide) never reaches special_features
+        # either.
+        self.assertNotIn("Whole-site amenities", new_row.special_features or "")
+        # ...but building_features (already scoped to THIS row's own
+        # building by _match_building_feature) still legitimately applies -
+        # gating is deliberately narrower than "ignore this document
+        # entirely".
+        self.assertIn("Kingsland House's own manned reception", new_row.special_features or "")
+        # Unit-level fields (matched by building+floor, not document-wide)
+        # are completely unaffected by the gate too.
+        self.assertEqual(new_row.size_sqft, 3000)
+
+    def test_is_shared_deck_document_false_by_default_leaves_contacts_and_property_features_behavior_unchanged(self):
+        # Regression guard: the exact same row/units as the test directly
+        # above, but WITHOUT is_shared_deck_document set (the default,
+        # identical to every prior call site before this parameter existed)
+        # - contacts and property_features must still apply normally, same
+        # as test_paste_a_link_row_gets_contacts_from_its_own_resolved_
+        # document_not_a_shared_deck/test_combine_never_pulls_in_a_shared_
+        # decks_own_contacts_only_the_rows_own_resolved_document above prove
+        # for the ordinary genuinely-distinct-document case - this just
+        # proves the SAME default path through the new parameter itself,
+        # not merely its absence.
+        row = ListingRow(
+            building="Kingsland House", floor_unit="2nd Floor", contacts=None, special_features=None,
+            brochure_link="https://example.com/kingsland-house-own-brochure.pdf",
+        )
+        units = _brochure_units(
+            [{"building": "Kingsland House", "floor_unit": "2nd Floor", "size_sqft": 3000}],
+            property_features="Kingsland House's own site amenities",
+            contacts="Jamie Quinn, jamie.quinn@colliers.com",
+            building_features=[{"building": "Kingsland House", "features": "Kingsland House's own manned reception"}],
+        )
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertEqual(new_row.contacts, "Jamie Quinn, jamie.quinn@colliers.com")
+        self.assertIn("contacts", fields)
+        self.assertIn("Kingsland House's own site amenities", new_row.special_features)
+        self.assertIn("Kingsland House's own manned reception", new_row.special_features)
+        self.assertEqual(new_row.size_sqft, 3000)
+
     def test_ambiguous_unit_match_stays_conservative_property_wide_still_applies(self):
         # Two floors, neither identifiable from the row's own vague label -
         # _match_unit correctly returns None (no unit-level guess), but the
@@ -6522,6 +6595,95 @@ class EnrichRowsGroupedTests(EnrichmentTestCase):
         self.assertEqual(stats["rows_eligible"], 3)
         self.assertEqual(stats["rows_enriched"], 1)
 
+    def test_shared_deck_url_gates_contacts_and_property_features_for_the_row_using_it(self):
+        # End-to-end companion to ThreeLevelEnrichmentTests' own is_shared_
+        # deck_document tests above, exercised through the real wiring a
+        # caller (app.py's own _run_automatic_brochure_enrichment/brochure_
+        # enrichment.run_brochure_enrichment) actually uses: shared_deck_url
+        # threaded into enrich_rows_grouped itself, gating per DISTINCT url,
+        # never per row. Kingsland House's own brochure_link IS the shared
+        # deck url (mirroring the real confirmed incident: its own listing
+        # page 403'd, so _validate_pasted_link_brochure_links fell back to
+        # this shared url); Mainframe's own brochure_link is a genuinely
+        # distinct, reachable individual document - the regression guard
+        # proving this doesn't over-correct and block legitimate enrichment
+        # for a row that never fell back to the shared url at all.
+        shared_url = "https://www.canva.com/design/DAGbhpjThxc/shared-colliers-deck"
+        individual_url = "https://example.com/mainframe-own-brochure.pdf"
+        kingsland_row = ListingRow(
+            building="Kingsland House", floor_unit="2nd Floor", contacts=None, special_features=None,
+            brochure_link=shared_url,
+        )
+        mainframe_row = ListingRow(
+            building="Mainframe", floor_unit="3rd Floor", contacts=None, special_features=None,
+            brochure_link=individual_url,
+        )
+        shared_deck_units = _brochure_units(
+            [{"building": "Kingsland House", "floor_unit": "2nd Floor", "size_sqft": 3000}],
+            property_features="Whole-site amenities: manned reception, on-site gym, cafe",
+            contacts="Team Mishon, mishon@colliers.com; Team Hechle, hechle@colliers.com; Team Chalk, chalk@colliers.com",
+            building_features=[{"building": "Kingsland House", "features": "Kingsland House's own manned reception"}],
+        )
+        mainframe_units = _brochure_units(
+            [{"building": "Mainframe", "floor_unit": "3rd Floor", "size_sqft": 4000}],
+            property_features="Mainframe's own site amenities",
+            contacts="Jamie Quinn, jamie.quinn@colliers.com",
+            building_features=[{"building": "Mainframe", "features": "Mainframe's own manned reception"}],
+        )
+
+        def _fake_extract(url):
+            return shared_deck_units if url == shared_url else mainframe_units
+
+        with patch("brochure_enrichment._extract_brochure_units", side_effect=_fake_extract):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped(
+                [kingsland_row, mainframe_row], shared_deck_url=shared_url,
+            )
+
+        kingsland_enriched = next(r for r in enriched if r.building == "Kingsland House")
+        mainframe_enriched = next(r for r in enriched if r.building == "Mainframe")
+
+        # Kingsland House's own link IS the shared deck - contacts/property_
+        # features never applied, building_features/unit-level still do.
+        self.assertIsNone(kingsland_enriched.contacts)
+        self.assertNotIn("Whole-site amenities", kingsland_enriched.special_features or "")
+        self.assertIn("Kingsland House's own manned reception", kingsland_enriched.special_features or "")
+        self.assertEqual(kingsland_enriched.size_sqft, 3000)
+
+        # Mainframe's own link is genuinely distinct from shared_url -
+        # completely unaffected, gets everything normally.
+        self.assertEqual(mainframe_enriched.contacts, "Jamie Quinn, jamie.quinn@colliers.com")
+        self.assertIn("Mainframe's own site amenities", mainframe_enriched.special_features)
+        self.assertIn("Mainframe's own manned reception", mainframe_enriched.special_features)
+        self.assertEqual(mainframe_enriched.size_sqft, 4000)
+
+    def test_shared_deck_url_none_by_default_leaves_contacts_and_property_features_unaffected(self):
+        # Regression guard for the default/"off" path through enrich_rows_
+        # grouped's own new parameter itself (not just _apply_units_to_row
+        # in isolation, see ThreeLevelEnrichmentTests above) - the exact
+        # same Kingsland House row/units as the gated test above, but
+        # enrich_rows_grouped is called with no shared_deck_url at all
+        # (identical to every prior call site before this parameter
+        # existed) - contacts/property_features must still apply exactly as
+        # they always have.
+        shared_url = "https://www.canva.com/design/DAGbhpjThxc/shared-colliers-deck"
+        kingsland_row = ListingRow(
+            building="Kingsland House", floor_unit="2nd Floor", contacts=None, special_features=None,
+            brochure_link=shared_url,
+        )
+        units = _brochure_units(
+            [{"building": "Kingsland House", "floor_unit": "2nd Floor", "size_sqft": 3000}],
+            property_features="Whole-site amenities: manned reception, on-site gym, cafe",
+            contacts="Team Mishon, mishon@colliers.com",
+            building_features=[{"building": "Kingsland House", "features": "Kingsland House's own manned reception"}],
+        )
+
+        with patch("brochure_enrichment._extract_brochure_units", return_value=units):
+            enriched, log, stats = brochure_enrichment.enrich_rows_grouped([kingsland_row])
+
+        self.assertEqual(enriched[0].contacts, "Team Mishon, mishon@colliers.com")
+        self.assertIn("Whole-site amenities", enriched[0].special_features)
+        self.assertIn("Kingsland House's own manned reception", enriched[0].special_features)
+
 
 class EnrichRowsGroupedConcurrencyTests(EnrichmentTestCase):
     def test_never_exceeds_the_configured_worker_limit(self):
@@ -6721,7 +6883,7 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         already_processed = {"https://example.com/shared.pdf": "ok"}
         special_features_matched = {"0": True}
 
-        def _fake_apply(row, units):
+        def _fake_apply(row, units, is_shared_deck_document=False):
             if row.building == "B":
                 return row.model_copy(update={"special_features": "Recovered for B"}), ["special_features"]
             return row, []
@@ -6768,7 +6930,7 @@ class EnrichRowsGroupedResumeTests(EnrichmentTestCase):
         already_processed = {"https://example.com/shared.pdf": "ok"}
         special_features_matched = {"0": True}
 
-        def _fake_apply(row, units):
+        def _fake_apply(row, units, is_shared_deck_document=False):
             if row.building == "B":
                 return row.model_copy(update={"special_features": "Recovered for B"}), ["special_features"]
             return row, []
