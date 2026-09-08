@@ -3665,6 +3665,28 @@ def _confident_building_mismatch(
        a row whose own building text carries no real distinguishing word
        either has nothing solid enough to call "different" FROM.
 
+       EXCEPTION - a shared street name does not save an overlap when the
+       two sides' own leading house numbers genuinely, confidently
+       disagree: whenever BOTH row_building and document_building_name
+       parse a real leading_house_number AND house_numbers_conflict says
+       those two numbers are genuinely disjoint (never merely "no house
+       number to compare" or "one number sits inside the other's stated
+       range" - house_numbers_conflict is already correctly tolerant of
+       that), the word overlap is NOT allowed to suppress the flag here -
+       same "a disagreeing house number is real evidence" precedent
+       _address_conflict_note's own numeric check already established.
+       Confirmed real case: row_building "167 Great Portland Street" vs a
+       wrongly-linked neighbour's own document_building_name "107-113
+       Great Portland Street" - "great"/"portland"/"street" overlap here
+       is coincidental (same street, textually adjacent numbering), not
+       genuine same-building evidence, and the actual house numbers (167
+       vs 107-113) are completely disjoint. The WeWork example above is
+       unaffected by this exception - neither side there has a digit at
+       the very START of the string (leading_house_number requires an
+       anchored leading match, see house_number.py's own docstring), so
+       leading_house_number returns None for both, and the ordinary
+       word-overlap-only fallback still applies exactly as before.
+
     4. NO ADDRESS CORROBORATION - _document_address_corroborates_row_
        address(row_address, document_building_address) is False. If the
        document's own address text genuinely corroborates the row's real,
@@ -3704,8 +3726,16 @@ def _confident_building_mismatch(
         return None
 
     row_significant_words = _mismatch_significant_words(row_building)
-    if not row_significant_words or (row_significant_words & doc_significant_words):
+    if not row_significant_words:
         return None
+    if row_significant_words & doc_significant_words:
+        row_number = leading_house_number(row_building)
+        doc_number = leading_house_number(document_building_name)
+        conflicting_house_numbers = (
+            row_number is not None and doc_number is not None and house_numbers_conflict(row_number, doc_number)
+        )
+        if not conflicting_house_numbers:
+            return None
 
     if _document_address_corroborates_row_address(row_address, document_building_address):
         return None

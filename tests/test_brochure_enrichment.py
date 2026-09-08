@@ -5379,6 +5379,61 @@ class ConfidentBuildingMismatchTests(unittest.TestCase):
         )
         self.assertIsNotNone(note)
 
+    # --- Point 3 exception: a disagreeing house number is real evidence,
+    # even across a shared street name ---
+
+    def test_confirmed_real_167_great_portland_street_vs_107_113_case_flags(self):
+        # The confirmed real incident: 167 Great Portland Street's row
+        # ended up with a neighbouring building's own brochure_link, whose
+        # real document text states "107-113 Great Portland Street" - a
+        # completely different, disjoint house-number range on the SAME
+        # street. "great"/"portland"/"street" overlap here is coincidental
+        # (same street, adjacent numbering), not genuine same-building
+        # evidence, and must not save this from being flagged the way the
+        # WeWork/brand-word case correctly is.
+        note = brochure_enrichment._confident_building_mismatch(
+            "167 Great Portland Street", "107-113 Great Portland Street",
+            row_address="167 Great Portland Street", document_building_address="107-113 Great Portland Street",
+        )
+        self.assertIsNotNone(note)
+        self.assertIn("167 Great Portland Street", note)
+        self.assertIn("107-113 Great Portland Street", note)
+
+    def test_house_number_falling_inside_the_other_sides_range_is_not_a_conflict(self):
+        # house_numbers_conflict's own established tolerance: a single
+        # number stated by one source falling inside a wider range another
+        # source states for the SAME building is not a real disagreement -
+        # must still fall back to the ordinary word-overlap suppression,
+        # exactly as before this exception existed.
+        note = brochure_enrichment._confident_building_mismatch(
+            "167 Great Portland Street", "165-169 Great Portland Street",
+        )
+        self.assertIsNone(note)
+
+    def test_shared_street_name_with_no_parseable_house_number_on_one_side_is_unaffected(self):
+        # document_building_name has no leading digit at all - the numeric
+        # exception can never apply, so this must fall straight back to
+        # the ordinary word-overlap-only behavior (suppressed here, same
+        # as before this exception existed) - no new false positive
+        # introduced for the common "no house number to compare" shape.
+        note = brochure_enrichment._confident_building_mismatch(
+            "167 Great Portland Street", "Great Portland Street Offices",
+        )
+        self.assertIsNone(note)
+
+    def test_shared_street_name_with_no_parseable_house_number_on_either_side_is_unaffected(self):
+        note = brochure_enrichment._confident_building_mismatch(
+            "Great Portland Street House", "Great Portland Street Offices",
+        )
+        self.assertIsNone(note)
+
+    def test_wework_brand_word_case_is_unaffected_by_the_house_number_exception(self):
+        # Neither side starts with a digit at all (leading_house_number
+        # requires an anchored leading match), so this protected case is
+        # untouched by the new exception - still correctly unflagged.
+        note = brochure_enrichment._confident_building_mismatch("WeWork 10 Fenchurch St", "WeWork 20 Old Broad St")
+        self.assertIsNone(note)
+
 
 class ApplyUnitsToRowBrochureBuildingMismatchTests(unittest.TestCase):
     """_apply_units_to_row's own wiring of _confident_building_mismatch
