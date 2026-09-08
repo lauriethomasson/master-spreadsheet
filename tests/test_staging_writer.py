@@ -315,6 +315,28 @@ class BrokenBrochureLinkDisplayTests(unittest.TestCase):
         self.assertTrue(ws.column_dimensions[column_letter].hidden)
         self.assertEqual(ws.cell(row=2, column=col_idx).value, "Regent's Wharf")
 
+    def test_brochure_building_mismatch_column_is_hidden_but_still_present_with_its_real_data(self):
+        # brochure_building_mismatch has its own dedicated decision card on
+        # the Review page (see pages/2_Review_and_Master.py's
+        # _render_brochure_mismatch_decision) - a raw exported column would
+        # show the same note a second time, in a spot no one is looking at
+        # it. Same hidden-not-dropped treatment as every other
+        # HIDDEN_COLUMNS entry: still written with its real value.
+        row = ListingRow(
+            building="New Derwent House",
+            brochure_building_mismatch="Brochure appears to be for a different building",
+        )
+        buffer = BytesIO()
+        write_rows_to_xlsx([row], buffer)
+        buffer.seek(0)
+        wb = load_workbook(buffer)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = headers.index(title_case_label("brochure_building_mismatch")) + 1
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        self.assertTrue(ws.column_dimensions[column_letter].hidden)
+        self.assertEqual(ws.cell(row=2, column=col_idx).value, "Brochure appears to be for a different building")
+
     def test_floorplan_link_column_is_hidden_but_still_present_with_its_real_data(self):
         # Purely a visibility change (see HIDDEN_COLUMNS' own comment) -
         # the column is hidden in Excel, never dropped: still there with

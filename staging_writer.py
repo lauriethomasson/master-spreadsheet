@@ -94,10 +94,15 @@ DATA_ROW_HEIGHT = 60
 # address_conflict is the same idea once more (see that field's own
 # schema.py docstring) - a raw text column would show the SAME conflict
 # note the Review page's own risky-field caption already surfaces, in a
-# spot no one is looking at it during review.
+# spot no one is looking at it during review. brochure_building_mismatch
+# is the same idea again (see that field's own schema.py docstring) - a
+# raw text column would show the SAME mismatch note the Review page's own
+# dedicated brochure-mismatch decision card already surfaces; confirmed
+# still showing as a plain, un-hidden visible column in two real
+# production exports (master (32).xlsx, master (33).xlsx) before this fix.
 HIDDEN_COLUMNS = [
     "source_file", "property_id", "brochure_link_broken", "brochure_link_is_floorplan", "floorplan_link",
-    "geocode_unverified", "development_name", "address_conflict",
+    "geocode_unverified", "development_name", "address_conflict", "brochure_building_mismatch",
 ]
 
 
