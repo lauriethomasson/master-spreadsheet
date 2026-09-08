@@ -3442,6 +3442,16 @@ class HouseNumberChangedTests(unittest.TestCase):
         self.assertFalse(master_merge.house_number_changed("1 to 5 Adam Street", "1-5 Adam Street"))
         self.assertFalse(master_merge.house_number_changed("1-5 Adam Street", "1 to 5 Adam Street"))
 
+    def test_unicode_dash_range_vs_word_to_range_real_case_is_not_flagged(self):
+        # The corrected real case: the user's live "1-5 Adam Street" text
+        # actually carried an en dash (U+2013), not a plain ASCII hyphen -
+        # visually indistinguishable in the Review screen's own caption
+        # text, but previously read as a bare "1" (no recognized range
+        # separator), which house_number_changed then flagged as a risky
+        # address change even though nothing actually changed.
+        self.assertFalse(master_merge.house_number_changed("1 to 5 Adam Street", "1–5 Adam Street"))
+        self.assertFalse(master_merge.house_number_changed("1–5 Adam Street", "1 to 5 Adam Street"))
+
 
 class HouseNumberSilentlyDroppedTests(unittest.TestCase):
     """
@@ -3568,6 +3578,60 @@ class HouseNumberSilentlyDroppedInBuildMergePlanTests(unittest.TestCase):
             if f in master_merge.HOUSE_NUMBER_FIELDS and master_merge._house_number_silently_dropped(*diffs[f])
         )
         self.assertEqual(kept_as_is_fields, frozenset({"building"}))
+
+
+class BuildMergePlanUnicodeDashHouseNumberTests(unittest.TestCase):
+    """
+    Full build_merge_plan repro for the corrected real Ivybridge House
+    report: the live "New" text that LOOKED like a plain ASCII-hyphen range
+    on screen actually carried a Unicode dash character (an en dash here,
+    but any of house_number.py's now-tolerated variants behaves the same
+    way) - previously read as a bare "1" (no recognized range separator),
+    which incorrectly landed address_1 in risky_fields via the HOUSE_
+    NUMBER_FIELDS/house_number_changed clause, with address_conflict
+    correctly unset (the GENERIC "Existing address would be replaced"
+    caption a reviewer actually saw, not address_conflict's own wording).
+    """
+
+    def test_en_dash_range_vs_word_to_range_does_not_land_in_risky_fields(self):
+        master_df = _master_df([{
+            "building": "Ivybridge House", "provider": "Colliers", "floor_unit": "LG",
+            "address_1": "1 to 5 Adam Street",
+        }])
+        new_row = ListingRow(
+            building="Ivybridge House", provider="Colliers", floor_unit="LG",
+            address_1="1–5 Adam Street",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        # Still a genuine plain-text diff (diff_fields' own comparison is
+        # not house-number-tolerant), so this correctly still lands in
+        # matched_changed with a real diffs["address_1"] entry - what
+        # matters is that it's no longer forced into risky_fields.
+        self.assertEqual(len(plan.matched_changed), 1)
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["address_1"], ("1 to 5 Adam Street", "1–5 Adam Street"))
+        self.assertNotIn("address_1", matched.risky_fields)
+        self.assertIsNone(matched.new_row.address_conflict)
+
+    def test_ascii_hyphen_range_baseline_is_also_unaffected(self):
+        # Same pair, plain ASCII hyphen - confirms the fix doesn't merely
+        # move the goalposts, the clean-hyphen case still behaves exactly
+        # as it did before this fix existed.
+        master_df = _master_df([{
+            "building": "Ivybridge House", "provider": "Colliers", "floor_unit": "LG",
+            "address_1": "1 to 5 Adam Street",
+        }])
+        new_row = ListingRow(
+            building="Ivybridge House", provider="Colliers", floor_unit="LG",
+            address_1="1-5 Adam Street",
+        )
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = plan.matched_changed[0]
+        self.assertNotIn("address_1", matched.risky_fields)
 
 
 class CollisionTests(unittest.TestCase):
