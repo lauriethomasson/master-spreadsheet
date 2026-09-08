@@ -1151,26 +1151,28 @@ def _render_brochure_mismatch_decision(m, key_prefix: str) -> str:
     Modeled on _render_let_status_decision's own warning-then-radio
     structure (same "positive evidence of a real problem, always needs a
     human's own look" philosophy) but NOT a call to it directly - the
-    field semantics differ entirely: this is about two SPECIFIC concrete
-    property fields (brochure_link/contacts) on one row, never a free-text
-    signal about the whole property's own let-status, so there's no
-    shared rendering logic to reuse (same "own sibling function, not a
-    parameterized variant" precedent as _render_stale_candidate_decision/
-    _render_new_property_let_status_decision below).
+    field semantics differ entirely: this is about a fixed set of SPECIFIC
+    concrete property fields (see master_merge.BROCHURE_MISMATCH_GATED_
+    FIELDS - originally just brochure_link/contacts, since generalized to
+    every field a mismatched brochure document could taint) on one row,
+    never a free-text signal about the whole property's own let-status, so
+    there's no shared rendering logic to reuse (same "own sibling
+    function, not a parameterized variant" precedent as _render_stale_
+    candidate_decision/_render_new_property_let_status_decision below).
 
     Only two choices - unlike _render_let_status_decision's three, there
     is deliberately no "remove property" option here: removing an
-    otherwise-fine, real property from master over a wrong brochure_link/
-    contacts pair would be wildly disproportionate to the actual problem
-    (a reviewer who has some OTHER, unrelated reason to remove this
-    property can still do that via the ordinary "Remove selected" action
-    on the master table itself - see that button's own always-clickable
-    design). Defaults to "keep current" (the opposite default from let-
-    status's own "apply") - a confirmed building mismatch is positive
-    evidence the NEW value is the one to distrust, so silently defaulting
-    to apply here would reproduce the exact New Derwent House incident
-    this whole feature exists to catch; a reviewer who's checked the
-    brochure and disagrees has to say so explicitly.
+    otherwise-fine, real property from master over a wrong brochure-
+    sourced field or two would be wildly disproportionate to the actual
+    problem (a reviewer who has some OTHER, unrelated reason to remove
+    this property can still do that via the ordinary "Remove selected"
+    action on the master table itself - see that button's own always-
+    clickable design). Defaults to "keep current" (the opposite default
+    from let-status's own "apply") - a confirmed building mismatch is
+    positive evidence the NEW value is the one to distrust, so silently
+    defaulting to apply here would reproduce the exact New Derwent House
+    incident this whole feature exists to catch; a reviewer who's checked
+    the brochure and disagrees has to say so explicitly.
 
     Returns "apply" (write every one of m.brochure_mismatch_fields' new
     values) or "keep" (leave master's existing values for those fields
@@ -1202,7 +1204,7 @@ def _render_brochure_mismatch_decision(m, key_prefix: str) -> str:
             st.write(new_val or "—")
 
     choice = st.radio(
-        "What would you like to do with the brochure_link/contacts update above?",
+        "What would you like to do with the flagged field(s) above?",
         [
             "Keep current information — ignore this update, leave the existing record unchanged.",
             "Apply anyway — use the new value(s) despite the mismatch warning.",
@@ -1444,7 +1446,7 @@ def _render_new_property_brochure_mismatch_decision(u, key_prefix: str) -> dict:
         st.write(row_dict.get(f) or "—")
 
     choice = st.radio(
-        "What would you like to do with the brochure_link/contacts value(s) above?",
+        "What would you like to do with the flagged value(s) above?",
         [
             "Add without these — add the property, but leave them blank for now.",
             "Add anyway — add the property with these value(s) despite the mismatch warning.",

@@ -320,27 +320,62 @@ LET_STATUS_KEYWORDS = (
     "let", "leased", "no longer available", "withdrawn", "under offer", "occupied", "u/o",
 )
 
-# brochure_link/contacts - the two fields a confident, confirmed brochure/
-# floorplan building-name mismatch (see schema.ListingRow.brochure_
-# building_mismatch's own docstring, brochure_enrichment._confident_
-# building_mismatch) means might actually belong to a DIFFERENT,
-# neighboring property, not this row at all. Real confirmed production
-# incident this exists for: a shared multi-property Colliers Canva deck
-# caused Gemini to occasionally misattribute a NEIGHBORING building's own
-# brochure_link/contacts to a row (New Derwent House's rows got Ivybridge
-# House's own brochure_link and real contacts). _confident_building_
-# mismatch already DETECTS this and sets brochure_building_mismatch, but
-# on its own that note is purely informational - nothing downstream
-# previously stopped brochure_link/contacts auto-applying on a flagged row
-# exactly like any other ordinary field. Gated the same "positive evidence
-# of a real problem, always needs a human's own look" way address_
-# conflict/GEOCODE_UNVERIFIED_FIELDS already are (see build_merge_plan's
-# own brochure_mismatch_fields computation) - never a silent block (a
-# reviewer decides apply vs. keep current - see pages/2_Review_and_
-# Master.py's own decision card), and NEVER triggered at all when
-# brochure_building_mismatch isn't set - the common case keeps auto-
-# applying brochure_link/contacts exactly as before this existed.
-BROCHURE_MISMATCH_GATED_FIELDS = ("brochure_link", "contacts")
+# Every field a confident, confirmed brochure/floorplan building-name
+# mismatch (see schema.ListingRow.brochure_building_mismatch's own
+# docstring, brochure_enrichment._confident_building_mismatch) means might
+# actually belong to a DIFFERENT, neighboring property, not this row at
+# all. Real confirmed production incident this originally exists for: a
+# shared multi-property Colliers Canva deck caused Gemini to occasionally
+# misattribute a NEIGHBORING building's own brochure_link/contacts to a
+# row (New Derwent House's rows got Ivybridge House's own brochure_link
+# and real contacts). _confident_building_mismatch already DETECTS this
+# and sets brochure_building_mismatch, but on its own that note is purely
+# informational - nothing downstream previously stopped the fields it
+# might taint from auto-applying on a flagged row exactly like any other
+# ordinary field. Gated the same "positive evidence of a real problem,
+# always needs a human's own look" way address_conflict/GEOCODE_UNVERIFIED_
+# FIELDS already are (see build_merge_plan's own brochure_mismatch_fields
+# computation) - never a silent block (a reviewer decides apply vs. keep
+# current - see pages/2_Review_and_Master.py's own decision card), and
+# NEVER triggered at all when brochure_building_mismatch isn't set - the
+# common case keeps auto-applying every one of these fields exactly as
+# before this existed.
+#
+# brochure_link is set via a mechanism of its own (see brochure_
+# enrichment._apply_units_to_row's own address_1-vs-brochure_link
+# distinction), not one of that function's own PROPERTY_LEVEL_FIELDS/
+# BUILDING_LEVEL_FIELDS/UNIT_LEVEL_FIELDS/HIGH_RISK_UNIT_LEVEL_FIELDS
+# constants, so it's listed here explicitly rather than derived from them.
+# Every other field below IS one of those four constants (the full set
+# _apply_units_to_row can ever populate FROM the same, potentially
+# mismatched brochure content - see that function's own docstring) -
+# deduplicated by hand here rather than imported (brochure_enrichment.py
+# itself imports FROM master_merge.py, so the reverse import would be
+# circular); confirm this list still matches those four constants'
+# combined field names if either module's own set of fields ever changes.
+#
+# address_1 itself is deliberately NOT included, even though it's one of
+# BUILDING_LEVEL_FIELDS - _apply_units_to_row's own docstring is explicit
+# that address_1 is NEVER directly overwritten by brochure enrichment; a
+# genuine disagreement there sets address_conflict instead (a separate
+# field). address_conflict already has its OWN, older, unconditional gate
+# forcing address_1 into risky_fields whenever it's set (see the
+# "address_conflict (see schema.ListingRow's own docstring..." clause
+# below in build_merge_plan) - that gate doesn't even require brochure_
+# building_mismatch to also be true, so it's already at least as strong a
+# guarantee as this card would add. Since diffs["address_conflict"] is
+# itself already popped out of `diffs` (see the address_1-injection clause
+# above) before brochure_mismatch_fields is ever computed, adding
+# "address_conflict" to this tuple would be dead code under the current
+# control flow regardless; adding "address_1" instead would double-gate
+# the same field under two independent mechanisms and risk sweeping in an
+# address_1 diff that came from some other, unrelated source merely
+# because brochure_building_mismatch also happens to be true on the row -
+# broader than intended. Investigated and deliberately left out.
+BROCHURE_MISMATCH_GATED_FIELDS = (
+    "brochure_link", "contacts", "special_features", "postcode", "submarket",
+    "state_of_space", "floor_unit", "size_sqft", "desks_max", "rent_pcm", "rent_psf",
+)
 
 
 def _let_status_pattern(kw: str) -> str:
