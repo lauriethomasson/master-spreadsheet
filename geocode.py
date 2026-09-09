@@ -750,6 +750,46 @@ def _address_line1_and_postcode(address_components: list, name_key: str = "longT
     return address_1, postcode
 
 
+def _candidate_premise_words(address_components: list) -> frozenset:
+    """
+    _building_name_words' own word set (same generic-word filtering, no
+    separate list), built from a Places (New) candidate's own "premise"-
+    typed address_components text - the Google-assigned component type for
+    a named building/development within an address (see _address_line1_
+    and_postcode's own "premise" test - that component is never read as a
+    street address there either; this is the counterpart read of the SAME
+    component type, this time as a second, independent source of name-
+    corroboration evidence for _best_places_result's own NAME_CONFLICT
+    check, alongside the candidate's bare "name" (displayName) field).
+    Real gap this closes: a candidate's own displayName can be a business/
+    POI name (e.g. a company registered there) with no resemblance at all
+    to the actual building's name, even when that candidate sits at
+    exactly the right address and its own address_components separately,
+    correctly state the building name via a "premise" component.
+
+    Deliberately NOT the candidate's whole formatted_address, or every
+    component's own text regardless of type - live-captured, real "New
+    Derwent House" case this specifically avoids over-matching: a WRONG
+    candidate at the CORRECT address ("Denave PTE Ltd", a company
+    registered there) had its own "New Derwent" text sitting in
+    address_components too, but as an UNTYPED fragment (no "types" key at
+    all - Google's own response didn't confidently classify it), while the
+    genuinely correct candidate's own "New Derwent" fragment at that same
+    address IS typed "premise". A plain formatted_address/whole-component
+    text scan would have matched both candidates identically and been
+    unable to tell them apart; restricting to the explicit "premise" type
+    is what actually distinguishes them.
+
+    Returns an empty frozenset when no component is premise-typed - same
+    permissive-on-missing-evidence shape _building_name_words(candidate_
+    name) already has when a candidate has no displayName at all.
+    """
+    premise_text = " ".join(
+        comp["longText"] for comp in address_components if "premise" in comp.get("types", [])
+    )
+    return _building_name_words(premise_text) if premise_text else frozenset()
+
+
 def _submarket_from_components(address_components: list, name_key: str = "long_name") -> str:
     """
     A political "sublocality"/"sublocality_level_1" component is Google's
@@ -1035,10 +1075,46 @@ def _best_places_result(
     words an EMPTY set - falsy, so the check silently no-ops and the
     candidate is accepted exactly as if source_name_words had never been
     passed (same permissive-on-missing-evidence precedent as the route-less
-    case above) - there is no weaker fallback corroboration to offer here
-    the way the street check's own postcode-district fallback has, since
-    source_name_words is only ever passed when source_hint is ALREADY
-    absent.
+    case above) - there IS now a weaker fallback corroboration source here
+    too (see candidate_premise_words just below), checked only once BOTH
+    are empty does this still fall back to the old fully-permissive no-op.
+
+    candidate_premise_words (see _candidate_premise_words) is a SECOND,
+    independent source of name-corroboration evidence, checked alongside
+    candidate_name_words (the candidate's own bare "name"/displayName) -
+    accepted if EITHER individually shares a majority of source_name_
+    words' own words, never a stricter combined requirement. Real,
+    live-captured gap this closes: querying the real Places API for "New
+    Derwent House, London, UK" returns, among others, the genuinely
+    correct building (69-73 Theobalds Road) TWICE over - once as "Denave
+    PTE Ltd" (a company registered there, sharing no name resemblance at
+    all) and once as the generic auto-label "House 69, 73 Theobalds Rd"
+    (sharing only the filtered-out generic word "house") - neither
+    candidate's own bare name states "New Derwent" anywhere, so both were
+    previously rejected exactly like the two genuinely wrong candidates in
+    the same response ("Derwent London plc"/25 Savile Row; a different,
+    unrelated "Derwent House" in South Kensington). The second of the two
+    correct candidates, however, has its own address_components state the
+    building name separately and correctly via a "premise"-typed
+    component reading "New Derwent" - real, independent, structured
+    evidence Google itself already provides, entirely unrelated to
+    whatever business/POI happens to occupy the address today. Checking
+    it too resolves this row correctly instead of leaving it blank.
+
+    Deliberately NOT looked at when candidate_name_words ALREADY shares a
+    majority on its own (never even computed - see the `or` short circuit
+    below) - this is purely additive corroboration for the case the name
+    check alone rejects, never a stricter re-check of a case it already
+    accepts. Every genuinely wrong candidate in the SAME live "New Derwent
+    House" response stays correctly rejected: the two wrong-building
+    candidates have no "premise" component naming the source's own words
+    at all (candidate_premise_words comes back empty, so only the already-
+    failing name check applies, same as before this existed), and the
+    OTHER same-address-but-wrong-name candidate's own "New Derwent" text
+    sits in its address_components as an UNTYPED fragment, not a "premise"
+    component - _candidate_premise_words deliberately never reads it (see
+    that function's own docstring for exactly why untyped address text is
+    excluded, not merely under-tested).
 
     source_house_number (see house_number.leading_house_number/house_
     numbers_conflict) is a FIFTH, independent validation, passed alongside
@@ -1119,11 +1195,26 @@ def _best_places_result(
                 # single-word case (e.g. "Packing House" -> "King's House") is
                 # completely unaffected.
                 if len(shared_name_words) * 2 <= len(source_name_words):
-                    last = {
-                        **place, "status": "NAME_CONFLICT", "candidate_name": candidate_name,
-                        "shared_name_words": shared_name_words,
-                    }
-                    continue
+                    # The bare name alone doesn't corroborate - before
+                    # rejecting outright, also check the candidate's own
+                    # "premise" address-component text (see _candidate_
+                    # premise_words' own docstring for the real, live-
+                    # captured "New Derwent House" gap this closes: a
+                    # correct candidate's displayName can be a completely
+                    # unrelated business/POI name while its own address
+                    # data separately, correctly states the building name).
+                    # Never computed at all once the name check above
+                    # already passed - purely additive corroboration for
+                    # the case the name check alone rejects, never a
+                    # stricter re-check of a case it already accepts.
+                    candidate_premise_words = _candidate_premise_words(place.get("address_components", []))
+                    shared_premise_words = source_name_words & candidate_premise_words
+                    if not candidate_premise_words or len(shared_premise_words) * 2 <= len(source_name_words):
+                        last = {
+                            **place, "status": "NAME_CONFLICT", "candidate_name": candidate_name,
+                            "shared_name_words": shared_name_words | shared_premise_words,
+                        }
+                        continue
         result = {**place, "status": "OK"}
         if weak_corroboration:
             result["weak_corroboration"] = weak_corroboration
