@@ -316,8 +316,29 @@ LET_STATUS_FIELDS = ("special_features", "state_of_space")
 # rows) - the word-boundary match on "under offer" alone never catches this,
 # so a re-upload showing "U/O" for a property already in master previously
 # passed through with no review prompt at all.
+#
+# "property is unavailable"/"property is not available" are deliberately
+# FULL PHRASES, not the bare words "unavailable"/"not available" - checked
+# directly against tests/sample_docs (this repo's own real review-page
+# corpus): neither bare word appears anywhere in it at all, whole-listing or
+# otherwise, so there's no real precedent to confirm a bare-word match's
+# blast radius against. What IS confirmed against real data is the shape of
+# the risk: special_features routinely holds 15-25+ semicolon-joined,
+# per-amenity items in one field (e.g. a real Workplace Plus row's "52 + 2
+# MR + 3 PB + BR; U/O; term 2 - 5 years"), so a bare "unavailable"/"not
+# available" would fire this WHOLE ROW's own off-the-market prompt off a
+# single unrelated item like "On-site gym currently unavailable due to
+# refurbishment" sitting among a dozen other bullet points - the same
+# false-positive shape "let"'s own pre-/re-/sub-let exclusion above already
+# exists to prevent. "property" is this file's own established term for
+# what mentions_let_status is about (see its own docstring: "the property is
+# no longer on the market") - the phrase only matches a sentence that names
+# the property/listing ITSELF as the thing that's unavailable, never a
+# specific named amenity, so it stays narrow the same way "no longer
+# available" already is.
 LET_STATUS_KEYWORDS = (
     "let", "leased", "no longer available", "withdrawn", "under offer", "occupied", "u/o",
+    "property is unavailable", "property is not available",
 )
 
 # Every field a confident, confirmed brochure/floorplan building-name
