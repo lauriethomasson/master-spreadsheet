@@ -558,7 +558,13 @@ Also extract for each unit:
   characteristic shared by the WHOLE building this unit is in (not just this one floor) belongs in
   building_features instead (see below, after the units) — do not repeat it here. Fit-out timing/
   completion details belong here too, as descriptive text (e.g. "Fit out to be completed in
-  July 2026") — never in state_of_space, which only ever holds the fit-out category itself.
+  July 2026") — never in state_of_space, which only ever holds the fit-out category itself. Also
+  always capture, verbatim, any stated unit-level leasing/marketing status — wording like "Let",
+  "Leased", "Under Offer", "Withdrawn", "No longer available", "Occupied", "Unavailable",
+  "Not available", or the abbreviation "U/O" — even if nothing else about the unit is notable and
+  every other field for it is otherwise blank; a downstream automated check searches special_features
+  specifically for this exact wording to flag a unit that may no longer be on the market, so dropping
+  it here would silently hide that signal from that check.
 - state_of_space: the physical fit-out condition/readiness of the space — NOT when it becomes
   available, which is a timing detail and belongs in special_features instead (see above), not
   here. Capture this whenever the document states or clearly implies it, using the source's own

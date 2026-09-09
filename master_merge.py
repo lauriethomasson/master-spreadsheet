@@ -317,28 +317,46 @@ LET_STATUS_FIELDS = ("special_features", "state_of_space")
 # so a re-upload showing "U/O" for a property already in master previously
 # passed through with no review prompt at all.
 #
-# "property is unavailable"/"property is not available" are deliberately
-# FULL PHRASES, not the bare words "unavailable"/"not available" - checked
-# directly against tests/sample_docs (this repo's own real review-page
-# corpus): neither bare word appears anywhere in it at all, whole-listing or
-# otherwise, so there's no real precedent to confirm a bare-word match's
-# blast radius against. What IS confirmed against real data is the shape of
-# the risk: special_features routinely holds 15-25+ semicolon-joined,
-# per-amenity items in one field (e.g. a real Workplace Plus row's "52 + 2
-# MR + 3 PB + BR; U/O; term 2 - 5 years"), so a bare "unavailable"/"not
-# available" would fire this WHOLE ROW's own off-the-market prompt off a
-# single unrelated item like "On-site gym currently unavailable due to
-# refurbishment" sitting among a dozen other bullet points - the same
-# false-positive shape "let"'s own pre-/re-/sub-let exclusion above already
-# exists to prevent. "property" is this file's own established term for
-# what mentions_let_status is about (see its own docstring: "the property is
-# no longer on the market") - the phrase only matches a sentence that names
-# the property/listing ITSELF as the thing that's unavailable, never a
-# specific named amenity, so it stays narrow the same way "no longer
-# available" already is.
+# "property is unavailable"/"property is not available" are FULL PHRASES,
+# not the bare words "unavailable"/"not available" - checked directly
+# against tests/sample_docs (this repo's own real review-page corpus):
+# neither bare word appears anywhere in it at all, whole-listing or
+# otherwise, so there was no real precedent to confirm a bare-word match's
+# blast radius against at the time these two phrases were added. "property"
+# is this file's own established term for what mentions_let_status is about
+# (see its own docstring: "the property is no longer on the market") - the
+# phrase only matches a sentence that names the property/listing ITSELF as
+# the thing that's unavailable, never a specific named amenity, so it stays
+# narrow the same way "no longer available" already is.
+#
+# "unavailable"/"not available" (bare) were added on top of the phrases
+# above specifically so the extraction prompts' own now-explicit "always
+# capture unit-level leasing/marketing status verbatim" instruction (see
+# extract.py/extract_spreadsheet_gemini.py's own special_features bullets)
+# isn't silently defeated by this list failing to recognize the plainer
+# wording a source document may use for the identical fact. NOT confirmed
+# against a real sample document the way the other entries above are - two
+# accepted, known risks come with this, neither guarded against here:
+# (1) special_features routinely holds 15-25+ semicolon-joined, per-amenity
+# items in one field (e.g. a real Workplace Plus row's "52 + 2 MR + 3 PB +
+# BR; U/O; term 2 - 5 years"), so a bare "unavailable"/"not available" can
+# fire this WHOLE ROW's own off-the-market prompt off a single unrelated
+# item like "On-site gym currently unavailable due to refurbishment" sitting
+# among a dozen other bullet points - the same false-positive shape "let"'s
+# own pre-/re-/sub-let exclusion above already exists to prevent, just not
+# guarded against for this pair; (2) "Not available until March 2027"/
+# "Unavailable until fit-out completes" describes a future-ready listing,
+# not a genuinely off-market one right now, and this list does no date
+# parsing at all to tell the two apart (see this module's own "small,
+# explicit, hand-maintained list, never generalized NLP" philosophy -
+# deliberately not extended with one here either). Both are accepted
+# because mentions_let_status only ever gates a reviewer's own decision
+# (see build_merge_plan/pages/2_Review_and_Master.py's own decision card) -
+# never a silent block or auto-reject - so an over-eager match costs a
+# reviewer one extra look, never a wrong or lost value.
 LET_STATUS_KEYWORDS = (
     "let", "leased", "no longer available", "withdrawn", "under offer", "occupied", "u/o",
-    "property is unavailable", "property is not available",
+    "property is unavailable", "property is not available", "unavailable", "not available",
 )
 
 # Every field a confident, confirmed brochure/floorplan building-name
