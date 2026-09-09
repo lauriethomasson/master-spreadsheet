@@ -110,7 +110,16 @@ Then extract EVERY SEPARATE AVAILABLE UNIT:
 - rent_pcm: a monthly rent total column/value if present. Same range rule as size_sqft above if a
   range is stated - use the upper end, never leave this null merely because a range was given.
 - special_features: the unit's own description/features text, plus a commission/incentive column's
-  text appended after a semicolon if one is given for that row.
+  text appended after a semicolon if one is given for that row. Also always capture, verbatim, any
+  stated unit-level leasing/marketing status - wording like "Let", "Leased", "Under Offer",
+  "Withdrawn", "No longer available", "Occupied", "Unavailable", "Not available", or the
+  abbreviation "U/O" - even if nothing else about the row is notable and every other field for it
+  is otherwise blank. This is the more likely miss on a spreadsheet specifically: a dedicated
+  "Status" column (or any other cell) stating this does NOT "look like" a feature/description column,
+  so don't overlook it just because it isn't the special_features/description column itself - a
+  downstream automated check searches special_features specifically for this exact wording to flag
+  a unit that may no longer be on the market, so dropping it here would silently hide that signal
+  from that check.
 - state_of_space: the physical fit-out state ONLY if the text EXPLICITLY states one (e.g. "Fitted",
   "CAT A", "To be fitted out") - never infer or guess this from a description that merely sounds
   furnished/equipped; leave null whenever the source doesn't use an explicit fit-out term.

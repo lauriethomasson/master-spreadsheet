@@ -3963,19 +3963,37 @@ class MentionsLetStatusTests(unittest.TestCase):
             "Reception; Bike racks; Property is unavailable",
         ))
 
-    def test_single_amenity_unavailable_mention_is_not_flagged(self):
-        # The real false-positive risk LET_STATUS_KEYWORDS' own docstring
-        # calls out: one unrelated amenity's own "unavailable" note buried
-        # in a long special_features list must never flag the WHOLE row's
-        # own listing status - only a genuine whole-property statement does.
-        self.assertFalse(master_merge.mentions_let_status(
+    def test_single_amenity_unavailable_mention_now_also_flags_the_row(self):
+        # A known, accepted tradeoff of adding bare "unavailable"/"not
+        # available" to LET_STATUS_KEYWORDS (see that constant's own
+        # updated docstring) - a single unrelated amenity's own
+        # "unavailable"/"not available" note buried in a long special_
+        # features list now ALSO flags the whole row, not just a genuine
+        # whole-property statement (contrast test_whole_property_
+        # unavailable_statement_is_flagged above, which is still the
+        # narrower, unambiguous case). Accepted because mentions_let_
+        # status only ever gates a reviewer's own decision, never a
+        # silent block or auto-reject - this costs an occasional extra
+        # look, never a wrong or lost value.
+        self.assertTrue(master_merge.mentions_let_status(
             "On-site gym currently unavailable due to refurbishment; "
             "Bike racks; showers; roof terrace; 24hr access; meeting rooms; "
             "kitchen; breakout space; parking; concierge; mail handling",
         ))
-        self.assertFalse(master_merge.mentions_let_status(
+        self.assertTrue(master_merge.mentions_let_status(
             "Meeting room not available on Fridays; Bike racks; showers",
         ))
+
+    def test_bare_unavailable_and_status_line_are_flagged(self):
+        self.assertTrue(master_merge.mentions_let_status("Unavailable"))
+        self.assertTrue(master_merge.mentions_let_status("Status: Not Available"))
+
+    def test_bare_available_is_never_flagged(self):
+        # "available" (affirmative) was never added as a keyword - only
+        # "unavailable" and the exact phrase "not available" were. A plain
+        # "available" (with or without a timing note) must never register.
+        self.assertFalse(master_merge.mentions_let_status("Available Now"))
+        self.assertFalse(master_merge.mentions_let_status("Available from September 2026"))
 
     def test_blank_is_not_flagged(self):
         self.assertFalse(master_merge.mentions_let_status(None))
