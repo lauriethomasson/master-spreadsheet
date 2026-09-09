@@ -1354,6 +1354,28 @@ def _render_missing_location_lookup(row_dict: dict, key_prefix: str) -> dict:
     return {}
 
 
+def _matched_row_location_dict(m, plan) -> dict:
+    """
+    The location-relevant dict for a MATCHED row `m`, as it will actually
+    read once this run's own changes are applied - master's own current
+    record (plan.master_records[m.master_index]) overlaid with whatever
+    m.diffs actually changed, the exact same {field: new_value} shape
+    apply_merge itself writes. Deliberately NOT m.new_row.model_dump()
+    alone: that's only this upload's OWN incoming data, and diff_fields'
+    own blank-new-value-skip rule means a field this run left blank never
+    appears in diffs at all - master's real, already-on-file value (which
+    could easily be non-blank) is what actually survives for it. Reading
+    m.new_row directly here would wrongly read a perfectly-fine, already-
+    resolved address as "missing" any time this run's own extraction for
+    that one field happened to come back empty.
+
+    Only ever used to decide whether _render_missing_location_lookup
+    applies to this row (see master_merge.new_property_missing_location) -
+    never written anywhere itself.
+    """
+    return {**plan.master_records[m.master_index], **{f: new_val for f, (old_val, new_val) in m.diffs.items()}}
+
+
 def _render_new_property_let_status_decision(u, key_prefix: str) -> tuple:
     """
     Like _render_let_status_decision, for a genuinely NEW property (see
@@ -3354,12 +3376,60 @@ def _render_pending_review(pending: list):
             for i, u in enumerate(plain_new)
         )
 
+    # ==== 3b. Existing properties missing a location ====
+    # The same brand-new-property lookup UI (_render_missing_location_
+    # lookup/master_merge.new_property_missing_location, both reused
+    # completely unchanged), now also offered for a MATCHED row that ends
+    # up with a genuinely blank address_1/postcode/lat/lng - e.g. a master
+    # record that never had a location at all, or this run's own Tier 2
+    # geocode attempt came back with nothing usable (see the NAME_CONFLICT
+    # fix, PR #13 - a rejected guess correctly resolves to blank rather
+    # than a wrong value, but that blank previously surfaced no signal to
+    # a reviewer at all on a matched row). Deliberately restricted to
+    # auto_matched/plan.matched_unchanged - a row that ALREADY has its own
+    # decision card elsewhere on this page (let-status/brochure-mismatch/
+    # collision/risky - every bucket above this point) is never offered a
+    # SECOND, separate card here for the same property; same "no duplicate
+    # rendering for one row" precedent plain_new above already follows by
+    # excluding any u with let_status_fields/brochure_mismatch_fields.
+    # Deliberately NOT geocode_unverified - that's a completely separate
+    # "found something but couldn't independently verify it" signal,
+    # already rendered elsewhere on this page; new_property_missing_
+    # location only ever looks at address_1/postcode/lat/lng themselves,
+    # so a row with a real (if unverified) address never lands here.
+    matched_missing_location = []
+    seen_master_indices = set()
+    for m in auto_matched + plan.matched_unchanged:
+        if m.master_index in seen_master_indices:
+            continue
+        location_dict = _matched_row_location_dict(m, plan)
+        if master_merge.new_property_missing_location(location_dict):
+            seen_master_indices.add(m.master_index)
+            matched_missing_location.append((m, location_dict))
+
+    if matched_missing_location:
+        n = len(matched_missing_location)
+        st.subheader("📍 Existing properties missing a location")
+        st.info(f"{n} existing propert{'y' if n == 1 else 'ies'} have no location on file.")
+        with st.expander("View properties missing a location"):
+            for m, location_dict in matched_missing_location:
+                st.write(display_utils.row_label(location_dict))
+                overrides = _render_missing_location_lookup(location_dict, f"matched_loc_{m.master_index}")
+                if overrides:
+                    entry = decision_updates.setdefault(m.master_index, {})
+                    entry.update(overrides)
+                    entry["source_file"] = m.new_row.source_file
+                st.divider()
+
     # ==== 4. No changes ====
     if plan.matched_unchanged:
         n = len(plan.matched_unchanged)
         st.caption(f"{n} propert{'y' if n == 1 else 'ies'} matched with no changes.")
 
-    if not any_decisions and not auto_updates and not plain_new and not plan.matched_unchanged:
+    if (
+        not any_decisions and not auto_updates and not plain_new and not plan.matched_unchanged
+        and not matched_missing_location
+    ):
         st.info("Nothing to apply — this upload has no rows to review.")
 
     # Merged only now, right before Approve - see auto_updates/decision_
