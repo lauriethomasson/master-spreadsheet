@@ -5480,6 +5480,29 @@ def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriche
     falls through to geocode_row's own existing Tier 2 logic exactly as
     today - never a special case, just an ordinary call.
 
+    ALSO re-geocodes whenever original.geocode_unverified is already True,
+    even when NEITHER of this pass's own backfill conditions fired -
+    confirmed real gap: a MATCHED row (e.g. New Derwent House) whose
+    MASTER record already has a non-blank postcode and a placeholder-
+    shaped address_1 that THIS pass never changes (the source document
+    still only ever states the building name, never a real street
+    address) previously never re-triggered geocode_row at all, no matter
+    how much better geocode.py's own Tier 2 logic later got - confirmed
+    directly: this exact row's master data still carried geocode_
+    unverified=1 and the old, wrong Tier 2 guess even after the NAME_
+    CONFLICT majority-check and address-text-premise-corroboration fixes
+    were merged, purely because this gate never let geocode_row run again
+    for it. Every previously-unverified guess now gets a fresh chance to
+    resolve better under current logic on its NEXT upload - never on every
+    upload regardless of relevance, only when this row is already part of
+    THIS pass's own (upload-sized, not master-sized) enrichment batch.
+    Deliberately original.geocode_unverified, not enriched's own - this
+    reads the row's state as it already was BEFORE this pass, exactly the
+    same "before" side the two backfill conditions above already check.
+    Purely additive: a row that's already confidently correct (geocode_
+    unverified False/None) with no backfill this pass is still completely
+    untouched below, no wasted re-geocode call.
+
     row.lat/row.lng are cleared FIRST when geocode_unverified was True -
     otherwise geocode_row's own early-return guard ("already has real
     coordinates") would block Tier 1 from ever running against the new
@@ -5502,10 +5525,11 @@ def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriche
     identity available here.
 
     A row whose address_1 was already genuine (not blank, not a placeholder)
-    and whose postcode was already present before this pass is completely
-    untouched - no wasted re-geocode call. This adds no new network/Gemini
-    cost beyond an occasional Geocoding API call: the brochure itself is
-    already fetched exactly once per URL by enrich_rows_grouped for its own,
+    and whose postcode was already present before this pass, and which
+    wasn't already flagged geocode_unverified, is completely untouched -
+    no wasted re-geocode call. This adds no new network/Gemini cost beyond
+    an occasional Geocoding API call: the brochure itself is already
+    fetched exactly once per URL by enrich_rows_grouped for its own,
     separate enrichment purposes, regardless of whether this function ever
     runs at all.
     """
@@ -5514,7 +5538,7 @@ def _regeocode_rows_with_newly_backfilled_addresses(original_rows: list, enriche
             original.address_1, original.building
         ) and not _is_placeholder_address(enriched.address_1, enriched.building)
         postcode_backfilled = _is_blank(original.postcode) and not _is_blank(enriched.postcode)
-        if not (address_1_backfilled or postcode_backfilled):
+        if not (address_1_backfilled or postcode_backfilled or original.geocode_unverified):
             continue
         if enriched.geocode_unverified:
             enriched.lat = None
