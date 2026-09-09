@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link
 from gemini_client import ResponseTruncatedError, call_gemini, compute_rent, get_client
-from master_merge import normalize_key
+from master_merge import matched_let_status_phrases, normalize_key
 from schema import ExtractedFields, ListingRow
 
 RENDER_DPI = 72
@@ -627,6 +627,160 @@ Return ONLY this JSON object. No preamble, no explanation, no markdown code fenc
 """
 
 
+def _pdf_page_let_status_matches(pdf_source) -> dict:
+    """
+    {page_index: [matched phrases]} for every page (0-indexed, the exact
+    same indexing PAGE_INDEX_KEY/render_pages already use) whose own raw
+    embedded PDF text layer (page.get_text() - cheap, deterministic, no
+    model call at all, completely separate from the vision-based Gemini
+    extraction above) states LET/off-market status wording - see master_
+    merge.matched_let_status_phrases/LET_STATUS_KEYWORDS, reused directly
+    here, never a second, independently-drifting copy of that matching
+    logic.
+
+    This is a deterministic CROSS-CHECK against Gemini's own occasionally
+    inconsistent extraction, never an attempt to make Gemini itself more
+    reliable (out of scope here) - confirmed real gap this exists for: a
+    real Colliers Ivybridge House PDF (a per-floor floor-plan deck) states,
+    on its own "Level 2" page, "Strand: 2,218 sq ft / River: LET" - one
+    extraction pass of this exact, UNCHANGED PDF correctly captured "(River
+    suite is LET)" into that unit's special_features; a LATER pass of the
+    SAME PDF dropped it entirely, replaced by generic building-wide
+    boilerplate duplicated across every floor. Same file, same prompt,
+    different output - real proof of a Gemini consistency problem, not a
+    source-document change, and not something this raw-text scan tries to
+    correct itself (see possible_missed_let_status_notes below for the
+    review-flag-only, never-auto-inject policy that follows from that).
+
+    pdf_source is either a Path (an uploaded PDF already on disk) or raw
+    bytes (a brochure fetched purely in memory - see brochure_enrichment.py)
+    - same dual-source handling as render_pages, and serialized through the
+    SAME _RENDER_LOCK for safety: PyMuPDF/MuPDF keeps process-wide, not
+    per-Document, internal state (see render_pages' own comment), and while
+    plain text extraction is far lighter-weight than page rendering, there
+    is no confirmed guarantee it's free of that same hazard - safer to
+    serialize a cheap operation than risk a new, subtle threading bug.
+
+    A page with no LET-status wording at all is simply absent from the
+    returned dict - {} for a document with none anywhere. Never raises on a
+    malformed/unreadable PDF - a caller (extract()/brochure_enrichment.py)
+    already has real page IMAGES to work with regardless of whether this
+    deterministic side-check succeeds, so a failure here must never block
+    the real extraction; the caller sees {} exactly as if nothing matched.
+    """
+    try:
+        if isinstance(pdf_source, (bytes, bytearray)):
+            doc = fitz.open(stream=pdf_source, filetype="pdf")
+        else:
+            doc = fitz.open(pdf_source)
+    except Exception as e:
+        print(f"[extract] could not open document for LET-status cross-check ({e!r}) — skipping.", file=sys.stderr)
+        return {}
+    try:
+        with _RENDER_LOCK:
+            matches = {}
+            for page_index, page in enumerate(doc):
+                phrases = matched_let_status_phrases(page.get_text())
+                if phrases:
+                    matches[page_index] = phrases
+            return matches
+    except Exception as e:
+        print(f"[extract] LET-status cross-check failed ({e!r}) — skipping.", file=sys.stderr)
+        return {}
+    finally:
+        doc.close()
+
+
+def _missed_let_status_note(phrases: list, shared_page: bool) -> str:
+    """
+    The reviewer-facing note text possible_missed_let_status_notes attaches
+    per flagged unit - see schema.ListingRow.possible_missed_let_status's
+    own docstring for the full policy (a review flag only, never an auto-
+    injected value). shared_page names the real, accepted "more than one
+    unit on this page" attribution limitation explicitly rather than
+    silently guessing which specific unit the raw match actually belongs
+    to - see possible_missed_let_status_notes' own docstring.
+    """
+    phrase_list = "; ".join(f"{p!r}" for p in phrases)
+    if shared_page:
+        return (
+            f"This page/row is shared by more than one unit, so this can't be confidently attributed to just "
+            f"one - but the source states {phrase_list}, which isn't reflected in this unit's own extracted "
+            f"data. Verify manually."
+        )
+    return (
+        f"This unit's own source page/row states {phrase_list}, but the extracted data doesn't reflect it. "
+        f"Verify manually."
+    )
+
+
+def possible_missed_let_status_notes(units: list, source_matches: dict, key: str = PAGE_INDEX_KEY) -> dict:
+    """
+    {id(unit): note} for every raw unit dict in `units` (Gemini's own raw
+    JSON - extract.py's own PROMPT, brochure_enrichment.py's equivalent
+    per-brochure extraction, or extract_spreadsheet_gemini.py's own per-row
+    shape, all sharing this same generic "one small int key names which
+    raw-source chunk this unit came from" idea) whose own special_features/
+    state_of_space does NOT already reflect LET-status wording the SAME
+    raw-source chunk plainly states.
+
+    key (default PAGE_INDEX_KEY = "page_index") names which field on each
+    unit dict that chunk identifier lives in - "page_index" for a PDF (see
+    _pdf_page_let_status_matches) or "row_number" for a spreadsheet (see
+    extract_spreadsheet_gemini.py's own per-line scan) - the cross-
+    referencing/already-reflected/shared-attribution logic below is
+    completely identical either way, so this is the one shared
+    implementation for all three source types, never three independently-
+    drifting copies of it.
+
+    Keyed by id(unit) - the identical dict object, never a copy - rather
+    than list position, so a caller looking up ONE already-matched unit
+    (brochure_enrichment._apply_units_to_row) and a caller enumerating
+    every unit fresh (_rows_from_raw below, extract_spreadsheet_gemini.py's
+    own row-building loop) share this exact same function with no separate
+    index-bookkeeping of their own.
+
+    Multi-unit-per-chunk limitation: some PDFs are tabular schedules-of-
+    areas with several floors/units sharing ONE page_index, unlike
+    Ivybridge House's own one-floor-per-page layout - a page-level match
+    there can't confidently attribute to a single unit (a spreadsheet row
+    is inherently 1:1 with a single unit almost always, but the identical
+    safeguard still applies if Gemini ever mis-reports the same row_number
+    for two units). When more than one unit shares a chunk identifier,
+    EVERY one of them is flagged rather than guessing which specific unit
+    the raw match belongs to (see _missed_let_status_note's own shared_page
+    wording) - a real, accepted limitation (a false positive on a busy
+    shared page/row is possible), not a bug silently papered over.
+
+    Purely a REVIEW FLAG - never rewrites/injects the missing wording into
+    any unit's own special_features/state_of_space here or anywhere else;
+    see schema.ListingRow.possible_missed_let_status's own docstring for
+    why (this codebase's established "never silently invent a field value"
+    philosophy, applied here exactly as brochure_building_mismatch/address_
+    conflict already apply it elsewhere).
+
+    A unit with no value for `key` at all (never stated, or already
+    consumed by a caller before this runs) never appears in the returned
+    dict - nothing to cross-reference it against.
+    """
+    if not source_matches:
+        return {}
+    notes = {}
+    for chunk_id, phrases in source_matches.items():
+        sharing_units = [u for u in units if isinstance(u, dict) and u.get(key) == chunk_id]
+        if not sharing_units:
+            continue
+        shared_page = len(sharing_units) > 1
+        for unit in sharing_units:
+            existing_text = " ".join(
+                str(unit.get(f) or "") for f in ("special_features", "state_of_space")
+            )
+            if matched_let_status_phrases(existing_text):
+                continue  # already reflected in this unit's own extracted text - nothing missed
+            notes[id(unit)] = _missed_let_status_note(phrases, shared_page)
+    return notes
+
+
 def render_pages(pdf_source) -> list[types.Part]:
     """
     pdf_source is either a Path (existing on-disk file - the uploaded-PDF
@@ -819,6 +973,17 @@ def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
 
     raw = extract_raw_units(pdf_path)
 
+    # Computed BEFORE _attach_per_row_pdf_links, which mutates page_index
+    # OUT of each unit dict it successfully attaches a link to (see its own
+    # docstring) - this deterministic LET-status cross-check reads page_
+    # index too (see possible_missed_let_status_notes), so it must capture
+    # each unit's own note (keyed by id(unit), which survives any later
+    # mutation to the unit dict's own OTHER keys) before that pop can ever
+    # remove the very field this depends on.
+    missed_let_status_notes = possible_missed_let_status_notes(
+        raw.get("units", []), _pdf_page_let_status_matches(pdf_path)
+    )
+
     # Runs BEFORE _attach_per_row_pdf_links - see _reject_unhinted_pdf_
     # brochure_links' own docstring for why the order matters (it reads
     # page_index without consuming it, so the stricter per-row match right
@@ -833,7 +998,7 @@ def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
     # apply to is completely unaffected either way.
     _attach_per_row_pdf_links(pdf_path, raw.get("units", []))
 
-    rows, _ = _rows_from_raw(raw, filename)
+    rows, _ = _rows_from_raw(raw, filename, missed_let_status_notes=missed_let_status_notes)
     return rows
 
 
@@ -941,8 +1106,20 @@ def _match_building_features(unit_building: str, building_features: list) -> str
 
 def _rows_from_raw(
     raw: dict, filename: str, document_wide_contacts_is_row_own_document: bool = True,
+    missed_let_status_notes: dict = None,
 ) -> tuple[list[ListingRow], list]:
     """
+    missed_let_status_notes ({id(unit): note}, default None/{}) - see
+    possible_missed_let_status_notes/extract()'s own call site, which
+    computes this BEFORE calling here (before _attach_per_row_pdf_links can
+    ever pop page_index out of a unit dict this depends on). Looked up per
+    unit by id(unit) - the identical dict object _rows_from_raw's own loop
+    below already iterates, never a copy - and set as ListingRow's own
+    possible_missed_let_status field. None/{} for extract_from_png_pages()
+    (a screenshot-derived source has no real PDF page-text layer to have
+    cross-checked at all - same exemption _attach_per_row_pdf_links already
+    has for the identical reason, see this module's own docstring).
+
     The raw Gemini JSON's own "units" (plus document-level provider/
     contacts) turned into (rows, page_indices) - rows shared by extract() (a
     real PDF file) and extract_from_png_pages() (an already-rendered page-
@@ -1106,6 +1283,7 @@ def _rows_from_raw(
                 lng=None,
                 source_file=filename,
                 brochure_link_is_floorplan=brochure_link_is_floorplan,
+                possible_missed_let_status=(missed_let_status_notes or {}).get(id(unit)),
             )
         )
         page_indices.append(page_index)

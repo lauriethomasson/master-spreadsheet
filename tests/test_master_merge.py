@@ -5689,6 +5689,96 @@ class AddressConflictRiskyFieldsTests(unittest.TestCase):
         self.assertIn("address_1", matched.risky_fields)
 
 
+class PossibleMissedLetStatusRiskyFieldsTests(unittest.TestCase):
+    """
+    row.possible_missed_let_status (see schema.ListingRow's own docstring
+    and extract.possible_missed_let_status_notes - the confirmed real
+    Ivybridge House case: a source page states "River: LET", but this run's
+    own extracted special_features doesn't reflect it) forces special_
+    features into risky_fields even when special_features ITSELF never
+    changed between master and this upload - build_merge_plan injects a
+    synthetic (old, old) diffs["special_features"] entry, the exact same
+    trick AddressConflictRiskyFieldsTests above already exercises for
+    address_conflict/address_1. possible_missed_let_status itself is
+    diagnostic metadata, never its own diff row (same address_conflict/
+    brochure_building_mismatch/geocode_unverified-style move into
+    MatchedRow.silent_updates).
+    """
+
+    def _plan(self, master_extra=None, new_extra=None):
+        master_df = _master_df([{
+            "building": "Ivybridge House", "provider": "Colliers", "floor_unit": "Level 2",
+            **(master_extra or {}),
+        }])
+        new_row = ListingRow(
+            building="Ivybridge House", provider="Colliers", floor_unit="Level 2",
+            **(new_extra or {}),
+        )
+        return master_merge.build_merge_plan([new_row], master_df)
+
+    def test_possible_missed_let_status_flags_special_features_risky_even_though_unchanged(self):
+        plan = self._plan(
+            master_extra={"special_features": "Views of the River Thames"},
+            new_extra={
+                "special_features": "Views of the River Thames",
+                "possible_missed_let_status": "This unit's own source page/row states 'LET', but the "
+                                               "extracted data doesn't reflect it. Verify manually.",
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertIn("special_features", matched.diffs)
+        self.assertEqual(
+            matched.diffs["special_features"], ("Views of the River Thames", "Views of the River Thames"),
+        )
+        self.assertIn("special_features", matched.risky_fields)
+
+    def test_possible_missed_let_status_itself_never_appears_as_its_own_diff_row(self):
+        plan = self._plan(
+            master_extra={"special_features": "Views of the River Thames"},
+            new_extra={
+                "special_features": "Views of the River Thames",
+                "possible_missed_let_status": "This unit's own source page/row states 'LET', but the "
+                                               "extracted data doesn't reflect it. Verify manually.",
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertNotIn("possible_missed_let_status", matched.diffs)
+        self.assertNotIn("possible_missed_let_status", matched.risky_fields)
+        self.assertEqual(
+            matched.silent_updates.get("possible_missed_let_status"),
+            "This unit's own source page/row states 'LET', but the extracted data doesn't reflect it. "
+            "Verify manually.",
+        )
+
+    def test_no_possible_missed_let_status_keeps_the_pre_existing_non_risky_behavior(self):
+        # Regression: an unchanged special_features with no possible_
+        # missed_let_status note at all must never appear in diffs/
+        # risky_fields - this row has genuinely nothing to review.
+        plan = self._plan(
+            master_extra={"special_features": "Views of the River Thames"},
+            new_extra={"special_features": "Views of the River Thames"},
+        )
+        self.assertEqual(len(plan.matched_changed), 0)
+        self.assertEqual(len(plan.matched_unchanged), 1)
+
+    def test_possible_missed_let_status_does_not_override_an_already_genuine_diff(self):
+        # special_features already has a real diff for an unrelated reason
+        # - possible_missed_let_status must still flag it risky, but must
+        # never overwrite/replace the already-computed (old, new) pair
+        # with a synthetic (old, old) one.
+        plan = self._plan(
+            master_extra={"special_features": "Bike racks"},
+            new_extra={
+                "special_features": "Bike racks; showers",
+                "possible_missed_let_status": "This unit's own source page/row states 'LET', but the "
+                                               "extracted data doesn't reflect it. Verify manually.",
+            },
+        )
+        matched = plan.matched_changed[0]
+        self.assertEqual(matched.diffs["special_features"], ("Bike racks", "Bike racks; showers"))
+        self.assertIn("special_features", matched.risky_fields)
+
+
 class GeocodeUnverifiedSelfCorrectionTests(unittest.TestCase):
     """
     geocode_row now writes an explicit False (never merely None) on a

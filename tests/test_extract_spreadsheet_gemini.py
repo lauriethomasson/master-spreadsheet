@@ -154,6 +154,83 @@ class ExtractSheetTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+class SheetRowLetStatusMatchesTests(unittest.TestCase):
+    """
+    extract_spreadsheet_gemini._sheet_row_let_status_matches - the
+    spreadsheet counterpart to extract._pdf_page_let_status_matches, run
+    against a plain rendered-sheet-text string (no workbook needed for
+    this half - see the end-to-end class below for the full row_number
+    cross-referencing exercised through extract_sheet itself).
+    """
+
+    def test_finds_the_row_number_a_status_line_is_on(self):
+        text = "Row 1: 28 Lime Street | 4th Floor | Bike racks\nRow 2: 30 Lime Street | 5th Floor | LET"
+        self.assertEqual(extract_spreadsheet_gemini._sheet_row_let_status_matches(text), {2: ["LET"]})
+
+    def test_a_dedicated_status_column_is_found_too(self):
+        # The real reason this matters more for spreadsheets than PDFs -
+        # see PROMPT's own row_number docstring: a dedicated "Status"
+        # column doesn't "look like" a feature/description column, but a
+        # plain per-line text scan finds it regardless of which column it
+        # sits in.
+        text = "Row 5: Copthall House | 4th Floor | 1200 | Under Offer"
+        self.assertEqual(extract_spreadsheet_gemini._sheet_row_let_status_matches(text), {5: ["Under Offer"]})
+
+    def test_no_status_wording_anywhere_returns_empty(self):
+        text = "Row 1: 28 Lime Street | 4th Floor | Bike racks"
+        self.assertEqual(extract_spreadsheet_gemini._sheet_row_let_status_matches(text), {})
+
+
+class PossibleMissedLetStatusEndToEndTests(unittest.TestCase):
+    """
+    Full extract_sheet repro of the same real Gemini-inconsistency shape
+    test_extract.py's own ExtractSetsPossibleMissedLetStatusEndToEndTests
+    covers for a PDF, here for a spreadsheet - a source row plainly states
+    LET-status wording (in a dedicated Status-like cell), but the unit
+    Gemini extracted for that same row_number doesn't reflect it anywhere
+    in its own special_features/state_of_space.
+    """
+
+    def _sheet(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["28 Lime Street", "4th Floor", "Bike racks; showers"])       # Row 1 - no status wording
+        ws.append(["30 Lime Street", "5th Floor", "LET"])                       # Row 2 - the real gap
+        return ws
+
+    def test_row_whose_status_column_is_dropped_by_extraction_is_flagged(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"row_number": 1, "building": "28 Lime Street", "floor_unit": "4th Floor",
+                 "special_features": "Bike racks; showers"},
+                {"row_number": 2, "building": "30 Lime Street", "floor_unit": "5th Floor",
+                 "special_features": None},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertIsNone(rows[0].possible_missed_let_status)
+        self.assertIsNotNone(rows[1].possible_missed_let_status)
+        self.assertIn("LET", rows[1].possible_missed_let_status)
+
+    def test_row_whose_extraction_already_captured_the_status_is_not_flagged(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"row_number": 2, "building": "30 Lime Street", "floor_unit": "5th Floor",
+                 "special_features": "LET"},
+            ],
+        }
+        with patch("extract_spreadsheet_gemini.get_client"), \
+             patch("extract_spreadsheet_gemini.call_gemini", return_value=raw):
+            rows = extract_spreadsheet_gemini.extract_sheet(self._sheet(), "file.xlsx — Sheet1", "file.xlsx")
+
+        self.assertIsNone(rows[0].possible_missed_let_status)
+
+
 class AddressHouseNumberVerificationTests(unittest.TestCase):
     """The real reported failure: Gemini transcribed a raw sheet cell of
     "14-18 Copthall Avenue, EC2R 7DJ" as address_1 "18 Copthall Avenue",

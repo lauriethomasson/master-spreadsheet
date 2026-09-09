@@ -1450,5 +1450,229 @@ class RejectUnhintedPdfBrochureLinksEndToEndTests(unittest.TestCase):
             pdf_path.unlink(missing_ok=True)
 
 
+def _make_ivybridge_test_pdf() -> Path:
+    """
+    A real, valid, two-page PDF - built with PyMuPDF itself (fitz.open()
+    with no path creates a new in-memory document), same "synthetic but
+    real, exercised through the actual PyMuPDF text-extraction code path"
+    precedent _make_test_pdf above already establishes in this exact file
+    (see its own module docstring), since the ACTUAL original Colliers
+    Ivybridge House PDF this reproduces isn't available in this repo or
+    environment either.
+
+    Reproduces the exact confirmed real wording from the real incident
+    this deterministic cross-check exists for: a per-floor floor-plan
+    deck's own "Level 2" page states "Strand: 2,218 sq ft / River: LET" -
+    meaning the river-facing half of that floor's suite is taken, the
+    Strand-facing half is available. Page 0 ("Level 1") is a plain control
+    page with no LET-status wording anywhere, to prove the cross-check
+    doesn't false-positive on an ordinary page.
+
+    Returns a path to a temp .pdf file the caller is responsible for
+    deleting (see _make_test_pdf's own docstring for the save/close
+    ordering this mirrors).
+    """
+    doc = fitz.open()
+    page0 = doc.new_page(width=595, height=842)
+    page0.insert_text((72, 72), "Ivybridge House", fontsize=18)
+    page0.insert_text((72, 110), "Level 1", fontsize=14)
+    page0.insert_text((72, 140), "Strand: 1,800 sq ft / River: 1,200 sq ft", fontsize=11)
+
+    page1 = doc.new_page(width=595, height=842)
+    page1.insert_text((72, 72), "Ivybridge House", fontsize=18)
+    page1.insert_text((72, 110), "Level 2", fontsize=14)
+    page1.insert_text((72, 140), "Strand: 2,218 sq ft / River: LET", fontsize=11)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    doc.save(str(tmp_path))
+    doc.close()
+    return tmp_path
+
+
+class PdfPageLetStatusMatchesTests(unittest.TestCase):
+    """
+    extract._pdf_page_let_status_matches - the deterministic (non-LLM) raw
+    PDF-text-layer scan for LET_STATUS_KEYWORDS, run against the real
+    reconstructed Ivybridge House PDF (see _make_ivybridge_test_pdf).
+    """
+
+    def test_finds_let_on_the_real_page_it_appears_on(self):
+        pdf_path = _make_ivybridge_test_pdf()
+        try:
+            matches = extract._pdf_page_let_status_matches(pdf_path)
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+        self.assertEqual(matches, {1: ["LET"]})
+
+    def test_control_page_with_no_status_wording_has_no_match(self):
+        pdf_path = _make_ivybridge_test_pdf()
+        try:
+            matches = extract._pdf_page_let_status_matches(pdf_path)
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+        self.assertNotIn(0, matches)
+
+    def test_malformed_source_never_raises_just_returns_empty(self):
+        # A real caller (extract()/brochure_enrichment.py) already has real
+        # page IMAGES to work with regardless of whether this deterministic
+        # side-check succeeds - a failure here must never block real
+        # extraction.
+        self.assertEqual(extract._pdf_page_let_status_matches(b"not a real pdf at all"), {})
+
+
+class PossibleMissedLetStatusNotesTests(unittest.TestCase):
+    """
+    extract.possible_missed_let_status_notes - the cross-referencing logic
+    shared by extract.py's own _rows_from_raw, extract_spreadsheet_gemini.
+    py's row-building loop, and brochure_enrichment._apply_units_to_row -
+    exercised here purely against constructed unit dicts/source_matches
+    (no PDF needed for this half - see PdfPageLetStatusMatchesTests above
+    for the raw-text-scan half).
+    """
+
+    def test_unit_whose_own_extraction_omits_stated_let_status_is_flagged(self):
+        # The confirmed real Gemini inconsistency this whole feature exists
+        # for: the raw source states "River: LET" on page 1, but this
+        # unit's own extracted special_features is generic boilerplate that
+        # never mentions it at all.
+        units = [{
+            "building": "Ivybridge House", "floor_unit": "Level 2 - River", "page_index": 1,
+            "special_features": "Views of the River Thames; Comprehensively refurbished",
+        }]
+        notes = extract.possible_missed_let_status_notes(units, {1: ["LET"]})
+
+        self.assertIn(id(units[0]), notes)
+        self.assertIn("LET", notes[id(units[0])])
+
+    def test_unit_whose_own_extraction_already_reflects_it_is_not_flagged(self):
+        # The OTHER real extraction pass of the identical PDF - this one
+        # correctly captured the status - must never be flagged; nothing
+        # was actually missed here.
+        units = [{
+            "building": "Ivybridge House", "floor_unit": "Level 2 - River", "page_index": 1,
+            "special_features": "(River suite is LET)",
+        }]
+        notes = extract.possible_missed_let_status_notes(units, {1: ["LET"]})
+
+        self.assertEqual(notes, {})
+
+    def test_unit_whose_own_state_of_space_reflects_it_is_also_not_flagged(self):
+        # state_of_space counts too - see schema.ListingRow.possible_
+        # missed_let_status's own docstring (special_features/state_of_
+        # space, the same two LET_STATUS_FIELDS master_merge itself uses).
+        units = [{
+            "building": "Ivybridge House", "floor_unit": "Level 2 - River", "page_index": 1,
+            "special_features": "Views of the River Thames", "state_of_space": "River suite: LET",
+        }]
+        notes = extract.possible_missed_let_status_notes(units, {1: ["LET"]})
+
+        self.assertEqual(notes, {})
+
+    def test_page_with_no_units_at_all_is_a_no_op(self):
+        notes = extract.possible_missed_let_status_notes([], {1: ["LET"]})
+        self.assertEqual(notes, {})
+
+    def test_no_source_matches_at_all_is_a_no_op(self):
+        units = [{"building": "X", "page_index": 0, "special_features": "Bike racks"}]
+        self.assertEqual(extract.possible_missed_let_status_notes(units, {}), {})
+
+    def test_unit_with_no_page_index_never_appears_in_the_result(self):
+        units = [{"building": "X", "special_features": "Bike racks"}]
+        notes = extract.possible_missed_let_status_notes(units, {0: ["LET"]})
+        self.assertEqual(notes, {})
+
+    def test_multiple_units_sharing_one_page_are_all_flagged_not_guessed(self):
+        # The real, accepted multi-unit-per-page limitation: a tabular
+        # schedule-of-areas can't confidently attribute a page-level match
+        # to a single unit - every unit sharing that page_index is flagged.
+        units = [
+            {"building": "X", "floor_unit": "1st", "page_index": 3, "special_features": "Bike racks"},
+            {"building": "X", "floor_unit": "2nd", "page_index": 3, "special_features": "Showers"},
+        ]
+        notes = extract.possible_missed_let_status_notes(units, {3: ["Under Offer"]})
+
+        self.assertEqual(set(notes.keys()), {id(units[0]), id(units[1])})
+        for note in notes.values():
+            self.assertIn("more than one unit", note)
+
+    def test_generic_key_works_for_row_number_too(self):
+        # extract_spreadsheet_gemini.py's own caller passes key="row_number"
+        # instead of the PDF-shaped default "page_index" - same shared
+        # logic either way (see this function's own docstring).
+        units = [{"building": "X", "row_number": 14, "special_features": "Bike racks"}]
+        notes = extract.possible_missed_let_status_notes(units, {14: ["Withdrawn"]}, key="row_number")
+
+        self.assertIn(id(units[0]), notes)
+
+
+class ExtractSetsPossibleMissedLetStatusEndToEndTests(unittest.TestCase):
+    """
+    Full extract() repro of the confirmed real Ivybridge House incident:
+    one extraction pass of a PDF drops LET-status wording the source page
+    plainly states, replacing it with generic boilerplate - proof this is
+    a real Gemini consistency problem (same file, same prompt, different
+    output), not a source-document change (see extract._pdf_page_let_
+    status_matches' own docstring). Gemini's OWN extraction is mocked
+    (extract.call_gemini) to reproduce exactly that; the deterministic
+    raw-text scan runs for real against the real reconstructed PDF.
+    """
+
+    def _extract_with_mocked_gemini(self, raw: dict) -> list:
+        pdf_path = _make_ivybridge_test_pdf()
+        try:
+            with patch("extract.get_client", return_value="fake-client"), \
+                    patch("extract.call_gemini", return_value=raw):
+                return extract.extract(pdf_path, original_filename="ivybridge.pdf")
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
+    def test_the_confirmed_real_failure_is_flagged(self):
+        # The LATER, buggy extraction pass - generic building-wide
+        # boilerplate duplicated across every floor, no "LET" anywhere.
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {
+                    "building": "Ivybridge House", "floor_unit": "Level 1", "page_index": 0,
+                    "special_features": "Views of the River Thames; Comprehensively refurbished",
+                },
+                {
+                    "building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 1,
+                    "special_features": "Views of the River Thames; Comprehensively refurbished",
+                },
+            ],
+        }
+        rows = self._extract_with_mocked_gemini(raw)
+
+        # Level 1's own page states no LET-status wording at all - never
+        # flagged, even though its special_features is the same generic
+        # text as Level 2's.
+        self.assertIsNone(rows[0].possible_missed_let_status)
+        # Level 2 is the real gap - its own page states "River: LET", which
+        # this row's extracted special_features doesn't reflect at all.
+        self.assertIsNotNone(rows[1].possible_missed_let_status)
+        self.assertIn("LET", rows[1].possible_missed_let_status)
+
+    def test_the_correct_extraction_pass_is_not_flagged(self):
+        # The EARLIER, correct extraction pass of the identical PDF -
+        # nothing was actually missed here, must never be flagged.
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {
+                    "building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 1,
+                    "special_features": "Comprehensively refurbished; (River suite is LET)",
+                },
+            ],
+        }
+        rows = self._extract_with_mocked_gemini(raw)
+
+        self.assertIsNone(rows[0].possible_missed_let_status)
+
+
 if __name__ == "__main__":
     unittest.main()
