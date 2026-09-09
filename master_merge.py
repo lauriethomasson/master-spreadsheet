@@ -962,11 +962,54 @@ _ADDRESS_HARMLESS_TRAILING_CHARS = ",.;:"
 _ADDRESS_DASH_VARIANTS_RE = re.compile("[‐‑‒–—―]")
 
 
+def _canonicalize_leading_house_number_range(text: str) -> str:
+    """
+    Rewrites ONLY a leading house-number RANGE at the very start of `text`
+    to a single canonical "low-high" spelling (a bare hyphen, no spaces) -
+    "1 to 5 Adam Street" and "1-5 Adam Street" both become "1-5 Adam
+    Street" - reusing _LEADING_HOUSE_NUMBER_RE (house_number.py's own
+    regex, imported above, never reimplemented here) to find the match and
+    its own two number groups. Confirmed real case: Ivybridge House's own
+    address_1 changed from "1-5 Adam Street" to "1 to 5 Adam Street" on a
+    fresh upload - genuinely the same address, just a different range-
+    separator spelling - previously compared as a real change since
+    _normalize_address_for_comparison never folded "to" the way it already
+    folds dash GLYPH variants above. house_number.leading_house_number/
+    house_numbers_conflict already treat these as the identical range
+    elsewhere in this codebase (house_number_changed, HOUSE_NUMBER_FIELDS'
+    own risky-flagging path) - this closes the same gap for address_1's
+    OWN separate tolerant-comparison layer, which decides whether a diff
+    is shown AT ALL, not just whether a shown diff counts as risky.
+
+    Only the matched leading portion is ever rewritten - everything from
+    match.end() onward (the street name and beyond) is preserved byte-for-
+    byte, so a genuinely different remainder still compares different
+    exactly as before.
+
+    A bare single house number ("89 Adam Street", no range at all) is left
+    completely untouched: _LEADING_HOUSE_NUMBER_RE's own range group (the
+    second number) is None whenever there's no genuine separator+second
+    number present, which this checks for explicitly before rewriting
+    anything. A genuinely different range ("1-5" vs "1-7", or "1 to 5" vs
+    "3 to 5") is UNAFFECTED by this - each still canonicalizes to its own
+    distinct "low-high" text, which still compares different exactly as
+    before; this only tolerates the SEPARATOR spelling, never the numbers
+    themselves.
+    """
+    match = _LEADING_HOUSE_NUMBER_RE.match(text)
+    if not match or match.group(3) is None:
+        return text
+    low, _separator, high = match.groups()
+    return f"{low}-{high}{text[match.end():]}"
+
+
 def _normalize_address_for_comparison(value) -> str:
     """
-    address_1's own tolerant-comparison form: every Unicode dash variant
-    folded to a plain hyphen-minus (see _ADDRESS_DASH_VARIANTS_RE's own
-    docstring), then _normalize_text's case/whitespace folding, PLUS a
+    address_1's own tolerant-comparison form: a leading house-number
+    range's own separator spelling canonicalized first (see _canonicalize_
+    leading_house_number_range's own docstring), then every Unicode dash
+    variant folded to a plain hyphen-minus (see _ADDRESS_DASH_VARIANTS_RE's
+    own docstring), then _normalize_text's case/whitespace folding, PLUS a
     harmless trailing punctuation mark stripped (see _ADDRESS_HARMLESS_
     TRAILING_CHARS/ADDRESS_TRAILING_PUNCTUATION_FIELDS' own docstring for
     the real "33 Cavendish Square," case this exists for). Deliberately
@@ -979,10 +1022,11 @@ def _normalize_address_for_comparison(value) -> str:
     Square", "33 Cavendish Square" vs "33 Cavendish Street", "19-21 Great
     Portland Street" vs "19 Great Portland Street", or vs "19-23 Great
     Portland Street") still compare different exactly as before - only the
-    digits/letters themselves (and, now, dash GLYPH choice) ever decide
-    that, completely unaffected by this.
+    digits/letters themselves (and, now, dash GLYPH/range-separator
+    choice) ever decide that, completely unaffected by this.
     """
-    text = _ADDRESS_DASH_VARIANTS_RE.sub("-", str(value))
+    text = _canonicalize_leading_house_number_range(str(value))
+    text = _ADDRESS_DASH_VARIANTS_RE.sub("-", text)
     return _normalize_text(text).rstrip(_ADDRESS_HARMLESS_TRAILING_CHARS)
 
 
