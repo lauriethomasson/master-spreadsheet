@@ -181,6 +181,55 @@ class ListingRow(BaseModel):
     # merge.diff_fields' own blank-skip rule never lets a fresh, unchecked
     # row silently clear a master row's own already-flagged note.
     brochure_building_mismatch: Optional[str] = None
+    # Human-readable note (never a bare bool - same convention as address_
+    # conflict/brochure_building_mismatch/geocode_unverified above) set by a
+    # deterministic (non-LLM) keyword cross-check - see master_merge.
+    # LET_STATUS_KEYWORDS/matched_let_status_phrases, reused directly, never
+    # a second copy - run separately against the RAW source text (a PDF
+    # page's own embedded text layer via PyMuPDF, a spreadsheet's own
+    # rendered row line, or a fetched per-unit brochure's own text) for
+    # whichever specific unit/row this is, whenever that raw text plainly
+    # states LET/off-market status wording ("Let", "Under Offer",
+    # "Withdrawn", ...) that this row's OWN extracted special_features/
+    # state_of_space does NOT reflect.
+    #
+    # Confirmed real case this exists for: a real Colliers Ivybridge House
+    # PDF (a per-floor floor-plan deck) states, on its own "Level 2" page,
+    # "Strand: 2,218 sq ft / River: LET". One extraction pass of this exact,
+    # UNCHANGED PDF correctly captured "(River suite is LET)" into that
+    # unit's special_features; a LATER pass of the SAME PDF dropped it
+    # entirely, replacing it with generic building-wide boilerplate
+    # duplicated across every floor - proof this is a real Gemini
+    # consistency problem (same file, same prompt, different output), not a
+    # source-document change, and not something a prompt tweak alone can be
+    # trusted to fix reliably every time.
+    #
+    # Purely a REVIEW FLAG, exactly like brochure_building_mismatch above -
+    # never silently rewrites/injects the missing wording into special_
+    # features itself (see this codebase's own established philosophy
+    # throughout: never silently invent a field value, always gate an
+    # ambiguous case to a human reviewer's own decision). Appears ALONGSIDE
+    # RISKY_TEXT_FIELDS' own generic "text looks shorter than before"
+    # richness-regression warning where both happen to fire on the same
+    # field, never replacing it - this note names the SPECIFIC wording the
+    # source states and why it matters, which the generic warning cannot.
+    #
+    # A page/row shared by MORE than one unit (a tabular schedule-of-areas,
+    # unlike Ivybridge House's own one-floor-per-page layout) can't be
+    # confidently attributed to a single unit - every unit sharing that
+    # page/row is flagged rather than guessing which one the raw match
+    # belongs to; this note's own wording says so explicitly in that case.
+    # A real, accepted limitation (a false positive on a busy shared page is
+    # possible), not a bug silently papered over.
+    #
+    # None (never explicitly False) when no gap was found OR this row's own
+    # raw source was never checked this run (e.g. no PDF page/spreadsheet
+    # row/fetched brochure text available to cross-check against) - same
+    # "None means this run didn't touch the question" convention as address_
+    # conflict/brochure_building_mismatch/geocode_unverified above, so
+    # master_merge.diff_fields' own blank-skip rule never lets a fresh,
+    # unchecked row silently clear a master row's own already-flagged note.
+    possible_missed_let_status: Optional[str] = None
     # The overall campus/development's own brand name, distinct from any
     # individual building's own name within it (e.g. "Regent's Wharf"
     # containing "The Canal Building", "Thorley Works", ...) - only when

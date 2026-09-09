@@ -382,6 +382,7 @@ def _render_combined_location_row(
 def _render_field_rows(
     diffs: dict, key_prefix: str, default_checked: bool, risky_fields: frozenset = frozenset(),
     unverified: bool = False, address_conflict: str = None, kept_as_is_fields: frozenset = frozenset(),
+    possible_missed_let_status: str = None,
 ) -> dict:
     """
     Renders one compact row per field that genuinely needs a reviewer's
@@ -536,6 +537,15 @@ def _render_field_rows(
             st.markdown(f"**{display_utils.friendly_field_label(f)}**")
             if is_risky:
                 st.caption(f"⚠️ {_risky_field_reason(f, unverified, address_conflict, new_val)}")
+            # A SEPARATE, distinctly-labeled caption line - never a
+            # replacement for the richness-regression wording above, which
+            # can fire at the same time on the same field (see schema.
+            # ListingRow.possible_missed_let_status's own docstring) - same
+            # "more than one independent caption can coexist on one field
+            # row" precedent looks_identical's own caption right below
+            # already establishes.
+            if f == "special_features" and possible_missed_let_status:
+                st.caption(f"🔍 {possible_missed_let_status}")
             if looks_identical:
                 st.caption(
                     "⚠️ Looks identical, but the underlying text differs (hidden character, punctuation, or "
@@ -919,6 +929,7 @@ def _render_matched_row(m, key_prefix: str, prefix: str, default_checked: bool, 
             m.diffs, key_prefix, default_checked=default_checked, risky_fields=m.risky_fields,
             unverified=bool(m.new_row.geocode_unverified), address_conflict=m.new_row.address_conflict,
             kept_as_is_fields=m.kept_as_is_fields,
+            possible_missed_let_status=m.new_row.possible_missed_let_status,
         )
     if approved_fields:
         entry = updates.setdefault(m.master_index, {})
@@ -2719,6 +2730,7 @@ def _render_near_miss_link_diff(u, row_dict: dict, target_index: int, plan, key_
         approved_fields = _render_field_rows(
             diffs, f"{key_prefix}_link", default_checked=True, risky_fields=risky_fields,
             unverified=unverified, kept_as_is_fields=kept_as_is_fields,
+            possible_missed_let_status=u.new_row.possible_missed_let_status,
         )
         if approved_fields:
             entry = decision_updates.setdefault(target_index, {})

@@ -2908,6 +2908,14 @@ class _BrochureUnits(list):
     property_features = None
     contacts = None
     building_features = None
+    # {page_index: [matched phrases]} - see extract._pdf_page_let_status_
+    # matches/_apply_units_to_row's own use of this below. None (its own
+    # falsy default) for a document with no LET-status wording anywhere, OR
+    # one that was never a real PDF at all (a Canva/Pitch screenshot list -
+    # see _images_from_fetched_document's own docstring; there is no raw
+    # text layer to scan for that source at all, same exemption extract.
+    # extract_from_png_pages already has for the identical reason).
+    let_status_page_matches = None
 
 
 def _images_from_fetched_document(data):
@@ -3056,6 +3064,19 @@ def _brochure_units_from_document_bytes(data, url: str):
         _record_status(STATUS_RENDER_FAILED, f"{e!r}")
         return None
 
+    # Computed HERE, while `data` (the real fetched bytes) is still alive -
+    # see extract._pdf_page_let_status_matches' own docstring for what this
+    # deterministic (non-LLM) scan does and why. Only meaningful for a real
+    # PDF (bytes/bytearray) - `data` can also be list[bytes] (a Canva/Pitch
+    # screenshot list, see _images_from_fetched_document's own docstring),
+    # which has no raw PDF text layer to scan at all, same exemption
+    # extract.extract_from_png_pages already has for the identical reason.
+    # Stored in this small, cheap local dict (never the bytes themselves)
+    # so it survives past the next line's own intentional data=None drop.
+    let_status_page_matches = (
+        extract._pdf_page_let_status_matches(data) if isinstance(data, (bytes, bytearray)) else {}
+    )
+
     # Dropped HERE, between the two calls - not in a finally at the end
     # of this function - specifically so it's freed BEFORE the slower
     # Gemini call below runs, not merely before this function returns.
@@ -3079,6 +3100,7 @@ def _brochure_units_from_document_bytes(data, url: str):
     units.property_features = property_features if isinstance(property_features, str) else None
     contacts = raw.get("contacts")
     units.contacts = contacts if isinstance(contacts, str) else None
+    units.let_status_page_matches = let_status_page_matches or None
     # Raw Gemini JSON, same as units above - never schema-validated before
     # reaching here, so a malformed entry (missing/non-string "building" or
     # "features") is simply excluded rather than raising (see _match_unit's
@@ -4083,6 +4105,25 @@ def _apply_units_to_row(row: ListingRow, units, is_shared_deck_document: bool = 
         if mismatch_note:
             updates["brochure_building_mismatch"] = mismatch_note
 
+    # Same purely-additive review-flag shape as brochure_building_mismatch
+    # just above - see schema.ListingRow.possible_missed_let_status/extract.
+    # possible_missed_let_status_notes' own docstrings for the deterministic
+    # (non-LLM) cross-check itself and the confirmed real Ivybridge House
+    # gap it exists for. Only meaningful once a SPECIFIC unit has already
+    # been confidently matched (unit is not None) - this fetched document's
+    # own text is tied to THIS row via that match, so attribution here is
+    # unambiguous in the sense that it's the right DOCUMENT; the multi-
+    # unit-per-page limitation inside possible_missed_let_status_notes
+    # still applies within that one document (a schedule-of-areas-style
+    # floor plan covering several floors, not just Ivybridge House's own
+    # one-floor-per-page layout).
+    if unit is not None and getattr(units, "let_status_page_matches", None):
+        missed_note = extract.possible_missed_let_status_notes(
+            units, units.let_status_page_matches,
+        ).get(id(unit))
+        if missed_note:
+            updates["possible_missed_let_status"] = missed_note
+
     if units is not None:
         # Combined, not "fill only if blank" (unlike every other PROPERTY_
         # LEVEL_FIELDS-adjacent field this function ever just overwrites a
@@ -4382,7 +4423,13 @@ def _apply_units_to_row(row: ListingRow, units, is_shared_deck_document: bool = 
     # scenario already triggers. enrich_rows_grouped's own stats counter
     # (brochure_building_mismatch_flags) reads the returned row's own
     # field directly instead of this list, for exactly this reason.
-    enriched_fields = [f for f in updates if f != "brochure_building_mismatch"]
+    #
+    # possible_missed_let_status (see this function's own top-of-body
+    # comment just above) is the identical shape - also a pure review
+    # flag, never genuine content enrichment - so it's excluded here for
+    # the exact same reason, never its own separate exclusion list.
+    non_enrichment_review_flags = ("brochure_building_mismatch", "possible_missed_let_status")
+    enriched_fields = [f for f in updates if f not in non_enrichment_review_flags]
     return row.model_copy(update=updates), enriched_fields
 
 

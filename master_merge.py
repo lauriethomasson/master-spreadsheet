@@ -3329,6 +3329,24 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             if "brochure_building_mismatch" in diffs:
                 silent["brochure_building_mismatch"] = diffs.pop("brochure_building_mismatch")[1]
 
+            # possible_missed_let_status (see schema.ListingRow's own
+            # docstring, extract.possible_missed_let_status_notes) is the
+            # same kind of diagnostic pipeline metadata as address_conflict
+            # just above, and uses the EXACT same injection trick for the
+            # exact same reason: the confirmed real Ivybridge House shape
+            # this exists for has special_features UNCHANGED-shaped between
+            # old and new in the sense that diff_fields alone would still
+            # show a diff here (this run's own special_features text did
+            # change, replaced by generic boilerplate) - but on a row where
+            # it DIDN'T happen to change at all (e.g. a matched_unchanged
+            # re-upload of an already-flagged unit), this still needs to
+            # force a genuine decision card the same way address_conflict's
+            # own address_1-injection does, so the flag is never silently
+            # lost just because special_features itself is diff-free.
+            if "possible_missed_let_status" in diffs:
+                silent["possible_missed_let_status"] = diffs.pop("possible_missed_let_status")[1]
+                diffs.setdefault("special_features", (old_rec.get("special_features"), new_dict.get("special_features")))
+
             # Auto-merge a DETAIL_LOSS_MERGE_FIELDS update BEFORE risky_fields
             # is computed below, whenever it's safe to (see merge_compatible_
             # text's own docstring): is_detail_loss says old_val has a
@@ -3476,6 +3494,14 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 # structural check).
                 f for f in diffs
                 if f == "address_1" and new_dict.get("address_conflict")
+            ) | frozenset(
+                # possible_missed_let_status (see schema.ListingRow's own
+                # docstring and the injection comment above) - flagged
+                # unconditionally whenever present, same "positive evidence
+                # of a real problem, always needs a human's own look"
+                # philosophy as the address_conflict clause just above.
+                f for f in diffs
+                if f == "special_features" and new_dict.get("possible_missed_let_status")
             )
             let_status_fields = frozenset(
                 f for f in diffs if f in LET_STATUS_FIELDS and mentions_let_status(diffs[f][1])

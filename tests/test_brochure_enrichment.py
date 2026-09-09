@@ -5523,6 +5523,83 @@ class ApplyUnitsToRowBrochureBuildingMismatchTests(unittest.TestCase):
         self.assertIsNone(new_row.brochure_building_mismatch)
 
 
+class ApplyUnitsToRowPossibleMissedLetStatusTests(unittest.TestCase):
+    """
+    _apply_units_to_row's own wiring of extract.possible_missed_let_status_
+    notes against a FETCHED per-unit brochure's own raw text (see
+    _brochure_units_from_document_bytes' own let_status_page_matches
+    attribute, set BEFORE the Gemini call so it survives that call's own
+    intentional data=None memory-drop) - same purely additive, review-
+    flag-only shape as ApplyUnitsToRowBrochureBuildingMismatchTests above.
+    """
+
+    def test_matched_unit_whose_own_page_states_let_status_not_reflected_is_flagged(self):
+        row = ListingRow(building="Ivybridge House", floor_unit="Level 2", brochure_link="https://example.com/x.pdf")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 1,
+             "special_features": "Views of the River Thames"},
+        ])
+        units.let_status_page_matches = {1: ["LET"]}
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("possible_missed_let_status", fields)
+        self.assertIsNotNone(new_row.possible_missed_let_status)
+        self.assertIn("LET", new_row.possible_missed_let_status)
+
+    def test_matched_unit_whose_own_extraction_already_reflects_it_is_not_flagged(self):
+        row = ListingRow(building="Ivybridge House", floor_unit="Level 2", brochure_link="https://example.com/x.pdf")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 1,
+             "special_features": "(River suite is LET)"},
+        ])
+        units.let_status_page_matches = {1: ["LET"]}
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("possible_missed_let_status", fields)
+        self.assertIsNone(new_row.possible_missed_let_status)
+
+    def test_no_page_matches_at_all_never_sets_the_flag(self):
+        row = ListingRow(building="Ivybridge House", floor_unit="Level 2", brochure_link="https://example.com/x.pdf")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 1,
+             "special_features": "Views of the River Thames"},
+        ])
+        # let_status_page_matches left at its own None default (no PDF
+        # text-layer matches at all, or not a real PDF - see _BrochureUnits'
+        # own docstring).
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("possible_missed_let_status", fields)
+        self.assertIsNone(new_row.possible_missed_let_status)
+
+    def test_unmatched_row_is_never_flagged(self):
+        # _match_unit finds nothing for this row at all - there is no
+        # specific unit to attribute a raw-text match to, so this must
+        # never guess.
+        row = ListingRow(building="A Completely Different Building", brochure_link="https://example.com/x.pdf")
+        units = _brochure_units([
+            {"building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 1,
+             "special_features": "Views of the River Thames"},
+        ])
+        units.let_status_page_matches = {1: ["LET"]}
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, units)
+
+        self.assertNotIn("possible_missed_let_status", fields)
+        self.assertIsNone(new_row.possible_missed_let_status)
+
+    def test_no_units_never_sets_the_flag_and_does_not_crash(self):
+        row = ListingRow(building="Ivybridge House", brochure_link="https://example.com/x.pdf")
+
+        new_row, fields = brochure_enrichment._apply_units_to_row(row, None)
+
+        self.assertNotIn("possible_missed_let_status", fields)
+        self.assertIsNone(new_row.possible_missed_let_status)
+
+
 class EnrichRowsGroupedBrochureBuildingMismatchStatsTests(EnrichmentTestCase):
     """enrich_rows_grouped's own brochure_building_mismatch_flags stats
     counter - incremented only when _confident_building_mismatch actually

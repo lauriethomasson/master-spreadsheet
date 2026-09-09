@@ -22,9 +22,11 @@ import re
 import sys
 from datetime import date
 
+import extract
 from brochure_link_resolver import finalize_brochure_link, finalize_floorplan_link
 from gemini_client import call_gemini, compute_rent, get_client
 from house_number import LEADING_HOUSE_NUMBER_RE, leading_house_number
+from master_merge import matched_let_status_phrases
 from schema import ExtractedFields, ListingRow
 
 # Strips render_sheet_as_text's own "Row 14: " row-number prefix back off a
@@ -32,6 +34,43 @@ from schema import ExtractedFields, ListingRow
 # row number itself (also a leading digit sequence) would be mistaken for
 # the address's leading house number.
 _ROW_PREFIX_RE = re.compile(r"^Row \d+:\s*")
+
+# Captures the row number itself (unlike _ROW_PREFIX_RE above, which only
+# strips it) - used by _sheet_row_let_status_matches to key each line's own
+# raw-text LET-status matches by the exact row_number Gemini is separately
+# asked to report per unit (see PROMPT's own "row_number" field), so a
+# unit's own extracted data can be cross-checked against ITS OWN source
+# line specifically, never any other row's.
+_ROW_NUMBER_RE = re.compile(r"^Row (\d+):")
+
+
+def _sheet_row_let_status_matches(text: str) -> dict:
+    """
+    {row_number: [matched phrases]} for every non-blank rendered sheet line
+    (see render_sheet_as_text) whose own raw text states LET/off-market
+    status wording - see master_merge.matched_let_status_phrases/
+    LET_STATUS_KEYWORDS, reused directly, never a second, independently-
+    drifting copy of that matching logic. The spreadsheet counterpart to
+    extract._pdf_page_let_status_matches - see that function's own
+    docstring for the real Ivybridge House gap this deterministic cross-
+    check exists for; unlike a PDF, each spreadsheet row already maps to
+    exactly one plain-text line with an unambiguous row NUMBER printed
+    right on it, so there is no rendering/page-image step to reproduce
+    here at all - just a plain per-line scan of the exact same rendered
+    text Gemini itself was shown.
+
+    A line with no LET-status wording at all is simply absent from the
+    returned dict - {} for a sheet with none anywhere.
+    """
+    matches = {}
+    for line in text.splitlines():
+        row_match = _ROW_NUMBER_RE.match(line)
+        if not row_match:
+            continue
+        phrases = matched_let_status_phrases(_ROW_PREFIX_RE.sub("", line))
+        if phrases:
+            matches[int(row_match.group(1))] = phrases
+    return matches
 
 PROMPT = """You are extracting structured commercial office availability data from ONE SHEET of a
 provider's Excel availability spreadsheet. The sheet has been converted to plain text, one line per
@@ -83,6 +122,10 @@ Extract file-level information:
   explicitly states this. Empty list if none, or if this sheet is shape (a).
 
 Then extract EVERY SEPARATE AVAILABLE UNIT:
+- row_number: the real spreadsheet row number this unit's own data comes from - the exact same number
+  already given to you as this line's own "Row N:" prefix (e.g. "Row 14: ..." -> row_number: 14). If a
+  unit's own data is stated across more than one line, use the row where its floor_unit/size_sqft is
+  given, the same rule page_index uses for a multi-page PDF unit.
 - building: the building name. Never leave this null - inherit from the most recent row/column that
   stated one if a data row doesn't restate it (shape (b)), or from that row's own Building-like
   column (shape (a)).
@@ -150,6 +193,7 @@ Return your answer as a single JSON object with this exact structure:
   "fully_occupied_buildings": ["...", ...],
   "units": [
     {
+      "row_number": integer,
       "building": "...",
       "submarket": "..." or null,
       "address_1": "..." or null,
@@ -840,6 +884,17 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
     client = get_client()
     raw = _call_gemini_in_batches(client, text, sheet_label)
 
+    # Deterministic (non-LLM) LET-status cross-check - see extract.
+    # possible_missed_let_status_notes/_sheet_row_let_status_matches' own
+    # docstrings. Computed against raw.get("units", []) (every unit Gemini
+    # returned, before the building-inheritance/skip loop below ever
+    # filters or reorders them) and looked up per surviving unit by
+    # id(unit) further down - the same dict objects, never copies, so this
+    # survives that filtering untouched.
+    missed_let_status_notes = extract.possible_missed_let_status_notes(
+        raw.get("units", []), _sheet_row_let_status_matches(text), key="row_number",
+    )
+
     # No "contacts" key here - each unit below always sets its own resolved
     # value (its own per-unit contacts, or the sheet-wide fallback) onto
     # itself before the merge; a duplicate key in both dicts would make the
@@ -915,6 +970,7 @@ def extract_sheet_with_metadata(ws, sheet_label: str, filename: str) -> tuple:
                 lng=None,
                 source_file=sheet_label,
                 brochure_link_is_floorplan=brochure_link_is_floorplan,
+                possible_missed_let_status=missed_let_status_notes.get(id(unit)),
             )
         )
 
