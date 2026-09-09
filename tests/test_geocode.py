@@ -2030,6 +2030,284 @@ class BareNameCorroborationTests(unittest.TestCase):
         self.assertEqual(row.lng, -0.124)
 
 
+class RealCapturedNewDerwentHouseCandidatesTests(unittest.TestCase):
+    """
+    The real, live-captured 4-candidate Places Text Search (New) response
+    for "New Derwent House, London, UK" - verbatim, not approximated (see
+    geocode.py's own _candidate_premise_words docstring for the summary).
+    Candidates 0/1 are genuinely wrong buildings (Derwent London plc's own
+    HQ at 25 Savile Row; an unrelated "Derwent House" in South Kensington).
+    Candidates 2/3 are BOTH at the genuinely correct address (69-73
+    Theobalds Road, WC1X 8TA) but neither candidate's own bare "name" says
+    "New Derwent" anywhere - candidate 2 is "Denave PTE Ltd" (a company
+    registered there), candidate 3 is a generic "House 69, 73 Theobalds
+    Rd" auto-label. Both candidates' own address text ALSO happens to
+    literally contain "New Derwent" (confirmed live - candidate 2's own
+    formatted_address reads "New Derwent, House, 69, 73 Theobalds Rd, ...")
+    - the real reason this suite exists: only candidate 3's own "New
+    Derwent" text is typed "premise" by Google; candidate 2's own is an
+    UNTYPED fragment (no "types" key at all). _candidate_premise_words
+    deliberately reads only the "premise"-typed one, which is what lets
+    candidate 3 be accepted while candidate 2 - despite ALSO containing
+    the literal substring "New Derwent" somewhere in its own address text
+    - stays correctly rejected. A naive whole-address-text word check
+    would have wrongly accepted both.
+    """
+
+    CANDIDATE_0_DERWENT_LONDON_PLC = {
+        "lat": 51.5118097, "lng": -0.1414146,
+        "formatted_address": "25 Savile Row, London W1S 2ER, UK",
+        "address_components": [
+            {"longText": "25", "shortText": "25", "types": ["street_number"], "languageCode": "en-US"},
+            {"longText": "Savile Row", "shortText": "Savile Row", "types": ["route"], "languageCode": "en"},
+            {"longText": "London", "shortText": "London", "types": ["postal_town"], "languageCode": "en"},
+            {
+                "longText": "Greater London", "shortText": "Greater London",
+                "types": ["administrative_area_level_2", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "England", "shortText": "England",
+                "types": ["administrative_area_level_1", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "United Kingdom", "shortText": "GB", "types": ["country", "political"],
+                "languageCode": "en",
+            },
+            {"longText": "W1S 2ER", "shortText": "W1S 2ER", "types": ["postal_code"], "languageCode": "en-US"},
+        ],
+        "name": "Derwent London plc",
+    }
+    CANDIDATE_1_DERWENT_HOUSE_SOUTH_KENSINGTON = {
+        "lat": 51.4951061, "lng": -0.17992249999999999,
+        "formatted_address": "Stanhope Gardens, South Kensington, London SW7 5BJ, UK",
+        "address_components": [
+            {
+                "longText": "Stanhope Gardens", "shortText": "Stanhope Gardens", "types": ["route"],
+                "languageCode": "en",
+            },
+            {
+                "longText": "South Kensington", "shortText": "South Kensington",
+                "types": ["neighborhood", "political"], "languageCode": "en",
+            },
+            {"longText": "London", "shortText": "London", "types": ["postal_town"], "languageCode": "en"},
+            {
+                "longText": "Greater London", "shortText": "Greater London",
+                "types": ["administrative_area_level_2", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "England", "shortText": "England",
+                "types": ["administrative_area_level_1", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "United Kingdom", "shortText": "GB", "types": ["country", "political"],
+                "languageCode": "en",
+            },
+            {"longText": "SW7 5BJ", "shortText": "SW7 5BJ", "types": ["postal_code"], "languageCode": "en-US"},
+        ],
+        "name": "Derwent House",
+    }
+    CANDIDATE_2_DENAVE_PTE_LTD = {
+        "lat": 51.5196803, "lng": -0.1196455,
+        "formatted_address": "New Derwent, House, 69, 73 Theobalds Rd, London WC1X 8TA, UK",
+        "address_components": [
+            # No "types" key at all - Google's own response didn't
+            # confidently classify this fragment. Deliberately kept
+            # exactly as captured live, not "fixed up" - this untyped
+            # fragment is the whole reason this candidate must stay
+            # rejected despite its own text literally saying "New Derwent".
+            {"longText": "New Derwent", "languageCode": "en"},
+            {"longText": "House, 69", "shortText": "House, 69", "types": ["subpremise"], "languageCode": "en"},
+            {"longText": "73", "shortText": "73", "types": ["street_number"], "languageCode": "en-US"},
+            {"longText": "Theobalds Road", "shortText": "Theobalds Rd", "types": ["route"], "languageCode": "en"},
+            {"longText": "London", "shortText": "London", "types": ["postal_town"], "languageCode": "en"},
+            {
+                "longText": "Greater London", "shortText": "Greater London",
+                "types": ["administrative_area_level_2", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "England", "shortText": "England",
+                "types": ["administrative_area_level_1", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "United Kingdom", "shortText": "GB", "types": ["country", "political"],
+                "languageCode": "en",
+            },
+            {"longText": "WC1X 8TA", "shortText": "WC1X 8TA", "types": ["postal_code"], "languageCode": "en-US"},
+        ],
+        "name": "Denave PTE Ltd",
+    }
+    CANDIDATE_3_HOUSE_69_THEOBALDS = {
+        "lat": 51.5196803, "lng": -0.1196455,
+        "formatted_address": "House 69, New Derwent, 73 Theobalds Rd, London WC1X 8TA, UK",
+        "address_components": [
+            {"longText": "House 69", "shortText": "House 69", "types": ["subpremise"], "languageCode": "en"},
+            # The genuine distinguishing signal: THIS "New Derwent"
+            # fragment IS typed "premise" - candidate 2's own identical
+            # text is not (see above).
+            {"longText": "New Derwent", "shortText": "New Derwent", "types": ["premise"], "languageCode": "und"},
+            {"longText": "73", "shortText": "73", "types": ["street_number"], "languageCode": "en-US"},
+            {"longText": "Theobalds Road", "shortText": "Theobalds Rd", "types": ["route"], "languageCode": "en"},
+            {"longText": "London", "shortText": "London", "types": ["postal_town"], "languageCode": "en"},
+            {
+                "longText": "Greater London", "shortText": "Greater London",
+                "types": ["administrative_area_level_2", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "England", "shortText": "England",
+                "types": ["administrative_area_level_1", "political"], "languageCode": "en",
+            },
+            {
+                "longText": "United Kingdom", "shortText": "GB", "types": ["country", "political"],
+                "languageCode": "en",
+            },
+            {"longText": "WC1X 8TA", "shortText": "WC1X 8TA", "types": ["postal_code"], "languageCode": "en-US"},
+        ],
+        "name": "House 69, 73 Theobalds Rd",
+    }
+    ALL_CANDIDATES = [
+        CANDIDATE_0_DERWENT_LONDON_PLC, CANDIDATE_1_DERWENT_HOUSE_SOUTH_KENSINGTON,
+        CANDIDATE_2_DENAVE_PTE_LTD, CANDIDATE_3_HOUSE_69_THEOBALDS,
+    ]
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def _best_result(self, candidates):
+        source_name_words = geocode._building_name_words("New Derwent House")
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "candidates": candidates, **candidates[0]},
+        ):
+            return geocode._best_places_result(
+                "New Derwent House, London, UK", None,
+                source_street_words=None, source_name_words=source_name_words, source_house_number=None,
+            )
+
+    def test_full_real_response_resolves_to_the_specifically_correct_candidate(self):
+        # Not "some candidate gets accepted" - the SPECIFICALLY correct
+        # one (candidate 3, the real Theobalds Road address), never
+        # candidate 2 (same real address, but rejected for its own name/
+        # premise-typing reasons - see the class docstring).
+        result = self._best_result(self.ALL_CANDIDATES)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["lat"], 51.5196803)
+        self.assertEqual(result["lng"], -0.1196455)
+        self.assertEqual(
+            result["formatted_address"], "House 69, New Derwent, 73 Theobalds Rd, London WC1X 8TA, UK",
+        )
+
+    def test_full_real_response_resolves_end_to_end_via_geocode_row(self):
+        row = ListingRow(building="New Derwent House", provider="beem")
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "candidates": self.ALL_CANDIDATES, **self.ALL_CANDIDATES[0]},
+        ), patch("geocode.call_reverse_geocoding_api", return_value={"status": "ZERO_RESULTS"}):
+            geocode.geocode_row(row)
+
+        self.assertEqual(row.lat, 51.5196803)
+        self.assertEqual(row.lng, -0.1196455)
+        self.assertEqual(row.address_1, "73 Theobalds Road")
+        self.assertEqual(row.postcode, "WC1X 8TA")
+        self.assertEqual(geocode.FAILURES, [])
+
+    def test_candidate_0_derwent_london_plc_still_rejected_in_isolation(self):
+        result = self._best_result([self.CANDIDATE_0_DERWENT_LONDON_PLC])
+        self.assertEqual(result["status"], "NAME_CONFLICT")
+
+    def test_candidate_1_derwent_house_south_kensington_still_rejected_in_isolation(self):
+        result = self._best_result([self.CANDIDATE_1_DERWENT_HOUSE_SOUTH_KENSINGTON])
+        self.assertEqual(result["status"], "NAME_CONFLICT")
+
+    def test_candidate_2_denave_pte_ltd_still_rejected_despite_its_own_untyped_new_derwent_text(self):
+        # The real reason this test matters: candidate 2's own formatted_
+        # address/address_components text ALSO literally contains "New
+        # Derwent" (confirmed live) - but only as an UNTYPED fragment,
+        # never typed "premise". This confirms the "premise"-only
+        # restriction, not a broader address-text scan, is what correctly
+        # keeps this candidate rejected.
+        result = self._best_result([self.CANDIDATE_2_DENAVE_PTE_LTD])
+        self.assertEqual(result["status"], "NAME_CONFLICT")
+
+    def test_candidate_3_house_69_accepted_via_its_own_typed_premise_component(self):
+        result = self._best_result([self.CANDIDATE_3_HOUSE_69_THEOBALDS])
+        self.assertEqual(result["status"], "OK")
+
+
+class PremiseWordsFalsePositiveGuardTests(unittest.TestCase):
+    """
+    The real risk of adding a second corroboration source: does it let a
+    genuinely wrong candidate through via a merely coincidental address-
+    text overlap? Every existing NAME_CONFLICT regression test (Packing
+    House/Canal Building/etc.) already has NO "premise"-typed component at
+    all in its own stub data, so those are already unaffected by
+    construction (see BareNameCorroborationTests - unchanged, still
+    passing). These are dedicated, deliberately adversarial synthetic
+    cases (no real building of this name is asserted here) built with a
+    genuine 2-significant-word source name (mirroring "New Derwent
+    House"'s own shape) specifically to stress-test that the SAME
+    majority-overlap rule PR #13 established for the name check also
+    correctly rejects a merely-partial or zero-overlap premise match,
+    never just "any premise text mentioning ANY shared word at all".
+    """
+
+    def setUp(self):
+        geocode.FAILURES.clear()
+
+    def _best_result(self, place):
+        source_name_words = geocode._building_name_words("Silver Birch Wharf")  # {"silver", "birch"}
+        with patch(
+            "geocode.call_places_text_search",
+            return_value={"status": "OK", "candidates": [place], **place},
+        ):
+            return geocode._best_places_result(
+                "Silver Birch Wharf, London, UK", None,
+                source_street_words=None, source_name_words=source_name_words, source_house_number=None,
+            )
+
+    def test_partial_one_of_two_word_premise_overlap_still_rejected(self):
+        # candidate_premise_words ends up {"silver"} only ("plaza" is a
+        # generic building word, filtered) - shares exactly 1 of the
+        # source's own 2 significant words, a bare 50%, not a genuine
+        # majority - must stay rejected, the exact same threshold the
+        # name check already enforces.
+        place = {
+            "lat": 51.5, "lng": -0.1, "name": "Totally Unrelated Co",
+            "address_components": [{"longText": "Silver Plaza", "types": ["premise"]}],
+        }
+        result = self._best_result(place)
+        self.assertEqual(result["status"], "NAME_CONFLICT")
+
+    def test_zero_overlap_premise_text_still_rejected(self):
+        place = {
+            "lat": 51.5, "lng": -0.1, "name": "Totally Unrelated Co",
+            "address_components": [{"longText": "Regents Wharf", "types": ["premise"]}],
+        }
+        result = self._best_result(place)
+        self.assertEqual(result["status"], "NAME_CONFLICT")
+
+    def test_genuine_majority_premise_overlap_is_accepted(self):
+        # Positive control confirming the mechanism itself works for a
+        # fresh, non-"New Derwent" example, not just the one literal case
+        # it was built for - "court" is generic and filtered, leaving both
+        # "silver" and "birch", a full 2-of-2 majority.
+        place = {
+            "lat": 51.5, "lng": -0.1, "name": "Totally Unrelated Co",
+            "address_components": [{"longText": "Silver Birch Court", "types": ["premise"]}],
+        }
+        result = self._best_result(place)
+        self.assertEqual(result["status"], "OK")
+
+    def test_untyped_matching_text_is_still_ignored(self):
+        # Same address text, but NOT typed "premise" - must be ignored
+        # entirely, exactly like the real captured candidate 2 case.
+        place = {
+            "lat": 51.5, "lng": -0.1, "name": "Totally Unrelated Co",
+            "address_components": [{"longText": "Silver Birch Court"}],
+        }
+        result = self._best_result(place)
+        self.assertEqual(result["status"], "NAME_CONFLICT")
+
+
 class Tier1AddressWithoutPostcodeTests(unittest.TestCase):
     """
     Regression coverage for geocode_row's own relaxed Tier 1 branch (see
