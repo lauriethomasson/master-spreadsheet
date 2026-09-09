@@ -3950,6 +3950,33 @@ class MentionsLetStatusTests(unittest.TestCase):
     def test_ordinary_amenity_text_is_not_flagged(self):
         self.assertFalse(master_merge.mentions_let_status("Bike racks; showers; roof terrace"))
 
+    def test_whole_property_unavailable_statement_is_flagged(self):
+        # The confirmed real gap this closes: bare "unavailable"/"not
+        # available" (without "no longer" in front) previously matched
+        # nothing at all - see LET_STATUS_KEYWORDS' own docstring for why
+        # this is a full phrase, not the bare words.
+        self.assertTrue(master_merge.mentions_let_status("This property is unavailable"))
+        self.assertTrue(master_merge.mentions_let_status("This property is not available"))
+        # As a dedicated status line sitting among unrelated amenities in
+        # special_features, exactly like "U/O" already does above.
+        self.assertTrue(master_merge.mentions_let_status(
+            "Reception; Bike racks; Property is unavailable",
+        ))
+
+    def test_single_amenity_unavailable_mention_is_not_flagged(self):
+        # The real false-positive risk LET_STATUS_KEYWORDS' own docstring
+        # calls out: one unrelated amenity's own "unavailable" note buried
+        # in a long special_features list must never flag the WHOLE row's
+        # own listing status - only a genuine whole-property statement does.
+        self.assertFalse(master_merge.mentions_let_status(
+            "On-site gym currently unavailable due to refurbishment; "
+            "Bike racks; showers; roof terrace; 24hr access; meeting rooms; "
+            "kitchen; breakout space; parking; concierge; mail handling",
+        ))
+        self.assertFalse(master_merge.mentions_let_status(
+            "Meeting room not available on Fridays; Bike racks; showers",
+        ))
+
     def test_blank_is_not_flagged(self):
         self.assertFalse(master_merge.mentions_let_status(None))
         self.assertFalse(master_merge.mentions_let_status(""))
