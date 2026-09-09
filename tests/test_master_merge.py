@@ -327,6 +327,58 @@ class AddressTrailingPunctuationEqualityTests(unittest.TestCase):
             master_merge._values_equal("19-21 Great Portland Street", "19–21 Great Portland Street", "building")
         )
 
+    def test_word_to_range_vs_hyphen_range_real_case_is_equal(self):
+        # The confirmed real case: Ivybridge House's address_1 went from
+        # "1-5 Adam Street" to "1 to 5 Adam Street" on a fresh upload -
+        # genuinely the same address, just a different range-separator
+        # spelling (house_number.leading_house_number/house_numbers_
+        # conflict already treat these as identical elsewhere - see
+        # house_number_changed's own tests - this closes the same gap for
+        # address_1's own separate "is this even a diff at all" layer).
+        self.assertTrue(
+            master_merge._values_equal("1-5 Adam Street", "1 to 5 Adam Street", "address_1")
+        )
+        self.assertTrue(
+            master_merge._values_equal("1 to 5 Adam Street", "1-5 Adam Street", "address_1")
+        )
+
+    def test_word_to_range_still_scoped_to_address_1_only(self):
+        self.assertFalse(
+            master_merge._values_equal("1-5 Adam Street", "1 to 5 Adam Street", "building")
+        )
+
+    def test_genuinely_different_range_is_still_flagged_regardless_of_separator_spelling(self):
+        # The real risk of this tolerance: it must never blur an actually
+        # DIFFERENT range, only the separator's own spelling.
+        self.assertFalse(
+            master_merge._values_equal("1-5 Adam Street", "1-7 Adam Street", "address_1")
+        )
+        self.assertFalse(
+            master_merge._values_equal("1 to 5 Adam Street", "3 to 5 Adam Street", "address_1")
+        )
+        self.assertFalse(
+            master_merge._values_equal("1-5 Adam Street", "1 to 7 Adam Street", "address_1")
+        )
+
+    def test_a_range_vs_a_plain_single_number_is_still_a_genuine_difference(self):
+        # One side stating a range and the other a single number is a real,
+        # narrower/wider structural difference, not the same separator
+        # spelled two ways - must still be flagged exactly as before.
+        self.assertFalse(
+            master_merge._values_equal("1 to 5 Adam Street", "1 Adam Street", "address_1")
+        )
+
+    def test_a_single_house_number_with_no_range_at_all_is_unaffected(self):
+        # No range on either side at all - this tolerance never applies,
+        # completely unrelated addresses still compare different exactly
+        # as before.
+        self.assertTrue(master_merge._values_equal("89 Adam Street", "89 Adam Street", "address_1"))
+        self.assertFalse(master_merge._values_equal("89 Adam Street", "90 Adam Street", "address_1"))
+
+    def test_an_address_with_no_leading_house_number_at_all_is_unaffected(self):
+        self.assertTrue(master_merge._values_equal("Adam Street", "Adam Street", "address_1"))
+        self.assertFalse(master_merge._values_equal("Adam Street", "Eve Street", "address_1"))
+
 
 class MergeFieldChoiceTests(unittest.TestCase):
     def test_all_equal_needs_no_choice(self):
@@ -3591,9 +3643,17 @@ class BuildMergePlanUnicodeDashHouseNumberTests(unittest.TestCase):
     NUMBER_FIELDS/house_number_changed clause, with address_conflict
     correctly unset (the GENERIC "Existing address would be replaced"
     caption a reviewer actually saw, not address_conflict's own wording).
+
+    _values_equal/_normalize_address_for_comparison now ALSO tolerate the
+    range-separator spelling (house_number_changed's own risky-flagging
+    fix above is a completely separate, narrower layer - this closes the
+    same real gap one level up: whether a diff exists at ALL, not just
+    whether an existing diff counts as risky), so this pair no longer
+    shows up as a diff of any kind - the row correctly lands in matched_
+    unchanged, exactly as if the same range had been re-uploaded verbatim.
     """
 
-    def test_en_dash_range_vs_word_to_range_does_not_land_in_risky_fields(self):
+    def test_en_dash_range_vs_word_to_range_is_not_even_a_diff(self):
         master_df = _master_df([{
             "building": "Ivybridge House", "provider": "Colliers", "floor_unit": "LG",
             "address_1": "1 to 5 Adam Street",
@@ -3605,14 +3665,13 @@ class BuildMergePlanUnicodeDashHouseNumberTests(unittest.TestCase):
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
-        # Still a genuine plain-text diff (diff_fields' own comparison is
-        # not house-number-tolerant), so this correctly still lands in
-        # matched_changed with a real diffs["address_1"] entry - what
-        # matters is that it's no longer forced into risky_fields.
-        self.assertEqual(len(plan.matched_changed), 1)
-        matched = plan.matched_changed[0]
-        self.assertEqual(matched.diffs["address_1"], ("1 to 5 Adam Street", "1–5 Adam Street"))
-        self.assertNotIn("address_1", matched.risky_fields)
+        # No diff at all now (not merely "a diff, but not risky") - the
+        # row lands in matched_unchanged, with nothing for a reviewer to
+        # see or act on, same as a byte-identical re-upload.
+        self.assertEqual(plan.matched_changed, [])
+        self.assertEqual(len(plan.matched_unchanged), 1)
+        matched = plan.matched_unchanged[0]
+        self.assertEqual(matched.diffs, {})
         self.assertIsNone(matched.new_row.address_conflict)
 
     def test_ascii_hyphen_range_baseline_is_also_unaffected(self):
@@ -3630,8 +3689,8 @@ class BuildMergePlanUnicodeDashHouseNumberTests(unittest.TestCase):
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
-        matched = plan.matched_changed[0]
-        self.assertNotIn("address_1", matched.risky_fields)
+        self.assertEqual(plan.matched_changed, [])
+        self.assertEqual(len(plan.matched_unchanged), 1)
 
 
 class CollisionTests(unittest.TestCase):
