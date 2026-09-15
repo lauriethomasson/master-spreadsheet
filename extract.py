@@ -1115,6 +1115,36 @@ def extract_from_png_pages(
     raw = render_and_extract(images, client=client)
     if page_texts is not None:
         matches = _png_page_let_status_matches(page_texts)
+        # TEMPORARY diagnostic — investigating a real, reported gap in a
+        # Colliers Ivybridge House Canva upload: two of six Strand-suite
+        # floors (LG, G - Strand) correctly get flagged with a real 🔍
+        # possible_missed_let_status note quoting 'LET'/'UNDER OFFER' from
+        # the actual rendered page text (confirming the DOM-text fix
+        # itself works), but two sibling floors (2-Strand, 3-Strand) whose
+        # CURRENT master data carries the identical "River suite is LET"
+        # phrasing were silently skipped. possible_missed_let_status_notes
+        # only flags a unit whose OWN page_index (as Gemini itself reports
+        # it) matches a page `matches` found wording on - this logs both
+        # sides of that cross-reference so the next real upload of this
+        # exact document shows whether 2-Strand/3-Strand genuinely sit on
+        # a different rendered slide than the LET wording (a real, already-
+        # documented per-unit attribution limit, not a bug - see
+        # possible_missed_let_status_notes' own docstring) or share a
+        # page_index with a flagged row and are being dropped incorrectly
+        # (an actual bug in the cross-referencing). Remove once that's
+        # confirmed — never meant to stay in this form long-term.
+        print(
+            f"[extract][DIAGNOSTIC-TEMP][let-status] {len(page_texts)} page(s) rendered; "
+            f"pages with LET-status wording (page_index -> matched phrases): {matches!r}",
+            file=sys.stderr,
+        )
+        for unit in raw.get("units", []):
+            if isinstance(unit, dict):
+                print(
+                    f"[extract][DIAGNOSTIC-TEMP][let-status] unit floor_unit="
+                    f"{unit.get('floor_unit')!r} page_index={unit.get(PAGE_INDEX_KEY)!r}",
+                    file=sys.stderr,
+                )
         notes = possible_missed_let_status_notes(raw.get("units", []), matches)
         rows, page_indices = _rows_from_raw(
             raw, original_filename, document_wide_contacts_is_row_own_document=False,
