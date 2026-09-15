@@ -26,6 +26,7 @@ and has no awareness that a merge happened at all.
 import difflib
 import math
 import re
+import sys
 import typing
 import uuid
 from collections import Counter
@@ -3255,6 +3256,25 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 fuzzy_idx = _fuzzy_building_match(new_dict, fuzzy_candidates, master_records)
                 if fuzzy_idx is not None:
                     master_idx, tier = fuzzy_idx, "fuzzy_building"
+
+        # TEMPORARY diagnostic — investigating a real, reported non-match
+        # (Colliers "New Derwent House", W1S 2ER, a Canva/Pitch upload
+        # landing as a brand-new property instead of matching two existing
+        # master rows). Prints every field the matching cascade above
+        # actually keyed on, for every row that fell through every tier,
+        # so the NEXT real upload of this document reveals exactly why
+        # (e.g. building/provider spelling drift, a postcode baked into
+        # the building field, a blank postcode). Remove once that's
+        # confirmed — never meant to stay in this form long-term.
+        if master_idx is None:
+            print(
+                f"[master_merge][DIAGNOSTIC-TEMP] no match for new row: "
+                f"building={new_dict.get('building')!r} provider={new_dict.get('provider')!r} "
+                f"postcode={new_dict.get('postcode')!r} floor_unit={new_dict.get('floor_unit')!r} — "
+                f"primary_key={_primary_key(new_dict)!r} fallback_key={_fallback_key(new_dict)!r} "
+                f"fuzzy_anchor_key={_fuzzy_anchor_key(new_dict)!r}",
+                file=sys.stderr,
+            )
 
         if master_idx is not None:
             old_rec = master_records[master_idx]

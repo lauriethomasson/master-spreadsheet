@@ -691,6 +691,47 @@ def _pdf_page_let_status_matches(pdf_source) -> dict:
         doc.close()
 
 
+def _png_page_let_status_matches(page_texts: list) -> dict:
+    """
+    {page_index: [matched phrases]} for every page (0-indexed, the exact
+    same indexing PAGE_INDEX_KEY/images_from_png_pages already use) whose
+    own real, browser-rendered DOM text (see canva_renderer/app.py's own
+    _page_visible_text, threaded here via brochure_enrichment.fetch_
+    rendered_page_with_links/app.py's own _PastedLinkFile) states LET/
+    off-market status wording - see master_merge.matched_let_status_
+    phrases/LET_STATUS_KEYWORDS, reused directly here, never a second,
+    independently-drifting copy of that matching logic.
+
+    This is extract_from_png_pages' own counterpart to _pdf_page_let_
+    status_matches above - the image-render path (a pasted Canva/Pitch
+    link) has no real PDF page-text layer to scan, but a real headless
+    browser DOES have real DOM text, which this checks against instead.
+    Unlike OCR (deliberately rejected - see schema.ListingRow.let_status_
+    check_unavailable's own docstring for why: a misread match that looks
+    exactly like "checked, all clear" is worse than an honest "couldn't
+    check"), this carries no misread risk at all - it's the literal text
+    the browser itself rendered, not a guess at what an image shows -
+    which is exactly why a row checked this way is treated identically to
+    a real PDF row (see extract_from_png_pages' own docstring) rather
+    than needing its own distinct low-confidence signal.
+
+    Never opens a file/PDF at all - page_texts is already plain strings
+    handed in by the caller, so there's no fitz/_RENDER_LOCK concern here
+    the way _pdf_page_let_status_matches has. A page with no LET-status
+    wording at all is simply absent from the returned dict - {} for a
+    document with none anywhere, or when page_texts itself is None/empty.
+    Never raises - a non-string entry (shouldn't happen, but this never
+    trusts an upstream contract blindly) is coerced via str(text or "")
+    rather than raising on it.
+    """
+    matches = {}
+    for page_index, text in enumerate(page_texts or []):
+        phrases = matched_let_status_phrases(str(text or ""))
+        if phrases:
+            matches[page_index] = phrases
+    return matches
+
+
 def _missed_let_status_note(phrases: list, shared_page: bool) -> str:
     """
     The reviewer-facing note text possible_missed_let_status_notes attaches
@@ -1003,7 +1044,7 @@ def extract(pdf_path: Path, original_filename: str = None) -> list[ListingRow]:
 
 
 def extract_from_png_pages(
-    png_pages: list, original_filename: str, page_links: list = None,
+    png_pages: list, original_filename: str, page_links: list = None, page_texts: list = None,
 ) -> list[ListingRow]:
     """
     Like extract(), but for a set of already-rendered page images (a
@@ -1037,22 +1078,53 @@ def extract_from_png_pages(
     does so afterward, on the returned rows; this function itself never
     fetches anything over the network.
 
-    Every returned row also has let_status_check_unavailable=True (see
-    schema.ListingRow's own docstring) - a rendered screenshot has no real
-    PDF page-text layer for the deterministic LET-status cross-check
-    (extract()'s own possible_missed_let_status_notes/_pdf_page_let_status_
-    matches) to run against at all, so unlike extract()/extract_
-    spreadsheet_gemini.py, that check never even attempts to run here; this
-    flag lets the Review page tell a reviewer "not checked" apart from
-    "checked, nothing found" rather than leaving both silences identical.
+    page_texts (each entry a page's own full visible DOM text - see
+    canva_renderer/app.py's own _page_visible_text, threaded through
+    brochure_enrichment.fetch_rendered_page_with_links/app.py's own
+    _PastedLinkFile) is what decides which of two genuinely different
+    LET-status cross-check outcomes every returned row gets - a
+    screenshot alone has no real PDF text layer to scan the way extract()
+    has, but a real headless browser (the renderer IS one - it already
+    reads real <a href> link text, not just pixels) genuinely does have
+    real DOM text, which is just as reliable a source for this specific
+    deterministic keyword check as a PDF's own embedded text layer -
+    unlike OCR (deliberately rejected, see schema.ListingRow.let_status_
+    check_unavailable's own docstring: a misread match reading as
+    "checked, all clear" would be worse than an honest "couldn't check"),
+    this has no misread risk at all.
+
+    - page_texts given (not None): runs the identical deterministic cross-
+      check extract() itself runs, just against _png_page_let_status_
+      matches(page_texts) instead of _pdf_page_let_status_matches(pdf_
+      path) - possible_missed_let_status fires normally on any row it
+      flags, and let_status_check_unavailable stays unset (None) on EVERY
+      row, identical to a real PDF row. This is the actual fix for the
+      confirmed real Ivybridge House gap: a Canva upload previously got
+      zero LET-status coverage either way, silently.
+    - page_texts omitted/None (the renderer's response predates this
+      field, or DOM text capture genuinely failed upstream): the original
+      fallback - every returned row gets let_status_check_unavailable=True
+      (see schema.ListingRow's own docstring) instead, so the Review
+      page's own page-level banner (pages/2_Review_and_Master.py's
+      _render_let_status_check_unavailable_banner) tells a reviewer "not
+      checked" apart from "checked, nothing found", rather than leaving
+      both silences identical.
     """
     client = get_client()
     images = images_from_png_pages(png_pages, page_links=page_links)
     raw = render_and_extract(images, client=client)
-    rows, page_indices = _rows_from_raw(
-        raw, original_filename, document_wide_contacts_is_row_own_document=False,
-        let_status_check_unavailable=True,
-    )
+    if page_texts is not None:
+        matches = _png_page_let_status_matches(page_texts)
+        notes = possible_missed_let_status_notes(raw.get("units", []), matches)
+        rows, page_indices = _rows_from_raw(
+            raw, original_filename, document_wide_contacts_is_row_own_document=False,
+            missed_let_status_notes=notes,
+        )
+    else:
+        rows, page_indices = _rows_from_raw(
+            raw, original_filename, document_wide_contacts_is_row_own_document=False,
+            let_status_check_unavailable=True,
+        )
     result = _ExtractedRows(rows)
     result.page_indices = page_indices
     return result

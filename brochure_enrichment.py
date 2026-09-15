@@ -2449,13 +2449,18 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
     each entry that page's own list of {"href", "text"} dicts, or [] for
     an older renderer response that predates this field entirely (see
     payload.get below - never a KeyError just because the OTHER service
-    hasn't been redeployed with this yet). Every EXISTING caller of this
-    function (_fetch_canva_rendered_page/_fetch_pitch_rendered_page below)
-    unpacks and discards this second value, keeping their own long-
-    standing `list[bytes]`-or-None contract for the per-unit brochure
-    enrichment path completely unchanged - only fetch_rendered_page_with_
-    links (a new, separate entry point for the paste-a-link flow, see
-    app.py's own _fetch_pasted_link) actually returns it to its caller.
+    hasn't been redeployed with this yet). `page_texts` is the renderer's
+    own "text" field (see canva_renderer/app.py's own _page_visible_text)
+    - the same length again, each entry that page's own full visible body
+    text as a string, or "" for an older renderer response that predates
+    this field entirely, same backward-compat reasoning as `page_links`.
+    Every EXISTING caller of this function (_fetch_canva_rendered_page/
+    _fetch_pitch_rendered_page below) unpacks and discards both of these
+    extra values, keeping their own long-standing `list[bytes]`-or-None
+    contract for the per-unit brochure enrichment path completely
+    unchanged - only fetch_rendered_page_with_links (a new, separate
+    entry point for the paste-a-link flow, see app.py's own _fetch_
+    pasted_link) actually returns them to its caller.
     """
     renderer_url = os.environ.get(CANVA_RENDERER_URL_ENV_VAR, "").rstrip("/")
     connect_exception = None
@@ -2491,7 +2496,7 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
             file=sys.stderr,
         )
         _record_status(STATUS_FETCH_FAILED, f"{platform_label} renderer unreachable ({connect_exception!r})")
-        return None, None
+        return None, None, None
 
     if response.status_code in (401, 403):
         # Distinguished from every other failure shape (see this function's
@@ -2510,7 +2515,7 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
             file=sys.stderr,
         )
         _record_status(STATUS_FETCH_FAILED, f"{platform_label} renderer authentication failed")
-        return None, None
+        return None, None, None
 
     content_type = response.headers.get("content-type", "")
     if response.status_code == 200 and "application/json" not in content_type and "image/" in content_type:
@@ -2535,7 +2540,7 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
             file=sys.stderr,
         )
         _record_status(STATUS_RENDER_FAILED, f"{platform_label} renderer is running an outdated single-page image response")
-        return None, None
+        return None, None, None
 
     if response.status_code != 200 or "application/json" not in content_type:
         try:
@@ -2552,7 +2557,7 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
         # deliberately the one log line to grep for that question.
         print(f"[brochure_enrichment] {platform_label} renderer failed for {url!r}: {reason}", file=sys.stderr)
         _record_status(STATUS_RENDER_FAILED, f"{platform_label} render failed: {reason}")
-        return None, None
+        return None, None, None
 
     try:
         payload = response.json()
@@ -2567,7 +2572,7 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
             file=sys.stderr,
         )
         _record_status(STATUS_RENDER_FAILED, f"malformed renderer response ({e!r})")
-        return None, None
+        return None, None, None
 
     # .get, not [...] - an older renderer deploy that predates this field
     # entirely (see this function's own docstring) must never turn into a
@@ -2575,6 +2580,12 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
     # all" answer for that case, identical to a page that genuinely has
     # no real anchors on it.
     page_links = payload.get("links") or [[] for _ in pages]
+    # Same "older renderer deploy predates this field" backward-compat
+    # reasoning as page_links above - "" per page is the correct, safe
+    # "no text captured at all" answer for that case, identical to a page
+    # whose own DOM read genuinely failed/returned nothing (see canva_
+    # renderer/app.py's own _page_visible_text).
+    page_texts = payload.get("text") or ["" for _ in pages]
     detected_total = payload.get("page_count_detected")
     if len(pages) > max_pages_accepted:
         print(
@@ -2584,6 +2595,7 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
         )
         pages = pages[:max_pages_accepted]
         page_links = page_links[:max_pages_accepted]
+        page_texts = page_texts[:max_pages_accepted]
 
     # The ONE clear, positive confirmation the whole authenticated round
     # trip actually worked - main app -> ID token -> Cloud Run IAM ->
@@ -2600,17 +2612,18 @@ def _fetch_rendered_page(url: str, *, platform_label: str, max_pages_accepted: i
         f"({detected_str}) — handing off to the existing extraction pipeline.",
         file=sys.stderr,
     )
-    return pages, page_links
+    return pages, page_links, page_texts
 
 
 def _fetch_canva_rendered_page(url: str):
     """Canva's own thin wrapper over _fetch_rendered_page - see that
     function's own docstring for the full contract. Unpacks and discards
-    the page_links half of that function's own (pages, page_links) return
-    - this is the per-unit brochure enrichment path's own entry point,
-    untouched by that field's addition; only fetch_rendered_page_with_
-    links (below) ever returns page_links to its caller."""
-    pages, _page_links = _fetch_rendered_page(
+    the page_links/page_texts halves of that function's own (pages,
+    page_links, page_texts) return - this is the per-unit brochure
+    enrichment path's own entry point, untouched by either field's
+    addition; only fetch_rendered_page_with_links (below) ever returns
+    them to its caller."""
+    pages, _page_links, _page_texts = _fetch_rendered_page(
         url, platform_label="Canva", max_pages_accepted=_CANVA_MAX_PAGES_ACCEPTED,
     )
     return pages
@@ -2622,9 +2635,9 @@ def _fetch_pitch_rendered_page(url: str):
     to _fetch_canva_rendered_page, just calling the same renderer service
     for a Pitch.com "view" link instead (see canva_renderer/app.py's own
     render_pitch_page_async) and its own, separately-tracked max_pages_
-    accepted cap. Unpacks and discards page_links exactly like _fetch_
-    canva_rendered_page does, for the same reason."""
-    pages, _page_links = _fetch_rendered_page(
+    accepted cap. Unpacks and discards page_links/page_texts exactly like
+    _fetch_canva_rendered_page does, for the same reason."""
+    pages, _page_links, _page_texts = _fetch_rendered_page(
         url, platform_label="Pitch", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED,
     )
     return pages
@@ -2641,8 +2654,10 @@ def _fetch_gpe_flipbook_rendered_page(url: str):
     docstring on why). platform_label is still its own distinct "GPE
     Flipbook" string, purely so this app's own logs/diagnostics can tell
     which URL shape actually triggered a given render, independent of the
-    fact that the underlying mechanism is identical to Pitch's."""
-    pages, _page_links = _fetch_rendered_page(
+    fact that the underlying mechanism is identical to Pitch's. Unpacks
+    and discards page_links/page_texts exactly like the other wrappers
+    here do, for the same reason."""
+    pages, _page_links, _page_texts = _fetch_rendered_page(
         url, platform_label="GPE Flipbook", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED,
     )
     return pages
@@ -2657,9 +2672,9 @@ def _fetch_kitt_rendered_page(url: str):
     new render function, confirmed NOT to be Canva or Pitch under the
     hood, see is_kitt_brochure_preview_link's own docstring) and its own,
     separately-tracked max_pages_accepted cap. Unpacks and discards
-    page_links exactly like the other two wrappers do, for the same
-    reason."""
-    pages, _page_links = _fetch_rendered_page(
+    page_links/page_texts exactly like the other wrappers do, for the
+    same reason."""
+    pages, _page_links, _page_texts = _fetch_rendered_page(
         url, platform_label="Kitt", max_pages_accepted=_KITT_MAX_PAGES_ACCEPTED,
     )
     return pages
@@ -2670,13 +2685,18 @@ def fetch_rendered_page_with_links(url: str) -> tuple:
     Public entry point for the paste-a-link flow (see app.py's own
     _fetch_pasted_link) - like _fetch_canva_rendered_page/_fetch_pitch_
     rendered_page, but ALSO returns each page's own real <a href> link
-    candidates (see canva_renderer/app.py's own _page_link_candidates),
-    needed to attribute a per-property brochure link during extraction
-    rather than always falling back to one shared link for the whole
-    document. Never called by the existing per-unit brochure enrichment
-    path (see _fetch_pdf_bytes' own canva/pitch branches, which call the
-    two plain wrappers above, untouched by this) - this is additive, a
-    new capability for a different caller, never a change to those.
+    candidates (see canva_renderer/app.py's own _page_link_candidates)
+    AND each page's own full visible body text (see that module's own
+    _page_visible_text), needed to attribute a per-property brochure link
+    during extraction (the former) and to run the deterministic LET-
+    status cross-check a real PDF's own text layer already gets (the
+    latter - see extract.extract_from_png_pages/extract._png_page_let_
+    status_matches) rather than always falling back to one shared link
+    for the whole document with zero LET-status coverage. Never called by
+    the existing per-unit brochure enrichment path (see _fetch_pdf_bytes'
+    own canva/pitch branches, which call the two plain wrappers above,
+    untouched by this) - this is additive, a new capability for a
+    different caller, never a change to those.
 
     Dispatches on the URL's own shape (see is_canva_view_link/is_pitch_
     view_link/is_gpe_flipbook_link/is_kitt_brochure_preview_link) exactly
@@ -2685,14 +2705,18 @@ def fetch_rendered_page_with_links(url: str) -> tuple:
     or is_gpe_flipbook_link(url) or is_kitt_brochure_preview_link(url)
     themselves before calling this (see _fetch_pasted_link), same as every
     other caller of either platform-specific fetch already does; a URL
-    matching none of these shapes returns (None, None) here rather than
-    raising, so this stays safe to call defensively.
+    matching none of these shapes returns (None, None, None) here rather
+    than raising, so this stays safe to call defensively.
 
-    Returns (pages, page_links) - pages is list[bytes] exactly like the
-    plain wrappers (or None on any failure, same failure contract as
-    _fetch_rendered_page's own docstring); page_links is the same length
-    as pages, each entry that page's own list of {"href", "text"} dicts -
-    or (None, None) whenever pages itself would be None.
+    Returns (pages, page_links, page_texts) - pages is list[bytes]
+    exactly like the plain wrappers (or None on any failure, same failure
+    contract as _fetch_rendered_page's own docstring); page_links is the
+    same length as pages, each entry that page's own list of {"href",
+    "text"} dicts; page_texts is the same length again, each entry that
+    page's own full visible body text as a string ("" for a page whose
+    own DOM read failed, or for an older renderer response that predates
+    this field) - or (None, None, None) whenever pages itself would be
+    None.
     """
     if is_canva_view_link(url):
         return _fetch_rendered_page(url, platform_label="Canva", max_pages_accepted=_CANVA_MAX_PAGES_ACCEPTED)
@@ -2702,7 +2726,7 @@ def fetch_rendered_page_with_links(url: str) -> tuple:
         return _fetch_rendered_page(url, platform_label="GPE Flipbook", max_pages_accepted=_PITCH_MAX_PAGES_ACCEPTED)
     if is_kitt_brochure_preview_link(url):
         return _fetch_rendered_page(url, platform_label="Kitt", max_pages_accepted=_KITT_MAX_PAGES_ACCEPTED)
-    return None, None
+    return None, None, None
 
 
 def _fetch_pdf_bytes(

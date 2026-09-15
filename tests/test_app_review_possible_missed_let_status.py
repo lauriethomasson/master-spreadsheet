@@ -190,5 +190,67 @@ class LetStatusCheckUnavailableBannerTests(IsolatedCwdTestCase):
         self.assertEqual(len(matching), 1)
 
 
+class DomTextCheckedRowVsUncheckedRowDistinguishabilityTests(IsolatedCwdTestCase):
+    """
+    End-to-end proof that a row checked via real DOM text (extract._png_
+    page_let_status_matches, when the Canva/Pitch renderer captured real
+    page text) and a row that genuinely couldn't be checked at all (no
+    DOM text captured) render DISTINCTLY on the actual Review page -
+    never confusably identical. This is the concrete UI-level guarantee
+    behind the "reviewer must always be able to tell which method
+    checked a row" requirement: a DOM-text-checked row behaves exactly
+    like a real PDF row (the normal 🔍 caption, no page-level banner);
+    an unchecked row gets the page-level banner instead, never the
+    caption.
+    """
+
+    def test_dom_checked_row_gets_the_caption_not_the_banner(self):
+        pid = str(uuid.uuid4())
+        master_writer.write_master([
+            ListingRow(
+                building="Ivybridge House", provider="Colliers", floor_unit="Level 2",
+                special_features="Views of the River Thames", property_id=pid,
+            ),
+        ])
+        save_staging_file(
+            [ListingRow(
+                building="Ivybridge House", provider="Colliers", floor_unit="Level 2",
+                special_features="Views of the River Thames",
+                possible_missed_let_status=_NOTE,
+                # Checked via real DOM text and something WAS found -
+                # let_status_check_unavailable stays unset (None),
+                # identical to a real PDF row.
+            )],
+            "www.canva.com_design_dom_checked_view.xlsx", content_hash="canva-dom-checked-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn(f"🔍 {_NOTE}", caption_text)
+        self.assertNotIn("pasted Canva/Pitch link", warning_text)
+
+    def test_unchecked_row_gets_the_banner_not_the_caption(self):
+        save_staging_file(
+            [ListingRow(
+                building="New Derwent House", provider="Colliers", floor_unit="Level 3",
+                special_features="Views of the West End",
+                let_status_check_unavailable=True,
+                # Genuinely never checked - no possible_missed_let_status
+                # note at all, distinct from "checked, nothing missed".
+            )],
+            "www.canva.com_design_unchecked_view.xlsx", content_hash="canva-unchecked-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        caption_text = "".join(c.value for c in at.caption)
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertNotIn("🔍", caption_text)
+        self.assertIn("pasted Canva/Pitch link", warning_text)
+        self.assertIn("could not run", warning_text)
+
+
 if __name__ == "__main__":
     unittest.main()

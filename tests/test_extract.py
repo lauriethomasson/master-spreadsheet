@@ -1051,6 +1051,94 @@ class LetStatusCheckUnavailableTests(unittest.TestCase):
         self.assertIsNone(rows[0].let_status_check_unavailable)
 
 
+class PngPageLetStatusMatchesTests(unittest.TestCase):
+    """
+    extract._png_page_let_status_matches - the image-render-path
+    counterpart to PdfPageLetStatusMatchesTests' own extract._pdf_page_
+    let_status_matches: the identical deterministic LET_STATUS_KEYWORDS
+    scan, run against real DOM-captured text (see canva_renderer/app.py's
+    own _page_visible_text) instead of a PDF's own embedded text layer -
+    no file/PDF ever opened here, page_texts is already plain strings.
+    """
+
+    def test_a_page_with_let_status_wording_is_flagged(self):
+        page_texts = ["Level 1: available", "Level 2: Strand suite / River suite is LET"]
+        matches = extract._png_page_let_status_matches(page_texts)
+
+        self.assertEqual(matches, {1: ["LET"]})
+
+    def test_a_page_with_no_status_wording_has_no_match(self):
+        page_texts = ["Level 1: available", "Level 2: available"]
+        matches = extract._png_page_let_status_matches(page_texts)
+
+        self.assertEqual(matches, {})
+
+    def test_none_page_texts_returns_empty(self):
+        self.assertEqual(extract._png_page_let_status_matches(None), {})
+
+    def test_empty_page_texts_returns_empty(self):
+        self.assertEqual(extract._png_page_let_status_matches([]), {})
+
+
+class ExtractFromPngPagesWithPageTextsTests(unittest.TestCase):
+    """
+    extract_from_png_pages, given real page_texts - the actual fix for the
+    confirmed real Ivybridge House gap (see LetStatusCheckUnavailableTests
+    above for the "before" behavior this replaces for this one signal): a
+    row checked via real DOM text behaves EXACTLY like a real PDF row
+    (possible_missed_let_status fires normally, let_status_check_
+    unavailable stays unset) rather than the blanket "couldn't check"
+    fallback that applies only when page_texts is genuinely omitted.
+    """
+
+    def test_a_missed_let_status_is_flagged_exactly_like_a_real_pdf_row(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {
+                    "building": "Ivybridge House", "floor_unit": "Level 2", "page_index": 0,
+                    "special_features": "Views of the River Thames; Comprehensively refurbished",
+                },
+            ],
+        }
+        page_texts = ["Level 2: Strand: 2,218 sq ft / River: LET"]
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [b"\x89PNG\r\n\x1a\n rest"], original_filename="www.canva.com_design_x_view.pdf",
+                page_texts=page_texts,
+            )
+
+        self.assertIsNotNone(rows[0].possible_missed_let_status)
+        self.assertIn("LET", rows[0].possible_missed_let_status)
+        # The critical requirement: checked via real DOM text behaves
+        # EXACTLY like a real PDF row - never also flagged "couldn't
+        # check at all".
+        self.assertIsNone(rows[0].let_status_check_unavailable)
+
+    def test_no_let_status_wording_anywhere_flags_nothing_but_still_stays_checked(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"building": "Ivybridge House", "floor_unit": "Level 4", "page_index": 0, "special_features": "Bike racks"},
+            ],
+        }
+        page_texts = ["Level 4: available, Bike racks"]
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [b"\x89PNG\r\n\x1a\n rest"], original_filename="www.canva.com_design_x_view.pdf",
+                page_texts=page_texts,
+            )
+
+        # Never a spurious flag - nothing was actually missed here.
+        self.assertIsNone(rows[0].possible_missed_let_status)
+        # AND never treated as "unchecked" just because nothing was
+        # found - it's about whether text was captured, not whether the
+        # check found anything.
+        self.assertIsNone(rows[0].let_status_check_unavailable)
+
+
 class PastedLinkContactsNeverFallBackToTheSharedDeckTests(unittest.TestCase):
     """
     Real, confirmed production bug this closes: a shared multi-property

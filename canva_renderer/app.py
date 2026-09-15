@@ -848,6 +848,17 @@ _PAGE_LINK_CANDIDATES_JS = """
 """
 
 
+# The full-page-text counterpart to _PAGE_LINK_CANDIDATES_JS above - a
+# named constant (not an inline string in _page_visible_text) for the
+# exact same reason that one is: a caller/test needs to be able to
+# recognize this specific page.evaluate() call apart from every OTHER one
+# this module makes (in particular _page_content_fingerprint's own
+# similarly-shaped but genuinely different document.body.innerText.
+# slice(0, 500) read, immediately below) rather than guessing from
+# argument shape alone.
+_PAGE_VISIBLE_TEXT_JS = "() => document.body.innerText"
+
+
 async def _page_link_candidates(page) -> list:
     """
     [{"href", "text"}, ...] for every real anchor currently on `page` (see
@@ -868,25 +879,63 @@ async def _page_link_candidates(page) -> list:
         return []
 
 
-async def render_canva_page_async(url: str) -> tuple[list[bytes], list, int]:
+async def _page_visible_text(page) -> str:
+    """
+    `page`'s own full visible body text (document.body.innerText, NOT the
+    500-char slice _page_content_fingerprint reads for its own different
+    purpose - see that function's own docstring) - called once per
+    captured screenshot, right alongside _page_link_candidates, so a
+    page's own text is always exactly as of the moment its own image was
+    captured (same reasoning as _page_link_candidates' own docstring on
+    why this must be read fresh per page, never once up front).
+
+    This is the ONE piece of real, DOM-sourced text a rendered Canva/
+    Pitch/Kitt page has that a plain screenshot alone doesn't - the main
+    app's own extract._png_page_let_status_matches runs the identical
+    deterministic LET-status keyword cross-check against this that a real
+    PDF's own embedded text layer already gets (see extract._pdf_page_
+    let_status_matches), closing a confirmed real coverage gap for a
+    pasted-link upload without resorting to OCR (which risks a WRONG kind
+    of silence - a misread match that looks exactly like "checked, all
+    clear" - this doesn't, since it's the literal text the browser itself
+    rendered, not a guess at what an image shows).
+
+    Best-effort: "" (never a hard failure) if the DOM read itself ever
+    raises, for the exact same reason _page_link_candidates degrades the
+    same way - a page that failed to yield a screenshot at all already
+    stopped this loop long before this would run, and a page with
+    genuinely no text (a pure-image slide) is a normal, expected result.
+    """
+    try:
+        return await page.evaluate(_PAGE_VISIBLE_TEXT_JS)
+    except Exception as e:
+        print(f"[canva_renderer] Could not read visible text from a page: {e!r}", file=sys.stderr)
+        return ""
+
+
+async def render_canva_page_async(url: str) -> tuple[list[bytes], list, list, int]:
     """
     The real render logic - see render_canva_page (this module's own sync-
     facing entry point HTTP requests actually call) for how this gets
     scheduled onto the single dedicated Playwright loop thread from an
     arbitrary request thread.
 
-    Returns (pages, page_links, detected_total): `pages` is a list of PNG
-    bytes, one per page actually captured, in page order, ALWAYS at least
-    length 1 (the first/cover page `url` lands on) - or raises
-    RenderError(reason) on any safe-failure condition preventing even that
-    first page, a caller only ever needs to catch this one exception type.
-    `page_links` is the same length as `pages`, each entry that page's own
-    real <a href> anchors (see _page_link_candidates) - possibly an empty
-    list for a page with none, never a page missing from the list
-    entirely. `detected_total` is Canva's own reported page count if it
-    could be read (see _detect_page_count), else None - purely
-    informational, never a promise that many pages were actually captured
-    (MAX_CANVA_PAGES may cap `pages` shorter).
+    Returns (pages, page_links, page_texts, detected_total): `pages` is a
+    list of PNG bytes, one per page actually captured, in page order,
+    ALWAYS at least length 1 (the first/cover page `url` lands on) - or
+    raises RenderError(reason) on any safe-failure condition preventing
+    even that first page, a caller only ever needs to catch this one
+    exception type. `page_links` is the same length as `pages`, each
+    entry that page's own real <a href> anchors (see _page_link_
+    candidates) - possibly an empty list for a page with none, never a
+    page missing from the list entirely. `page_texts` is the same length
+    again, each entry that page's own full visible body text (see _page_
+    visible_text) - possibly "" for a page with none/an unreadable page,
+    never a page missing from the list entirely. `detected_total` is
+    Canva's own reported page count if it could be read (see _detect_
+    page_count), else None - purely informational, never a promise that
+    many pages were actually captured (MAX_CANVA_PAGES may cap `pages`
+    shorter).
 
     Captures every further page via Canva's own accessible "Next page"
     button (confirmed directly against a real multi-page public brochure:
@@ -983,6 +1032,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], list, int]:
 
         pages = [await page.screenshot(type="png")]
         page_links = [await _page_link_candidates(page)]
+        page_texts = [await _page_visible_text(page)]
         detected_total = await _detect_page_count(page)
 
         # Every further page - see this function's own docstring above for
@@ -1056,6 +1106,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], list, int]:
                     await _wait_for_page_content_to_stabilize(page, signature_after[1])
                     pages.append(await page.screenshot(type="png"))
                     page_links.append(await _page_link_candidates(page))
+                    page_texts.append(await _page_visible_text(page))
                     advanced = True
                     break
 
@@ -1126,7 +1177,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], list, int]:
                         file=sys.stderr,
                     )
 
-        return pages, page_links, detected_total
+        return pages, page_links, page_texts, detected_total
     finally:
         # Page closed BEFORE its context - releases this request's own
         # renderer-process resources (every slide's DOM/canvas state
@@ -1142,7 +1193,7 @@ async def render_canva_page_async(url: str) -> tuple[list[bytes], list, int]:
         await context.close()
 
 
-def render_canva_page(url: str) -> tuple[list[bytes], list, int]:
+def render_canva_page(url: str) -> tuple[list[bytes], list, list, int]:
     """
     Sync-facing entry point - what the HTTP handler actually calls, on
     whichever request thread is handling this call. Schedules render_
@@ -1165,7 +1216,7 @@ def render_canva_page(url: str) -> tuple[list[bytes], list, int]:
         raise RenderError("render timed out")
 
 
-async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
+async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, list, int]:
     """
     Pitch.com's own counterpart to render_canva_page_async - see that
     function's own docstring for the shared shape (browser/context setup,
@@ -1297,6 +1348,7 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
 
         pages = [await page.screenshot(type="png")]
         page_links = [await _page_link_candidates(page)]
+        page_texts = [await _page_visible_text(page)]
         detected_total = await _detect_page_count(page)
 
         # Identical loop shape to render_canva_page_async's own (see that
@@ -1346,6 +1398,7 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
                     await _wait_for_page_content_to_stabilize(page, signature_after[1])
                     pages.append(await page.screenshot(type="png"))
                     page_links.append(await _page_link_candidates(page))
+                    page_texts.append(await _page_visible_text(page))
                     advanced = True
                     break
 
@@ -1396,7 +1449,7 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
                         file=sys.stderr,
                     )
 
-        return pages, page_links, detected_total
+        return pages, page_links, page_texts, detected_total
     finally:
         if page is not None:
             try:
@@ -1406,7 +1459,7 @@ async def render_pitch_page_async(url: str) -> tuple[list[bytes], list, int]:
         await context.close()
 
 
-def render_pitch_page(url: str) -> tuple[list[bytes], list, int]:
+def render_pitch_page(url: str) -> tuple[list[bytes], list, list, int]:
     """Sync-facing entry point for Pitch, mirroring render_canva_page's
     own thread-bridging (see that function's own docstring) - the only
     difference is its own PITCH_RENDER_TIMEOUT_SECONDS budget, sized off
@@ -1455,7 +1508,7 @@ async def _kitt_scroll_metrics(page):
     return metrics.get("scrollHeight"), metrics.get("clientHeight")
 
 
-async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
+async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, list, int]:
     """
     Kitt's own counterpart to render_canva_page_async/render_pitch_page_
     async - same overall shape (browser/context setup, SSRF route guard,
@@ -1567,10 +1620,12 @@ async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
             # rather than failing outright.
             pages = [await page.screenshot(type="png")]
             page_links = [await _page_link_candidates(page)]
-            return pages, page_links, None
+            page_texts = [await _page_visible_text(page)]
+            return pages, page_links, page_texts, None
 
         pages = []
         page_links = []
+        page_texts = []
         scroll_top = 0
         while len(pages) < MAX_KITT_PAGES:
             try:
@@ -1593,6 +1648,7 @@ async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
             await _wait_for_page_content_to_stabilize(page)
             pages.append(await page.screenshot(type="png"))
             page_links.append(await _page_link_candidates(page))
+            page_texts.append(await _page_visible_text(page))
 
             if scroll_top + client_height >= scroll_height:
                 break
@@ -1606,7 +1662,7 @@ async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
                 file=sys.stderr,
             )
 
-        return pages, page_links, None
+        return pages, page_links, page_texts, None
     finally:
         if page is not None:
             try:
@@ -1616,7 +1672,7 @@ async def render_kitt_page_async(url: str) -> tuple[list[bytes], list, int]:
         await context.close()
 
 
-def render_kitt_page(url: str) -> tuple[list[bytes], list, int]:
+def render_kitt_page(url: str) -> tuple[list[bytes], list, list, int]:
     """Sync-facing entry point for Kitt, mirroring render_canva_page's
     own thread-bridging (see that function's own docstring) - the only
     difference is its own KITT_RENDER_TIMEOUT_SECONDS budget, sized off
@@ -1630,7 +1686,7 @@ def render_kitt_page(url: str) -> tuple[list[bytes], list, int]:
         raise RenderError("render timed out")
 
 
-def render_page(url: str) -> tuple[list[bytes], list, int]:
+def render_page(url: str) -> tuple[list[bytes], list, list, int]:
     """
     Dispatches to whichever platform's own renderer a `url` shape
     recognizes (see _is_recognized_canva_url/_is_recognized_pitch_url/
@@ -1736,7 +1792,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             try:
-                pages, page_links, detected_total = render_page(url)
+                pages, page_links, page_texts, detected_total = render_page(url)
             except RenderError as e:
                 # e.reason is already _safe_reason'd at RenderError's own
                 # construction time (see that class's own docstring) -
@@ -1841,6 +1897,15 @@ class Handler(BaseHTTPRequestHandler):
                 # (see brochure_enrichment._fetch_rendered_page) is
                 # completely unaffected by this simply being present.
                 "links": page_links,
+                # One string per page, in the SAME order as "pages" (see
+                # _page_visible_text) - each page's own full visible body
+                # text, used by the main app's own extract._png_page_let_
+                # status_matches to run the identical deterministic LET-
+                # status keyword cross-check a real PDF's own embedded text
+                # layer already gets. Another NEW, additive key, same
+                # reasoning as "links" above - an existing caller reading
+                # only the pre-existing keys is completely unaffected.
+                "text": page_texts,
             })
         finally:
             _render_semaphore.release()
