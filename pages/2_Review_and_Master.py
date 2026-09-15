@@ -2738,6 +2738,36 @@ def _render_near_miss_link_diff(u, row_dict: dict, target_index: int, plan, key_
             entry["source_file"] = u.new_row.source_file
 
 
+def _render_let_status_check_unavailable_banner(new_rows: list) -> None:
+    """
+    One-time, page-level notice - never a per-row caption - for this
+    batch's own pasted Canva/Pitch-link uploads (see schema.ListingRow.
+    let_status_check_unavailable's own docstring for the confirmed real
+    Ivybridge House gap this exists for: that upload path has no real PDF
+    text layer at all, so the deterministic possible_missed_let_status
+    cross-check never even runs for it, and a reviewer seeing no 🔍 note
+    anywhere could otherwise mistake that silence for "checked, nothing
+    missed" rather than the true "never checked" state).
+
+    Shown ONCE for the whole batch, not once per affected row - every row
+    from the SAME pasted-link upload shares the identical limitation, so a
+    repeated per-row caption would just be noise; a reviewer only needs to
+    know, once, that this specific safety net doesn't cover this upload and
+    to look special_features/state_of_space over manually instead. Draws
+    nothing at all when no row in this batch came through that path -
+    every ordinary PDF/spreadsheet/brochure-enrichment upload is completely
+    unaffected and unchanged.
+    """
+    if not any(getattr(row, "let_status_check_unavailable", False) for row in new_rows):
+        return
+    st.warning(
+        "🔍 This upload includes a pasted Canva/Pitch link, which is rendered as an image rather than a "
+        "real PDF - the automated check for missed 'Let'/'Under Offer'/etc. wording (see the 🔍 notes "
+        "elsewhere on this page) could not run against it. Please double-check text fields like Special "
+        "Features manually for this upload rather than assuming no note means nothing was missed."
+    )
+
+
 def _render_pending_review(pending: list):
     # Splits `pending` into active vs superseded BEFORE anything else reads
     # rows from it - see active_and_superseded_staging_files' own docstring
@@ -2774,6 +2804,8 @@ def _render_pending_review(pending: list):
         fully_occupied_buildings = [
             fo for path in active for fo in get_staging_fully_occupied_buildings(path)
         ]
+
+    _render_let_status_check_unavailable_banner(new_rows)
 
     st.caption(master_merge.pending_status_line(len(active), plan))
     auto_consolidated_rows = total_unmatched_before - len(plan.unmatched)

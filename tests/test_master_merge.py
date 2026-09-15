@@ -2261,6 +2261,38 @@ class BuildMergePlanBrochureLinkBrokenTests(unittest.TestCase):
         self.assertIs(merged[0].brochure_link_broken, False)
 
 
+class BuildMergePlanLetStatusCheckUnavailableTests(unittest.TestCase):
+    """
+    ListingRow.let_status_check_unavailable - diagnostic pipeline metadata
+    (see schema.ListingRow's own docstring), the same category as
+    brochure_link_broken/geocode_unverified above. Confirmed real gap this
+    closes: a pasted Canva/Pitch-link row matched against an EXISTING
+    master record (not a brand-new row) was showing a meaningless
+    "None -> True" line in the per-row diff/checkbox UI instead of only
+    the page-level banner this flag was actually meant to drive.
+    """
+
+    def test_a_genuine_flag_is_routed_to_silent_never_to_diffs(self):
+        master_df = _master_df([{"building": "Ivybridge House", "floor_unit": "LG"}])
+        new_row = ListingRow(building="Ivybridge House", floor_unit="LG", let_status_check_unavailable=True)
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("let_status_check_unavailable", matched.diffs)
+        self.assertEqual(matched.silent_updates.get("let_status_check_unavailable"), True)
+
+    def test_an_ordinary_pdf_row_never_touches_this_field_at_all(self):
+        master_df = _master_df([{"building": "Ivybridge House", "floor_unit": "LG"}])
+        new_row = ListingRow(building="Ivybridge House", floor_unit="LG")  # defaults to None
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertNotIn("let_status_check_unavailable", matched.diffs)
+        self.assertNotIn("let_status_check_unavailable", matched.silent_updates)
+
+
 class MatchedRowPropertyIdStabilityTests(unittest.TestCase):
     """
     Real, confirmed production incident: comparing two real master

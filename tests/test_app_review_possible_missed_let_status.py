@@ -127,5 +127,68 @@ class PossibleMissedLetStatusCaptionTests(IsolatedCwdTestCase):
         self.assertIn("may be missing detail", caption_text)
 
 
+class LetStatusCheckUnavailableBannerTests(IsolatedCwdTestCase):
+    """
+    The one-time, page-level banner for a pasted Canva/Pitch-link upload
+    (see schema.ListingRow.let_status_check_unavailable/pages/2_Review_
+    and_Master.py's own _render_let_status_check_unavailable_banner) - the
+    confirmed real gap this closes: extract_from_png_pages's own rows
+    previously showed NO signal at all that the deterministic LET-status
+    cross-check never ran for them, indistinguishable from "checked,
+    nothing missed".
+    """
+
+    def test_banner_shown_when_a_row_could_not_be_checked(self):
+        save_staging_file(
+            [ListingRow(
+                building="Ivybridge House", provider="Colliers", floor_unit="Level 2",
+                special_features="Views of the River Thames",
+                let_status_check_unavailable=True,
+            )],
+            "www.canva.com_design_x_view.xlsx", content_hash="canva-let-status-unavailable-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertIn("pasted Canva/Pitch link", warning_text)
+        self.assertIn("could not run", warning_text)
+
+    def test_no_banner_for_an_ordinary_upload(self):
+        save_staging_file(
+            [ListingRow(
+                building="Ivybridge House", provider="Colliers", floor_unit="Level 2",
+                special_features="Views of the River Thames",
+            )],
+            "ordinary_upload.xlsx", content_hash="ordinary-upload-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        warning_text = "".join(w.value for w in at.warning)
+        self.assertNotIn("pasted Canva/Pitch link", warning_text)
+
+    def test_banner_shown_once_even_when_multiple_rows_are_affected(self):
+        save_staging_file(
+            [
+                ListingRow(
+                    building="Ivybridge House", provider="Colliers", floor_unit="Level 1",
+                    let_status_check_unavailable=True,
+                ),
+                ListingRow(
+                    building="Ivybridge House", provider="Colliers", floor_unit="Level 2",
+                    let_status_check_unavailable=True,
+                ),
+            ],
+            "www.canva.com_design_y_view.xlsx", content_hash="canva-let-status-unavailable-multi-hash",
+        )
+        at = _run_review_page()
+        self.assertFalse(at.exception)
+
+        warning_text = [w.value for w in at.warning]
+        matching = [w for w in warning_text if "pasted Canva/Pitch link" in w]
+        self.assertEqual(len(matching), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1006,6 +1006,51 @@ class ExtractFromPngPagesTests(unittest.TestCase):
         self.assertFalse(hasattr(rows, "page_indices"))
 
 
+class LetStatusCheckUnavailableTests(unittest.TestCase):
+    """
+    schema.ListingRow.let_status_check_unavailable - the confirmed real gap
+    this closes: extract_from_png_pages (a pasted Canva/Pitch link,
+    rendered as page IMAGES - see app.py's own _fetch_pasted_link) has no
+    real PDF page-text layer at all, so possible_missed_let_status_notes'
+    own deterministic cross-check never runs for it - previously silent
+    and indistinguishable from "checked, nothing missed". Every row from
+    this path now carries this explicit "never checked" flag instead.
+    """
+
+    def test_extract_from_png_pages_flags_every_row(self):
+        raw = {
+            "provider": "Colliers", "contacts": None,
+            "units": [
+                {"building": "Ivybridge House", "floor_unit": "Level 1", "brochure_link": None},
+                {"building": "Ivybridge House", "floor_unit": "Level 2", "brochure_link": None},
+            ],
+        }
+        with patch("extract.get_client", return_value="fake-client"), \
+                patch("extract.call_gemini", return_value=raw):
+            rows = extract.extract_from_png_pages(
+                [b"\x89PNG\r\n\x1a\n rest"], original_filename="www.canva.com_design_x_view.pdf",
+            )
+
+        self.assertTrue(rows[0].let_status_check_unavailable)
+        self.assertTrue(rows[1].let_status_check_unavailable)
+        # The two signals stay genuinely distinct - never checked (True)
+        # is not the same thing as checked-and-found-a-gap (a note).
+        self.assertIsNone(rows[0].possible_missed_let_status)
+        self.assertIsNone(rows[1].possible_missed_let_status)
+
+    def test_extract_never_sets_the_flag(self):
+        # The real-PDF-upload path DOES run the deterministic cross-check
+        # (see ExtractSetsPossibleMissedLetStatusEndToEndTests) - it must
+        # never also carry this "couldn't check at all" flag.
+        raw = {"provider": None, "contacts": None, "units": [{"building": "X", "brochure_link": None}]}
+        with patch("extract.extract_raw_units", return_value=raw), \
+                patch("extract._attach_per_row_pdf_links"), \
+                patch("extract._reject_unhinted_pdf_brochure_links"):
+            rows = extract.extract(Path("irrelevant.pdf"))
+
+        self.assertIsNone(rows[0].let_status_check_unavailable)
+
+
 class PastedLinkContactsNeverFallBackToTheSharedDeckTests(unittest.TestCase):
     """
     Real, confirmed production bug this closes: a shared multi-property
