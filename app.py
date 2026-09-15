@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -1473,6 +1474,22 @@ with page_setup.setup_page("upload"):
                     # docstrings), which never goes through find_previous_
                     # upload_by_hash at all.
                     previous_staging_path = find_previous_upload_by_hash(content_hash)
+                    # TEMPORARY diagnostic — investigating whether the
+                    # Ivybridge House Review page is showing possible_
+                    # missed_let_status notes computed during an OLDER
+                    # upload (a reused staging entry from BEFORE the DOM-
+                    # text LET-status fix) rather than a fresh extraction
+                    # against the CURRENT code - see extract.py's own
+                    # [DIAGNOSTIC-TEMP] logging for the actual per-unit
+                    # page-attribution question this is upstream of.
+                    # Remove once that's confirmed — never meant to stay
+                    # in this form long-term.
+                    print(
+                        f"[app][DIAGNOSTIC-TEMP] content_hash={content_hash!r} "
+                        f"reusing_previous_staging={bool(previous_staging_path)} "
+                        f"previous_staging_path={previous_staging_path!r}",
+                        file=sys.stderr,
+                    )
                     fully_occupied_buildings = []
                     # Set below ONLY when previous_staging_path's own
                     # enrichment was left incomplete (status="in_progress"),
