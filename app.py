@@ -808,27 +808,34 @@ class _PastedLinkFile:
     list as a real st.file_uploader UploadedFile and flow through all of
     that completely unchanged.
 
-    png_pages/page_links (both None for a direct-PDF or resolved-landing-
-    page link - see _fetch_pasted_link) are the ONE piece the Extract
-    loop below does treat specially: when present, they're the ORIGINAL
-    Canva/Pitch render pages and each page's own real link candidates
-    (see brochure_enrichment.fetch_rendered_page_with_links) - extracted
-    via extract.extract_from_png_pages directly (never by re-rasterizing
+    png_pages/page_links/page_texts (all None for a direct-PDF or
+    resolved-landing-page link - see _fetch_pasted_link) are the ONE
+    piece the Extract loop below does treat specially: when present,
+    they're the ORIGINAL Canva/Pitch render pages, each page's own real
+    link candidates, and each page's own full visible body text (see
+    brochure_enrichment.fetch_rendered_page_with_links) - extracted via
+    extract.extract_from_png_pages directly (never by re-rasterizing
     .getvalue()'s own assembled PDF bytes back into images - png_pages
     already ARE real screenshots, so that round trip would just be a
     slower, lossier no-op for identical content) so Gemini can attribute
-    a per-property brochure_link from each page's own real anchors,
-    rather than every unit falling back to one shared document link.
-    .getvalue()'s own assembled-PDF bytes are still what gets persisted
-    as this pasted link's own "whole document" fallback copy either way -
-    only which BYTES Gemini actually sees differs.
+    a per-property brochure_link from each page's own real anchors, and
+    so the deterministic LET-status cross-check (extract._png_page_let_
+    status_matches) can run against page_texts exactly like it already
+    does against a real PDF's own embedded text layer, rather than every
+    unit falling back to one shared document link with zero LET-status
+    coverage. .getvalue()'s own assembled-PDF bytes are still what gets
+    persisted as this pasted link's own "whole document" fallback copy
+    either way - only which BYTES Gemini actually sees differs.
     """
 
-    def __init__(self, name: str, data: bytes, png_pages: list = None, page_links: list = None):
+    def __init__(
+        self, name: str, data: bytes, png_pages: list = None, page_links: list = None, page_texts: list = None,
+    ):
         self.name = name
         self._data = data
         self.png_pages = png_pages
         self.page_links = page_links
+        self.page_texts = page_texts
 
     def getvalue(self) -> bytes:
         return self._data
@@ -943,14 +950,16 @@ def _fetch_pasted_link(url: str):
     if (
         brochure_enrichment.is_canva_view_link(url) or brochure_enrichment.is_pitch_view_link(url)
     ) and brochure_enrichment._canva_renderer_configured():
-        pages, page_links = brochure_enrichment.fetch_rendered_page_with_links(url)
+        pages, page_links, page_texts = brochure_enrichment.fetch_rendered_page_with_links(url)
         if pages is None:
             return None
         try:
             data = _pdf_bytes_from_png_pages(pages)
         except Exception:
             return None
-        return _PastedLinkFile(_filename_from_url(url), data, png_pages=pages, page_links=page_links)
+        return _PastedLinkFile(
+            _filename_from_url(url), data, png_pages=pages, page_links=page_links, page_texts=page_texts,
+        )
 
     data = brochure_enrichment._fetch_pdf_bytes(url)
     if data is None:
@@ -1785,6 +1794,7 @@ with page_setup.setup_page("upload"):
                                     rows = extract.extract_from_png_pages(
                                         png_pages, original_filename=uploaded_file.name,
                                         page_links=uploaded_file.page_links,
+                                        page_texts=uploaded_file.page_texts,
                                     )
                                     # Gemini's own per-unit pick was, up to
                                     # this point, trusted purely by LABEL -

@@ -153,10 +153,11 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         # rendered_page_with_links, not _fetch_pdf_bytes, for this shape.
         png_pages = [_make_png((1, 0, 0)), _make_png((0, 1, 0)), _make_png((0, 0, 1))]
         page_links = [[], [], []]
+        page_texts = ["Level 4: available", "Level 3: Strand suite / River suite is LET", "Level 2: available"]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch(
                     "brochure_enrichment.fetch_rendered_page_with_links",
-                    return_value=(png_pages, page_links),
+                    return_value=(png_pages, page_links, page_texts),
                 ) as mock_fetch:
             result = app._fetch_pasted_link("https://canva.link/cvkmdcet1gpz149")
 
@@ -164,6 +165,7 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         self.assertIsInstance(result, app._PastedLinkFile)
         self.assertEqual(result.png_pages, png_pages)
         self.assertEqual(result.page_links, page_links)
+        self.assertEqual(result.page_texts, page_texts)
         doc = fitz.open("pdf", result.getvalue())
         try:
             self.assertEqual(doc.page_count, 3)
@@ -187,7 +189,7 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch(
                     "brochure_enrichment.fetch_rendered_page_with_links",
-                    return_value=(png_pages, page_links),
+                    return_value=(png_pages, page_links, [""]),
                 ) as mock_fetch:
             result = app._fetch_pasted_link("www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view")
 
@@ -475,10 +477,11 @@ class SuccessfulCanvaStyleLinkTests(unittest.TestCase):
         url = "https://canva.link/cvkmdcet1gpz149"
         png_pages = [_make_png((1, 0, 0)), _make_png((0, 1, 0)), _make_png((0, 0, 1))]
         page_links = [[], [], []]
+        page_texts = ["Level 4: available", "Level 3: Strand suite / River suite is LET", "Level 2: available"]
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch(
                     "brochure_enrichment.fetch_rendered_page_with_links",
-                    return_value=(png_pages, page_links),
+                    return_value=(png_pages, page_links, page_texts),
                 ), \
                 patch("extract.extract_from_png_pages", return_value=[]) as mock_extract, \
                 patch("extract.extract") as mock_plain_extract:
@@ -497,6 +500,7 @@ class SuccessfulCanvaStyleLinkTests(unittest.TestCase):
         self.assertEqual(mock_extract.call_args.args[0], png_pages)
         self.assertEqual(mock_extract.call_args.kwargs["original_filename"], app._filename_from_url(url))
         self.assertEqual(mock_extract.call_args.kwargs["page_links"], page_links)
+        self.assertEqual(mock_extract.call_args.kwargs["page_texts"], page_texts)
         mock_plain_extract.assert_not_called()  # never the re-rasterizing PDF-file path for this source
         self.assertEqual(len(list_pending_staging_files()), 1)
 
@@ -684,7 +688,7 @@ class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch(
                     "brochure_enrichment.fetch_rendered_page_with_links",
-                    return_value=(png_pages, page_links),
+                    return_value=(png_pages, page_links, None),
                 ), \
                 patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw), \
@@ -754,7 +758,7 @@ class PerPropertyLinkAttributionEndToEndTests(unittest.TestCase):
         with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
                 patch(
                     "brochure_enrichment.fetch_rendered_page_with_links",
-                    return_value=(png_pages, page_links),
+                    return_value=(png_pages, page_links, None),
                 ), \
                 patch("extract.get_client", return_value="fake-client"), \
                 patch("extract.call_gemini", return_value=raw), \
