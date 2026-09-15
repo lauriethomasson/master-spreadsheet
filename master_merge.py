@@ -3288,6 +3288,19 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
             if "geocode_unverified" in diffs:
                 silent["geocode_unverified"] = diffs.pop("geocode_unverified")[1]
 
+            # let_status_check_unavailable (see schema.ListingRow's own
+            # docstring) is the same kind of diagnostic pipeline metadata
+            # as brochure_link_broken/geocode_unverified above - a pasted
+            # Canva/Pitch-link row sets this True unconditionally (see
+            # extract.extract_from_png_pages), so without this move every
+            # SUCH row matched against an existing master record would
+            # otherwise show a meaningless "None -> True" line in the
+            # per-row diff/checkbox UI instead of only the page-level
+            # banner (_render_let_status_check_unavailable_banner) this
+            # was actually meant to surface through.
+            if "let_status_check_unavailable" in diffs:
+                silent["let_status_check_unavailable"] = diffs.pop("let_status_check_unavailable")[1]
+
             # address_conflict (see schema.ListingRow's own docstring) is
             # the same kind of diagnostic pipeline metadata as brochure_
             # link_broken/geocode_unverified above - never shown as its

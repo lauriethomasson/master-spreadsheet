@@ -1036,11 +1036,23 @@ def extract_from_png_pages(
     building (see app.py's own _propagate_validated_links_within_page),
     does so afterward, on the returned rows; this function itself never
     fetches anything over the network.
+
+    Every returned row also has let_status_check_unavailable=True (see
+    schema.ListingRow's own docstring) - a rendered screenshot has no real
+    PDF page-text layer for the deterministic LET-status cross-check
+    (extract()'s own possible_missed_let_status_notes/_pdf_page_let_status_
+    matches) to run against at all, so unlike extract()/extract_
+    spreadsheet_gemini.py, that check never even attempts to run here; this
+    flag lets the Review page tell a reviewer "not checked" apart from
+    "checked, nothing found" rather than leaving both silences identical.
     """
     client = get_client()
     images = images_from_png_pages(png_pages, page_links=page_links)
     raw = render_and_extract(images, client=client)
-    rows, page_indices = _rows_from_raw(raw, original_filename, document_wide_contacts_is_row_own_document=False)
+    rows, page_indices = _rows_from_raw(
+        raw, original_filename, document_wide_contacts_is_row_own_document=False,
+        let_status_check_unavailable=True,
+    )
     result = _ExtractedRows(rows)
     result.page_indices = page_indices
     return result
@@ -1106,7 +1118,7 @@ def _match_building_features(unit_building: str, building_features: list) -> str
 
 def _rows_from_raw(
     raw: dict, filename: str, document_wide_contacts_is_row_own_document: bool = True,
-    missed_let_status_notes: dict = None,
+    missed_let_status_notes: dict = None, let_status_check_unavailable: bool = False,
 ) -> tuple[list[ListingRow], list]:
     """
     missed_let_status_notes ({id(unit): note}, default None/{}) - see
@@ -1119,6 +1131,15 @@ def _rows_from_raw(
     (a screenshot-derived source has no real PDF page-text layer to have
     cross-checked at all - same exemption _attach_per_row_pdf_links already
     has for the identical reason, see this module's own docstring).
+
+    let_status_check_unavailable (default False) - True ONLY when called
+    from extract_from_png_pages, below - see schema.ListingRow's own field
+    of the identical name for exactly why a screenshot-derived source needs
+    this HONEST "never checked" signal distinct from missed_let_status_
+    notes' own "checked and found nothing" silence. Set on every row this
+    call produces, unconditionally - the whole document is either a real
+    PDF (missed_let_status_notes may apply) or a screenshot render (this
+    does), never a mix of both within one _rows_from_raw call.
 
     The raw Gemini JSON's own "units" (plus document-level provider/
     contacts) turned into (rows, page_indices) - rows shared by extract() (a
@@ -1284,6 +1305,7 @@ def _rows_from_raw(
                 source_file=filename,
                 brochure_link_is_floorplan=brochure_link_is_floorplan,
                 possible_missed_let_status=(missed_let_status_notes or {}).get(id(unit)),
+                let_status_check_unavailable=let_status_check_unavailable or None,
             )
         )
         page_indices.append(page_index)

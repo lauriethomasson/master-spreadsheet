@@ -230,6 +230,37 @@ class ListingRow(BaseModel):
     # master_merge.diff_fields' own blank-skip rule never lets a fresh,
     # unchecked row silently clear a master row's own already-flagged note.
     possible_missed_let_status: Optional[str] = None
+    # True ONLY for a row extracted via extract.extract_from_png_pages (a
+    # pasted Canva/Pitch link, rendered as page IMAGES - see app.py's own
+    # _fetch_pasted_link/_PastedLinkFile) - the ONE source shape possible_
+    # missed_let_status's own deterministic cross-check structurally cannot
+    # run against at all: there is no real PDF page-text layer to scan (see
+    # extract._pdf_page_let_status_matches' own docstring), only a rendered
+    # screenshot. Confirmed real gap: a real Ivybridge House upload via
+    # this exact path (filename "www.canva.com_design_..._view.pdf") lost
+    # its own "(River suite is LET)" wording between extraction passes with
+    # NO possible_missed_let_status note anywhere - indistinguishable, on
+    # the Review page, from "checked and found nothing wrong", when the
+    # true state was "never checked at all". This field exists so a
+    # reviewer can tell those two silences apart (see pages/2_Review_and_
+    # Master.py's own one-time banner for this upload path) rather than
+    # mistakenly trusting an absent 🔍 note as proof nothing was missed.
+    #
+    # Deliberately NOT a fix to the underlying gap itself (OCR against the
+    # rendered images was considered and rejected - no OCR engine is
+    # available in this environment/deployment today, and an OCR read of a
+    # compressed marketing screenshot risks a WRONG kind of silence: a
+    # missed/misread match that looks exactly like "checked, all clear"
+    # would be worse than this honest "couldn't check" signal). extract.py/
+    # extract_spreadsheet_gemini.py/brochure_enrichment.py's own three
+    # working cross-check paths are completely untouched by this - never
+    # set True by any of them.
+    #
+    # None (never explicitly False) for every other extraction path - same
+    # "None means this run didn't touch the question" convention as
+    # address_conflict/brochure_building_mismatch/geocode_unverified/
+    # possible_missed_let_status above.
+    let_status_check_unavailable: Optional[bool] = None
     # The overall campus/development's own brand name, distinct from any
     # individual building's own name within it (e.g. "Regent's Wharf"
     # containing "The Canal Building", "Thorley Works", ...) - only when
