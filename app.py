@@ -23,6 +23,7 @@ import page_flow
 import page_setup
 from brochure_link_resolver import looks_like_url
 from display_utils import LONDON_TZ
+from extraction_fingerprint import pdf_email_logic_fingerprint, spreadsheet_logic_fingerprint
 from gemini_client import QuotaExceededError
 import geocode
 from geocode import geocode_rows
@@ -42,109 +43,18 @@ from storage.file_store import (
 
 SPREADSHEET_SUFFIXES = (".xlsx", ".csv")
 
-# Column-header mapping (extract_spreadsheet.py) has no Gemini call and is
-# fully deterministic - the only way its cached result could ever go stale
-# is a change to that module's own mapping/guessing logic itself (suggest_
-# mapping, guess_provider_name, FIELD_SYNONYMS, etc.), never anything the
-# PDF/email path's own version counter (since removed - see
-# _PDF_EMAIL_LOGIC_FINGERPRINT below) was ever meant to track. Confirmed to
-# have actually gone stale this way: a real fix to that logic landed without
-# that counter being bumped (it had no reason to know spreadsheet logic even
-# changed), so a byte-identical re-upload of an already-staged spreadsheet
-# kept silently reusing its pre-fix cached rows - dedup working exactly as
-# designed, just against the wrong invalidation signal for this source
-# type. Hashing the source of both spreadsheet-path modules directly instead
-# makes invalidation automatic and self-maintaining - no version number to
-# remember, ever, for this source type specifically. extract_spreadsheet_
-# gemini.py is included here too even though IT does call Gemini (and so
-# isn't "fully deterministic" the way the comment above once meant) -
-# folding it into the same fingerprint is still correct: a prompt/logic
-# change there must invalidate a cached result exactly like a mapping-logic
-# change does, for the same reason, even though a fresh (non-cached) call to
-# that module was never guaranteed byte-identical to begin with.
-# brochure_enrichment.py is included for the exact same reason: it now runs
-# automatically, unconditionally, right after a fresh spreadsheet
-# extraction (see _run_automatic_brochure_enrichment/the spreadsheet branch
-# below), so a change to its matching/field rules must invalidate an
-# already-staged result too, not silently keep serving rows enriched (or
-# not enriched) under the OLD logic.
-#
-# geocode.py is included for the same reason again, confirmed via a real
-# gap: geocode_rows() runs unconditionally right after a fresh extraction
-# for BOTH source types (see the spreadsheet and PDF/email branches below),
-# but wasn't part of either invalidation mechanism at all - neither this
-# fingerprint nor the PDF/email path's own version counter (since removed -
-# see _PDF_EMAIL_LOGIC_FINGERPRINT below). A real geocoding-validation fix
-# (rejecting a Places candidate that contradicts the source's own postcode
-# evidence - see geocode.py's own module docstring) landed without either
-# being touched, so re-uploading an already-staged file (e.g. the real beem
-# Live Flex Availability.xlsx) kept silently reusing its pre-fix cached
-# rows/coordinates - dedup working exactly as designed, just blind to this
-# one dependency. Folding geocode.py's own source in here (see also its
-# addition to the PDF/email versioned_content below) closes that gap the
-# same automatic, self-maintaining way as the other three modules.
-#
-# brochure_link_resolver.py is included for the same reason once more, and
-# was found to have the exact same gap: extract_spreadsheet_gemini.py (and,
-# on the PDF/email side below, extract.py/extract_email.py) all call
-# finalize_brochure_link, but that function lives in its own separate
-# module, whose source was never folded into either fingerprint at all - a
-# real fix to finalize_brochure_link itself (the rule-3 PDF-fallback
-# removal) landed without either fingerprint changing, so a byte-identical
-# re-upload of an already-staged file kept silently reusing its pre-fix
-# cached brochure_link values, exactly the same failure shape as the
-# geocode.py gap above.
-_SPREADSHEET_LOGIC_FINGERPRINT = hashlib.sha256(
-    Path(extract_spreadsheet.__file__).read_bytes()
-    + Path(extract_spreadsheet_gemini.__file__).read_bytes()
-    + Path(brochure_enrichment.__file__).read_bytes()
-    + Path(geocode.__file__).read_bytes()
-    + Path(brochure_link_resolver.__file__).read_bytes()
-).hexdigest()
-
-# extract.py's/extract_email.py's own source, folded into
-# _pdf_or_email_content_hash for a PDF/email upload the exact same
-# automatic, self-maintaining way _SPREADSHEET_LOGIC_FINGERPRINT above
-# already does for extract_spreadsheet.py/extract_spreadsheet_gemini.py -
-# replacing the EXTRACTION_VERSION human-maintained counter this used to
-# rely on instead. Confirmed to have already gone stale exactly the same
-# way the spreadsheet-mapping gap above did: EXTRACTION_VERSION stayed "3"
-# across two real extract.py fixes since it was introduced (the single-
-# unit-page PDF link attachment fix, and the bulk-upload-fallback-
-# suppression fix), so a PDF re-uploaded after either fix kept silently
-# reusing its pre-fix cached extraction result - the fix was sitting in the
-# repo but never actually took effect for anything already uploaded once.
-#
-# brochure_link_resolver.py's own source is folded in here too, same as
-# _SPREADSHEET_LOGIC_FINGERPRINT above and for the same confirmed gap: both
-# extract.py and extract_email.py call finalize_brochure_link, and it
-# applies to both unconditionally, so it belongs in the fingerprint itself
-# rather than in versioned_content.
-#
-# brochure_enrichment.py's own source is folded in here too, for the exact
-# same reason _SPREADSHEET_LOGIC_FINGERPRINT above already includes it -
-# automatic brochure enrichment now runs unconditionally for every PDF/
-# email upload too (see _run_automatic_brochure_enrichment/the PDF-email
-# branch below), so a change to its own matching/field rules (e.g. the
-# shared-deck-contamination fix _apply_units_to_row's own is_shared_deck_
-# document param exists for) must invalidate an already-staged PDF/email
-# result too, not silently keep serving rows enriched under the OLD logic.
-# Previously only added to _pdf_or_email_content_hash's own versioned_
-# content below (still functionally identical either way - both end up in
-# the same final content_hash - but stated here explicitly now, alongside
-# extract.py/extract_email.py/brochure_link_resolver.py, the same place
-# _SPREADSHEET_LOGIC_FINGERPRINT already states its own equivalent
-# inclusion, rather than split across two different spots for the two
-# source types). geocode.py is NOT folded in here - left exactly where it
-# already was (_pdf_or_email_content_hash's own versioned_content below) -
-# this fingerprint's own scope is deliberately just brochure enrichment's
-# gap, not a broader reorganization of every dependency's placement.
-_PDF_EMAIL_LOGIC_FINGERPRINT = hashlib.sha256(
-    Path(extract.__file__).read_bytes()
-    + Path(extract_email.__file__).read_bytes()
-    + Path(brochure_link_resolver.__file__).read_bytes()
-    + Path(brochure_enrichment.__file__).read_bytes()
-).hexdigest()
+# _SPREADSHEET_LOGIC_FINGERPRINT/_PDF_EMAIL_LOGIC_FINGERPRINT: hashes of this
+# codebase's own extraction/enrichment module source, folded into
+# content_hash below so a logic change invalidates any already-staged
+# result automatically - see extraction_fingerprint.py's own module
+# docstring for the full history of confirmed invalidation gaps each
+# included module closes, and for why the actual computation lives in that
+# separate module as plain FUNCTIONS, called fresh here on every one of
+# app.py's own top-level runs (never cached module constants imported by
+# value - see that module's own docstring for why caching here would
+# silently defeat the whole mechanism).
+_SPREADSHEET_LOGIC_FINGERPRINT = spreadsheet_logic_fingerprint()
+_PDF_EMAIL_LOGIC_FINGERPRINT = pdf_email_logic_fingerprint()
 
 # The neutral, un-decided option in an ambiguous-sheet decision radio (see
 # _render_ambiguous_sheet_decision) - deliberately never pre-selecting
@@ -1430,6 +1340,15 @@ with page_setup.setup_page("upload"):
                         source_identity_hash = hashlib.sha256(
                             file_hash.encode("utf-8") + b"\0" + decisions_repr
                         ).hexdigest()
+                        # Recorded alongside source_identity_hash so a LATER
+                        # staging-tie-break (active_and_superseded_staging_
+                        # files' own current_logic_fingerprints param) can
+                        # tell "this entry's own extraction logic is the one
+                        # running right now" apart from "merely more
+                        # brochure-enrichment complete" - see that function's
+                        # own docstring for the real Ivybridge House LET-
+                        # status case this closes.
+                        extraction_logic_fingerprint = _SPREADSHEET_LOGIC_FINGERPRINT
                     else:
                         content_hash = _pdf_or_email_content_hash(file_bytes)
                         # Same idea as the spreadsheet branch above - the
@@ -1438,6 +1357,7 @@ with page_setup.setup_page("upload"):
                         # PDF/email across a code change is still recognized
                         # as superseding an earlier, stale pending copy.
                         source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
+                        extraction_logic_fingerprint = _PDF_EMAIL_LOGIC_FINGERPRINT
 
                     # content_hash ONLY here - deliberately NOT source_
                     # identity_hash, despite find_previous_upload_by_hash's
@@ -1897,6 +1817,7 @@ with page_setup.setup_page("upload"):
                         rows, uploaded_file.name, content_hash=content_hash,
                         fully_occupied_buildings=fully_occupied_buildings,
                         source_identity_hash=source_identity_hash,
+                        extraction_logic_fingerprint=extraction_logic_fingerprint,
                     )
 
                     # Automatic brochure enrichment now runs HERE, before
