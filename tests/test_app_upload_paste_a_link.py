@@ -576,6 +576,39 @@ class SourceIdentityHashForCanvaPitchLinksTests(unittest.TestCase):
 
         self.assertNotEqual(first_hash, second_hash)
 
+    def test_same_design_with_different_tracking_params_produces_the_same_hash(self):
+        # Real, confirmed production case: the identical Ivybridge House/
+        # Colliers Canva design pasted once bare and once with a long
+        # utm_*/utlId tracking suffix + "#1" fragment still hashed as two
+        # unrelated documents even after the URL-based fix above, since
+        # query/fragment text is sharing metadata, never part of which
+        # design is being viewed (see canonical_identity_url's own
+        # docstring in brochure_link_resolver.py).
+        bare_url = "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view"
+        tracked_url = (
+            "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view"
+            "?utm_content=DAGbhpjThxc&utm_campaign=designshare&utm_medium=link2"
+            "&utm_source=uniquelinks&utlId=he02fc7993a#1"
+        )
+        first_hash = self._extract_canva_link(bare_url, [_make_png((1, 0, 0))])
+        _clear_pending()
+        second_hash = self._extract_canva_link(tracked_url, [_make_png((0, 1, 0))])
+
+        self.assertEqual(first_hash, second_hash)
+
+    def test_different_design_paths_still_produce_different_hashes_with_tracking_params(self):
+        first_hash = self._extract_canva_link(
+            "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view?utm_source=uniquelinks",
+            [_make_png((1, 0, 0))],
+        )
+        _clear_pending()
+        second_hash = self._extract_canva_link(
+            "https://www.canva.com/design/DIFFERENTID/anotherToken/view?utm_source=uniquelinks",
+            [_make_png((1, 0, 0))],
+        )
+
+        self.assertNotEqual(first_hash, second_hash)
+
     def test_direct_pdf_link_source_identity_hash_is_still_the_raw_bytes_hash(self):
         # png_pages is None for a direct-PDF pasted link (see
         # app._PastedLinkFile's own docstring) - this path must be

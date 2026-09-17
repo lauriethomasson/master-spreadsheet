@@ -22,8 +22,8 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brochure_link_resolver import (
-    finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link, is_gpe_flipbook_link,
-    is_kitt_brochure_preview_link, is_pitch_view_link, looks_like_url,
+    canonical_identity_url, finalize_brochure_link, is_canva_view_link, is_floorplan_not_brochure_url, is_generic_link,
+    is_gpe_flipbook_link, is_kitt_brochure_preview_link, is_pitch_view_link, looks_like_url,
 )
 from storage import blob_store, file_store
 
@@ -33,6 +33,50 @@ def _fake_bucket():
     bucket = MagicMock()
     bucket.blob.return_value = blob
     return bucket, blob
+
+
+class CanonicalIdentityUrlTests(unittest.TestCase):
+    """
+    Unit coverage for canonical_identity_url's own query/fragment-stripping
+    - see its docstring for the real confirmed Ivybridge House/Colliers
+    case this exists for (app.py's own source_identity_hash tests cover
+    the full end-to-end staging behavior; these are the narrower unit-
+    level checks on the helper itself).
+    """
+
+    def test_strips_query_string_and_fragment(self):
+        url = (
+            "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view"
+            "?utm_content=DAGbhpjThxc&utm_campaign=designshare#1"
+        )
+        self.assertEqual(
+            canonical_identity_url(url),
+            "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view",
+        )
+
+    def test_bare_url_with_no_query_or_fragment_is_unchanged(self):
+        url = "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view"
+        self.assertEqual(canonical_identity_url(url), url)
+
+    def test_path_case_is_preserved_not_lowercased(self):
+        # Unlike _clean_path (case-insensitive keyword matching), a real
+        # Canva design ID/share token is a case-sensitive mixed-case
+        # string - lowercasing it here would risk conflating two
+        # genuinely different tokens that differ only in case.
+        url = "https://www.canva.com/design/DAGbhpjThxc/18LeF-NYtfUff8o3byKDmQ/view?x=1"
+        self.assertIn("DAGbhpjThxc", canonical_identity_url(url))
+        self.assertIn("18LeF-NYtfUff8o3byKDmQ", canonical_identity_url(url))
+
+    def test_missing_scheme_still_gets_normalized_before_stripping(self):
+        self.assertEqual(
+            canonical_identity_url("canva.com/design/ABC/xyz/view?utm_source=x"),
+            "https://canva.com/design/ABC/xyz/view",
+        )
+
+    def test_different_paths_produce_different_results(self):
+        first = canonical_identity_url("https://www.canva.com/design/AAA/token/view?x=1")
+        second = canonical_identity_url("https://www.canva.com/design/BBB/token/view?x=1")
+        self.assertNotEqual(first, second)
 
 
 class FinalizeBrochureLinkNoFallbackTests(unittest.TestCase):
