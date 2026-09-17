@@ -685,7 +685,7 @@ class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
 
     def _staged(
         self, content_hash, status=None, processed_urls=None, unique=1, n_rows=275, filename="UNION.xlsx",
-        source_identity_hash=None,
+        source_identity_hash=None, extraction_logic_fingerprint=None,
     ):
         # save_staging_file's own path is {second-resolution timestamp}_
         # {filename stem}.xlsx (see its own docstring) - a distinct suffix
@@ -703,7 +703,7 @@ class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
         unique_filename = f"{stem}__{type(self)._staged_counter}{suffix}"
         path = file_store.save_staging_file(
             [ListingRow(building="A")] * n_rows, unique_filename, content_hash=content_hash,
-            source_identity_hash=source_identity_hash,
+            source_identity_hash=source_identity_hash, extraction_logic_fingerprint=extraction_logic_fingerprint,
         )
         meta = file_store._read_meta(path)
         meta["filename"] = filename
@@ -902,6 +902,94 @@ class ActiveAndSupersededStagingFilesTests(IsolatedCwdTestCase):
 
         self.assertEqual(active, [a])
         self.assertEqual(superseded, [b])
+
+    # Real, confirmed THIRD-round production report: a fresh, CORRECT
+    # re-extraction under current code (matches: {}, genuinely nothing to
+    # flag) was marked superseded by an older, fully-enriched entry
+    # extracted under stale, pre-fix code - so the Review page kept showing
+    # that older entry's own stale possible_missed_let_status note as if it
+    # were the latest upload's finding. Enrichment completeness alone (this
+    # class's own tests above) has no way to know one sibling's own
+    # extraction logic is outdated; current_logic_fingerprints closes that.
+    def test_current_code_entry_beats_a_more_enriched_but_stale_code_entry(self):
+        stale_code_complete = self._staged(
+            "hash-a", status="complete", unique=126,
+            source_identity_hash="same-real-file", extraction_logic_fingerprint="pre-fix-fingerprint",
+        )
+        current_code_incomplete = self._staged(
+            "hash-b", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126,
+            source_identity_hash="same-real-file", extraction_logic_fingerprint="post-fix-fingerprint",
+        )
+
+        active, superseded = file_store.active_and_superseded_staging_files(
+            [stale_code_complete, current_code_incomplete],
+            current_logic_fingerprints=frozenset({"post-fix-fingerprint"}),
+        )
+
+        self.assertEqual(active, [current_code_incomplete])
+        self.assertEqual(superseded, [stale_code_complete])
+
+    def test_no_current_logic_fingerprints_given_preserves_prior_enrichment_only_behavior(self):
+        # The exact same pair as above, but the caller passes no current-
+        # code signal at all (the default) - must fall back to this class's
+        # pre-existing enrichment-completeness ranking, unchanged: the more
+        # enriched entry wins regardless of which code produced it.
+        stale_code_complete = self._staged(
+            "hash-a", status="complete", unique=126,
+            source_identity_hash="same-real-file", extraction_logic_fingerprint="pre-fix-fingerprint",
+        )
+        current_code_incomplete = self._staged(
+            "hash-b", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126,
+            source_identity_hash="same-real-file", extraction_logic_fingerprint="post-fix-fingerprint",
+        )
+
+        active, superseded = file_store.active_and_superseded_staging_files(
+            [stale_code_complete, current_code_incomplete],
+        )
+
+        self.assertEqual(active, [stale_code_complete])
+        self.assertEqual(superseded, [current_code_incomplete])
+
+    def test_both_entries_current_code_falls_back_to_enrichment_completeness(self):
+        # Neither sibling is stale - the fingerprint signal doesn't
+        # differentiate them, so enrichment completeness still decides,
+        # exactly as it did before this signal existed.
+        incomplete = self._staged(
+            "hash-a", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126,
+            source_identity_hash="same-real-file", extraction_logic_fingerprint="current-fingerprint",
+        )
+        complete = self._staged(
+            "hash-b", status="complete", unique=126,
+            source_identity_hash="same-real-file", extraction_logic_fingerprint="current-fingerprint",
+        )
+
+        active, superseded = file_store.active_and_superseded_staging_files(
+            [incomplete, complete], current_logic_fingerprints=frozenset({"current-fingerprint"}),
+        )
+
+        self.assertEqual(active, [complete])
+        self.assertEqual(superseded, [incomplete])
+
+    def test_neither_entry_has_a_recorded_fingerprint_falls_back_to_enrichment_completeness(self):
+        # Both legacy entries (extraction_logic_fingerprint never recorded)
+        # - a non-empty current_logic_fingerprints has nothing to match
+        # against either one, so this must behave exactly as it did before
+        # this signal existed, never crash or treat blank-vs-blank as a
+        # spurious match.
+        incomplete = self._staged(
+            "hash-a", status="in_progress", processed_urls={"https://0.pdf": "ok"}, unique=126,
+            source_identity_hash="same-real-file",
+        )
+        complete = self._staged(
+            "hash-b", status="complete", unique=126, source_identity_hash="same-real-file",
+        )
+
+        active, superseded = file_store.active_and_superseded_staging_files(
+            [incomplete, complete], current_logic_fingerprints=frozenset({"current-fingerprint"}),
+        )
+
+        self.assertEqual(active, [complete])
+        self.assertEqual(superseded, [incomplete])
 
 
 if __name__ == "__main__":

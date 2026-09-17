@@ -53,6 +53,7 @@ def _write_meta(xlsx_path: str, meta: dict) -> None:
 def save_staging_file(
     rows: list[ListingRow], original_filename: str, content_hash: str = None,
     fully_occupied_buildings: list = None, source_identity_hash: str = None,
+    extraction_logic_fingerprint: str = None,
 ) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     stem = Path(original_filename).stem
@@ -84,6 +85,21 @@ def save_staging_file(
             # before this field existed - group_pending_by_content_hash
             # falls back to content_hash for those, unchanged from before.
             "source_identity_hash": source_identity_hash,
+            # app.py's own extraction_fingerprint.SPREADSHEET_LOGIC_
+            # FINGERPRINT/PDF_EMAIL_LOGIC_FINGERPRINT value at the moment
+            # THIS entry was extracted - the one piece of "was this produced
+            # by the code running right now" evidence source_identity_hash
+            # deliberately excludes (see its own comment above). Stored
+            # separately, rather than recomputed later, since recomputing it
+            # would need the original upload's raw bytes, which staging
+            # never retains past extraction time. None for a staging entry
+            # written before this field existed, or for a caller that never
+            # passes one - active_and_superseded_staging_files' own
+            # current_logic_fingerprints tie-break treats that exactly like
+            # any other non-matching value: never preferred over a sibling
+            # confirmed current, but otherwise falls through to its existing
+            # enrichment-completeness/recency comparison unaffected.
+            "extraction_logic_fingerprint": extraction_logic_fingerprint,
             # {"provider", "building"} dicts (see extract_spreadsheet_gemini.
             # extract_sheet_with_metadata) - buildings this upload's own
             # source text explicitly states have zero current availability.
@@ -562,6 +578,30 @@ def _enrichment_completeness_rank(path: str) -> tuple:
     return (status_rank, stats.get("brochures_done", 0))
 
 
+def _is_current_code_fingerprint(path: str, current_logic_fingerprints: frozenset) -> bool:
+    """
+    True if `path`'s own recorded extraction_logic_fingerprint (see
+    save_staging_file) is one of `current_logic_fingerprints` - i.e. this
+    entry was produced by the extraction/enrichment code that's running
+    RIGHT NOW, not an earlier version of it. False for a blank/missing
+    fingerprint (an entry written before this field existed, or by a caller
+    that never passed one) exactly the same as for one that's merely
+    outdated - "confirmed current" is the only thing this distinguishes,
+    never "confirmed stale" vs "unknown".
+
+    False unconditionally when `current_logic_fingerprints` itself is empty
+    - the caller's own signal that it has no current-fingerprint information
+    to offer (an older call site, or a test not yet updated) - so every
+    entry in a group compares equal on this signal and active_and_
+    superseded_staging_files' own sort falls straight through to its
+    pre-existing _enrichment_completeness_rank/timestamp comparison,
+    unchanged.
+    """
+    if not current_logic_fingerprints:
+        return False
+    return _read_meta(path).get("extraction_logic_fingerprint") in current_logic_fingerprints
+
+
 def _grouping_hash(meta: dict) -> str:
     """
     The hash group_pending_by_content_hash/active_and_superseded_staging_
@@ -606,7 +646,7 @@ def group_pending_by_content_hash(pending: list) -> dict:
     return groups
 
 
-def active_and_superseded_staging_files(pending: list) -> tuple:
+def active_and_superseded_staging_files(pending: list, current_logic_fingerprints: frozenset = frozenset()) -> tuple:
     """
     (active_paths, superseded_paths), both subsets of `pending`, in `pending`'s
     own relative order - splits pending staging files by SOURCE identity
@@ -615,6 +655,24 @@ def active_and_superseded_staging_files(pending: list) -> tuple:
     _render_pending_review) reads rows from exactly ONE staging file per
     genuinely distinct uploaded document, never once per PROCESSING RUN of
     the same document.
+
+    `current_logic_fingerprints` (see _is_current_code_fingerprint) is
+    normally {extraction_fingerprint.SPREADSHEET_LOGIC_FINGERPRINT,
+    extraction_fingerprint.PDF_EMAIL_LOGIC_FINGERPRINT} as the calling page
+    computes them right now - the caller's own current-code signal, passed
+    in rather than imported here to avoid a circular import (this module is
+    itself imported BY app.py). Real, confirmed gap this parameter closes:
+    within a source-identity group, an OLDER staging entry - extracted by a
+    now-superseded version of the extraction code, but with its brochure
+    enrichment fully complete - could outrank a FRESH entry extracted by
+    CURRENT (fixed) code that hadn't finished enrichment yet, since
+    enrichment completeness alone (see _enrichment_completeness_rank) has no
+    way to know one entry's own extraction logic is stale. Confirmed real
+    case: a pending Ivybridge House upload's fresh, DOM-text-LET-status-
+    fixed extraction (matches: {}, genuinely nothing to flag) was marked
+    superseded by an older, fully-enriched entry from before that fix, so
+    the Review page kept showing that entry's own stale possible_missed_
+    let_status note as if it were the latest upload's own finding.
 
     Real problem this solves: re-uploading the identical source file while
     an earlier run's brochure enrichment was still incomplete (or simply
@@ -639,12 +697,18 @@ def active_and_superseded_staging_files(pending: list) -> tuple:
     it sat there un-discarded.
 
     Within a source-identity group of 2+ staging files, exactly ONE is
-    "active" (the one whose brochure-enrichment state is most complete -
-    see _enrichment_completeness_rank; a genuine tie breaks toward the
-    most recently written entry, the LAST resort here, never the primary
-    signal - "latest wins" alone is exactly the naive rule this function
-    deliberately does NOT implement) - every other member of that group is
-    "superseded": excluded from Review's own row-combination/counts, but
+    "active": first, an entry confirmed produced by CURRENT extraction code
+    (see _is_current_code_fingerprint) is always preferred over a sibling
+    that isn't, regardless of either one's own enrichment completeness -
+    that signal exists specifically so a fresh, correct re-extraction can
+    never be buried by an older, merely-more-enriched, pre-fix copy (see
+    this function's own Ivybridge House case above). Only when neither or
+    both siblings are current-code-confirmed does enrichment completeness
+    decide instead (see _enrichment_completeness_rank), with a genuine tie
+    breaking toward the most recently written entry, the LAST resort here,
+    never the primary signal - "latest wins" alone is exactly the naive rule
+    this function deliberately does NOT implement. Every other member of
+    that group is "superseded": excluded from Review's own row-combination/counts, but
     still a completely ordinary member of `pending` for every other
     purpose (staging management's own per-file listing, its own
     individual Discard button, Continue enrichment if the reviewer
@@ -671,7 +735,11 @@ def active_and_superseded_staging_files(pending: list) -> tuple:
             continue
         ranked = sorted(
             paths,
-            key=lambda p: (_enrichment_completeness_rank(p), _read_meta(p).get("timestamp", "")),
+            key=lambda p: (
+                _is_current_code_fingerprint(p, current_logic_fingerprints),
+                _enrichment_completeness_rank(p),
+                _read_meta(p).get("timestamp", ""),
+            ),
             reverse=True,
         )
         active.append(ranked[0])

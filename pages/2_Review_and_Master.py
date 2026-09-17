@@ -11,6 +11,7 @@ import streamlit as st
 
 import brochure_enrichment
 import display_utils
+from extraction_fingerprint import pdf_email_logic_fingerprint, spreadsheet_logic_fingerprint
 import geocode
 import master_merge
 import master_writer
@@ -2782,7 +2783,10 @@ def _render_pending_review(pending: list):
     # own per-file listing/discard button, see _render_brochure_
     # enrichment_summary), it just never gets to double-count its own
     # building/floor rows against its more-complete twin.
-    active, superseded = active_and_superseded_staging_files(pending)
+    active, superseded = active_and_superseded_staging_files(
+        pending,
+        current_logic_fingerprints=frozenset({spreadsheet_logic_fingerprint(), pdf_email_logic_fingerprint()}),
+    )
 
     with st.spinner("Loading..."):
         combined_df = display_utils.sort_by_provider(pd.concat(
