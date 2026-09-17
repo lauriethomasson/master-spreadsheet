@@ -26,7 +26,6 @@ and has no awareness that a merge happened at all.
 import difflib
 import math
 import re
-import sys
 import typing
 import uuid
 from collections import Counter
@@ -656,6 +655,7 @@ def _canonical_provider_key(value) -> str:
 # a "closest" canonical spelling for a provider that isn't on it.
 KNOWN_PROVIDERS = (
     "Business Cube",
+    "Colliers",
     "GPE",
     "JLL / HK London",
     "Kitt's",
@@ -665,7 +665,35 @@ KNOWN_PROVIDERS = (
     "Workplace Plus",
 )
 
+# Confirmed real provider-name variants that name a genuinely DIFFERENT
+# string, not merely a case/punctuation/whitespace-only drift of a
+# KNOWN_PROVIDERS spelling (_canonical_provider_key already folds that kind
+# of drift together on its own - see canonicalize_provider_name's own
+# docstring). This is for the rarer case where a provider is confirmed to
+# also go by a materially different name (a divisional/trading name, not a
+# typo) - deliberately still "small, explicit, hand-maintained, only ever a
+# confirmed real pair", never a fuzzy "close enough" guess, the same
+# philosophy as KNOWN_PROVIDERS itself.
+#
+# Real confirmed case this exists for: a Colliers-branded Canva/Pitch deck's
+# own rendered page text names the provider "Colliers London Offices" (a
+# real, confirmed variant, not a company distinct from "Colliers") for New
+# Derwent House rows that match two existing master rows (building "New
+# Derwent House", postcode "W1S 2ER") already on file under the plain
+# "Colliers". Left uncorrected, provider is part of every matching key
+# (_fallback_key/_primary_key/_dedup_key/_fuzzy_anchor_key above) -
+# normalize_key("Colliers London Offices") == "colliers london offices" is
+# a genuinely different string from normalize_key("Colliers") ==
+# "colliers", so those rows matched nothing on any tier and landed as a
+# brand-new property instead of updating the two rows already on file.
+PROVIDER_ALIASES = {
+    "Colliers London Offices": "Colliers",
+}
+
 _CANONICAL_PROVIDER_BY_KEY = {_canonical_provider_key(p): p for p in KNOWN_PROVIDERS}
+_CANONICAL_PROVIDER_BY_KEY.update(
+    {_canonical_provider_key(alias): canonical for alias, canonical in PROVIDER_ALIASES.items()}
+)
 
 
 def canonicalize_provider_name(value):
@@ -673,13 +701,15 @@ def canonicalize_provider_name(value):
     Corrects value to its known-correct spelling from KNOWN_PROVIDERS when
     it's a recognizable variant of one of them (case, "+"/"Plus"/"&"/"and",
     or minor punctuation/whitespace difference - see _canonical_provider_
-    key); returns value completely unchanged otherwise, including for every
-    provider not yet on that list. That's deliberate: the point is to fix
-    known, already-confirmed spelling drift for names this project has
-    already seen, not to guess at correctness for one it hasn't - a
-    genuinely new real provider should be added to KNOWN_PROVIDERS once
-    confirmed, not silently matched against something close on the list by
-    a looser heuristic. Same "conservative, human catches it" philosophy as
+    key), OR when it's a confirmed different-wording alias of one of them
+    (see PROVIDER_ALIASES); returns value completely unchanged otherwise,
+    including for every provider not yet on either of those. That's
+    deliberate: the point is to fix known, already-confirmed spelling/
+    naming drift for names this project has already seen, not to guess at
+    correctness for one it hasn't - a genuinely new real provider (or a new
+    alias of one already known) should be added once confirmed, not
+    silently matched against something close on the list by a looser
+    heuristic. Same "conservative, human catches it" philosophy as
     normalize_key itself, applied one level earlier - fixing the value at
     the source instead of loosening how match keys compare it.
 
@@ -688,7 +718,10 @@ def canonicalize_provider_name(value):
     "Workplace Plus" (its own literal document text - "At Workplace Plus,
     we believe..."), "Workplace+", and "WORKPLACE+" across different runs -
     all three canonicalize to "Workplace Plus" here. Real spreadsheet data
-    separately shows "MetSpace" vs "Metspace" the same way.
+    separately shows "MetSpace" vs "Metspace" the same way. See
+    PROVIDER_ALIASES' own docstring for the "Colliers London Offices" ->
+    "Colliers" case, a confirmed different-wording alias rather than a
+    formatting-only variant.
     """
     if _is_blank(value):
         return value
@@ -3256,25 +3289,6 @@ def build_merge_plan(new_rows: list, master_df: pd.DataFrame) -> MergePlan:
                 fuzzy_idx = _fuzzy_building_match(new_dict, fuzzy_candidates, master_records)
                 if fuzzy_idx is not None:
                     master_idx, tier = fuzzy_idx, "fuzzy_building"
-
-        # TEMPORARY diagnostic — investigating a real, reported non-match
-        # (Colliers "New Derwent House", W1S 2ER, a Canva/Pitch upload
-        # landing as a brand-new property instead of matching two existing
-        # master rows). Prints every field the matching cascade above
-        # actually keyed on, for every row that fell through every tier,
-        # so the NEXT real upload of this document reveals exactly why
-        # (e.g. building/provider spelling drift, a postcode baked into
-        # the building field, a blank postcode). Remove once that's
-        # confirmed — never meant to stay in this form long-term.
-        if master_idx is None:
-            print(
-                f"[master_merge][DIAGNOSTIC-TEMP] no match for new row: "
-                f"building={new_dict.get('building')!r} provider={new_dict.get('provider')!r} "
-                f"postcode={new_dict.get('postcode')!r} floor_unit={new_dict.get('floor_unit')!r} — "
-                f"primary_key={_primary_key(new_dict)!r} fallback_key={_fallback_key(new_dict)!r} "
-                f"fuzzy_anchor_key={_fuzzy_anchor_key(new_dict)!r}",
-                file=sys.stderr,
-            )
 
         if master_idx is not None:
             old_rec = master_records[master_idx]

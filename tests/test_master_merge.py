@@ -1732,6 +1732,15 @@ class CanonicalizeProviderNameTests(unittest.TestCase):
         self.assertIsNone(master_merge.canonicalize_provider_name(None))
         self.assertEqual(master_merge.canonicalize_provider_name(""), "")
 
+    def test_known_alias_is_corrected_to_its_canonical_name(self):
+        # Real confirmed case: a Colliers-branded Canva/Pitch deck's own
+        # rendered page text names the provider "Colliers London Offices"
+        # for New Derwent House rows already on master under "Colliers".
+        self.assertEqual(master_merge.canonicalize_provider_name("Colliers London Offices"), "Colliers")
+
+    def test_known_alias_is_case_insensitive(self):
+        self.assertEqual(master_merge.canonicalize_provider_name("COLLIERS LONDON OFFICES"), "Colliers")
+
 
 class CanonicalizeProvidersTests(unittest.TestCase):
     def test_mutates_every_row_in_place(self):
@@ -2052,6 +2061,51 @@ class BuildMergePlanFuzzyBuildingTests(unittest.TestCase):
         # unmatched rather than guessing.
         master_df = _master_df([{"building": "Conran Building", "provider": "Kitt's", "floor_unit": "3rd"}])
         new_row = ListingRow(building="Cowan Building", provider=None, floor_unit="3rd")
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.unmatched), 1)
+
+
+class BuildMergePlanProviderAliasTests(unittest.TestCase):
+    """
+    Real confirmed bug: a Colliers-branded Canva/Pitch deck's own rendered
+    page text names the provider "Colliers London Offices" for New Derwent
+    House rows already on master under "Colliers", with no postcode
+    captured on the new row at all. The postcode-inclusive tier can't run
+    (new row has no postcode), and both the fallback and fuzzy-anchor tiers
+    still key on provider - "colliers" vs "colliers london offices" is a
+    genuinely different normalize_key() string, so neither matched at all
+    and the row landed as a brand-new property. canonicalize_providers runs
+    on every row before build_merge_plan in the real pipeline (app.py) -
+    exercised here the same way, not synthesized straight into build_merge_
+    plan, so this covers the actual end-to-end fix.
+    """
+
+    def test_known_provider_alias_matches_via_fallback_tier_despite_missing_postcode(self):
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers",
+            "floor_unit": "2nd", "postcode": "W1S 2ER",
+        }])
+        new_row = ListingRow(building="New Derwent House", provider="COLLIERS LONDON OFFICES", floor_unit="2nd")
+        master_merge.canonicalize_providers([new_row])
+
+        plan = master_merge.build_merge_plan([new_row], master_df)
+
+        self.assertEqual(len(plan.matched_changed) + len(plan.matched_unchanged), 1)
+        matched = (plan.matched_changed + plan.matched_unchanged)[0]
+        self.assertEqual(matched.match_tier, "fallback")
+        self.assertEqual(matched.master_index, 0)
+
+    def test_unrecognized_alias_still_falls_through_unmatched(self):
+        # Not on PROVIDER_ALIASES - never guessed at, same "conservative,
+        # human catches it" contract as canonicalize_provider_name itself.
+        master_df = _master_df([{
+            "building": "New Derwent House", "provider": "Colliers",
+            "floor_unit": "2nd", "postcode": "W1S 2ER",
+        }])
+        new_row = ListingRow(building="New Derwent House", provider="Colliers West End Desk", floor_unit="2nd")
+        master_merge.canonicalize_providers([new_row])
 
         plan = master_merge.build_merge_plan([new_row], master_df)
 
