@@ -26,6 +26,7 @@ Run with:
     .venv\\Scripts\\python.exe -m unittest tests.test_app_upload_paste_a_link -v
 """
 
+import hashlib
 import os
 import sys
 import unittest
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app
 from schema import ListingRow
+from storage import file_store
 from storage.file_store import list_pending_staging_files
 
 # The bare `import app` above executes app.py's top-level page code once,
@@ -144,6 +146,7 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         self.assertIsInstance(result, app._PastedLinkFile)
         self.assertEqual(result.name, "brochure.pdf")
         self.assertEqual(result.getvalue(), b"%PDF-1.4 fake pdf bytes")
+        self.assertEqual(result.source_url, "https://example.com/brochure.pdf")
 
     def test_png_pages_are_assembled_into_a_real_multi_page_pdf(self):
         # A Canva/Pitch link is now intercepted BEFORE _fetch_pdf_bytes
@@ -166,6 +169,7 @@ class FetchPastedLinkUnitTests(unittest.TestCase):
         self.assertEqual(result.png_pages, png_pages)
         self.assertEqual(result.page_links, page_links)
         self.assertEqual(result.page_texts, page_texts)
+        self.assertEqual(result.source_url, "https://canva.link/cvkmdcet1gpz149")
         doc = fitz.open("pdf", result.getvalue())
         try:
             self.assertEqual(doc.page_count, 3)
@@ -503,6 +507,92 @@ class SuccessfulCanvaStyleLinkTests(unittest.TestCase):
         self.assertEqual(mock_extract.call_args.kwargs["page_texts"], page_texts)
         mock_plain_extract.assert_not_called()  # never the re-rasterizing PDF-file path for this source
         self.assertEqual(len(list_pending_staging_files()), 1)
+
+
+class SourceIdentityHashForCanvaPitchLinksTests(unittest.TestCase):
+    """
+    Regression coverage for a real, confirmed production case: the
+    Ivybridge House Canva deck's stale possible_missed_let_status note kept
+    reappearing even after active_and_superseded_staging_files' own
+    current-code tie-break (see file_store.py) shipped, because a Canva/
+    Pitch render's own assembled PDF bytes (app._pdf_bytes_from_png_pages)
+    are NOT guaranteed byte-identical across two separate renders of the
+    identical live URL - so hashing those bytes for source_identity_hash
+    (correct for a real, fixed uploaded file) gave two genuinely different
+    renders of the SAME document two DIFFERENT source_identity_hash values,
+    meaning group_pending_by_content_hash/_grouping_hash never recognized
+    them as the same source document at all - the tie-break never got a
+    chance to run between them. Fixed by hashing the pasted link's own
+    normalized URL (app._PastedLinkFile.source_url) instead, for the
+    Canva/Pitch render path (png_pages present) specifically - see that
+    attribute's own docstring.
+    """
+
+    def setUp(self):
+        _clear_pending()
+
+    def tearDown(self):
+        _clear_pending()
+
+    def _source_identity_hash_for_single_pending(self):
+        pending = list_pending_staging_files()
+        self.assertEqual(len(pending), 1)
+        return file_store._read_meta(pending[0])["source_identity_hash"]
+
+    def _extract_canva_link(self, url, png_pages):
+        with patch.dict(os.environ, {"CANVA_RENDERER_URL": "https://canva-renderer.example.run.app"}), \
+                patch(
+                    "brochure_enrichment.fetch_rendered_page_with_links",
+                    return_value=(png_pages, [[] for _ in png_pages], ["" for _ in png_pages]),
+                ), \
+                patch("extract.extract_from_png_pages", return_value=[]):
+            at = _run_upload_page()
+            _add_link(at, url)
+            self.assertFalse(at.exception)
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+        return self._source_identity_hash_for_single_pending()
+
+    def test_two_renders_of_the_same_url_produce_the_same_source_identity_hash(self):
+        url = "https://canva.link/cvkmdcet1gpz149"
+        first_hash = self._extract_canva_link(url, [_make_png((1, 0, 0)), _make_png((0, 1, 0))])
+        _clear_pending()
+        # A DIFFERENT render of the identical URL - different synthesized
+        # PDF bytes (different page images), simulating the genuine render-
+        # to-render non-determinism this fix exists for.
+        second_hash = self._extract_canva_link(url, [_make_png((0, 0, 1))])
+
+        self.assertEqual(first_hash, second_hash)
+
+    def test_two_different_urls_still_produce_different_source_identity_hashes(self):
+        first_hash = self._extract_canva_link(
+            "https://canva.link/cvkmdcet1gpz149", [_make_png((1, 0, 0))],
+        )
+        _clear_pending()
+        second_hash = self._extract_canva_link(
+            "https://canva.link/a-totally-different-design", [_make_png((1, 0, 0))],
+        )
+
+        self.assertNotEqual(first_hash, second_hash)
+
+    def test_direct_pdf_link_source_identity_hash_is_still_the_raw_bytes_hash(self):
+        # png_pages is None for a direct-PDF pasted link (see
+        # app._PastedLinkFile's own docstring) - this path must be
+        # completely unaffected by the Canva/Pitch fix above, exactly like
+        # an ordinary uploaded PDF/email file.
+        pdf_bytes = b"%PDF-1.4 fake pdf bytes"
+        with patch("brochure_enrichment._fetch_pdf_bytes", return_value=pdf_bytes), \
+                patch("extract.extract", return_value=[]):
+            at = _run_upload_page()
+            _add_link(at, "https://example.com/brochure.pdf")
+            self.assertFalse(at.exception)
+            extract_buttons = [b for b in at.button if b.label == "Extract"]
+            extract_buttons[0].click().run()
+            self.assertFalse(at.exception)
+
+        actual_hash = self._source_identity_hash_for_single_pending()
+        self.assertEqual(actual_hash, hashlib.sha256(pdf_bytes).hexdigest())
 
 
 class FailedLinkTests(unittest.TestCase):

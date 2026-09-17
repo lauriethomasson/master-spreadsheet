@@ -741,12 +741,35 @@ class _PastedLinkFile:
 
     def __init__(
         self, name: str, data: bytes, png_pages: list = None, page_links: list = None, page_texts: list = None,
+        source_url: str = None,
     ):
         self.name = name
         self._data = data
         self.png_pages = png_pages
         self.page_links = page_links
         self.page_texts = page_texts
+        # The pasted link's own normalized URL (see _fetch_pasted_link) -
+        # None for a plain st.file_uploader UploadedFile (this attribute
+        # only ever exists on THIS class), used ONLY by the upload loop's
+        # own source_identity_hash computation below for a Canva/Pitch
+        # render (png_pages present): a live design's re-rendered PDF bytes
+        # are NOT guaranteed byte-identical across two separate renders of
+        # the identical URL (timing/font-rasterization/compression can all
+        # vary run to run even though the visible content hasn't changed),
+        # so hashing the assembled PDF bytes themselves - correct for a
+        # real uploaded file, a fixed artifact - silently produces a
+        # DIFFERENT source_identity_hash for what active_and_superseded_
+        # staging_files/_grouping_hash need to recognize as the SAME source
+        # document. Real, confirmed production case: the Ivybridge House
+        # Canva deck's stale possible_missed_let_status note kept
+        # reappearing even after the staging-tie-break fix (active_and_
+        # superseded_staging_files' own current_logic_fingerprint check,
+        # see file_store.py) shipped and a fresh re-render genuinely found
+        # zero LET-status matches - because the fresh render's own
+        # synthesized PDF bytes hashed differently from the earlier
+        # attempt's, so the two were never grouped as the same document at
+        # all, and the tie-break never got a chance to run between them.
+        self.source_url = source_url
 
     def getvalue(self) -> bytes:
         return self._data
@@ -870,12 +893,13 @@ def _fetch_pasted_link(url: str):
             return None
         return _PastedLinkFile(
             _filename_from_url(url), data, png_pages=pages, page_links=page_links, page_texts=page_texts,
+            source_url=url,
         )
 
     data = brochure_enrichment._fetch_pdf_bytes(url)
     if data is None:
         return None
-    return _PastedLinkFile(_filename_from_url(url), data)
+    return _PastedLinkFile(_filename_from_url(url), data, source_url=url)
 
 
 def _validate_pasted_link_brochure_links(rows: list, shared_fallback_link: str) -> None:
@@ -1356,7 +1380,48 @@ with page_setup.setup_page("upload"):
                         # geocode.py fingerprint, so a re-upload of the same
                         # PDF/email across a code change is still recognized
                         # as superseding an earlier, stale pending copy.
-                        source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
+                        #
+                        # EXCEPT for a pasted Canva/Pitch link (uploaded_
+                        # file.png_pages present - see _PastedLinkFile/
+                        # _fetch_pasted_link): there, file_bytes is a PDF
+                        # freshly SYNTHESIZED from that render's own PNG
+                        # screenshots (_pdf_bytes_from_png_pages), not a
+                        # fixed uploaded artifact - two separate renders of
+                        # the identical live URL are not guaranteed to
+                        # produce byte-identical assembled PDF bytes (see
+                        # _PastedLinkFile.source_url's own docstring for the
+                        # real, confirmed Ivybridge House production case
+                        # this closes). Hashing the URL instead - the thing
+                        # that's actually stable across re-renders - is what
+                        # lets active_and_superseded_staging_files/_grouping_
+                        # hash recognize two such renders as the SAME source
+                        # document at all, which is a precondition for its
+                        # own current-code tie-break to ever run between
+                        # them. A direct-PDF or resolved-landing-page pasted
+                        # link (png_pages is None) is a real fetched
+                        # artifact, not a synthesized one, so it keeps
+                        # hashing file_bytes exactly like an ordinary
+                        # uploaded PDF/email.
+                        # getattr, NEVER isinstance(uploaded_file, _PastedLinkFile)
+                        # - Streamlit re-execs this whole script from scratch on
+                        # every rerun, so _PastedLinkFile is a BRAND NEW class
+                        # object each rerun, while a wrapper instance sitting in
+                        # st.session_state["pasted_links"] was constructed by an
+                        # EARLIER rerun's class definition; isinstance compares
+                        # class identity, so it silently evaluates False across
+                        # reruns despite being "the same class" by name/
+                        # definition - confirmed directly the hard way while
+                        # building this fix. png_pages is the existing, already-
+                        # correct duck-typed signal for "this came from a Canva/
+                        # Pitch render" used elsewhere in this same file (see the
+                        # Extract loop's own "if png_pages is not None:" branch) -
+                        # None (via getattr's default) for a plain st.file_
+                        # uploader UploadedFile, which has no such attribute at
+                        # all.
+                        if getattr(uploaded_file, "png_pages", None) is not None:
+                            source_identity_hash = hashlib.sha256(uploaded_file.source_url.encode("utf-8")).hexdigest()
+                        else:
+                            source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
                         extraction_logic_fingerprint = _PDF_EMAIL_LOGIC_FINGERPRINT
 
                     # content_hash ONLY here - deliberately NOT source_
