@@ -1418,8 +1418,19 @@ with page_setup.setup_page("upload"):
                         # None (via getattr's default) for a plain st.file_
                         # uploader UploadedFile, which has no such attribute at
                         # all.
+                        # canonical_identity_url, NEVER the raw source_url -
+                        # real confirmed case: the identical Ivybridge House/
+                        # Colliers design pasted once bare and once with a
+                        # long utm_*/utlId tracking suffix + "#1" fragment
+                        # hashed as two unrelated documents under the raw
+                        # URL, reopening this same staging-duplication bug
+                        # through a different door (see canonical_identity_
+                        # url's own docstring for the full case). Query
+                        # params/fragments are sharing/tracking metadata,
+                        # never part of which design is being viewed.
                         if getattr(uploaded_file, "png_pages", None) is not None:
-                            source_identity_hash = hashlib.sha256(uploaded_file.source_url.encode("utf-8")).hexdigest()
+                            identity_url = brochure_link_resolver.canonical_identity_url(uploaded_file.source_url)
+                            source_identity_hash = hashlib.sha256(identity_url.encode("utf-8")).hexdigest()
                         else:
                             source_identity_hash = hashlib.sha256(file_bytes).hexdigest()
                         extraction_logic_fingerprint = _PDF_EMAIL_LOGIC_FINGERPRINT

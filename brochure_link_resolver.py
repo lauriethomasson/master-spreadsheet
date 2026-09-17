@@ -20,7 +20,7 @@ import functools
 import json
 import re
 import sys
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -49,6 +49,38 @@ def _normalize_url(url: str) -> str:
     if not urlparse(url).scheme:
         return f"https://{url}"
     return url
+
+
+def canonical_identity_url(url: str) -> str:
+    """Scheme + host + path ONLY - query string and fragment stripped
+    entirely, case preserved. For a pasted Canva/Pitch link's own identity
+    hashing (see app.py's _PastedLinkFile.source_url/source_identity_hash),
+    never for anything that needs _clean_path's own lowercased, still-
+    query-stripped comparison (matching an href against known keywords) -
+    a different job with a different correctness requirement.
+
+    NOT the same as _clean_path: that lowercases the whole string, which is
+    fine for its own case-insensitive keyword matching but wrong here - a
+    real Canva design ID/share token (e.g. "DAGbhpjThxc",
+    "18LeF-NYtfUff8o3byKDmQ") is a case-SENSITIVE mixed-case string, and
+    lowercasing it for an identity hash would risk conflating two
+    genuinely different real tokens that happen to differ only in case.
+
+    Real, confirmed production case this exists for: the identical
+    Ivybridge House/Colliers Canva design (DAGbhpjThxc) was pasted once as
+    a bare ".../view" link and again with a long tracking-parameter suffix
+    (utm_content/utm_campaign/utm_medium/utm_source/utlId, plus a "#1"
+    fragment) - genuinely the same live design, but two different query
+    strings meant app.py's URL-based source_identity_hash (see its own
+    docstring on why byte-hashing a synthesized render's own PDF is wrong
+    for a Canva/Pitch link) still hashed them as two unrelated documents,
+    reopening the exact staging-duplication bug that fix was meant to
+    close, just through a different door. Query params/fragments carry
+    tracking/sharing metadata, never part of which design is being viewed.
+    """
+    normalized = _normalize_url(url)
+    parsed = urlparse(normalized)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
 # Social/professional profile platforms that turn up in every email signature
